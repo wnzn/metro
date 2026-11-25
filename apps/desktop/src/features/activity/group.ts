@@ -43,6 +43,7 @@ export type ActivityGroup = {
   pick: string | null;
   /** The server's id for the turn (a Space run's `run_…`); null for an uncorrelated event. */
   activityId: string | null;
+  compactionMiss?: boolean;
   /** When its first and last events were recorded (ms), when the server dated them. */
   firstMs: number | null;
   lastMs: number | null;
@@ -61,6 +62,9 @@ const TERMINAL: Record<Exclude<ActivityPhase, "started">, GroupOutcome> = {
 };
 
 const isLifecycle = (e: RoomEvent) => e.kind.trim().toLowerCase() === "activity";
+export const COMPACTION_MISS = "Couldn't summarize earlier messages";
+export const isRoomCompactionMiss = (e: RoomEvent) => e.activity?.source === "agent" &&
+  e.kind === "status" && e.text === `${COMPACTION_MISS}; the agent used the most recent messages.`;
 
 function legacySource(actor: string): { source: GroupSource; name: string } {
   const a = actor.trim().toLowerCase();
@@ -148,7 +152,13 @@ export function groupTranscript(events: readonly RoomEvent[]): TranscriptItem[] 
       if (g.firstMs === null || ms < g.firstMs) g.firstMs = ms;
       if (g.lastMs === null || ms > g.lastMs) g.lastMs = ms;
     }
-    if (isLifecycle(e)) {
+    if (isRoomCompactionMiss(e)) {
+      g.compactionMiss = true;
+      memberOf.set(e.id, key);
+    } else if (meta.source === "agent" && e.kind === "status" && e.text.startsWith(`${COMPACTION_MISS}: `)) {
+      // Chat carries its private reason as a regular status row. Neither
+      // status ends the agent's activity: the current run keeps answering.
+    } else if (isLifecycle(e)) {
       memberOf.set(e.id, key);
       if (meta.phase === "started") {
         g.started = true;
@@ -196,7 +206,7 @@ export function groupTranscript(events: readonly RoomEvent[]): TranscriptItem[] 
     // A turn that ended with nothing to inspect leaves no empty shell, unless
     // its route is worth saying (a use case, a chosen model, a System One or
     // scheduled start): then it stays one row, with nothing else in it.
-    if (!g.noReply && g.steps.length === 0 && !routeBadge(g.route) && !pickBadge(g.pick) && (g.outcome === "completed" || g.outcome === "ended")) continue;
+    if (!g.noReply && !g.compactionMiss && g.steps.length === 0 && !routeBadge(g.route) && !pickBadge(g.pick) && (g.outcome === "completed" || g.outcome === "ended")) continue;
     placed.add(key);
     const { started: _s, ended: _e, terminal: _t, ...group } = g;
     items.push({ type: "group", key: `group:${key}`, group });

@@ -42,6 +42,7 @@ import { Action, ActionBar, Badge, Banner, Column, compactWidth, FactList, Field
 import type { Fact, ModelOption } from "../ui";
 import { vendorOf } from "./providerGroups";
 import { MediaModelSettings, MediaModelFeedback, MediaModelSaveBar } from "./library/LibraryView";
+import { CompactionSettings } from "./commands/CompactionSettings";
 
 const NONE = "";
 
@@ -98,7 +99,7 @@ export function ModelChoicesSettings() {
         </Column>
       }
     >
-      <PageHeader title="Model choices" subtitle="Choose how Metro routes requests, searches messages and indexes files." scope={settingsAccountScope()} />
+      <PageHeader title="Model choices" subtitle="Choose how Metro routes requests, summarizes conversations, searches messages and indexes files." scope={settingsAccountScope()} />
       <If when={!routingUnsupported()}>
         <If when={draft()} else={<If when={!routingError()}><SettingsGroup><SettingRow label="Loading your model choices…" /></SettingsGroup></If>}>
           {(d) => (
@@ -112,6 +113,7 @@ export function ModelChoicesSettings() {
           )}
         </If>
       </If>
+      <CompactionSettings />
       <MediaModelSettings separate canReveal={!availableLoading() && !!(draft() || routingUnsupported() || routingError())} />
       <If when={routingUnsupported() ? null : draft()}>
         {(d) => <DataFlow draft={d()} />}

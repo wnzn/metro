@@ -19,7 +19,7 @@
 // the composer has separate Ask agent and Send actions; explicit recipients
 // still decide who a Space message reaches.
 
-import { Clipboard, announce, cleanup, computed, effect, localeSettings, signal } from "nsh";
+import { Clipboard, announce, cleanup, computed, effect, keymap, localeSettings, signal } from "nsh";
 import type { CaretEvent, InputRef, JSX, ViewRef } from "nsh";
 import {
   activeEvents,
@@ -27,7 +27,10 @@ import {
   activeReactions,
   activeSpace,
   actionError,
+  commandHint,
+  composerCommandPlace,
   composerScope,
+  compacting,
   eventsInRoom,
   focusTarget,
   draft,
@@ -45,6 +48,7 @@ import {
   roomEventScope,
   rooms,
   retryNow,
+  runComposerCommand,
   saveChatNote,
   send,
   sending,
@@ -72,6 +76,7 @@ import {
   ComposerBar,
   ComposerBox,
   ComposerField,
+  ComposerHint,
   DaySeparator,
   DraftSuggestion,
   EmojiChoice,
@@ -87,11 +92,14 @@ import {
   MessageFrame,
   MessageHeader,
   MessageToolbar,
+  PopoverNote,
   ReactionChip,
   RecipientTag,
   Row,
   SendButton,
   StagedFileChip,
+  SuggestionList,
+  SuggestionOption,
   Timestamp,
   ToolbarIconButton,
 } from "../ui";
@@ -121,6 +129,8 @@ import { copyMentionText, leadingMentionsCoverRecipients, sentMentions } from ".
 import { SenderNotice } from "./senderNotices/SenderNotice";
 import { openForward } from "./forward/state";
 import { ReplySummary } from "./replies/ReplySummary";
+import { commandSuggestions, parseCommand } from "./commands/registry";
+import { CompactionMarker } from "./commands/CompactionMarker";
 
 /** The user's zone and hour cycle; follows the system's settings as they change. */
 const clock = computed(() => clockFor(localeSettings()));
@@ -187,7 +197,8 @@ export type DraftIdea = { id: string; label: string; apply: () => void };
 
 export function Transcript(props: TranscriptActions & { emptyText: string; emptyTitle?: string; ideas?: DraftIdea[]; testID?: string }) {
   const chat = () => mainPlace() === "chat";
-  const events = () => props.direct?.events() ?? (props.roomId ? eventsInRoom(props.roomId) : activeEvents());
+  const events = computed(() => (props.direct?.events() ?? (props.roomId ? eventsInRoom(props.roomId) : activeEvents()))
+    .filter(e => e.kind !== "compaction" || !props.direct && e.compaction));
   const rows = computed(() => transcriptRows(groupTranscript(events()), events(), clock()));
   const ideas = () => props.ideas ?? [];
   const glyph = (): ChatGlyphName => (chat() || props.direct ? "chat" : "hash");
@@ -249,6 +260,7 @@ function TranscriptRowView(props: { row: () => TranscriptRow; actions: Transcrip
   const card = () => {
     const entry = as("event"), where = mainPlace();
     if (!entry) return null;
+    if (entry.event.compaction) return entry;
     if (entry.event.kind === "page_draft" && (where === "space" || where === "chat")) return entry;
     return where === "chat" && entry.event.kind === "space_post" && entry.event.activity?.spacePost ? entry : null;
   };
@@ -258,17 +270,21 @@ function TranscriptRowView(props: { row: () => TranscriptRow; actions: Transcrip
       else={
         <If when={as("group")} else={
           <If when={card()} else={<MessageRow row={() => row() as Of<"event">} actions={props.actions} />}>
-            {entry => <MessageFrame gutter={<StampGutter stamp={entry().stamp} id={entry().event.id} />} continued>
-              <If when={entry().event.kind === "space_post"} else={<PageDraftCard event={entry().event} />}>
-                <SpacePostRow event={entry().event} />
-              </If>
-            </MessageFrame>}
+            {entry => <If when={entry().event.compaction} else={
+              <MessageFrame gutter={<StampGutter stamp={entry().stamp} id={entry().event.id} />} continued>
+                <If when={entry().event.kind === "space_post"} else={<PageDraftCard event={entry().event} />}>
+                  <SpacePostRow event={entry().event} />
+                </If>
+              </MessageFrame>
+            }><CompactionMarker event={entry().event} stamp={entry().stamp}
+              scope={props.actions.roomId ? roomEventScope(props.actions.roomId) : composerScope()} /></If>}
           </If>
         }>
           {(g) => (
             <MessageFrame gutter={<StampGutter stamp={g().stamp} id={g().key} />} continued>
               <ActivityGroupRow
                 group={g().group}
+                roomId={props.actions.roomId}
                 agentName={g().group.agent?.name}
                 agentAvatar={g().group.agent && activeSpace()?.id ? <SpaceAgentAvatar spaceId={activeSpace()!.id} agent={g().group.agent!} size="sm" /> : undefined}
               />
@@ -827,11 +843,40 @@ export function Composer(props: {
   stopReply?: JSX.Element;
 }) {
   const hasFiles = () => stagedFor(composerScope()).length > 0;
-  const ready = () => !props.disabled && status().phase !== "signedOut" && !sending();
+  const ready = () => !props.disabled && status().phase !== "signedOut" && !sending() && !compacting();
   const canSend = () => ready() && (draft().trim().length > 0 || hasFiles());
   // A Space Ask needs a typed question; Chat Send can start a turn with files alone.
   const canAsk = () => ready() && draft().trim().length > 0;
   const personal = () => mainPlace() === "chat";
+  const parsed = computed(() => parseCommand(draft(), composerCommandPlace()));
+  const command = () => parsed() !== null;
+  const focused = signal(false);
+  const dismissed = signal<string | null>(null);
+  const selected = signal(0);
+  const suggestions = computed(() => ready() && !hasFiles() ? commandSuggestions(draft(), composerCommandPlace()) : []);
+  const suggestionKey = () => `${composerScope()}:${draft()}`;
+  const listOpen = () => suggestions().length > 0 && dismissed() !== suggestionKey();
+  const choose = (index: number) => {
+    const item = suggestions()[index];
+    if (!listOpen() || !item) return false;
+    setDraft(`/${item.name} `);
+    focusComposer();
+    return true;
+  };
+  effect(() => {
+    if (!listOpen() || !focused()) return;
+    const move = (by: number) => () => {
+      const options = suggestions();
+      if (!options.length) return;
+      const i = (selected() + by + options.length) % options.length;
+      selected.set(i);
+      announce(`/${options[i].name}, ${i + 1} of ${options.length}`);
+    };
+    return keymap.bind({
+      down: move(1), up: move(-1), tab: () => { choose(selected()); },
+      escape: () => dismissed.set(suggestionKey()),
+    }, { when: "always", repeat: true });
+  });
   const post = (ask: boolean) => {
     if ((personal() && props.stopReply) || !(ask && !personal() ? canAsk() : canSend())) return;
     if (!personal()) {
@@ -843,6 +888,10 @@ export function Composer(props: {
     } else void send(false);
   };
   const submit = () => {
+    if (command()) {
+      if (!choose(selected()) && ready()) void runComposerCommand();
+      return;
+    }
     if (props.onSubmitIntercept?.()) return;
     post(personal());
   };
@@ -852,19 +901,40 @@ export function Composer(props: {
       <ComposerBox testID="composer-box">
         {props.above}
         <StagedFiles />
+        <If when={listOpen()}>
+          <Column padX={3} padY={2}>
+            <SuggestionList accessibilityLabel="Commands" testID="command-suggestions">
+              <PopoverNote text="Commands" />
+              <Each of={suggestions()} key={item => item.name}>
+                {(item, index) => <SuggestionOption title={`/${item().name} ${item().args}`} detail={item().description}
+                  accessibilityLabel={`/${item().name} ${item().args} — ${item().description}`}
+                  testID={`command-option:${item().name}`} active={index() === selected()} onPress={() => { choose(index()); }} />}
+              </Each>
+            </SuggestionList>
+          </Column>
+        </If>
         <ComposerField
           testID="composer"
           ref={(node) => (composerInput = node)}
           accessibilityLabel={mainPlace() === "chat" ? "Message your Chat" : "Message"}
           value={draft()}
-          onChange={setDraft}
+          onChange={(text) => { dismissed.set(null); selected.set(0); setDraft(text); }}
           onSubmit={submit}
-          onFocusChange={(f) => props.onFocusChange?.(f)}
+          onFocusChange={(f) => { focused.set(f); props.onFocusChange?.(f); }}
           onCaretMove={props.onCaretMove}
           onSelectionChange={props.onSelectionChange}
           placeholder={props.placeholder}
           disabled={props.disabled}
         />
+        <If when={command()}>
+          <Column padX={3} gap={1}>
+            <If when={commandHint()} else={
+              <If when={parsed()?.command?.privacy(composerCommandPlace())}>
+                {hint => <ComposerHint text={hint()} />}
+              </If>
+            }>{hint => <ComposerHint text={hint()} testID="command-hint" />}</If>
+          </Column>
+        </If>
         <ComposerBar
           leading={
             <>
@@ -878,11 +948,11 @@ export function Composer(props: {
                 onPress={() => void pickAttachments()}
               />
               {props.tools}
-              <ComposerModelControls />
+              <If when={!command()}><ComposerModelControls /></If>
             </>
           }
           trailing={
-            <If when={personal()} else={
+            <If when={command()} else={<If when={personal()} else={
               <>
                 <AskAgentButton
                   testID="ask-agent"
@@ -923,6 +993,9 @@ export function Composer(props: {
                 disabled={!canSend()}
                 onPress={() => post(true)}
               />}
+            </If>}>
+              <Action compact variant="primary" testID="run-command" label="Run command" busyLabel="Summarizing…"
+                busy={compacting()} disabled={!ready()} onPress={submit} />
             </If>
           }
         />

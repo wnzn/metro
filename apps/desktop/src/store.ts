@@ -33,12 +33,15 @@
 //   device tokens shown in Settings (src/settings.ts registers its clearers
 //   here with onTransientClear / onSessionEnd).
 
-import { batch, computed, effect, signal, Storage, untracked } from "nsh";
+import { announce, batch, computed, effect, signal, Storage, untracked } from "nsh";
 import { ApiError, createClient, isCanonicalMessageRow, parseReaction } from "./api/client";
 import type { Client, Me, Member, Mention, Room, RoomEvent, Run, Space, SpaceMessageBody, TurnModelChoice } from "./api/client";
 export { ApiError };
 import { DEFAULT_SERVER_URL, parseServerUrl, serverHost } from "./api/serverUrl";
 import { plainHttpAccepted } from "./plainHttp";
+import { commandError, isCommandDraft, parseCommand } from "./features/commands/registry";
+import type { CommandPlace } from "./features/commands/registry";
+import { isRoomCompactionMiss } from "./features/activity/group";
 import { acceptSpaceRunnerSummary, clearSpaceRunnerOrder } from "./spaceRunnerOrder";
 import {
   captureTypedMentions, editMentionDraft, mentionIdentityKey, pickMention, prepareMentionSend, scanMentionDraft, updateMentionDraft,
@@ -207,6 +210,9 @@ export const dispatchError = signal<string | null>(null);
 export const dispatchNotice = signal<string | null>(null);
 export const draft = signal("");
 export const sending = signal<null | "message" | "agent">(null);
+const commandsRunning = signal<ReadonlySet<string>>(new Set());
+export const compacting = computed(() => commandsRunning().has(activeScope()));
+export const commandHint = signal<string | null>(null);
 export const demoPending = signal(false);
 export const creatingRoom = signal(false);
 export const creatingSpace = signal(false);
@@ -277,6 +283,7 @@ let tickAgain = false;
 let failures = 0;
 let lastListsRefresh = 0;
 let lastRunsRefresh = 0;
+let compactionRunRefresh = false;
 const cursors = new Map<string, number>();
 const inflight = new Map<string, Promise<void>>();
 const pollAgain = new Set<string>();
@@ -1433,6 +1440,72 @@ export function composerScope(): string {
   return activeScope();
 }
 
+export function composerCommandPlace(): CommandPlace {
+  return basePlace() === "chat" ? "chat" : replyPane() || activeRoom()?.parentRoomId ? "thread" : "room";
+}
+
+/** Commands never enter the message path, including Save note and Ask agent. */
+export async function runComposerCommand(): Promise<void> {
+  const c = client;
+  const scope = activeScope();
+  const text = draft();
+  const submitted = mentionDraft();
+  const sid = activeSpaceId(), rid = composerRoomId();
+  const where = composerCommandPlace();
+  const chat = where === "chat";
+  const pane = replyPane();
+  if (!c || sending() || compacting() || !scope || settingsOpen() ||
+    (chat ? !!chatUnavailable() : !sid || !rid || !inSpaceComposer() ||
+      !!pane && (!replyAnchor() || !activeLoaded()))) return;
+  const parsed = parseCommand(text, where);
+  if (!parsed) return;
+  actionError.set(null);
+  notice.set(null);
+  const hint = attachments?.pending(scope) ? "Commands can't include files."
+    : !parsed.command ? (parsed.name ? `Unknown command /${parsed.name.slice(0, 48)}. To send text that starts with /, begin with //.`
+      : "Choose a command, or begin with // to send a literal slash.")
+    : parsed.command.validate(parsed.args);
+  commandHint.set(hint);
+  if (hint || !parsed.command) return;
+
+  const to: SendDestination = chat ? { kind: "chat" } : { kind: "room", spaceId: sid!, roomId: rid! };
+  const origin = captureSendOrigin(c, to);
+  const sameSession = guard();
+  const navigation = navigationGeneration;
+  const here = () => origin.current() && navigation === navigationGeneration && activeScope() === scope && replyPane() === pane &&
+    !settingsOpen() && (chat ? !chatUnavailable() : inSpaceComposer());
+  const unchanged = () => chat ? draft() === text : mentionDraft() === submitted;
+  commandsRunning.set(new Set(commandsRunning()).add(scope));
+  try {
+    await parsed.command.run(c, to, parsed.args);
+    if (!origin.current() || !origin.canRetireDraft()) return;
+    // Read through the regular event cursor: inserting the POST result first
+    // could skip another event that arrived while the summary was running.
+    if (here()) {
+      if (unchanged()) setDraft("");
+      notice.set("Conversation summarized");
+      announce("Conversation summarized");
+    } else if (chat ? stashedDrafts()[scope]?.text === text : stashedDrafts()[scope]?.mention === submitted) {
+      const { [scope]: _sent, ...rest } = stashedDrafts();
+      stashedDrafts.set(rest);
+    }
+    kick();
+  } catch (error) {
+    if (sameSession() && error instanceof ApiError && error.kind === "auth") {
+      disconnect(error.message);
+      return;
+    }
+    if (here() && unchanged()) commandHint.set(commandError(error));
+    if (isAccessDenial(error)) origin.deny();
+  } finally {
+    if (sameSession()) {
+      const running = new Set(commandsRunning());
+      running.delete(scope);
+      commandsRunning.set(running);
+    }
+  }
+}
+
 /** Asking the agent needs a typed question: files alone are saved to the Library, not sent to a model. */
 export const ASK_NEEDS_TEXT = "Type a question to ask the agent. Attached files are saved to the Library; they aren't sent to the agent.";
 
@@ -1463,12 +1536,14 @@ async function sendDraft(intent: DraftSend): Promise<void> {
   const retryAction = saveNote ? "Save note" : "Send";
   const { invokeAgent, choice: pickModel, agentId } = saveNote ? { invokeAgent: false } : intent;
   const submittedText = draft();
-  const text = submittedText.trim();
+  if (isCommandDraft(submittedText)) return runComposerCommand();
+  const escaped = submittedText.startsWith("//");
+  const text = (escaped ? submittedText.slice(1) : submittedText).trim();
   const sid = activeSpaceId();
   const rid = composerRoomId();
   const c = client;
   const scope = activeScope();
-  if (!c || sending() || !scope || (!chat && (!sid || !rid || !inSpaceComposer()))) return;
+  if (!c || sending() || compacting() || !scope || (!chat && (!sid || !rid || !inSpaceComposer()))) return;
   if (replyPane() && (!replyAnchor() || !activeLoaded())) return;
   const target = chat ? null : replyTarget();
   const reply = target ? {
@@ -1576,7 +1651,13 @@ async function sendDraft(intent: DraftSend): Promise<void> {
         return;
       }
       origin = captureSendOrigin(c, to);
-      origin.acknowledge(await c.sendMessage(sid!, rid!, body, ids, selected.choice, reply));
+      // The literal escape removes one ASCII byte at the start, not any of
+      // the verified recipient text. Keep the same recipients and shift spans.
+      const outgoing = escaped ? {
+        ...body, text: body.text.slice(1),
+        ...(body.spans ? { spans: body.spans.map(s => ({ ...s, start: s.start - 1, end: s.end - 1 })) } : {}),
+      } : body;
+      origin.acknowledge(await c.sendMessage(sid!, rid!, outgoing, ids, selected.choice, reply));
     }
     // Accepted files are identified by immutable staging keys, not by the
     // current room epoch. Never leave them staged for a duplicate send after
@@ -1966,6 +2047,7 @@ async function refreshRuns() {
   try {
     const list = await c.listRuns();
     if (!ok()) return;
+    compactionRunRefresh = false;
     lastRunsRefresh = Date.now();
     batch(() => {
       runs.set(list);
@@ -1980,6 +2062,7 @@ async function refreshRuns() {
     if (!ok()) return;
     lastRunsRefresh = Date.now();
     if (error instanceof ApiError && !error.transient && error.kind !== "auth") {
+      compactionRunRefresh = false;
       runsError.set(describe(error, "Could not load runs"));
       return;
     }
@@ -2235,6 +2318,7 @@ export function removeMention(mention: MentionRecipient) {
 }
 
 export function setDraft(text: string) {
+  if (text !== draft()) commandHint.set(null);
   const sid = activeSpaceId();
   if (basePlace() !== "space" || !sid) {
     draft.set(text);
@@ -2357,6 +2441,7 @@ export function setRunnerPaired(spaceId: string, paired: boolean | null) {
 }
 
 function clearTransient(keepReply = false) {
+  commandHint.set(null);
   if (!keepReply) clearReplyPane();
   else {
     replyOpenRequest++;
@@ -2379,6 +2464,7 @@ effect(() => {
     if (scope === mentionScope) return;
     const left = mentionScope;
     mentionScope = scope;
+    commandHint.set(null);
     const stash = { ...stashedDrafts() };
     if (left && draft()) stash[left] = { text: draft(), mention: mentionDraft(), directory: editDirectory() };
     else delete stash[left];
@@ -2410,6 +2496,7 @@ function endSession() {
   failures = 0;
   lastListsRefresh = 0;
   lastRunsRefresh = 0;
+  compactionRunRefresh = false;
   cursors.clear();
   inflight.clear();
   pollAgain.clear();
@@ -2463,6 +2550,8 @@ function endSession() {
     draft.set("");
     stashedDrafts.set({});
     sending.set(null);
+    commandsRunning.set(new Set());
+    commandHint.set(null);
     demoPending.set(false);
     creatingRoom.set(false);
     creatingSpace.set(false);
@@ -2519,6 +2608,7 @@ async function tick(sess: number) {
       if (sid && rid && view() === "room") {
         const pane = replyPane();
         await Promise.all([pollRoom(sid, rid), pane ? pollRoom(sid, pane.roomId) : undefined]);
+        if (sess === session && compactionRunRefresh) await refreshRuns();
         if (sid === activeSpaceId() && rid === activeRoomId() && basePlace() === "space") {
           const current = replyPane();
           const recent = current ? undefined : rooms().filter(r => r.parentRoomId === rid && r.anchorEventId !== undefined);
@@ -2964,6 +3054,7 @@ function merge(key: string, events: RoomEvent[]): number {
       shown.push(event);
       // A delegated thread was created or reported: pick up the room list now.
       if (event.kind === "thread") lastListsRefresh = 0;
+      if (key !== CHAT && isRoomCompactionMiss(event)) compactionRunRefresh = true;
       continue;
     }
     const change = parseReaction(event);
