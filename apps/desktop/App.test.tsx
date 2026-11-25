@@ -346,7 +346,7 @@ test("Chat: personal messages, runs, follow-up to an explicit Space and room, st
   await signIn(app, "alice");
   await app.waitFor("id:chat-view");
   await app.type("id:composer", "what's running?");
-  await askAgent(app);
+  await app.press("id:send");
   await app.waitFor("text:(agent) re: what's running?");
   expect(f.posts().find((p) => p.path === "/v1/chat/messages")?.body).toMatchObject({ text: "what's running?", invoke_agent: true });
 

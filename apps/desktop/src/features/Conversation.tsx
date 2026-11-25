@@ -15,13 +15,11 @@
 // to the toolbar's button. Explicit recipients are always shown; an audience
 // phrase is left out only where a typed @agent already says the same.
 //
-// The composer is one raised box: recipients, the growing field, and a bar
-// with the tools, "Ask agent"
-// (explicitly asks the agent) and the plain send at the bottom right. Send
-// never asks the agent by itself; who a message reaches is the store's and
-// the server's rule (explicit recipients decide).
+// In personal Chat, Send asks the agent and Save note does not. In a Space,
+// the composer has separate Ask agent and Send actions; explicit recipients
+// still decide who a Space message reaches.
 
-import { Clipboard, announce, cleanup, computed, effect, localeSettings, signal, untracked } from "nsh";
+import { Clipboard, announce, cleanup, computed, localeSettings, signal } from "nsh";
 import type { CaretEvent, InputRef, JSX, ViewRef } from "nsh";
 import {
   activeEvents,
@@ -47,7 +45,7 @@ import {
   toggleReaction,
 } from "../store";
 import type { RoomEvent } from "../store";
-import { choiceForTurn, ComposerModelControls, knownNoSystemOne } from "./composerModels";
+import { choiceForTurn, ComposerModelControls } from "./composerModels";
 import { composerAddress } from "./composerAddress";
 import type { AttachedFile, EventAgent } from "../api/client";
 import { agentById } from "./space/agents";
@@ -265,6 +263,7 @@ function authorOf(e: RoomEvent, myId: string | null): Author {
 
 /** "@you", "@<their display name>" or "@<id>" when no profile is known; agent mentions as eventKinds says. */
 function recipientText(m: NonNullable<RoomEvent["mentions"]>[number], myId: string | null): string {
+  if (m.kind === "agent" && !m.addressedBy && mainPlace() === "chat") return "to the agent";
   if (m.kind === "agent" && m.agentId) {
     const a = agentById(activeSpace()?.id, m.agentId);
     if (m.addressedBy === "classifier") return `${a?.name ?? "agent"} · detected by System One`;
@@ -675,26 +674,14 @@ export function Composer(props: {
   const hasFiles = () => stagedFor(composerScope()).length > 0;
   const ready = () => !props.disabled && status().phase !== "signedOut" && !sending();
   const canSend = () => ready() && (draft().trim().length > 0 || hasFiles());
-  // Asking the agent needs a typed question: files alone are saved, not sent to it.
+  // A Space Ask needs a typed question; Chat Send can start a turn with files alone.
   const canAsk = () => ready() && draft().trim().length > 0;
   const personal = () => mainPlace() === "chat";
   const addressed = computed(() => composerAddress(draft(), personal() ? [] : (members() ?? []).map(m => m.userId)));
   const toAgent = () => addressed().agent || (!personal() && mentions().some(m => m.kind === "agent"));
-  // Decide once when a new draft starts (including a suggestion). A catalog
-  // that finishes loading while somebody writes must never promote their Send.
-  const askDraft = signal(false);
-  let started = false;
-  effect(() => {
-    const filled = personal() && !!draft().trim();
-    if (filled !== started) {
-      started = filled;
-      askDraft.set(filled && untracked(knownNoSystemOne));
-    }
-  });
-  const primaryAsk = () => personal() && askDraft() && !!draft().trim() && (!addressed().people || toAgent());
   const post = (ask: boolean) => {
-    if (!(ask ? canAsk() : canSend())) return;
-    if (draft().trim() && (ask || toAgent())) {
+    if (!(ask && !personal() ? canAsk() : canSend())) return;
+    if (ask || (draft().trim() && toAgent())) {
       const { error, choice } = choiceForTurn();
       if (error) { actionError.set(error); return; }
       void send(ask, choice, ask ? props.askAgentId : undefined);
@@ -702,7 +689,7 @@ export function Composer(props: {
   };
   const submit = () => {
     if (props.onSubmitIntercept?.()) return;
-    post(primaryAsk());
+    post(personal());
   };
   return (
     <Column padX={4} padY={3} gap={2}>
@@ -739,30 +726,51 @@ export function Composer(props: {
             </>
           }
           trailing={
-            <>
-              <AskAgentButton
-                testID="ask-agent"
-                primary={primaryAsk()}
-                label={`${props.askLabel ?? "Ask agent"}${primaryAsk() ? " ↵" : ""}`}
-                picture={props.askPicture}
-                chooser={props.askChooser}
-                busyLabel="Asking…"
-                accessibilityLabel={`Send and ask the agent to answer. ${primaryAsk() ? "Return asks the agent. " : ""}${props.agentHint}${hasFiles() ? " Attached files are saved to the Library, not sent to the agent." : ""}`}
-                tooltip={primaryAsk() ? "Ask agent (Return)" : props.agentHint}
-                busy={sending() === "agent"}
-                disabled={!canAsk()}
-                onPress={() => post(true)}
-              />
+            <If when={personal()} else={
+              <>
+                <AskAgentButton
+                  testID="ask-agent"
+                  label={props.askLabel ?? "Ask agent"}
+                  picture={props.askPicture}
+                  chooser={props.askChooser}
+                  busyLabel="Asking…"
+                  accessibilityLabel={`Send and ask the agent to answer. ${props.agentHint}${hasFiles() ? " Attached files are saved to the Library, not sent to the agent." : ""}`}
+                  tooltip={props.agentHint}
+                  busy={sending() === "agent"}
+                  disabled={!canAsk()}
+                  onPress={() => post(true)}
+                />
+                <SendButton
+                  testID="send"
+                  accessibilityLabel={hasFiles() ? "Send with files" : "Send"}
+                  tooltip="Send (Return)"
+                  busy={sending() === "message"}
+                  disabled={!canSend()}
+                  onPress={() => post(false)}
+                />
+              </>
+            }>
+              {/* A legacy note with an explicit @agent mention would ask the agent. */}
+              <If when={!toAgent()}>
+                <SendButton
+                  testID="save-note"
+                  note
+                  accessibilityLabel="Save note without asking the agent"
+                  tooltip="Save note without asking the agent"
+                  busy={sending() === "message"}
+                  disabled={!canSend()}
+                  onPress={() => post(false)}
+                />
+              </If>
               <SendButton
                 testID="send"
-                note={primaryAsk() && !toAgent()}
-                accessibilityLabel={primaryAsk() && !toAgent() ? "Save note without asking the agent" : hasFiles() ? "Send with files" : "Send"}
-                tooltip={primaryAsk() ? (toAgent() ? "Send to mentioned recipients" : "Save note without asking the agent") : "Send (Return)"}
-                busy={sending() === "message"}
+                accessibilityLabel={hasFiles() ? "Send to your agent. The agent cannot read attached files." : "Send to your agent"}
+                tooltip="Send to your agent (Return)"
+                busy={sending() === "agent"}
                 disabled={!canSend()}
-                onPress={() => post(false)}
+                onPress={() => post(true)}
               />
-            </>
+            </If>
           }
         />
       </ComposerBox>

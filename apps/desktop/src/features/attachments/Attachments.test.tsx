@@ -83,7 +83,7 @@ test("Chat: a file-only message goes to my personal Library; the file opens in t
   await app.waitFor("id:attachments", { state: "gone" });
   expect(uploads(w)[0]!.url).toBe(`${BASE}/v1/library/assets?scope=personal&name=notes.txt`);
   const id = w.l.assets[0]!.id;
-  expect(posts(w).at(-1)!.body).toEqual({ text: "", invoke_agent: false, asset_ids: [id] });
+  expect(posts(w).at(-1)!.body).toEqual({ text: "", invoke_agent: true, asset_ids: [id] });
   const ev = lastFiles(w, "chat:alice");
   await app.waitFor(`id:file:${ev.id}:${id}`);
 

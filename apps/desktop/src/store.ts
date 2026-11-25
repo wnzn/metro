@@ -743,7 +743,7 @@ export const ASK_NEEDS_TEXT = "Type a question to ask the agent. Attached files 
  * Posts the draft (and any staged files) to the active place; `invokeAgent`
  * asks the agent to answer. Files are uploaded to the destination's library
  * first; if one fails nothing is posted and the draft and files stay. A
- * message may be files only, unless it asks the agent.
+ * message may be files only, unless it asks an agent in a Space.
  */
 export async function send(invokeAgent: boolean, choice?: TurnModelChoice, agentId?: string): Promise<void> {
   const chat = basePlace() === "chat";
@@ -755,7 +755,7 @@ export async function send(invokeAgent: boolean, choice?: TurnModelChoice, agent
   if (!c || sending() || !scope || (!chat && (!sid || !rid))) return;
   const files = !!attachments?.pending(scope);
   if (!text && !files) return;
-  if (invokeAgent && !text) {
+  if (!chat && invokeAgent && !text) {
     batch(() => {
       actionError.set(ASK_NEEDS_TEXT);
       notice.set(null);

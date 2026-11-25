@@ -40,13 +40,14 @@ async function pin(app: App, target: { id: string }) {
   await app.press("text:Done");
 }
 
-test("Chat Return explicitly asks using the picked connection, model and effort; people and notes omit all three", async () => {
+test("Chat Return sends directly with the picked model, even with @text; Save note omits it and Space addressing is unchanged", async () => {
   const { f, posts, target } = setup();
   const app = await chat(f);
   await pin(app, target);
   const chosen = { provider_connection_id: target.id, model_id: "review", reasoning_effort: "high" };
   await app.type("id:composer", "Please review");
-  await app.waitFor("text:Ask agent ↵");
+  await app.waitFor("id:send");
+  expect(app.shows("id:ask-agent")).toBe(false);
   await app.submit("id:composer");
   await app.waitUntil(() => posts().length === 1);
   expect(posts()[0]!.body).toEqual({ text: "Please review", invoke_agent: true, ...chosen });
@@ -55,10 +56,9 @@ test("Chat Return explicitly asks using the picked connection, model and effort;
   await app.waitUntil(() => posts().length === 2);
   expect(posts()[1]!.body).toEqual({ text: "remember tomorrow", invoke_agent: false });
   await app.type("id:composer", "@bob please review");
-  expect(app.shows("text:Ask agent ↵")).toBe(false);
   await app.submit("id:composer");
   await app.waitUntil(() => posts().length === 3);
-  expect(posts()[2]!.body).toEqual({ text: "@bob please review", invoke_agent: false });
+  expect(posts()[2]!.body).toEqual({ text: "@bob please review", invoke_agent: true, ...chosen });
   await app.press("id:space:acme");
   await app.waitFor("text:hello from bob in acme");
   await app.type("id:composer", "@agent please review");
@@ -82,29 +82,31 @@ test("Chat Return explicitly asks using the picked connection, model and effort;
   expect(posts()[6]!.body).toMatchObject({ invoke_agent: true, ...chosen });
 });
 
-test("System One keeps Return as Send; an unavailable pin blocks Ask but never blocks a note", async () => {
+test("with System One available, Send still asks directly; a stale pin blocks Send but not Save note", async () => {
   const { f, target, posts } = setup(true);
   const app = await chat(f);
   await pin(app, target);
-  await app.type("id:composer", "ordinary conversation");
+  await app.type("id:composer", "direct conversation");
   await app.submit("id:composer");
   await app.waitUntil(() => posts().length === 1);
-  expect(posts()[0]!.body).toEqual({ text: "ordinary conversation", invoke_agent: false });
+  expect(posts()[0]!.body).toEqual({
+    text: "direct conversation", invoke_agent: true, provider_connection_id: target.id, model_id: "review", reasoning_effort: "high",
+  });
   f.state.connections.delete(target.id);
   await app.press("id:composer-model");
   await app.waitFor("id:composer-model-options");
   await app.press("text:Done");
   await app.type("id:composer", "keep my draft");
-  await app.press("id:ask-agent");
+  await app.press("id:send");
   await app.waitFor("id:action-error");
   expect(posts()).toHaveLength(1);
   expect(app.value("id:composer")).toBe("keep my draft");
-  await app.submit("id:composer");
+  await app.press("id:save-note");
   await app.waitUntil(() => posts().length === 2);
   expect(posts()[1]!.body).toEqual({ text: "keep my draft", invoke_agent: false });
 });
 
-test("a file-only personal draft with a pinned chat connection still saves with Return", async () => {
+test("a file-only Chat send starts a turn using the pinned model", async () => {
   const w = attachmentWorld();
   const notes = w.f.addConnection("alice", "openai", "Notes", "review");
   const app = await chat(w);
@@ -116,11 +118,11 @@ test("a file-only personal draft with a pinned chat connection still saves with 
   app.onPick(() => [{ name: "notes.txt", type: "text/plain", data: new TextEncoder().encode("a note") }]);
   await app.press("id:attach");
   await app.waitFor("id:staged:notes.txt");
-  expect(app.enabled("id:ask-agent")).toBe(false);
+  expect(app.enabled("id:send")).toBe(true);
   await app.submit("id:composer");
   await app.waitFor("id:attachments", { state: "gone" });
   expect(w.f.posts().find(p => p.path === "/v1/chat/messages")?.body).toEqual({
-    text: "", invoke_agent: false, asset_ids: [w.l.assets[0]!.id],
+    text: "", invoke_agent: true, asset_ids: [w.l.assets[0]!.id], provider_connection_id: notes.id,
   });
 });
 
@@ -135,17 +137,19 @@ test("an empty composer catalog offers the provider setup without contacting a m
   expect(f.posts().filter(p => p.path.endsWith("/models") || p.path.endsWith("/messages"))).toHaveLength(0);
 });
 
-test("catalog completion cannot promote an in-progress personal note into an Ask", async () => {
+test("unloaded and loaded catalogs give Chat Send the same direct behavior", async () => {
   const { f, posts } = setup();
   f.state.delays.set("/v1/models/available", 600);
   const app = await chat(f);
   await app.type("id:composer", "already writing");
-  await app.wait(700);
   await app.submit("id:composer");
   await app.waitUntil(() => posts().length === 1);
-  expect(posts()[0]!.body).toEqual({ text: "already writing", invoke_agent: false });
+  expect(posts()[0]!.body).toEqual({ text: "already writing", invoke_agent: true });
+  await app.wait(700);
   await app.type("id:composer", "fresh draft");
-  await app.waitFor("text:Ask agent ↵");
+  await app.submit("id:composer");
+  await app.waitUntil(() => posts().length === 2);
+  expect(posts()[1]!.body).toEqual({ text: "fresh draft", invoke_agent: true });
 });
 
 test("agent addressing matches standalone handles outside inline and fenced code", () => {
