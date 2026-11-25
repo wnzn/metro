@@ -162,6 +162,7 @@ export type ProviderConnection = {
   name: string;
   providerId: string;
   baseUrl: string | null;
+  endpointRevision?: string;
   model: string | null;
   isDefault: boolean;
   hasKey: boolean;
@@ -349,6 +350,8 @@ const ENDPOINT_REFUSAL_STATUSES = {
   endpoint_missing: [404],
   endpoint_rejected: [400, 403, 404, 409, 422, 500, 503],
 } as const;
+export const revisionToken = (value: unknown): string | null =>
+  typeof value === "string" && /^(0|[1-9][0-9]{0,18})$/.test(value) ? value : null;
 type EndpointRefusal = keyof typeof ENDPOINT_REFUSAL_STATUSES;
 
 /** A Metro endpoint PATCH response that expressly refuses the write. */
@@ -634,10 +637,11 @@ export function createClient(options: ClientOptions) {
     },
 
     /** The server tests and commits in one operation (its endpoint probe can take up to 20s). */
-    async updateProviderEndpoint(id: string, baseUrl: string): Promise<ProviderConnection> {
+    async updateProviderEndpoint(id: string, baseUrl: string, revision: string): Promise<ProviderConnection> {
       const path = `/v1/providers/${encodeURIComponent(id)}`;
-      const data = await request("PATCH", path, { base_url: baseUrl }, undefined, 25_000);
-      if (!isConnection(data) || String(data.id) !== id || data.base_url !== baseUrl) {
+      const data = await request("PATCH", path, { base_url: baseUrl, expected_endpoint_revision: revision }, undefined, 25_000);
+      const savedRevision = isObject(data) ? revisionToken(data.endpoint_revision) : null;
+      if (!isConnection(data) || String(data.id) !== id || data.base_url !== baseUrl || !savedRevision || savedRevision === revision) {
         throw new ApiError("protocol", "The server did not confirm the requested endpoint.");
       }
       return toConnection(data);
@@ -1096,6 +1100,7 @@ function toConnection(v: Record<string, unknown> & { id: string | number; name: 
     name: v.name,
     providerId: v.provider_id,
     baseUrl: typeof v.base_url === "string" && v.base_url ? v.base_url : null,
+    endpointRevision: revisionToken(v.endpoint_revision) ?? undefined,
     model: typeof v.model === "string" && v.model ? v.model : null,
     isDefault: v.is_default === true,
     hasKey: v.has_key === true,

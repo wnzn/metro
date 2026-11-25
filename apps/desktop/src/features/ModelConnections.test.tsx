@@ -53,7 +53,7 @@ test("an owner tests and saves an approved shared endpoint with one authenticate
   await app.waitFor(`id:endpoint-current:${custom.id} >> text:${NEW}`);
   await app.waitFor("text:Endpoint changed. Models listed again: +1 new, 1 no longer listed.");
   expect(app.shows(`id:endpoint-input:${custom.id}`)).toBe(false);
-  expect(patches(f, custom.id)).toEqual([{ method: "PATCH", path: `/v1/providers/${custom.id}`, body: { base_url: NEW }, user: "alice" }]);
+  expect(patches(f, custom.id)).toEqual([{ method: "PATCH", path: `/v1/providers/${custom.id}`, body: { base_url: NEW, expected_endpoint_revision: "0" }, user: "alice" }]);
   expect(f.state.endpointProbes).toEqual([NEW]);
   expect(f.posts().filter((p) => p.path.endsWith("/model-list/refresh"))).toHaveLength(1);
   expect(custom.base_url).toBe(NEW);
@@ -318,4 +318,42 @@ test("an old session's delayed endpoint response cannot refresh models or appear
   await app.clock!.runFor(3000);
   expect(app.shows("id:endpoint-feedback")).toBe(false);
   expect(f.posts().filter((p) => p.path.endsWith("/model-list/refresh"))).toHaveLength(0);
+});
+
+test("a PATCH held before Metro reads the row cannot overwrite a new same-account session's edit", async () => {
+  const { f, custom } = fixture();
+  f.state.allowedBaseUrls.push(OTHER);
+  f.state.heldEndpointRequests.add(NEW);
+  const app = await signIn(f, "alice");
+  await edit(app, custom.id);
+  await app.press(`id:endpoint-section:${custom.id} >> label:${NEW}`);
+  await app.press(`id:endpoint-save:${custom.id}`);
+  await app.waitFor("id:endpoint-feedback >> label:Reload connection");
+  expect(patches(f, custom.id)).toHaveLength(0);
+  await app.press("id:settings-close");
+  await app.press("id:account-menu");
+  await app.press("id:disconnect");
+  await app.waitFor("id:connect-screen");
+  await signIn(f, "alice", app);
+  await edit(app, custom.id);
+  await app.press(`id:endpoint-section:${custom.id} >> label:${OTHER}`);
+  await app.press(`id:endpoint-save:${custom.id}`);
+  await app.waitFor(`id:endpoint-current:${custom.id} >> text:${OTHER}`);
+  expect(f.state.forwardEndpointRequests.get(NEW)!()).toMatchObject({ status: 409, body: { code: "endpoint_conflict" } });
+  expect(patches(f, custom.id).map((p) => p.body)).toEqual([
+    { base_url: OTHER, expected_endpoint_revision: "0" },
+    { base_url: NEW, expected_endpoint_revision: "0" },
+  ]);
+  expect(f.state.endpointProbes).toEqual([OTHER]);
+  expect(custom.base_url).toBe(OTHER);
+});
+
+test("a server that does not advertise endpoint revisions cannot be edited unguarded", async () => {
+  const { f, custom } = fixture();
+  f.state.exposesEndpointRevision = false;
+  const app = await signIn(f, "alice");
+  await app.press(`id:connection:${custom.id}:open`);
+  await app.waitFor("text:This server doesn't support guarded endpoint changes.");
+  expect(app.enabled(`id:endpoint-change:${custom.id}`)).toBe(false);
+  expect(patches(f, custom.id)).toHaveLength(0);
 });

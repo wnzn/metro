@@ -26,6 +26,8 @@ pub struct Row {
     /// Bumped on model or endpoint changes for search indexes, and on chat
     /// credential changes so an older authorization or listing can't be reused.
     pub config_rev: i64,
+    /// Owner-only compare token, independent of the index fingerprint.
+    pub edit_rev: i64,
 }
 
 impl std::fmt::Debug for Row {
@@ -83,11 +85,25 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
             "ALTER TABLE provider_connections ADD COLUMN config_rev INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
+    if !has("edit_rev")? {
+        conn.execute_batch(
+            "ALTER TABLE provider_connections ADD COLUMN edit_rev INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
     conn.execute_batch(
-        // One default per owner and capability. The old one-per-owner index
-        // is equivalent while every row is `chat`; it is replaced, no row
-        // changes.
-        "DROP INDEX IF EXISTS provider_connections_one_default;
+        // Keep the compare token in step with every row mutation, including
+        // implicit default changes and writes from older clients.
+        "CREATE TRIGGER IF NOT EXISTS provider_connection_edit_rev
+         AFTER UPDATE OF name, provider_id, base_url, model, is_default, sealed_key, capability, config_rev
+         ON provider_connections
+         WHEN OLD.name IS NOT NEW.name OR OLD.provider_id IS NOT NEW.provider_id
+           OR OLD.base_url IS NOT NEW.base_url OR OLD.model IS NOT NEW.model
+           OR OLD.is_default IS NOT NEW.is_default OR OLD.sealed_key IS NOT NEW.sealed_key
+           OR OLD.capability IS NOT NEW.capability OR OLD.config_rev IS NOT NEW.config_rev
+         BEGIN
+             UPDATE provider_connections SET edit_rev = OLD.edit_rev + 1 WHERE id = NEW.id;
+         END;
+         DROP INDEX IF EXISTS provider_connections_one_default;
          CREATE UNIQUE INDEX IF NOT EXISTS provider_connections_one_default_per_capability
              ON provider_connections (user_id, capability) WHERE is_default = 1;
          CREATE TABLE IF NOT EXISTS provider_shares (
@@ -116,7 +132,7 @@ fn now() -> i64 {
 }
 
 const COLUMNS: &str = "id, user_id, name, provider_id, base_url, model, is_default, sealed_key, \
-                       capability, config_rev";
+                       capability, config_rev, edit_rev";
 
 fn read(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
     let capability: String = r.get(8)?;
@@ -137,6 +153,7 @@ fn read(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
             )
         })?,
         config_rev: r.get(9)?,
+        edit_rev: r.get(10)?,
     })
 }
 
@@ -267,6 +284,7 @@ pub struct Patch {
     /// is saved only while the committed endpoint is still this one, so a
     /// key or model meant for it never lands on another endpoint.
     pub base_url_is: Option<String>,
+    pub edit_rev_is: Option<i64>,
 }
 
 impl std::fmt::Debug for Patch {
@@ -314,6 +332,7 @@ pub fn patch(
         return Ok(Patched::Missing);
     };
     if expected.is_some_and(|expected| expected != &old)
+        || patch.edit_rev_is.is_some_and(|rev| rev != old.edit_rev)
         || (patch.base_url.is_some() && expected.is_none())
         || patch
             .base_url_is
@@ -598,8 +617,8 @@ pub fn shared_with(
              WHERE (?2 IS NOT NULL OR ?3) AND (?2 IS NULL OR ss.space_id = ?2)
              GROUP BY ss.connection_id
          )
-         SELECT {columns}, s.visibility,
-             CASE WHEN s.visibility = 'spaces' THEN g.space_id END
+         SELECT {columns}, s.visibility AS grant_visibility,
+             CASE WHEN s.visibility = 'spaces' THEN g.space_id END AS granted_space_id
          FROM provider_connections c
          JOIN provider_shares s ON s.connection_id = c.id
          LEFT JOIN granted_spaces g ON g.connection_id = c.id
@@ -610,11 +629,11 @@ pub fn shared_with(
     ))?;
     stmt.query_map(params![caller, space, any_space], |r| {
         let row = read(r)?;
-        let v: String = r.get(10)?;
+        let v: String = r.get("grant_visibility")?;
         Ok((
             row,
             Visibility::parse(&v).unwrap_or(Visibility::Personal),
-            r.get(11)?,
+            r.get("granted_space_id")?,
         ))
     })?
     .collect()

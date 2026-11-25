@@ -72,6 +72,9 @@ pub struct ConnectionView {
     pub provider_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Only in the owner's view. An old server rejects this PATCH field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_revision: Option<String>,
     /// Empty until a model is chosen.
     pub model: String,
     pub is_default: bool,
@@ -98,6 +101,9 @@ impl From<&Row> for ConnectionView {
             name: row.name.clone(),
             provider_id: row.provider_id.clone(),
             base_url: row.base_url.clone(),
+            endpoint_revision: catalog::find(&row.provider_id)
+                .filter(|e| !e.is_device())
+                .map(|_| row.edit_rev.to_string()),
             model: row.model.clone(),
             is_default: row.is_default,
             has_key: row.sealed_key.is_some(),
@@ -370,6 +376,7 @@ pub async fn create(
         sealed_key,
         capability: entry.capability,
         config_rev: 0,
+        edit_rev: 0,
     };
     let explicit = body.is_default;
     let saved = state
@@ -515,6 +522,13 @@ pub struct UpdateBody {
     /// Absent: unchanged. An explicit null cannot reset the endpoint.
     #[serde(default, deserialize_with = "explicit_null")]
     base_url: Option<Option<String>>,
+    #[serde(default, deserialize_with = "explicit_null")]
+    expected_endpoint_revision: Option<Option<String>>,
+}
+
+fn endpoint_conflict() -> ApiError {
+    conflict("the connection changed while this change was being saved; reload it and try again")
+        .with_code(ENDPOINT_CONFLICT)
 }
 
 pub async fn update(
@@ -535,6 +549,27 @@ pub async fn update(
     };
     let previous = load(&state, &who, &id).await.map_err(missing)?;
     let Json(body) = body?;
+    let expected = match body.expected_endpoint_revision.as_ref() {
+        None => None, // Legacy endpoint edits retain their existing preflight and CAS.
+        Some(Some(rev)) if endpoint => Some(
+            rev.parse::<i64>()
+                .ok()
+                .filter(|n| *n >= 0 && n.to_string() == *rev)
+                .ok_or_else(|| {
+                    bad_request("invalid expected_endpoint_revision").with_code(ENDPOINT_REJECTED)
+                })?,
+        ),
+        Some(_) => {
+            return Err(endpoint_code(
+                endpoint,
+                bad_request("expected_endpoint_revision requires a non-null revision and base_url"),
+                ENDPOINT_REJECTED,
+            ));
+        }
+    };
+    if expected.is_some_and(|rev| rev != previous.edit_rev) {
+        return Err(endpoint_conflict());
+    }
     let entry = catalog::find(&previous.provider_id).ok_or_else(|| {
         endpoint_code(
             endpoint,
@@ -542,8 +577,9 @@ pub async fn update(
             ENDPOINT_REJECTED,
         )
     })?;
-    let patch = patch_of(&state, entry, &previous, body)
+    let mut patch = patch_of(&state, entry, &previous, body)
         .map_err(|e| endpoint_code(endpoint, e, ENDPOINT_REJECTED))?;
+    patch.edit_rev_is = expected;
     match save_update(&state, entry, patch, previous).await? {
         store::Patched::Saved(row) => Ok(Json(view_of(&state, row).await?)),
         store::Patched::Missing => Err(missing(not_found())),
@@ -554,14 +590,13 @@ pub async fn update(
         )),
         store::Patched::Changed => {
             load(&state, &who, &id).await.map_err(missing)?;
-            Err(endpoint_code(
-                endpoint,
+            Err(if endpoint {
+                endpoint_conflict()
+            } else {
                 conflict(
-                    "the connection changed while this change was being saved; reload it and try \
-                 again",
-                ),
-                ENDPOINT_CONFLICT,
-            ))
+                    "the connection changed while this change was being saved; reload it and try again",
+                )
+            })
         }
     }
 }
@@ -843,6 +878,7 @@ pub(crate) fn probe_row(state: &AppState, provider: &str, base_url: &str) -> Row
         sealed_key: None,
         capability: catalog::find(provider).unwrap().capability,
         config_rev: 0,
+        edit_rev: 0,
     };
     assert!(store::insert(&mut state.db.lock(), &row, 20).unwrap());
     row
@@ -1035,6 +1071,7 @@ async fn endpoint_changes_probe_capabilities_and_keep_the_old_url_on_failure() {
             sealed_key: None,
             capability: entry.capability,
             config_rev: 0,
+            edit_rev: 0,
         };
         assert!(store::insert(&mut state.db.lock(), &previous, 20).unwrap());
 
