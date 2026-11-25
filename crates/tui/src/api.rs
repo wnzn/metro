@@ -369,6 +369,8 @@ mod tests {
         }
         for bad in [
             "localhost",
+            "http://100.64.0.1.",
+            "http://127.0.0.1.",
             "http://127.1",
             "http://0x7f000001",
             "http://127.000.0.1",
@@ -406,6 +408,7 @@ mod tests {
             "http://192.168.1.5:8787",
             "http://metro.example.org",
             "http://100.128.0.1",
+            "http://localhost.",
         ] {
             let w = plain_http_warning(&origin(loud).unwrap()).unwrap();
             assert!(

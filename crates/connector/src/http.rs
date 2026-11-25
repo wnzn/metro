@@ -142,6 +142,7 @@ mod server_proxy_tests {
         for proxied in [
             "https://metro.example.com",
             "http://192.168.1.5:8787",
+            "http://localhost.:8787",
             "not a url",
         ] {
             assert!(!server_bypasses_proxy(proxied), "{proxied}");

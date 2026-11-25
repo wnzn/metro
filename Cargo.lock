@@ -1675,6 +1675,9 @@ dependencies = [
 [[package]]
 name = "metro-url-policy"
 version = "0.4.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "mime"

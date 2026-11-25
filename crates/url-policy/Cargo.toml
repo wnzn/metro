@@ -10,3 +10,7 @@ license = "MIT OR Apache-2.0"
 [lib]
 name = "metro_url_policy"
 path = "src/lib.rs"
+
+[dev-dependencies]
+# Reads the shared test vectors (testdata/host_vectors.json).
+serde_json = "1.0.150"

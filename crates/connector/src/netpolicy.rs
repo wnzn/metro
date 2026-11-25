@@ -196,7 +196,19 @@ mod tests {
                 "{quiet}"
             );
         }
+        // The url crate turns 100.64.0.1. into the IP literal, and the
+        // request goes to that address directly; localhost. stays a name.
+        assert_eq!(
+            validate_server_url("http://100.64.0.1.:8787", "x").unwrap(),
+            "http://100.64.0.1:8787"
+        );
+        assert_eq!(
+            server_plain_http_warning("http://100.64.0.1.:8787", "t"),
+            None
+        );
         for loud in [
+            "http://localhost.:8787",
+            "http://foo.localhost:8787",
             "http://192.168.1.5:8787",
             "http://metro.example.com",
             "http://100.128.0.1",

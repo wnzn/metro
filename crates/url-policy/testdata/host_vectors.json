@@ -1,0 +1,246 @@
+{
+  "comment": [
+    "Shared host classification vectors for a plain-HTTP Metro server URL.",
+    "class: what every classifier returns for this exact host string: metro-url-policy (Rust), classifyHost",
+    "(apps/desktop/src/api/serverUrl.ts) and hostClass (crates/server/src/admin_web/admin.js).",
+    "installer: what the runner installers (install-metro-runner-linux.sh, metro-runner-container.sh and",
+    "metro-runner-container.ps1) do with http://<host>:8787 when it differs from class. They take only the exact",
+    "loopback literals localhost, 127.0.0.1 and [::1], and refuse other names for this machine, trailing dots and",
+    "malformed hosts. A trailing dot sends the name through the resolver, so 100.64.0.1. and localhost. are other."
+  ],
+  "hosts": [
+    {
+      "host": "localhost",
+      "class": "loopback"
+    },
+    {
+      "host": "LOCALHOST",
+      "class": "loopback",
+      "installer": "refused"
+    },
+    {
+      "host": "127.0.0.1",
+      "class": "loopback"
+    },
+    {
+      "host": "127.255.0.9",
+      "class": "loopback",
+      "installer": "refused"
+    },
+    {
+      "host": "[::1]",
+      "class": "loopback"
+    },
+    {
+      "host": "::1",
+      "class": "loopback",
+      "installer": "refused"
+    },
+    {
+      "host": "[0:0:0:0:0:0:0:1]",
+      "class": "loopback",
+      "installer": "refused"
+    },
+    {
+      "host": "[::ffff:127.0.0.1]",
+      "class": "loopback",
+      "installer": "refused"
+    },
+    {
+      "host": "[::ffff:7f00:1]",
+      "class": "loopback",
+      "installer": "refused"
+    },
+    {
+      "host": "localhost.",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "127.0.0.1.",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "foo.localhost",
+      "class": "other"
+    },
+    {
+      "host": "localhost.example.com",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "127.0.0.1.evil.com",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "127.1",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "128.0.0.1",
+      "class": "other"
+    },
+    {
+      "host": "100.64.0.0",
+      "class": "tailscale"
+    },
+    {
+      "host": "100.64.0.1",
+      "class": "tailscale"
+    },
+    {
+      "host": "100.101.102.103",
+      "class": "tailscale"
+    },
+    {
+      "host": "100.127.255.255",
+      "class": "tailscale"
+    },
+    {
+      "host": "[fd7a:115c:a1e0::1]",
+      "class": "tailscale"
+    },
+    {
+      "host": "[FD7A:115C:A1E0:AB12:4843:CD96:6258:B240]",
+      "class": "tailscale"
+    },
+    {
+      "host": "fd7a:115c:a1e0::53",
+      "class": "tailscale",
+      "installer": "refused"
+    },
+    {
+      "host": "[::ffff:100.100.100.100]",
+      "class": "tailscale",
+      "installer": "refused"
+    },
+    {
+      "host": "[::ffff:6464:6464]",
+      "class": "tailscale",
+      "installer": "refused"
+    },
+    {
+      "host": "metro.tail1234.ts.net",
+      "class": "tailscale"
+    },
+    {
+      "host": "Metro.Tail-Net.TS.NET",
+      "class": "tailscale"
+    },
+    {
+      "host": "a.ts.net",
+      "class": "tailscale"
+    },
+    {
+      "host": "x1.y-2.ts.net",
+      "class": "tailscale"
+    },
+    {
+      "host": "metro.tail1234.ts.net.",
+      "class": "tailscale",
+      "installer": "refused"
+    },
+    {
+      "host": "100.64.0.1.",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "100.63.255.255",
+      "class": "other"
+    },
+    {
+      "host": "100.128.0.0",
+      "class": "other"
+    },
+    {
+      "host": "99.64.0.1",
+      "class": "other"
+    },
+    {
+      "host": "10.0.0.1",
+      "class": "other"
+    },
+    {
+      "host": "192.168.1.5",
+      "class": "other"
+    },
+    {
+      "host": "0.0.0.0",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "1.2.3.999",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "[fd7a:115c:a1e1::1]",
+      "class": "other"
+    },
+    {
+      "host": "[fd7a:115c::1]",
+      "class": "other"
+    },
+    {
+      "host": "[fe80::1]",
+      "class": "other"
+    },
+    {
+      "host": "[::ffff:c0a8:1]",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "ts.net",
+      "class": "other"
+    },
+    {
+      "host": ".ts.net",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "a..ts.net",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "-a.ts.net",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "a-.ts.net",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "a_b.ts.net",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "evilts.net",
+      "class": "other"
+    },
+    {
+      "host": "metro.ts.net.evil.com",
+      "class": "other"
+    },
+    {
+      "host": "metro.example.com",
+      "class": "other"
+    },
+    {
+      "host": "",
+      "class": "other",
+      "installer": "refused"
+    }
+  ]
+}

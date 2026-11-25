@@ -333,6 +333,10 @@ mod tests {
             assert!(c.agent.config().proxy().is_none(), "{direct}");
         }
         for proxied in [
+            // Trailing dots go through the resolver: never treated as direct.
+            "http://100.64.0.1.:8787",
+            "http://127.0.0.1.:8787",
+            "http://localhost.:8787",
             "https://metro.example.com",
             "http://192.168.1.5:8787",
             "http://100.128.0.1",

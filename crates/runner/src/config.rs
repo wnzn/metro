@@ -605,6 +605,10 @@ mod tests {
             assert_eq!(warn(quiet), None, "{quiet}");
         }
         for loud in [
+            // A trailing dot makes it a name for the resolver, not the address.
+            "http://100.64.0.1.:8787",
+            "http://127.0.0.1.:8787",
+            "http://localhost.:8787",
             "http://192.168.1.5:8787",
             "http://metro.example.com/base",
             "http://100.128.0.1",
