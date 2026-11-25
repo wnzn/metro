@@ -18,6 +18,7 @@ function FolderConsumer() {
 function WatchFixture() {
   const active = signal(true);
   const settings = signal(false);
+  const duplicate = signal(true);
   const visibleCount = signal(0);
   let shown = false;
   effect(() => {
@@ -39,7 +40,8 @@ function WatchFixture() {
       <Action testID="toggle-watchers" label="Toggle watches" onPress={() => active.set(!active())} />
       <Action testID="toggle-runner-settings" label="Toggle runner settings" onPress={() => settings.set(!settings())} />
       <If when={settings()}>
-        <FolderConsumer />
+        <Action testID="toggle-folder-watch" label="Toggle duplicate folder watch" onPress={() => duplicate.set(!duplicate())} />
+        <If when={duplicate()}><FolderConsumer /></If>
         <RunnersSettings />
       </If>
     </Column>

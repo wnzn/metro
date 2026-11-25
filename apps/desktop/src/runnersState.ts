@@ -19,6 +19,7 @@ const watching = computed(() => watchers() > 0);
 const folderWatchers = signal(0);
 const watchingFolders = computed(() => folderWatchers() > 0);
 const RUNNER_REFRESH_MS = 5000;
+const FOLDER_REFRESH_BUDGET_MS = 30_000;
 const OFFER_REFRESH_GRACE_MS = 2000;
 const attachFeedback = signal<{ message: string; incomplete: boolean } | null>(null);
 export const runnerAttachFeedback = () => attachFeedback();
@@ -72,23 +73,55 @@ export function watchInstalledRunner(refreshFoldersOnOpen = false) {
   cleanup(() => folderWatchers.set(untracked(folderWatchers) - 1));
 }
 
-type FolderInterest = { baseline: number | null; valid: () => boolean };
+type FolderInterest = { baseline: number | null; valid: () => boolean; expired: () => boolean; started: boolean };
 const folderInterest = signal<FolderInterest | null>(null);
-const wantsFolderRead = (interest: FolderInterest | null) => {
+const folderRetry = signal(0);
+const needsFolderRead = (interest: FolderInterest | null) => {
   if (!interest || folderInterest() !== interest || !interest.valid()) return false;
   const snapshot = installedFolderSnapshot();
   return snapshot === null || snapshot === interest.baseline;
 };
+const wantsFolderRead = (interest: FolderInterest | null) =>
+  !!interest && !interest.expired() && needsFolderRead(interest) && helper().phase !== "checking";
+const canCheckFolders = () => installedRunnerStatusWatchable() || installedRunnerSeen();
+const folderReadReady = computed(() => helper().phase !== "checking" && !runnerAttachBusy() && !installedBusy());
+
+export const installedFolderRefreshExhausted = computed(() => {
+  const interest = folderInterest();
+  return !!interest?.expired() && needsFolderRead(interest) && canCheckFolders();
+});
+
+/** Retry the current Settings scope; never reset a running budget. */
+export function retryInstalledFolderRefresh() {
+  if (installedFolderRefreshExhausted()) folderRetry.set(folderRetry() + 1);
+}
 
 effect(() => {
-  if (!watchingFolders() || !offerKey() || helper().phase === "checking") return;
-  const interest = { baseline: untracked(installedFolderSnapshot), valid: sessionGuard() };
+  if (!watchingFolders() || !offerKey()) return;
+  folderRetry();
+  const expired = signal(false);
+  const interest: FolderInterest = {
+    baseline: untracked(installedFolderSnapshot), valid: sessionGuard(), expired, started: false,
+  };
+  // One budget per mounted Settings scope, not per response, watcher or
+  // bridge phase. It also bounds retries when the Sidebar offer is dismissed.
+  const timer = setTimeout(() => expired.set(true), FOLDER_REFRESH_BUDGET_MS);
   folderInterest.set(interest);
-  cleanup(() => folderInterest.set(null));
+  cleanup(() => {
+    clearTimeout(timer);
+    folderInterest.set(null);
+  });
+});
+
+effect(() => {
+  const interest = folderInterest();
+  if (!interest || !folderReadReady()) return;
   // Try on open, joining any Sidebar read already in flight. If this attempt
   // can't verify the candidate, the mounted demand survives for a later read.
   untracked(() => {
-    if (!runnerAttachBusy()) void loadInstalledRunner(true, () => wantsFolderRead(interest));
+    if (interest.started || !wantsFolderRead(interest)) return;
+    interest.started = true;
+    void loadInstalledRunner(true, () => wantsFolderRead(interest));
   });
 });
 
@@ -112,8 +145,7 @@ const shouldWatchOffer = computed(() => {
 });
 
 const shouldRefreshRunner = computed(() => shouldWatchOffer() ||
-  ((installedRunnerStatusWatchable() || installedRunnerSeen()) && !runnerAttachBusy() &&
-    !installedBusy() && wantsFolderRead(folderInterest())));
+  (canCheckFolders() && folderReadReady() && wantsFolderRead(folderInterest())));
 
 effect(() => {
   if (!shouldWatchOffer()) offerFresh.set(false);

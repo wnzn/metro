@@ -543,6 +543,72 @@ test("mounted Settings retries a failed or empty joined read after offer dismiss
   }
 });
 
+test("persistent folder failures exhaust the mounted Settings budget without stopping Sidebar liveness", async () => {
+  for (const mode of ["bridge failure", "unregistered", "offer still active"]) {
+    const f = world();
+    f.addSpace("solo", "Solo", "alice");
+    f.addSpace("empty", "Empty", "alice");
+    const mine = f.addRunner("This PC", "personal", "alice");
+    const t = bridgeWithRunner(f, mine.id, mine.name);
+    const reads = () => t.log.filter((l) => l.method === "GET" && l.path === "/v1/local-tools/runner").length;
+    const folderReads = () => f.state.log.filter((l) => l.method === "GET" && l.path === "/v1/spaces/solo/runner").length;
+    const app = await open("./runnerWatch.fixture.tsx", {
+      network: { ...f.network, ...t.network } as any, modules: bridgeEnv() as any, platform: "linux", width: 1280, height: 900, clock: {},
+    });
+    await app.press("id:fixture-connect");
+    await app.waitFor("id:dismiss-fixture-offer");
+    if (mode !== "offer still active") await app.press("id:dismiss-fixture-offer");
+    if (mode === "unregistered") {
+      t.st.runnerId = "no-longer-registered";
+      t.st.state = "revoked";
+      t.st.canReconnect = true;
+    } else t.st.status = 503;
+    f.state.attached.set("solo", mine.id);
+
+    await app.press("id:toggle-runner-settings");
+    await app.waitFor("id:runners-settings");
+    await app.clock!.runFor(24_000);
+    expect(app.shows("id:installed-runner-folders-retry")).toBe(false);
+    // A duplicate consumer mounting mid-budget doesn't restart the clock.
+    const beforeDuplicate = reads();
+    await app.press("id:toggle-folder-watch");
+    await app.press("id:toggle-folder-watch");
+    expect(reads()).toBe(beforeDuplicate);
+    await app.clock!.runFor(7000);
+    await app.waitFor("id:installed-runner-folders-retry");
+    expect(text(app)).toContain("Automatic checks stopped.");
+    expect(folderReads()).toBe(0);
+    const atExpiry = reads();
+    expect(atExpiry).toBeGreaterThan(2);
+    expect(atExpiry).toBeLessThanOrEqual(8); // Initial read plus bounded retries.
+
+    t.st.status = 200;
+    t.st.runnerId = mine.id;
+    t.st.state = "online";
+    t.st.canReconnect = false;
+    await app.clock!.runFor(45_000);
+    if (mode === "offer still active") {
+      expect(reads()).toBeGreaterThan(atExpiry);
+      expect(app.shows(`text:Create choice: ${mine.id}`)).toBe(true);
+      expect(app.shows("id:dismiss-fixture-offer")).toBe(true);
+    } else {
+      expect(reads()).toBe(atExpiry); // Settings stayed mounted, but stopped polling.
+    }
+    expect(folderReads()).toBe(0); // Liveness doesn't reset the folder budget.
+    expect(app.shows("id:installed-runner-folders-retry")).toBe(true);
+
+    await app.press("id:installed-runner-folders-retry");
+    await app.waitFor("id:installed-runner-folder:solo");
+    expect(app.shows("id:installed-runner-folders-retry")).toBe(false);
+    expect(folderReads()).toBe(1);
+    await app.clock!.runFor(35_000);
+    expect(folderReads()).toBe(1);
+    // A stale registration ID needs one guarded follow-up for the new ID.
+    if (mode !== "offer still active") expect(reads()).toBe(atExpiry + (mode === "unregistered" ? 2 : 1));
+    expect(posts(t)).toEqual([]);
+  }
+});
+
 const fixtureRelease = (install: string, action: string, extra = {}) => ({
   presence: { version: "0.4.0", online: true, seen_at: Date.now(), install, self_update: install === "managed" },
   update: { latest: "0.5.0", available: true, action, pending: null, last_result: null, ...extra },
