@@ -109,12 +109,37 @@ pub fn detect(exe: &Path, own: &Version, in_container: bool) -> InstallKind {
     }
 }
 
+/// This build's version. In an e2e test build with the test release source
+/// active, the version is the name of its `versions/<v>` folder, so one test
+/// binary can play several releases.
+pub fn own_version() -> Option<Version> {
+    #[cfg(feature = "e2e-test-release")]
+    if metro_release::e2e::active()
+        && let Some(v) = std::env::current_exe()
+            .and_then(|e| e.canonicalize())
+            .ok()
+            .and_then(|e| e.parent()?.file_name()?.to_str().and_then(Version::parse))
+    {
+        return Some(v);
+    }
+    Version::this_build()
+}
+
+/// This build's channel (an e2e test build with the test source: release).
+pub fn channel() -> Channel {
+    #[cfg(feature = "e2e-test-release")]
+    if metro_release::e2e::active() {
+        return Channel::Release;
+    }
+    Channel::current()
+}
+
 /// This process's install kind.
 pub fn detect_current() -> InstallKind {
     let in_container = Path::new("/.dockerenv").exists()
         || Path::new("/run/.containerenv").exists()
         || std::env::var("METRO_RUNNER_PACKAGING").is_ok_and(|v| v == "container");
-    let own = Version::this_build();
+    let own = own_version();
     match (std::env::current_exe().and_then(|e| e.canonicalize()), own) {
         (Ok(exe), Some(own)) => detect(&exe, &own, in_container),
         _ if in_container => InstallKind::Container,
@@ -744,7 +769,7 @@ impl SelfUpdate {
         SelfUpdate {
             install,
             channel,
-            own: Version::this_build(),
+            own: own_version(),
             enabled,
             updater,
             report,
@@ -754,13 +779,13 @@ impl SelfUpdate {
 
     /// Report only (no updater): unmanaged, container, tests.
     pub fn report_only(install: InstallKind) -> SelfUpdate {
-        SelfUpdate::new(install, Channel::current(), false, None)
+        SelfUpdate::new(install, channel(), false, None)
     }
 
     /// The claim body.
     pub fn body(&self) -> String {
         let mut runner = serde_json::json!({
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": self.own.map_or_else(|| env!("CARGO_PKG_VERSION").to_string(), |v| v.to_string()),
             "channel": self.channel.as_str(),
             "install": self.install.as_str(),
             "self_update": self.enabled,

@@ -15,6 +15,10 @@ path = "src/main.rs"
 name = "metro_server"
 path = "src/lib.rs"
 
+[features]
+# tests/e2e/updates.py only: see metro_release::e2e. Never in a release build.
+e2e-test-release = ["metro-release/e2e"]
+
 [dependencies]
 metro-auth = { path = "../auth" }
 metro-model-protocol = { path = "../model-protocol" }

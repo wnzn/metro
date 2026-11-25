@@ -93,6 +93,23 @@ def matches_conjunction(expression, context):
     return all(matches(term) for term in expression.split("&&"))
 
 
+class E2eTestHooksNeverShipTests(unittest.TestCase):
+    """metro-server/metro-runner `e2e-test-release` (tests/e2e/updates.py) loads
+    a loopback release source and the test verifier. No build path that makes
+    shipped binaries may enable it (metro-release also refuses to compile it
+    with METRO_RELEASE_CHANNEL=release)."""
+
+    def test_no_release_build_enables_the_e2e_feature(self):
+        paths = sorted(WF.glob("*.yml")) + [ROOT / "Dockerfile", ROOT / "packaging/Dockerfile.build"]
+        paths += sorted((ROOT / "packaging").glob("*.py")) + sorted((ROOT / "packaging").glob("*.sh"))
+        for path in paths:
+            if path.name == Path(__file__).name or not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8")
+            for needle in ("e2e-test-release", "metro-release/e2e", "--all-features"):
+                self.assertNotIn(needle, text, f"{path.name} mentions {needle}")
+
+
 @unittest.skipIf(yaml is None and not os.environ.get("CI"), "PyYAML is not installed (CI installs python3-yaml)")
 class ReleaseWorkflowTests(unittest.TestCase):
     @classmethod

@@ -15,6 +15,10 @@ path = "src/lib.rs"
 default = []
 # Test doubles (TestVerifier, fixture releases). Only from dev-dependencies.
 testing = []
+# End-to-end test builds only (tests/e2e/updates.py): a loopback release
+# source and the test verifier, from METRO_TEST_RELEASE_BASE. Never enabled
+# by a release build (packaging/test_release_workflow.py checks).
+e2e = ["testing"]
 # Fetchers: `blocking` (ureq, the runner) and `async` (reqwest, desktop/server).
 blocking = ["dep:ureq"]
 async = ["dep:reqwest", "dep:sigstore-tuf", "dep:jiff"]

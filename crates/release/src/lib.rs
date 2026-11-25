@@ -18,6 +18,8 @@
 
 pub mod archive;
 pub mod channel;
+#[cfg(feature = "e2e")]
+pub mod e2e;
 pub mod error;
 #[cfg(any(feature = "blocking", feature = "async"))]
 pub mod fetch;

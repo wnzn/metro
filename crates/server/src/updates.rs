@@ -407,7 +407,7 @@ pub async fn server_update(
         return Err(ApiError::not_found("not found"));
     }
     let current = env!("CARGO_PKG_VERSION");
-    let channel = Channel::current();
+    let channel = channel();
     let latest = state.updates.latest();
     let status = state.updates.lock().status.clone();
     let running = Version::parse(current);
@@ -634,14 +634,48 @@ pub async fn check_once(state: &AppState, fetcher: &AsyncFetcher, verifier: &dyn
     }
 }
 
+/// This build's channel (an e2e test build with the test release source
+/// active counts as a release; see `metro_release::e2e`).
+fn channel() -> Channel {
+    #[cfg(feature = "e2e-test-release")]
+    if metro_release::e2e::active() {
+        return Channel::Release;
+    }
+    Channel::current()
+}
+
+/// An e2e test build's fixture source, verifier and check interval.
+#[cfg(feature = "e2e-test-release")]
+fn test_release() -> Option<(Source, Arc<dyn ReleaseVerifier>, Duration)> {
+    let (source, verifier) = metro_release::e2e::release_source()?;
+    let secs = std::env::var("METRO_TEST_RELEASE_CHECK_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+    Some((source, Arc::from(verifier), Duration::from_secs(secs)))
+}
+
 /// Start the daily check (release builds with the check on only).
 pub fn spawn(state: AppState) {
     if !state.updates.check_enabled {
         tracing::info!("release check is off (METRO_UPDATE_CHECK=off)");
         return;
     }
-    if Channel::current() != Channel::Release {
+    if channel() != Channel::Release {
         tracing::info!("release check is off: this is not a published release build");
+        return;
+    }
+    #[cfg(feature = "e2e-test-release")]
+    if let Some((source, verifier, every)) = test_release() {
+        tokio::spawn(async move {
+            let Ok(fetcher) = AsyncFetcher::new(source, Duration::from_secs(30)) else {
+                return;
+            };
+            loop {
+                check_once(&state, &fetcher, verifier.as_ref()).await;
+                tokio::time::sleep(every).await;
+            }
+        });
         return;
     }
     tokio::spawn(async move {

@@ -10,23 +10,39 @@ use metro_runner::spaces::SpaceRoots;
 use metro_runner::tools::{Registry, SubprocessPolicy};
 use metro_runner::update::{self, InstallKind, SelfUpdate, StartAction, Updater};
 
+/// Where releases come from: GitHub and the vendored Sigstore root; in an
+/// e2e test build, the loopback fixture source and the test verifier.
+type ReleaseSource = (
+    metro_release::fetch::Source,
+    Box<dyn metro_release::ReleaseVerifier>,
+);
+
+fn release_source() -> Result<ReleaseSource, metro_release::Error> {
+    #[cfg(feature = "e2e-test-release")]
+    if let Some(s) = metro_release::e2e::release_source() {
+        return Ok(s);
+    }
+    let verifier = metro_release::sigstore::SigstoreVerifier::vendored()?;
+    Ok((metro_release::fetch::Source::github(), Box::new(verifier)))
+}
+
 /// Version reporting, and the self-updater when this host opted in and this
 /// is a managed install of a published release build.
 fn self_update(install: InstallKind, cfg: &Config) -> SelfUpdate {
-    let channel = metro_release::Channel::current();
-    let updater = match (&install, metro_release::Version::this_build()) {
+    let channel = update::channel();
+    let updater = match (&install, update::own_version()) {
         (InstallKind::Managed { root }, Some(own))
             if cfg.self_update && channel == metro_release::Channel::Release =>
         {
-            match metro_release::sigstore::SigstoreVerifier::vendored() {
-                Ok(verifier) => Some(Updater {
+            match release_source() {
+                Ok((source, verifier)) => Some(Updater {
                     root: root.clone(),
                     own,
                     fetcher: metro_release::fetch::BlockingFetcher::new(
-                        metro_release::fetch::Source::github(),
+                        source,
                         std::time::Duration::from_secs(300),
                     ),
-                    verifier: Box::new(verifier),
+                    verifier,
                 }),
                 Err(e) => {
                     eprintln!("metro-runner: warning: self-update unavailable: {e}");
@@ -128,7 +144,7 @@ fn main() -> ExitCode {
     let install = update::detect_current();
     if !check_start
         && let InstallKind::Managed { root } = &install
-        && let Some(own) = metro_release::Version::this_build()
+        && let Some(own) = update::own_version()
     {
         match update::on_start(root, &own) {
             Ok(StartAction::Continue) => {}
@@ -144,6 +160,13 @@ fn main() -> ExitCode {
                 "metro-runner: warning: update bookkeeping failed: {}",
                 e.kind()
             ),
+        }
+        // e2e test builds only: a version that "fails to start" after its
+        // start was counted (tests/e2e/updates.py).
+        #[cfg(feature = "e2e-test-release")]
+        if std::env::var("METRO_TEST_CRASH_VERSION").is_ok_and(|v| v == own.to_string()) {
+            eprintln!("TEST BUILD: {own} crashes on start (METRO_TEST_CRASH_VERSION)");
+            return ExitCode::from(3);
         }
     }
     let cfg = match Config::from_env() {
