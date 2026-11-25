@@ -476,9 +476,9 @@ function MessageRow(props: { row: () => Of<"event"> }) {
         when={failure()}
         else={
           <If when={event().text.trim().length > 0}>
-            <If when={pieces().length > 0 ? spaceId() : undefined}
+            <If when={event().kind === "message" || event().kind === "agent"}
               else={<FoldableText text={event().text} mono={tone() === "runner"} stateKey={disclosureKey(disclosureScope(), event().id, "all")} />}>
-              {(sid) => <MentionedBody event={event()} sid={sid()} pieces={pieces()} stateKey={disclosureKey(disclosureScope(), event().id, "all")} />}
+              <MentionedBody event={event()} sid={spaceId()} pieces={pieces()} stateKey={disclosureKey(disclosureScope(), event().id, "all")} />
             </If>
           </If>
         }

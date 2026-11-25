@@ -6,21 +6,75 @@
 // A picture's `src` is a `blob:` URL the feature made from bytes it fetched
 // with the user's credential, never a remote URL.
 
-import { Image, Text, View } from "nsh";
-import { Button } from "nsh/base";
+import { announce, computed, effect, Image, openUrl, signal, Text, View } from "nsh";
+import { Button, TextView } from "nsh/base";
+import type { TextViewCustomNode } from "nsh/base";
 import type { JSX, ViewRef } from "nsh";
+import { messageMarkdown } from "./messageMarkdown";
+import { httpsLink } from "./pageMarkdown";
+import { Modal } from "./chrome";
+import { Action, ActionBar, Column, Label } from "./primitives";
 import { cx, focusRingClass, toneSurfaceClass, toneTextClass } from "./tokens";
 import type { Tone } from "./tokens";
 
 type Testable = { testID?: string; accessibilityLabel?: string };
 
-/** One logical line of a message laid out as wrapped text and focusable chips. */
-export function MentionMessageLine(props: { children?: JSX.Element }) {
-  return <View class="min-h-[20px] flex-row flex-wrap items-baseline">{props.children}</View>;
-}
-
-export function MentionMessageText(props: { text: string }) {
-  return <Text class="min-w-0 max-w-full text-(length:--text-md) text-foreground">{props.text}</Text>;
+/** The bounded, selectable Markdown body of a person or agent message. */
+export function MessageBody(props: {
+  text: string;
+  testID?: string;
+  scopeKey?: string;
+  mentions?: Parameters<typeof messageMarkdown>[1];
+  renderMention?: (ordinal: number) => JSX.Element;
+}) {
+  const rich = computed(() => messageMarkdown(props.text, props.mentions));
+  const pending = signal<{ url: string; scope?: string } | null>(null);
+  const external = () => {
+    const link = pending();
+    return link?.scope === props.scopeKey ? link : null;
+  };
+  const close = () => pending.set(null);
+  effect(() => { if (pending() && !external()) close(); });
+  const renderCustom = (node: TextViewCustomNode) =>
+    node.name === "mention" && props.renderMention ? props.renderMention(Number(node.attributes?.ordinal)) : <Text>{node.text}</Text>;
+  return <>
+    <TextView
+      class="min-w-0 max-w-full text-(length:--text-md) text-foreground"
+      classes={{
+        heading1: "text-(length:--text-lg)", heading2: "text-(length:--text-md)", heading3: "text-(length:--text-md)",
+        listItemContent: "min-w-0", table: "min-w-0 max-w-full", codeBlock: "min-w-0 max-w-full",
+      }}
+      testID={props.testID}
+      document={rich().document}
+      selectable
+      links="report"
+      renderCustom={renderCustom}
+      onLinkPress={e => {
+        const url = httpsLink(e.url);
+        if (url) pending.set({ url, scope: props.scopeKey });
+      }}
+    />
+    <If when={rich().limited}><Label variant="caption" color="muted">Showing part of this message.</Label></If>
+    <If when={external()}>{link =>
+      <Modal open size="compact" title="Open external link" onClose={close}>
+        <Column pad={4} gap={3}>
+          <Label heading variant="title">Open in your browser?</Label>
+          <Label>{link().url}</Label>
+          <ActionBar>
+            <Action label="Cancel" variant="ghost" onPress={close} />
+            <Action label="Open link" variant="primary" onPress={() => {
+              const url = external()?.url;
+              const safe = url && httpsLink(url);
+              close();
+              if (!safe) return;
+              const failed = () => announce("Could not open the link in your browser.");
+              void openUrl(safe).then(result => { if (!result.opened) failed(); }, failed);
+            }} />
+          </ActionBar>
+        </Column>
+      </Modal>
+    }</If>
+  </>;
 }
 
 /** An inline attachment, focusable only for a verified identity. */
@@ -31,20 +85,21 @@ export function MentionToken(props: Testable & {
   const colors = () => props.tone === "self" ? "bg-tone-warning text-tone-warning-foreground font-semibold"
     : props.tone === "person" ? "bg-accent text-accent-foreground"
     : props.tone === "agent" ? "bg-tone-agent text-tone-agent-foreground" : "bg-muted text-muted-foreground";
-  return (
+  const shape = "max-w-[175px] rounded-full px-(--space-1)";
+  return <View class="flex-row items-center align-middle">
     <If when={props.onPress} else={
-      <View class={cx("max-w-[175px] rounded-full px-(--space-1)", colors())}
+      <View class={cx(shape, colors())}
         testID={props.testID} accessibilityLabel={props.accessibilityLabel}>
         <Text class={colors()} style={{ numberOfLines: 1 }}>{props.label}</Text>
       </View>
     }>
       <Button role="link" testID={props.testID} ref={props.ref} accessibilityLabel={props.accessibilityLabel}
-        onPress={props.onPress} class={cx("max-w-[175px] rounded-full px-(--space-1) hover:opacity-80", colors(), focusRingClass)}>
+        onPress={props.onPress} class={cx(shape, "hover:opacity-80", colors(), focusRingClass)}>
         <Text class={colors()} testID={props.tone === "self" ? "mention-token-me" : undefined}
           style={{ numberOfLines: 1 }}>{props.label}</Text>
       </Button>
     </If>
-  );
+  </View>;
 }
 
 export function IdentityCardFrame(props: { children?: JSX.Element }) {

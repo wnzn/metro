@@ -3,7 +3,7 @@ import type { ViewRef } from "nsh";
 import type { Mention, RoomEvent } from "../../api/client";
 import type { SpaceAgent } from "../../api/spaces";
 import { activeSpace, composerScope, me } from "../../store";
-import { Action, AnchoredPopover, Badge, Column, IdentityCardFrame, Label, MentionMessageLine, MentionMessageText, MentionToken, Row } from "../../ui";
+import { Action, AnchoredPopover, Badge, Column, IdentityCardFrame, Label, MentionToken, MessageBody, Row } from "../../ui";
 import { toolName } from "../activity/classify";
 import { isOpen, toggle } from "../activity/disclosure";
 import { FOLD_LINES, outputView } from "../activity/output";
@@ -36,44 +36,20 @@ export function sentMentionLabel(sid: string, mention: Mention, literal: string)
   return identity ? `@${identity.name}` : literal;
 }
 
-type Part = { key: string; text: string; token?: { piece: MentionPiece; ordinal: number } };
-function messageLines(text: string, pieces: readonly MentionPiece[]): Part[][] {
-  const lines: Part[][] = [[]];
-  const line = () => lines[lines.length - 1];
-  const addText = (start: number, end: number) => {
-    for (const m of text.slice(start, end).matchAll(/\n|[^\s]+[^\S\n]*|[^\S\n]+/gu)) {
-      if (m[0] === "\n") lines.push([]);
-      else line().push({ key: `text:${start + m.index!}`, text: m[0] });
-    }
-  };
-  let end = 0;
-  for (const [ordinal, piece] of pieces.entries()) {
-    if (piece.end > text.length) {
-      if (piece.start < text.length) { addText(end, piece.start); return lines; }
-      break;
-    }
-    if (end < piece.start) addText(end, piece.start);
-    line().push({ key: `mention:${piece.start}`, text: piece.literal, token: { piece, ordinal } });
-    end = piece.end;
-  }
-  if (end < text.length) addText(end, text.length);
-  return lines;
-}
-
-export function MentionedBody(props: { event: RoomEvent; sid: string; pieces: readonly MentionPiece[]; stateKey: string }) {
+export function MentionedBody(props: { event: RoomEvent; sid?: string; pieces: readonly MentionPiece[]; stateKey: string }) {
   const open = () => isOpen(props.stateKey);
   const view = computed(() => outputView(props.event.text, open()));
-  const lines = computed(() => {
+  const shown = computed(() => {
     const v = view();
-    if (!v.foldable || open()) return messageLines(v.shown, props.pieces);
+    if (!v.foldable || open()) return v.shown;
     const visible = v.shown.split("\n", FOLD_LINES).join("\n");
-    return messageLines(visible.length > 600 ? [...visible].slice(0, 600).join("") : visible, props.pieces);
+    return visible.length > 600 ? [...visible.slice(0, 1200)].slice(0, 600).join("") : visible;
   });
   const card = signal<{ piece: MentionPiece; scope: string; eventId: number; anchor: ViewRef } | null>(null);
   const identity = () => {
-    const target = card();
-    return target && target.scope === composerScope() && target.eventId === props.event.id
-      ? localMentionIdentity(props.sid, target.piece.mention) : null;
+    const target = card(), sid = props.sid;
+    return target && sid && target.scope === composerScope() && target.eventId === props.event.id
+      ? localMentionIdentity(sid, target.piece.mention) : null;
   };
   effect(() => { if (card() && !identity()) card.set(null); });
   const close = () => {
@@ -82,44 +58,36 @@ export function MentionedBody(props: { event: RoomEvent; sid: string; pieces: re
     card.set(null);
     if (canRestore) previous?.anchor.focus();
   };
+  const renderMention = (ordinal: number) => {
+    const piece = () => props.pieces[ordinal];
+    let anchor: ViewRef | null = null;
+    const info = computed(() => props.sid && piece() ? localMentionIdentity(props.sid, piece().mention) : null);
+    const self = () => {
+      const m = piece().mention;
+      return m.kind === "user" && m.id === me();
+    };
+    const generic = () => {
+      const m = piece().mention;
+      return m.kind === "agent" && !m.agentId;
+    };
+    const label = () => info() ? `@${info()!.name}` : generic() ? "@agent" : piece().literal;
+    return <If when={piece()}>
+      <MentionToken
+        testID={`mention-token:${props.event.id}:${ordinal}`}
+        tone={info() ? self() ? "self" : piece().mention.kind === "user" ? "person" : "agent" : generic() ? "agent" : "unavailable"}
+        label={label()}
+        accessibilityLabel={info() ? `${info()!.name}, mentioned. Open card.` : generic() ? label() : `${label()}, unavailable`}
+        ref={node => { anchor = node; }}
+        onPress={info() ? () => {
+          if (anchor && info()) card.set({ piece: piece(), eventId: props.event.id, scope: composerScope(), anchor });
+        } : undefined}
+      />
+    </If>;
+  };
   return (
     <Column gap={1}>
-      <Each of={lines()} key="index">
-        {line => <MentionMessageLine>
-          <Each of={line()} key={p => p.key}>
-            {(part) => (
-              <If when={part().token} else={<MentionMessageText text={part().text} />}>
-                {(token) => {
-                  const piece = () => token().piece;
-                  let anchor: ViewRef | null = null;
-                  const info = computed(() => localMentionIdentity(props.sid, piece().mention));
-                  const self = () => {
-                    const m = piece().mention;
-                    return m.kind === "user" && m.id === me();
-                  };
-                  const generic = () => {
-                    const m = piece().mention;
-                    return m.kind === "agent" && !m.agentId;
-                  };
-                  const label = () => info() ? `@${info()!.name}` : generic() ? "@agent" : piece().literal;
-                  return <MentionToken
-                    testID={`mention-token:${props.event.id}:${token().ordinal}`}
-                    tone={info() ? self() ? "self" : piece().mention.kind === "user" ? "person" : "agent" : generic() ? "agent" : "unavailable"}
-                    label={label()}
-                    accessibilityLabel={info() ? `${info()!.name}, mentioned. Open card.` : generic() ? label() : `${label()}, unavailable`}
-                    ref={node => { anchor = node; }}
-                    onPress={info() ? () => {
-                      if (anchor && localMentionIdentity(props.sid, piece().mention)) {
-                        card.set({ piece: piece(), eventId: props.event.id, scope: composerScope(), anchor });
-                      }
-                    } : undefined}
-                  />;
-                }}
-              </If>
-            )}
-          </Each>
-        </MentionMessageLine>}
-      </Each>
+      <MessageBody text={shown()} testID={`message-body:${props.event.id}`}
+        scopeKey={props.stateKey} mentions={props.pieces} renderMention={renderMention} />
       <If when={view().toggleLabel}>
         {label => <Row><Action label={label()} variant="ghost" onPress={() => { close(); toggle(props.stateKey); }} /></Row>}
       </If>
@@ -129,7 +97,7 @@ export function MentionedBody(props: { event: RoomEvent; sid: string; pieces: re
           <AnchoredPopover anchor={card()?.anchor} placement="bottom" align="start" onClose={close}
             testID="identity-card" accessibilityLabel={`About ${info().name}`}>
             <IdentityCardFrame>
-              <IdentityDetails info={info()} sid={props.sid} close={close} />
+              <IdentityDetails info={info()} sid={props.sid!} close={close} />
             </IdentityCardFrame>
           </AnchoredPopover>
         )}
