@@ -1,7 +1,7 @@
-import { cleanup, signal, untracked } from "nsh";
-import type { PageMeta, PageTarget, Template } from "../../api/pages";
+import { cleanup, effect, signal, untracked } from "nsh";
+import type { DraftMeta, PageMeta, PageTarget, Template } from "../../api/pages";
 import { isPageStatus, pageFailure } from "../../api/pages";
-import { goPages, hasSpace, pageGuard, pages, pagesError, pagesLoading, pagesProblem, recentPageDrafts, refreshPages, scopeVisible, spaceGrants, watchPageScope } from "../../pagesState";
+import { forgetPageDraft, goPages, hasSpace, pageDrafts, pageDraftsError, pageGuard, pages, pagesError, pagesLoading, pagesProblem, refreshPageDrafts, refreshPages, scopeVisible, spaceGrants, watchPageScope } from "../../pagesState";
 import type { PagesRoute } from "../../pagesState";
 import { apiClient, sessionGuard, spaces } from "../../store";
 import { Action, ActionBar, Badge, Column, compactWidth, Label, Modal, PageHeader, PageLayout, Picker, Row, SettingsGroup, Surface } from "../../ui";
@@ -15,7 +15,15 @@ export function PagesHome(props: { route: Home }) {
   const creating = signal(false), deleted = signal(false);
   const scopeId = () => props.route.spaceId;
   const inSpace = () => !!scopeId();
-  const drafts = () => recentPageDrafts().filter(d => !scopeId() || d.spaceId === scopeId());
+  const valid = pageGuard(props.route);
+  let lastSpaces: string | undefined;
+  effect(() => {
+    const key = JSON.stringify(spaces().map(s => s.id).sort());
+    if (key !== lastSpaces) {
+      lastSpaces = key;
+      untracked(() => void refreshPageDrafts(valid));
+    }
+  });
   return <PageLayout testID="pages-home" inset={6} gap={6}>
     <Column gap={2}>
       <If when={inSpace()}><Row><Action compact variant="ghost" label="‹ All pages" onPress={() => goPages()} /></Row></If>
@@ -25,7 +33,9 @@ export function PagesHome(props: { route: Home }) {
       </PageHeader>
     </Column>
     <Row gap={2} wrap>
-      <Action compact testID="pages-reload" label="Refresh list" onPress={() => void refreshPages()} />
+      <Action compact testID="pages-reload" label="Refresh list" onPress={() => {
+        void refreshPages(); void refreshPageDrafts(valid);
+      }} />
       <Action compact testID="pages-deleted" label="Recently deleted" variant="ghost" onPress={() => deleted.set(true)} />
     </Row>
     <PagesError message={pagesError()} onRetry={() => void refreshPages()} />
@@ -35,17 +45,65 @@ export function PagesHome(props: { route: Home }) {
       .slice().sort((a, b) => a.name.localeCompare(b.name))} key={s => s.id}>
       {space => <PageGroup title={space().name} entries={pages().filter(p => p.space_id === space().id)} />}
     </Each>
-    <If when={drafts().length}>
-      <SettingsGroup title="Continue reviewing" description="Drafts opened in this session. Only you can review or apply them.">
-        <Each of={drafts()} key={d => d.id}>{draft => <Row gap={2} padX={4} padY={3} align="center" justify="between" wrap>
-          <Label>{pages().find(p => p.id === draft().returnPage)?.title ?? (draft().returnRoom ? "Draft from a room" : "Page draft")} · {scopeName(draft().spaceId)}</Label>
-          <Action compact label="Review draft" testID={`continue-page-draft:${draft().id}`} onPress={() => goPages({ ...draft() })} />
-        </Row>}</Each>
-      </SettingsGroup>
-    </If>
+    <DraftGroup route={props.route} />
     <If when={creating()}><NewPageSheet route={props.route} close={() => creating.set(false)} /></If>
     <If when={deleted()}><DeletedPages route={props.route} close={() => deleted.set(false)} /></If>
   </PageLayout>;
+}
+
+function DraftGroup(props: { route: Home }) {
+  const rows = () => pageDrafts().filter(d => !props.route.spaceId || d.space_id === props.route.spaceId);
+  const selected = signal<DraftMeta | null>(null), busy = signal(false), error = signal("");
+  const valid = pageGuard(props.route);
+  async function discard(draft: DraftMeta) {
+    const client = apiClient();
+    if (!client || !valid() || busy() || !rows().some(d => d.id === draft.id)) return;
+    const grant = sessionGuard(draft.space_id ?? undefined);
+    busy.set(true); error.set("");
+    try {
+      await client.discardPageDraft(draft.id);
+      if (valid() && grant()) forgetPageDraft(draft.id);
+    } catch (e) {
+      if (valid() && grant()) {
+        if (isPageStatus(e, 404)) forgetPageDraft(draft.id);
+        else error.set(pagesProblem(e));
+      }
+    } finally {
+      busy.set(false); selected.set(null);
+    }
+  }
+  const title = (draft: DraftMeta) => draft.page_title ?? "New page";
+  return <Column gap={2}>
+    <PagesError message={pageDraftsError()} onRetry={() => void refreshPageDrafts(valid)} />
+    <PagesError message={error()} />
+    <If when={rows().length}>
+      <SettingsGroup title="Drafts" description="Only you can review or apply your drafts.">
+        <Each of={rows()} key={d => d.id}>{draft => <Row gap={2} padX={4} padY={3} align="center" justify="between" wrap>
+          <Column gap={1} grow>
+            <Label>{title(draft())} · {draft().space_name ?? "Personal"}</Label>
+            <Label variant="meta">{({ generating: "Building", ready: "Ready", failed: "Failed" })[draft().status]} · Updated {cell(draft().updated_at, "relative").label.toLowerCase()}</Label>
+          </Column>
+          <Action compact label="Resume" accessibilityLabel={`Resume draft: ${title(draft())}`} testID={`continue-page-draft:${draft().id}`}
+            onPress={() => goPages({ kind: "draft", id: draft().id, spaceId: draft().space_id ?? undefined, returnPage: draft().page_id ?? undefined })} />
+          <Action compact variant="ghost" label="Discard…" accessibilityLabel={`Discard draft: ${title(draft())}`} testID={`discard-listed-draft:${draft().id}`}
+            onPress={() => { error.set(""); selected.set(draft()); }} />
+        </Row>}</Each>
+      </SettingsGroup>
+    </If>
+    <If when={selected() && rows().some(d => d.id === selected()?.id)}>
+      <Modal open title="Discard draft?" onClose={() => { if (!busy()) selected.set(null); }}>
+        <Column pad={4} gap={3}>
+          <Label>The published page won’t change.</Label>
+          <ActionBar>
+            <Action label="Cancel" variant="ghost" disabled={busy()} onPress={() => selected.set(null)} />
+            <Action label="Discard draft" testID="discard-listed-draft-confirm" variant="danger" busy={busy()} onPress={() => {
+              const draft = selected(); if (draft) void discard(draft);
+            }} />
+          </ActionBar>
+        </Column>
+      </Modal>
+    </If>
+  </Column>;
 }
 
 function PageGroup(props: { title: string; entries: PageMeta[] }) {
@@ -83,6 +141,9 @@ function NewPageSheet(props: { route: Home; close: () => void }) {
   const client = apiClient();
   const valid = pageGuard(props.route);
   const options = () => templates().filter(t => t.scopes.includes(scope() ? "space" : "personal"));
+  const pickedTemplate = () => options().find(t => t.id === template());
+  const needsRoom = () => !!scope() && !!pickedTemplate() && pickedTemplate()?.requires_space_destination !== false;
+  const pickedRoom = () => room() === null ? rooms()[0] : rooms().find(r => r.id === room());
   const target = (): PageTarget => scope() ? { scope: "space", space_id: scope()! } : { scope: "personal" };
   async function templatesLoad() {
     templateError.set("");
@@ -98,7 +159,7 @@ function NewPageSheet(props: { route: Home; close: () => void }) {
     const grant = sessionGuard(sid);
     void client.listRooms(sid).then(list => {
       if (alive && valid() && grant() && ticket === roomTicket) rooms.set(list.filter(r => !r.parentRoomId));
-    }, () => { /* default room is independently checked by the server */ });
+    }, () => { /* A destination-dependent template cannot be submitted without a room. */ });
   });
   async function create(run: (c: NonNullable<typeof client>, dest: PageTarget, current: () => boolean) => Promise<void>) {
     if (!client || !valid() || busy() || !hasSpace(scope())) return;
@@ -130,15 +191,20 @@ function NewPageSheet(props: { route: Home; close: () => void }) {
       <If when={mode() === "prompt"} else={<Column gap={2}>
         <PagesError message={templateError()} onRetry={() => void templatesLoad()} />
         <Picker accessibilityLabel="Page template" testID="page-template" placeholder="Choose a template" value={template()}
-          disabled={!!busy()} items={options().map(t => ({ value: t.id, label: t.title, detail: t.description }))} onChange={template.set} />
-        <If when={scope() && rooms().length}>
-          <Picker accessibilityLabel="Template room" testID="page-template-room" disabled={!!busy()} value={room() ?? ""}
-            items={[{ value: "", label: "First room" }, ...rooms().map(r => ({ value: r.id, label: r.name }))]} onChange={room.set} />
-          <Label variant="caption" color="muted">Templates use the Space’s default agent.</Label>
+          disabled={!!busy()} items={options().map(t => ({ value: t.id, label: t.title, detail: t.description }))} onChange={value => {
+            template.set(value); room.set(null);
+          }} />
+        <If when={needsRoom()}>
+          <Picker accessibilityLabel="Template room" testID="page-template-room" disabled={!!busy() || !rooms().length} value={pickedRoom()?.id ?? null}
+            placeholder="No room available" items={rooms().map(r => ({ value: r.id, label: r.name }))} onChange={room.set} />
+          <Label variant="caption" color="muted">This template uses the selected room and the Space’s default agent.</Label>
         </If>
-        <Row justify="end"><Action testID="create-page-template" label="Create page" variant="primary" disabled={!template() || !hasSpace(scope())} busy={!!busy()}
+        <Row justify="end"><Action testID="create-page-template" label="Create page" variant="primary" disabled={!pickedTemplate() || !hasSpace(scope()) || (needsRoom() && !pickedRoom())} busy={!!busy()}
           onPress={() => void create(async (client, dest, current) => {
-            const page = await client.createPage({ ...dest, template: template()!, room: rooms().find(r => r.id === room())?.name });
+            const t = pickedTemplate(), r = needsRoom() ? pickedRoom() : undefined;
+            if (!t || (needsRoom() && !r)) return;
+            const page = await client.createPage({ ...dest, template: t.id,
+              ...(r ? { room: r.name, ...(t.requires_space_destination ? { room_id: r.id } : {}) } : {}) });
             if (current() && sameTarget(dest, page)) showPage(page);
           })} /></Row>
       </Column>}>

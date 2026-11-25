@@ -1,5 +1,6 @@
 import { batch, computed, effect, signal, untracked } from "nsh";
-import type { PageMeta } from "./api/pages";
+import { isPageStatus } from "./api/pages";
+import type { DraftMeta, PageMeta } from "./api/pages";
 import { ApiError, apiClient, describe, disconnect, isAborted, mainPlace, onSessionEnd, openPlace, sessionGuard, spaces } from "./store";
 
 export type PagesRoute =
@@ -11,15 +12,15 @@ const route = signal<PagesRoute>({ kind: "home" });
 /** A primitive key for NSH's keyed view, not a new object on each evaluation. */
 export const pagesRouteMount = signal(0);
 const entries = signal<{ page: PageMeta; valid?: () => boolean }[]>([]);
-type DraftRoute = Extract<PagesRoute, { kind: "draft" }>;
-const draftLinks = signal<{ route: DraftRoute; valid: () => boolean }[]>([]);
+const draftEntries = signal<{ draft: DraftMeta; valid: () => boolean }[]>([]);
 export const pagesRoute = computed(route);
 export const pages = computed(() => entries().filter(e => scopeVisible(e.page) && (e.valid?.() ?? true)).map(e => e.page));
-/** Session-only handles; no draft source, prompt, or preview is cached here. */
-export const recentPageDrafts = computed(() => draftLinks().filter(entry => hasSpace(entry.route.spaceId) && entry.valid()).map(entry => entry.route));
+/** Metadata only. Review always loads the draft again by ID. */
+export const pageDrafts = computed(() => draftEntries().filter(e => scopeVisible(e.draft) && e.valid()).map(e => e.draft));
+export const pageDraftsError = signal("");
 export const pagesError = signal("");
 export const pagesLoading = signal(false);
-let listRequest = 0;
+let listRequest = 0, draftsRequest = 0;
 
 export function hasSpace(id?: string | null) {
   return !id || spaces().some(s => s.id === id);
@@ -54,7 +55,6 @@ export function scopeVisible(page: { scope: string; space_id: string | null }) {
 export function goPages(next: PagesRoute = { kind: "home" }) {
   if (!apiClient() || !hasSpace(next.spaceId)) return;
   batch(() => {
-    if (next.kind === "draft") draftLinks.set([{ route: { ...next }, valid: sessionGuard(next.spaceId) }, ...draftLinks().filter(entry => entry.route.id !== next.id && entry.valid())].slice(0, 20));
     route.set(next);
     pagesRouteMount.set(pagesRouteMount() + 1);
     // Keep mutation navigation guards in step even for Page A → B → A.
@@ -63,7 +63,8 @@ export function goPages(next: PagesRoute = { kind: "home" }) {
 }
 
 export function forgetPageDraft(id: string) {
-  draftLinks.set(draftLinks().filter(entry => entry.route.id !== id));
+  draftsRequest++;
+  draftEntries.set(draftEntries().filter(entry => entry.draft.id !== id));
 }
 
 export function pageGuard(current: PagesRoute, spaceId = current.spaceId) {
@@ -104,10 +105,33 @@ export async function refreshPages() {
   }
 }
 
+export async function refreshPageDrafts(current: () => boolean) {
+  const client = apiClient();
+  if (!client) return;
+  const index = ++draftsRequest;
+  const session = sessionGuard(), grants = spaceGrants();
+  const valid = () => current() && session() && index === draftsRequest;
+  pageDraftsError.set("");
+  try {
+    const list = await client.listPageDrafts();
+    if (valid()) draftEntries.set(list.flatMap(draft => {
+      const access = draft.space_id ? grants.get(draft.space_id) : session;
+      return scopeVisible(draft) && access?.() ? [{ draft, valid: access }] : [];
+    }));
+  } catch (error) {
+    if (!valid()) return;
+    draftEntries.set([]);
+    // Older servers only support POST at this path.
+    if (!isPageStatus(error, 404) && !isPageStatus(error, 405)) pageDraftsError.set(pagesProblem(error));
+  }
+}
+
 onSessionEnd(() => {
   listRequest++;
+  draftsRequest++;
   entries.set([]);
-  draftLinks.set([]);
+  draftEntries.set([]);
+  pageDraftsError.set("");
   pagesError.set("");
   pagesLoading.set(false);
   route.set({ kind: "home" });

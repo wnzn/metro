@@ -1,5 +1,5 @@
 import { BASE, header, TOKENS, world } from "../../../../test/fakeServer";
-import type { Draft, Page, PageData, PageDraftEvent, PageMeta, PageSpec } from "../../../api/pages";
+import type { Draft, DraftMeta, Page, PageData, PageDraftEvent, PageMeta, PageSpec } from "../../../api/pages";
 import { bind, lit, sample, sampleData, stamp } from "./sample";
 
 export const TEAM = "pg_team", PERSONAL = "pg_personal", DRAFT = "pgd_fixture";
@@ -42,6 +42,12 @@ export function pagesFixture() {
     denyDraftRead: false, liveRoom: "Renamed room", liveAgent: "renamed_agent", liveAgentName: "Renamed agent",
     stale: false, staleSource: false, outside: false, generating: 0, started: 0, applied: 0 };
   const visible = (p: PageMeta, user: string) => p.scope === "personal" ? p.creator_id === user : !!p.space_id && f.state.spaces.get(p.space_id)?.members.has(user);
+  function draftVisible(d: Draft, user: string) {
+    if (d.space_id && !f.state.spaces.get(d.space_id)?.members.has(user)) return false;
+    if (!d.page_id) return true;
+    const p = entries.get(d.page_id);
+    return !!p && !p.deleted_at && !!visible(p, user);
+  }
   const caps = (p: Page, user: string): Page => {
     const can_manage = p.creator_id === user || (!!p.space_id && f.state.spaces.get(p.space_id)?.owner === user);
     return { ...p, can_edit: can_manage || p.members_edit, can_manage, can_delete: can_manage, pinned: prefs.get(`${user}/${p.id}`) ?? p.pinned };
@@ -109,16 +115,25 @@ export function pagesFixture() {
         delay: state.createDelay };
     }
     if (id === "templates") return ok({ templates: [
-      { id: "files", title: "Files", description: "Recent library files", scopes: ["personal", "space"] },
-      { id: "release-watch", title: "Release watch", description: "Watch a Space", scopes: ["space"] },
+      { id: "files", title: "Files", description: "Recent library files", scopes: ["personal", "space"], requires_space_destination: false },
+      { id: "release-watch", title: "Release watch", description: "Watch a Space", scopes: ["space"], requires_space_destination: true },
     ] });
     if (id === "validate") return ok(body.source.includes("INVALID")
       ? { ok: false, source: body.source, spec: null, diagnostics: [{ line: 1, column: 1, message: "Unsupported fixture source" }] }
       : { ok: true, source: body.source, spec: team.spec, diagnostics: [] });
     if (id === "drafts") {
       if (!op && method === "POST") return ok(makeDraft(body, user), 202);
+      if (!op && method === "GET") return ok({
+        drafts: [...privateDrafts.values()].flatMap(({ owner, draft: d }): DraftMeta[] =>
+          owner === user && draftVisible(d, user) ? [{
+            id: d.id, status: d.status, scope: d.scope, space_id: d.space_id, page_id: d.page_id,
+            space_name: d.space_id ? f.state.spaces.get(d.space_id)?.name ?? null : null,
+            page_title: d.page_id ? entries.get(d.page_id)?.title ?? null : null,
+            created_at: d.created_at, updated_at: d.created_at, expires_at: "2099-11-25T00:00:00.000Z",
+          }] : []),
+      });
       const found = op && privateDrafts.get(op);
-      if (!found || found.owner !== user || (found.draft.space_id && !f.state.spaces.get(found.draft.space_id)?.members.has(user))) return fail(404, "no such draft");
+      if (!found || found.owner !== user || (method !== "DELETE" && !draftVisible(found.draft, user))) return fail(404, "no such draft");
       const d = found.draft, base = d.page_id ? entries.get(d.page_id) : undefined;
       if (method === "DELETE") { privateDrafts.delete(op!); return { status: 204 }; }
       if (detail !== "apply" && state.denyDraftRead) return { ...fail(404, "no such draft"), delay: state.draftDelay };

@@ -892,7 +892,7 @@ fn markdown_links_are_checked_structurally() {
 #[test]
 fn template_placeholders_are_replaced_in_one_pass() {
     let t = super::generate::template("release-watch").unwrap();
-    let src = super::generate::instantiate(t, Some(("r-1", "__ROOM_ONLY__ __TARGET__", "agent")));
+    let src = super::generate::instantiate(t, Some(("__ROOM_ONLY__ __TARGET__", "agent")));
     // The room name is inserted verbatim; nothing inside it is expanded.
     assert_eq!(src.matches("__ROOM_ONLY__ __TARGET__").count(), 3, "{src}");
     assert!(!src.contains("room=room="), "{src}");
