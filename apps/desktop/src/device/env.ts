@@ -1,7 +1,8 @@
 // Where the desktop bridge is, if this UI was started by the packaged Metro
-// launcher (contract v1). The launcher sets exactly two variables on the UI
+// launcher (contract v1). The launcher sets these two variables on the UI
 // process only; NSH exposes them because nsh.json lists them under
-// capabilities.process.env (NSH 0.6.1 shows no other variables to an app).
+// capabilities.process.env (NSH 0.6.1 shows no other variables to an app;
+// the only others listed are the non-secret proxy route, api/proxyEnv.ts).
 //
 // Strict on purpose: anything but `http://127.0.0.1:<port>` and a 64-hex
 // bearer counts as "no bridge" (`nsh run`, `nsh test`, a hand-started UI),

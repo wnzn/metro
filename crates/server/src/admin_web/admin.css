@@ -220,6 +220,11 @@ code.block { display: block; margin: var(--space-2) 0; padding: var(--space-2) v
   border: 1px solid transparent; border-radius: var(--radius-sm);
   background: var(--secondary); color: var(--secondary-foreground); cursor: pointer;
 }
+/* A text-sized action inside a hint line. */
+.btn-link {
+  font: inherit; color: var(--primary); background: none; border: 0; padding: 0;
+  text-decoration: underline; cursor: pointer;
+}
 .btn-primary { background: var(--primary); color: var(--primary-foreground); }
 .btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
 .btn-secondary { background: var(--secondary); color: var(--secondary-foreground); border-color: var(--input-border); }

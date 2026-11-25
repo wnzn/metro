@@ -206,6 +206,26 @@ class ShardTests(unittest.TestCase):
             self.assertEqual(Path(run["XDG_DATA_HOME"]).parent, Path(run["HOME"]))
         self.assertEqual(sorted(path.name for path in exported.iterdir()), ["000.xml", "001.xml", "002.xml"])
 
+    def test_desktop_worker_keeps_relative_import_to_shared_host_vectors(self):
+        desktop = self.root / "apps/desktop"
+        desktop.parent.mkdir()
+        self.app.rename(desktop)
+        self.app = desktop
+        fixture = "crates/url-policy/testdata/host_vectors.json"
+        vectors = self.root / fixture
+        vectors.parent.mkdir(parents=True)
+        vectors.write_text('{"hosts": []}')
+        workers = self.tmp / "workers"
+        workers.mkdir()
+
+        _, contexts = policy.prepare(desktop, workers, str(self.root / "nsh"), self.env)
+
+        for app, _, _ in contexts:
+            copied = app / "../.." / fixture
+            self.assertEqual(copied.read_text(), '{"hosts": []}')
+            self.assertNotEqual(copied.resolve(), vectors)
+            self.assertTrue(copied.resolve().is_relative_to(workers))
+
     def test_new_file_added_after_first_run_and_repeatable_count(self):
         self.assertIn("2/2 files", self.run_helper().stdout)
         self.write("dev/new.test.tsx")

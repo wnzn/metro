@@ -8,6 +8,7 @@ import type { App } from "nsh/test";
 import { BASE, header, TOKENS } from "../../test/fakeServer";
 import { libraryWorld } from "./library/test/fixtures";
 import theme from "../../theme/theme.json";
+import { launched } from "../../test/launched";
 
 type Req = { method: string; url: string; headers: unknown; body?: string | null };
 type Wire = { assets: unknown[]; messages: unknown[] };
@@ -59,7 +60,7 @@ function quickWorld() {
 type QW = ReturnType<typeof quickWorld>;
 
 async function signIn(w: QW, user = "alice", app?: App): Promise<App> {
-  const a = app ?? (await open("../../App.tsx", { network: w.network as any, platform: "linux", width: 1280, height: 860 }));
+  const a = app ?? (await open("../../App.tsx", { modules: launched(), network: w.network as any, platform: "linux", width: 1280, height: 860 }));
   await a.clear("id:server-url");
   await a.type("id:server-url", BASE);
   await a.type("id:access-token", TOKENS[user]!);
@@ -355,7 +356,7 @@ test("Down walks a full list of eight to More, which is last", async () => {
   const w = quickWorld();
   const files = Array.from({ length: 8 }, (_, i) => w.addAsset("alice", null, `note ${i}.txt`, "x"));
   w.q.answers.set("note", () => ({ assets: files.map(w.wireAsset), messages: [] }));
-  const app = await open("../../App.tsx", { network: w.network as any, platform: "linux", width: 900, height: 520 });
+  const app = await open("../../App.tsx", { modules: launched(), network: w.network as any, platform: "linux", width: 900, height: 520 });
   await signIn(w, "alice", app);
   await app.type("id:top-search", "note");
   await app.waitFor(`id:quick-asset:${files[7]!.id}`);

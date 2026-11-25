@@ -20,6 +20,8 @@ url = os.environ.get("METRO_DESKTOP_BRIDGE_URL", "")
 tok = os.environ.get("METRO_DESKTOP_BRIDGE_TOKEN", "")
 res = {"url": url, "token_len": len(tok), "token_hex": all(c in "0123456789abcdef" for c in tok),
        "nsh_app_dir": os.environ.get("NSH_APP_DIR"), "no_proxy": os.environ.get("NO_PROXY"),
+       "proxy_route": os.environ.get("METRO_PROXY_ROUTE"), "direct_for": os.environ.get("METRO_PROXY_DIRECT_FOR"),
+       "proxy_vars": sorted(k for k in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy") if k in os.environ),
        "cwd": os.getcwd(), "argv": sys.argv[1:], "pid": os.getpid(), "pgid": os.getpgid(0)}
 hp = url[len("http://"):]
 host, port = hp.split(":")
@@ -172,7 +174,23 @@ fn launches_the_packaged_ui_with_a_private_bridge_and_cleans_up() {
         Value::Null,
         "NSH_APP_DIR must not reach the UI"
     );
-    assert_eq!(r["no_proxy"], "example.com,127.0.0.1,localhost,::1");
+    // The person's entries and loopback first, then loopback and Tailscale in
+    // ureq's NO_PROXY syntax, so the UI reaches them without a proxy.
+    let mut expected = vec![
+        "example.com".to_string(),
+        "127.0.0.1".into(),
+        "localhost".into(),
+        "::1".into(),
+    ];
+    for e in metro_url_policy::loopback_no_proxy_entries() {
+        if !expected.contains(&e) {
+            expected.push(e);
+        }
+    }
+    assert_eq!(r["no_proxy"], expected.join(","));
+    // The UI learns the route and the direct-for list as non-secret metadata.
+    assert_eq!(r["direct_for"], expected.join(","));
+    assert_eq!(r["proxy_route"], "proxied", "the test sets HTTP_PROXY");
     assert_eq!(r["argv"], serde_json::json!([]));
     let ui_dir = std::fs::canonicalize(dir.join(UI_DIR)).unwrap();
     assert_eq!(Path::new(r["cwd"].as_str().unwrap()), ui_dir);

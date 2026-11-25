@@ -10,6 +10,7 @@
 import { expect, open, test } from "nsh/test";
 import { BASE, TOKENS } from "../../../test/fakeServer";
 import { libraryWorld } from "./test/fixtures";
+import { launched } from "../../../test/launched";
 
 type W = ReturnType<typeof libraryWorld>;
 
@@ -17,7 +18,7 @@ const REPLY_DELAY = 5_000; // app time, below the client's request timeout
 const BEFORE_REPLY = { timeout: 500 };
 
 async function signIn(w: W, user = "alice") {
-  const app = await open("./test/QuickHarness.tsx", { network: w.network as any, platform: "linux", width: 1100, height: 900, clock: {} });
+  const app = await open("./test/QuickHarness.tsx", { modules: launched(), network: w.network as any, platform: "linux", width: 1100, height: 900, clock: {} });
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS[user]!);

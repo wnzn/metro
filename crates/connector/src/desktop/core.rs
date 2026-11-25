@@ -28,7 +28,7 @@ use super::metro_api::{ApiError, MetroApi};
 use super::monitoring::{EventKind, Events};
 use super::store::{self, Binding};
 use crate::metro::MetroClient;
-use crate::netpolicy::validate_base_url;
+use crate::netpolicy::{validate_base_url, validate_server_url};
 use crate::openai_oauth::{self, Endpoints, LoginOptions};
 use crate::profile::{
     DEFAULT_REQUEST_TIMEOUT_SECS, Kind, Profile, ProfileConfig, validate_models,
@@ -805,7 +805,9 @@ impl Desktop {
                 "Another Metro window already serves this device's connections",
             ));
         }
-        let server = validate_base_url(server_url, "server_url")
+        // The app asked the person before using plain HTTP to a host that is
+        // neither loopback nor Tailscale (apps/desktop/src/plainHttp.ts).
+        let server = validate_server_url(server_url, "server_url")
             .map_err(|e| err(422, "invalid", e.to_string()))?;
         let t = session_token.expose();
         if t.is_empty() || t.len() > 8192 || t.chars().any(|c| c.is_whitespace() || c.is_control())

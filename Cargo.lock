@@ -1568,6 +1568,7 @@ dependencies = [
  "jsonwebtoken",
  "libc",
  "metro-model-protocol",
+ "metro-url-policy",
  "rand 0.9.5",
  "reqwest",
  "rpassword",
@@ -1588,6 +1589,7 @@ version = "0.4.0"
 dependencies = [
  "libc",
  "metro-connector",
+ "metro-url-policy",
  "serde_json",
  "tokio",
  "windows-sys 0.61.2",
@@ -1612,6 +1614,7 @@ name = "metro-runner"
 version = "0.4.0"
 dependencies = [
  "libc",
+ "metro-url-policy",
  "serde",
  "serde_json",
  "tempfile",
@@ -1659,6 +1662,7 @@ dependencies = [
  "crossterm",
  "ctrlc",
  "libc",
+ "metro-url-policy",
  "reqwest",
  "serde",
  "serde_json",
@@ -1667,6 +1671,14 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "url",
+]
+
+[[package]]
+name = "metro-url-policy"
+version = "0.4.0"
+dependencies = [
+ "serde_json",
+ "ureq",
 ]
 
 [[package]]
