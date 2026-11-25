@@ -645,19 +645,47 @@ pub fn spawn(state: AppState) {
         return;
     }
     tokio::spawn(async move {
-        let verifier = match metro_release::sigstore::SigstoreVerifier::vendored() {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!(error = %e, "release check unavailable");
-                return;
-            }
+        // The trust cache lives next to the database (private folder).
+        let trust_dir = state
+            .config
+            .db_path
+            .parent()
+            .map(|d| {
+                if d.as_os_str().is_empty() {
+                    std::path::Path::new(".")
+                } else {
+                    d
+                }
+            })
+            .map(|d| d.join("sigstore-trust"));
+        let trust = trust_dir
+            .and_then(|d| metro_release::trust_refresh::TrustRefresh::new(&d).ok())
+            .map(Arc::new);
+        let verifier: Arc<dyn ReleaseVerifier> = match &trust {
+            Some(t) => t.verifier.clone(),
+            None => match metro_release::sigstore::SigstoreVerifier::vendored() {
+                Ok(v) => Arc::new(v),
+                Err(e) => {
+                    tracing::error!(error = %e, "release check unavailable");
+                    return;
+                }
+            },
         };
         let Ok(fetcher) = AsyncFetcher::new(Source::github(), Duration::from_secs(60)) else {
             return;
         };
         tokio::time::sleep(CHECK_FIRST_DELAY + jitter(Duration::from_secs(60))).await;
         loop {
-            check_once(&state, &fetcher, &verifier).await;
+            check_once(&state, &fetcher, verifier.as_ref()).await;
+            // Sigstore rotated keys since this build: refresh the trusted root
+            // through TUF (weekly at most) and try once more.
+            let stale = state.updates.lock().status.error == Some("trust_root_stale");
+            if stale
+                && let Some(trust) = &trust
+                && trust.refresh_if_due().await
+            {
+                check_once(&state, &fetcher, verifier.as_ref()).await;
+            }
             tokio::time::sleep(CHECK_INTERVAL + jitter(Duration::from_secs(3600))).await;
         }
     });

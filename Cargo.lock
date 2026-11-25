@@ -1756,14 +1756,17 @@ dependencies = [
 name = "metro-release"
 version = "0.4.0"
 dependencies = [
+ "aws-lc-rs",
  "base64 0.22.1",
  "der",
  "flate2",
+ "jiff",
  "metro-release",
  "reqwest",
  "serde",
  "serde_json",
  "sha2",
+ "sigstore-tuf",
  "sigstore-verify",
  "tempfile",
  "tokio",
@@ -3053,6 +3056,24 @@ dependencies = [
  "thiserror",
  "tracing",
  "x509-cert",
+]
+
+[[package]]
+name = "sigstore-tuf"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55fcdb90054c5ab76f4122d72406127780dbb595adab417382efb7721ebf5990"
+dependencies = [
+ "glob",
+ "hex",
+ "jiff",
+ "serde",
+ "serde_json",
+ "sigstore-crypto",
+ "sigstore-types",
+ "tempfile",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]

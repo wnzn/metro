@@ -28,6 +28,8 @@ pub mod release;
 pub mod sigstore;
 #[cfg(feature = "testing")]
 pub mod testing;
+#[cfg(feature = "async")]
+pub mod trust_refresh;
 pub mod version;
 
 pub use channel::Channel;
@@ -100,4 +102,22 @@ pub fn release_url(version: &Version) -> String {
 /// A 40-character lowercase hex commit.
 pub fn is_commit(text: &str) -> bool {
     text.len() == 40 && text.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Write a file atomically (temp file, fsync, rename).
+pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }

@@ -233,6 +233,9 @@ pub struct UpdaterConfig {
     pub trial: Option<String>,
     /// The library checker for Linux stages (`ldd`).
     pub ldd: PathBuf,
+    /// Sigstore trust-root refresh (weekly at most, only after
+    /// `trust_root_stale`); `None` in tests.
+    pub trust: Option<Arc<metro_release::trust_refresh::TrustRefresh>>,
 }
 
 impl UpdaterConfig {
@@ -245,7 +248,13 @@ impl UpdaterConfig {
         let own = Version::parse(env!("CARGO_PKG_VERSION"))?;
         let channel = Channel::current();
         let kind = install::detect(install_dir, &own, channel, trial.as_deref());
-        let verifier = metro_release::sigstore::SigstoreVerifier::vendored().ok()?;
+        let trust = Arc::new(
+            metro_release::trust_refresh::TrustRefresh::new(
+                &desktop_root.join("update").join("trust-cache"),
+            )
+            .ok()?,
+        );
+        let verifier: Arc<dyn ReleaseVerifier> = trust.verifier.clone();
         Some(UpdaterConfig {
             dir: desktop_root.join("update"),
             install_dir: install_dir.to_path_buf(),
@@ -253,9 +262,10 @@ impl UpdaterConfig {
             channel,
             kind,
             source: Source::github(),
-            verifier: Arc::new(verifier),
+            verifier,
             trial,
             ldd: PathBuf::from("ldd"),
+            trust: Some(trust),
         })
     }
 }
@@ -457,7 +467,14 @@ impl Updater {
                 inner.phase = Phase::Checking;
             }
         }
-        let result = self.check_inner().await;
+        let mut result = self.check_inner().await;
+        if let Err(e) = &result
+            && e.code == metro_release::ErrorCode::TrustRootStale
+            && let Some(trust) = &self.cfg.trust
+            && trust.refresh_if_due().await
+        {
+            result = self.check_inner().await;
+        }
         let mut inner = self.lock();
         if inner.phase == Phase::Checking {
             inner.phase = Phase::Idle;

@@ -20,6 +20,12 @@ pub struct SigstoreVerifier {
     inner: Verifier,
 }
 
+impl std::fmt::Debug for SigstoreVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SigstoreVerifier")
+    }
+}
+
 impl SigstoreVerifier {
     /// The vendored trusted root.
     pub fn vendored() -> Result<Self, Error> {
@@ -79,7 +85,11 @@ fn classify(error: sigstore_verify::Error) -> Error {
         E::TransparencyLog(TransparencyLogError::UnknownLog { .. })
             | E::Certificate(CertificateError::NoValidAuthority { .. })
             | E::Certificate(CertificateError::ChainInvalid(_))
-    ) || matches!(&error, E::Timestamp(_));
+    ) || matches!(&error, E::Timestamp(_))
+        // sigstore-verify (pinned) reports a log key the trusted root lacks
+        // as an invalid inclusion promise / checkpoint with this text;
+        // tests/tuf_refresh.rs guards it.
+        || matches!(&error, E::TransparencyLog(_)) && error.to_string().contains("No log key valid");
     let code = if stale {
         ErrorCode::TrustRootStale
     } else {

@@ -165,6 +165,7 @@ fn updater(i: &Install, f: &Fixture, channel: Channel) -> Arc<Updater> {
         verifier: Arc::new(TestVerifier),
         trial: None,
         ldd: i.ldd.clone(),
+        trust: None,
     })
 }
 
@@ -769,6 +770,7 @@ async fn trial_started_writes_the_ok_file() {
         verifier: Arc::new(TestVerifier),
         trial: Some("00112233aabbccdd".into()),
         ldd: i.ldd.clone(),
+        trust: None,
     });
     assert!(u.started());
     assert!(u.started());

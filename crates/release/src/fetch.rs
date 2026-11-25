@@ -26,6 +26,10 @@ pub const ALLOWED_HOSTS: [&str; 3] = [
     "release-assets.githubusercontent.com",
     "objects.githubusercontent.com",
 ];
+/// Sigstore's public-good TUF repository: the only other host Metro contacts,
+/// and only to refresh its Sigstore trusted root (see `trust_refresh`).
+pub const TUF_REPOSITORY: &str = "https://tuf-repo-cdn.sigstore.dev";
+pub const TUF_HOST: &str = "tuf-repo-cdn.sigstore.dev";
 const MAX_REDIRECTS: usize = 5;
 const API_VERSION: &str = "2022-11-28";
 
@@ -46,6 +50,43 @@ impl Source {
             hosts: ALLOWED_HOSTS.iter().map(|h| h.to_string()).collect(),
             https_only: true,
         }
+    }
+
+    /// The Sigstore public-good TUF repository (trust-root refresh only).
+    /// Its own host list: release downloads never go there, and trust
+    /// metadata never comes from GitHub.
+    pub fn sigstore_tuf() -> Source {
+        Source {
+            base: TUF_REPOSITORY.to_string(),
+            api: String::new(),
+            hosts: vec![TUF_HOST.to_string()],
+            https_only: true,
+        }
+    }
+
+    /// A loopback TUF fixture repository (`http://127.0.0.1:<port>`), tests only.
+    #[doc(hidden)]
+    pub fn loopback_tuf_fixture(base: &str) -> Option<Source> {
+        let mut s = Source::loopback_fixture(base)?;
+        s.base = base.to_string();
+        s.api = String::new();
+        Some(s)
+    }
+
+    /// A TUF file under this source's base (names from TUF metadata only).
+    pub fn tuf_url(&self, name: &str) -> Result<String, Error> {
+        let ok = (1..=200).contains(&name.len())
+            && !name.starts_with('.')
+            && !name.starts_with('/')
+            && !name.contains("..")
+            && !name.contains("//")
+            && name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-' | b'/'));
+        if !ok {
+            return Err(Error::new(ErrorCode::Manifest, "bad TUF file name"));
+        }
+        Ok(format!("{}/{name}", self.base))
     }
 
     /// A loopback fixture server (`http://127.0.0.1:<port>`), for tests.
@@ -87,7 +128,7 @@ impl Source {
     }
 
     fn is_api(&self, url: &str) -> bool {
-        url.starts_with(&self.api)
+        !self.api.is_empty() && url.starts_with(&self.api)
     }
 
     /// Check a redirect target (absolute URLs only).
@@ -438,6 +479,15 @@ mod nonblocking {
                 return Ok(resp);
             }
             Err(Error::new(ErrorCode::RedirectRefused, "too many redirects"))
+        }
+
+        /// Like [`Self::get`], but a 404 is `Ok(None)` (TUF root chaining).
+        pub async fn get_optional(&self, url: &str, cap: usize) -> Result<Option<Vec<u8>>, Error> {
+            match self.get(url, cap).await {
+                Ok(b) => Ok(Some(b)),
+                Err(e) if e.code == ErrorCode::Http && e.detail == "HTTP 404" => Ok(None),
+                Err(e) => Err(e),
+            }
         }
 
         pub async fn get(&self, url: &str, cap: usize) -> Result<Vec<u8>, Error> {
