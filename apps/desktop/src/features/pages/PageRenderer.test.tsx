@@ -1,6 +1,7 @@
 import { expect, open, test } from "nsh/test";
 import type { PageBlock } from "../../api/pages";
 import { httpsLink, MAX_PAGE_MARKDOWN_BYTES, MAX_PAGE_MARKDOWN_NODES, pageRichText } from "../../ui/pageMarkdown";
+import { listItems } from "./PageRenderer";
 import { MAX_PAGE_TEXT_BYTES, MAX_RENDERED, own, planPage } from "./renderPlan";
 import { bind, lit, plainBudgetData, plainBudgetSpec, sample, sampleData } from "./test/sample";
 
@@ -18,6 +19,57 @@ test("PageSpec fixture draws native blocks, tables, repeated conditions and deni
   await app.press("id:fixture-draft");
   await app.waitFor("text:Show live");
   expect(text()).toContain("Preview only");
+});
+
+test("List items render as one divided row per item, keeping each item's blocks together", async () => {
+  const spec = { format: 1, data: [{ name: "records" }], blocks: [
+    { type: "List", key: "list", props: { items: bind("records"), as: lit("row") }, children: [
+      { type: "Text", key: "name", content: [bind("row", "name")] },
+      { type: "Text", key: "note", content: [bind("row", "note")], props: { muted: lit(true) } },
+    ] },
+  ] };
+  const data = { ...sampleData, data: { records: { ok: true as const, value: [{ name: "One", note: "a" }, { name: "Two", note: "b" }] } } };
+  const list = planPage(spec, data, false).blocks[0]!;
+  expect(listItems(list).map(item => item.blocks.map(b => b.text))).toEqual([["One", "a"], ["Two", "b"]]);
+  const app = await open("./test/pages.fixture.tsx", { width: 1100, height: 850, platform: "linux" });
+  await app.waitFor("text:Build release");
+  expect(app.count("id:page-list-item")).toBe(1);
+});
+
+test("A wide table owns its labelled horizontal scroll", async () => {
+  const app = await open("./test/pages.fixture.tsx", { width: 720, height: 480, platform: "linux" });
+  await app.press("id:fixture-wide-table");
+  await app.waitFor("label:Run details, scroll horizontally");
+  await app.scroll("id:page-table-scroll", 900);
+  await app.waitFor("text:Column 10");
+});
+
+test("Table plans align only numeric columns, leaving mixed text and statuses readable", () => {
+  const spec = { format: 1, data: [{ name: "records" }], blocks: [
+    { type: "Table", key: "table", props: { rows: bind("records") }, children: [
+      { type: "Column", props: { field: lit("name") } },
+      { type: "Column", props: { field: lit("size"), format: lit("bytes") } },
+      { type: "Column", props: { field: lit("count") } },
+      { type: "Column", props: { field: lit("mixed") } },
+      { type: "Column", props: { field: lit("status"), format: lit("status") } },
+    ] },
+  ] };
+  const data = { ...sampleData, data: { records: { ok: true as const, value: [
+    { name: "One", size: 2048, count: 4, mixed: 3, status: "running" },
+    { name: "Two", mixed: "unknown", status: "completed" },
+  ] } } };
+  const table = planPage(spec, data, false).blocks[0];
+  expect(table?.numericColumns).toEqual([false, true, true, false, false]);
+  expect(table?.rows?.[0]?.[1]?.label).toBe("2 KiB");
+});
+
+test("Page Markdown uses underlined, high-contrast link ink", async () => {
+  const app = await open("./test/pages.fixture.tsx", { width: 1100, height: 850, platform: "linux" });
+  await app.setColorScheme("dark");
+  await app.waitFor("id:page-block:markdown");
+  const link = app.spanStyle("id:page-block:markdown >> text:release");
+  expect(link.color.toLowerCase()).toBe("#a6c8ffff");
+  expect(link.underline).toBe(true);
 });
 
 test("only own scalar data paths and supported blocks are interpreted", () => {

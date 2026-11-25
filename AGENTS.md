@@ -36,8 +36,9 @@ don't affect which model Metro calls at runtime.
 
 ## Rules
 
-The rules below describe the current source. For behaviour added after
-0.4.0, see [In the source, not released](docs/next-source.md).
+The rules below describe the current source. For the published changes,
+see [New in Metro 0.5.0](docs/released-0.5.0.md); for later changes, see
+[In the source, not released](docs/next-source.md).
 
 - Stay inside the files you were assigned. Don't edit another lane's files;
   report what needs to change instead.
@@ -358,7 +359,13 @@ The rules below describe the current source. For behaviour added after
     Documents & media gate (497 Rust tests, the 83 hardened media-service
     tests, `nsh test` 106/106) and the earlier 403-test gate are historical
     milestones.
-  - **Metro 0.4.0 is published**: GitHub release `v0.4.0` (2026-11-25),
+  - **Metro 0.5.0 is published**: stable GitHub release `v0.5.0`
+    (2026-11-25T20:56:24Z), tag on `6a038f1` (PR #17), made by CI run
+    45692417663, with 18 assets, Sigstore-signed `SHA256SUMS`, unsigned
+    Windows files and signed GHCR images (see [release record](docs/acceptance.md#published-metro-050-2026-11-25-github-release-v050)).
+    Native Windows by a person, real vendor accounts and real sign-ins
+    remain unverified. Pages work after `6a038f1` is not released.
+  - The previous release, Metro 0.4.0: GitHub release `v0.4.0` (2026-11-25),
     tag on `1a743e5`, made by CI run 45560122825, with Sigstore-signed
     `SHA256SUMS`, unsigned Windows files and GHCR images signed by the release workflow
     (`docs/acceptance.md`). Metro 0.3.2 (`v0.3.2` on `d943797`, CI run
@@ -381,16 +388,16 @@ The rules below describe the current source. For behaviour added after
   sidecar next to the desktop app. Source builds live only in
   [docs/development.md](docs/development.md). Docs point to the published
   release by the names and URLs recorded in `docs/acceptance.md`: the
-  current one is **Metro 0.4.0**
-  (https://github.com/wnzn/metro/releases/tag/v0.4.0, tag `v0.4.0` on
-  `1a743e5`), with `Metro-0.4.0-linux-x64.tar.gz`,
-  `Metro-0.4.0-windows-x64.zip`,
-  `Metro-0.4.0-windows-x64.unsigned-preview.msi`,
-  `Metro-runner-0.4.0-linux-x64.tar.gz` (each with `.sha256`), the
+  current one is **Metro 0.5.0**
+  (https://github.com/wnzn/metro/releases/tag/v0.5.0, tag `v0.5.0` on
+  `6a038f1`), with `Metro-0.5.0-linux-x64.tar.gz`,
+  `Metro-0.5.0-windows-x64.zip`,
+  `Metro-0.5.0-windows-x64.unsigned-preview.msi`,
+  `Metro-runner-0.5.0-linux-x64.tar.gz` (each with `.sha256`), the
   installer scripts, `SHA256SUMS` with its Sigstore bundle, `IMAGES.txt`,
-  and the images `ghcr.io/wnzn/metro-server:v0.4.0`,
-  `ghcr.io/wnzn/metro-runner:v0.4.0` and
-  `ghcr.io/wnzn/metro-embeddinggemma2:v0.4.0` (pinned by digest). Windows
+  and the images `ghcr.io/wnzn/metro-server:v0.5.0`,
+  `ghcr.io/wnzn/metro-runner:v0.5.0` and
+  `ghcr.io/wnzn/metro-embeddinggemma2:v0.5.0` (pinned by digest). Windows
   files are **unsigned** (no Authenticode). Docs never present source
   that came after a release's commit as part of that release; label it
   "in the source, not released". A newer release is named in docs only
@@ -404,7 +411,7 @@ The rules below describe the current source. For behaviour added after
   native GUI by a person. Real vendor accounts and sign-ins remain
   unverified. A deployment's own address (such as a dev LAN host) is
   never a documented default.
-- **Metro server transport** in the current source: prefer HTTPS or SSH
+- **Metro server transport** in 0.5.0: prefer HTTPS or SSH
   forwarding. The desktop and `/admin` require informed consent before
   sending a token over ordinary plain HTTP; runner and CLI clients warn
   rather than prompt. Direct loopback and recognized Tailscale hosts can
@@ -412,8 +419,7 @@ The rules below describe the current source. For behaviour added after
   hosts is proxied or unknown; don't silently exempt tailnet hosts from a
   user's desktop proxy. Runner and connector server clients reach loopback
   and Tailscale directly; the admin panel can't detect browser proxies.
-  This doesn't relax provider URL rules or change the published 0.4.0
-  instructions.
+  This doesn't relax provider URL rules.
 - **Updates** require a verified published release and an explicit
   install action. Source and preview builds don't offer updates. Only
   eligible managed Linux desktop installs update in-app; portable and

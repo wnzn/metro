@@ -46,10 +46,9 @@ identity namespace:
   change takes effect on the next request. Managed accounts can't be admins,
   are never deleted, and start with no Space memberships.
 
-With the published 0.4.0 desktop and web admin, use loopback, an SSH
-port forward or HTTPS (see [Deploy](deploy.md#reaching-the-server-from-other-machines)).
-The [transport changes](next-source.md#http-tailscale-and-proxies) are in
-the source, not released.
+For remote connections, prefer HTTPS or an SSH port forward. See the 0.5.0
+[transport and proxy rules](released-0.5.0.md#http-tailscale-and-proxies)
+before sending a token over plain HTTP.
 
 ### OIDC (JWT access tokens)
 

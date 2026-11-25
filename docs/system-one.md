@@ -72,8 +72,7 @@ docs describe it no further than TypeSafe's own docs do:
   ([API reference](https://docs.typesafe.ai/api/system-one)).
 - Metro uses two question types
   ([primitives](https://docs.typesafe.ai/primitives)):
-  - `noul`, the probability of yes from 0 to 1, for addressing in personal
-    Chat and the search rerank;
+  - `noul`, the probability of yes from 0 to 1, for the search rerank;
   - `choice`, one option with `confidence` and per-option `probabilities`,
     for choosing a Space agent and for use-case routing.
 
@@ -106,10 +105,9 @@ This is documented from the code in
 
 ## How a message reaches the agent
 
-The addressing behaviour below is for 0.4.0. In the source, not released,
-[Personal Chat sends directly](next-source.md#personal-chat); only
-Spaces still classify whom a message is for. Space senders can see
-[private notices](next-source.md#private-sender-notices) about failed
+Since 0.5.0, [Personal Chat sends directly](released-0.5.0.md#personal-chat);
+only Spaces classify whom a message is for. Space senders can see
+[private notices](released-0.5.0.md#private-sender-notices) about failed
 decisions. Use-case routing is separate.
 
 Explicit recipients always decide who a message is addressed to. System One
@@ -127,7 +125,7 @@ makes separate decisions, each behind the sender's own opt-in:
 | An agent's `@handle`, or Ask agent with that agent chosen | Yes, that agent (one run per agent mentioned) | None | See [which model a run uses](settings.md#which-model-a-run-uses) |
 | `@agent`, or Ask agent without an agent, including mixed `@bob @agent` | Yes | The default agent; with the sender's classification on in that Space, a Choice among the agents (no "no agent" option). Unsure: the default agent. Failed: an error, and nothing runs. | Same |
 | Unaddressed, with the sender's classification **off** (the default) | No | None | None. There's no run. |
-| Unaddressed, with the sender's classification **on** | Only if System One clearly picks an agent | A Choice among the agents plus *No agent* (Spaces), or a `noul` (personal Chat) | Same |
+| Unaddressed Space message, with the sender's classification **on** | Only if System One clearly picks an agent | A Choice among the agents plus *No agent* | Same |
 
 ## Opt-in classification of unaddressed messages
 
@@ -135,9 +133,7 @@ A person can turn on classification for **their own** outgoing messages. In
 Spaces it's a setting **per Space** (`classify_unaddressed` in
 [your preferences for that Space](spaces.md#your-preferences-in-a-space)).
 It can be turned on only while the person has a System One connection
-usable in that Space. Personal Chat keeps its own setting
-(`infer_addressing`, [below](#settings-get--put-v1model-routing)). Both are
-off by default.
+usable in that Space. It is off by default.
 
 **In a Space room**, it decides two things for the sender's messages:
 
@@ -155,11 +151,7 @@ off by default.
   agent. A failed decision posts an error in the room and runs nothing for
   `@agent`.
 
-**In personal Chat**, it decides only whether an unaddressed message is
-asking the agent: a single `noul`, and only an answer at or above
-`min_directedness` starts a run.
-
-In both places:
+For these decisions:
 
 - Only that one new message, never the room's history, ids or the agents'
   instructions, goes to the sender's System One connection (`classifier_id`),
@@ -212,20 +204,20 @@ answers, never whether the agent is addressed.
   and a short reason. No prompt or credential is recorded.
 
 Every System One request carries one question. A run costs at most two
-calls: one agent decision (the Space `choice`, or the personal Chat `noul`,
-only for someone who opted in), then the routing `choice`, only when the run
+calls: one Space addressing `choice` for someone who opted in, then the
+routing `choice`, only when the run
 uses routing. A message that starts several agents makes one routing call
 per run.
 
 ### Settings: `GET` / `PUT /v1/model-routing`
 
-Each person has their own settings, and both features are off by default.
+Each person has their own settings. Use-case routing is off by default.
 
 | Field | Meaning |
 | --- | --- |
 | `enabled` | Use-case routing on or off (default `false`) |
-| `infer_addressing` | Classification of your own unaddressed messages **in your personal Chat** on or off (default `false`). In Spaces, use each Space's `classify_unaddressed` ([preferences](spaces.md#your-preferences-in-a-space)). |
-| `classifier_id` | Your System One connection. It's required when either feature is on, and it's also used for per-Space classification and the search rerank. |
+| `infer_addressing` | Legacy field accepted for compatibility and the one-time Space preference migration. It doesn't control Chat dispatch in 0.5.0. Use each Space's `classify_unaddressed` ([preferences](spaces.md#your-preferences-in-a-space)). |
+| `classifier_id` | Your System One connection. Used for routing, per-Space classification and the search rerank. |
 | `embedding_id` | Your embeddings connection, used for [search](#semantic-search) |
 | `default_chat_id` | The chat connection to use on `no_match`. Leave it out to keep your default. |
 | `min_directedness` | 0.5 to 1, default 0.85 |

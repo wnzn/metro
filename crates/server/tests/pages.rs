@@ -126,6 +126,10 @@ impl Server {
     }
 
     async fn start_with(model: Option<ModelConfig>, limits: Limits) -> Self {
+        Self::start_on(model, limits, Db::open_in_memory().unwrap()).await
+    }
+
+    async fn start_on(model: Option<ModelConfig>, limits: Limits, db: Db) -> Self {
         let user = |id: &str, name: &str| UserIdentity {
             id: id.to_owned(),
             actor: name.to_owned(),
@@ -144,9 +148,7 @@ impl Server {
             // An org admin gets no view of anyone's pages.
             org_admins: vec!["carol".to_owned()],
         };
-        let state = AppState::new(config, Db::open_in_memory().unwrap(), Arc::new(auth))
-            .await
-            .unwrap();
+        let state = AppState::new(config, db, Arc::new(auth)).await.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
@@ -669,6 +671,226 @@ async fn saves_are_optimistic_and_restores_add_versions() {
         )
         .await;
     assert_eq!(st, StatusCode::CREATED, "{v}");
+}
+
+#[tokio::test]
+async fn template_destinations_are_explicit_when_reviewed_and_optional_for_older_clients() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("metro.db");
+    let s = Server::start_on(None, Limits::default(), Db::open(&path).unwrap()).await;
+    let sid = s.space(ALICE, "Team", &[]).await;
+    let (status, catalog) = s.get(ALICE, "/v1/pages/templates").await;
+    assert_eq!(status, StatusCode::OK);
+    for t in catalog["templates"].as_array().unwrap() {
+        let expected = match t["id"].as_str().unwrap() {
+            "files" | "my-runs" => false,
+            "space-overview" | "daily-brief" | "release-watch" => true,
+            other => panic!("check destination requirements for {other}"),
+        };
+        assert_eq!(t["requires_space_destination"], expected);
+    }
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("DELETE FROM space_rooms WHERE space_id = ?1", [&sid])
+        .unwrap();
+    for template in ["files", "my-runs"] {
+        let (st, page) = s
+            .post(
+                ALICE,
+                "/v1/pages",
+                json!({
+                    "scope": "space", "space_id": sid, "template": template,
+                    // Old clients showed a room even for destination-free templates.
+                    "room": "obsolete room"
+                }),
+            )
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{page}");
+    }
+    let create = |body| s.post(ALICE, "/v1/pages", body);
+    let old = json!({"scope": "space", "space_id": sid, "template": "release-watch"});
+    assert_eq!(create(old.clone()).await.0, StatusCode::NOT_FOUND);
+    let (st, room) = s
+        .post(
+            ALICE,
+            &format!("/v1/spaces/{sid}/rooms"),
+            json!({"name": "Releases"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{room}");
+    let reviewed = json!({
+        "scope": "space", "space_id": sid, "template": "daily-brief",
+        "room": "Releases", "room_id": room["id"]
+    });
+    let (st, saved) = create(reviewed.clone()).await;
+    assert_eq!(st, StatusCode::CREATED, "{saved}");
+    assert_eq!(saved["spec"]["data"][0]["params"]["room_id"], room["id"]);
+    conn.execute(
+        "UPDATE space_rooms SET name = 'Renamed' WHERE space_id = ?1",
+        [&sid],
+    )
+    .unwrap();
+    assert_eq!(create(reviewed.clone()).await.0, StatusCode::NOT_FOUND);
+    let (st, replacement) = s
+        .post(
+            ALICE,
+            &format!("/v1/spaces/{sid}/rooms"),
+            json!({"name": "Releases"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{replacement}");
+    assert_ne!(room["id"], replacement["id"]);
+    assert_eq!(create(reviewed).await.0, StatusCode::NOT_FOUND);
+    let (st, saved) = create(old).await;
+    assert_eq!(st, StatusCode::CREATED, "{saved}");
+    assert_eq!(saved["spec"]["data"][0]["params"]["room_id"], room["id"]);
+}
+
+#[tokio::test]
+async fn resumable_draft_list_is_private_metadata_with_current_access() {
+    const LIST: &str = "/v1/pages/drafts";
+    const SOURCE: &str = r#"export default <Page title="Example"><Text>Fixture</Text></Page>"#;
+    let m = model(|_, _| SOURCE.to_owned()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("metro.db");
+    let s = Server::start_on(
+        Some(m.config.clone()),
+        Limits::default(),
+        Db::open(&path).unwrap(),
+    )
+    .await;
+    let sid = s.space(ALICE, "Team", &["bob"]).await;
+    let page = s
+        .create_page(ALICE, json!({"scope": "personal"}), SOURCE)
+        .await;
+    let build = |token, mut target: Value| {
+        let s = &s;
+        async move {
+            target["prompt"] = json!("private prompt");
+            let (st, d) = s.post(token, LIST, target).await;
+            assert_eq!(st, StatusCode::ACCEPTED, "{d}");
+            let id = d["id"].as_str().unwrap().to_owned();
+            assert_eq!(s.draft_done(token, &id).await["status"], "ready");
+            id
+        }
+    };
+    let personal = json!({"scope": "personal"});
+    let space = json!({"scope": "space", "space_id": sid});
+    let edit = build(ALICE, json!({"page_id": page["id"]})).await;
+    let keep = build(ALICE, personal.clone()).await;
+    let expired = build(ALICE, personal.clone()).await;
+    let dropped = build(ALICE, personal).await;
+    let applied = build(ALICE, space.clone()).await;
+    let revoked = build(BOB, space).await;
+    let request_count = m.requests.lock().unwrap().len();
+
+    let list = |token| {
+        let s = &s;
+        async move {
+            let (st, v) = s.get(token, LIST).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            v["drafts"].as_array().unwrap().clone()
+        }
+    };
+    let alice = list(ALICE).await;
+    assert_eq!(alice.len(), 5);
+    assert!(!alice.iter().any(|d| d["id"] == revoked));
+    let edit_meta = alice.iter().find(|d| d["id"] == edit).unwrap();
+    assert_eq!(edit_meta["page_id"], page["id"]);
+    assert_eq!(edit_meta["page_title"], "Example");
+    assert_eq!(edit_meta["scope"], "personal");
+    assert_eq!(edit_meta["status"], "ready");
+    let mut keys: Vec<_> = edit_meta
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "created_at",
+            "expires_at",
+            "id",
+            "page_id",
+            "page_title",
+            "scope",
+            "space_id",
+            "space_name",
+            "status",
+            "updated_at",
+        ]
+    );
+    for k in ["created_at", "updated_at", "expires_at"] {
+        assert!(edit_meta[k].is_string(), "{k}");
+    }
+    let bob = list(BOB).await;
+    assert_eq!(bob.len(), 1);
+    assert_eq!(bob[0]["id"], revoked);
+    assert_eq!(bob[0]["scope"], "space");
+    assert_eq!(bob[0]["space_id"], sid);
+    assert_eq!(bob[0]["space_name"], "Team");
+    assert_eq!(bob[0]["page_id"], Value::Null);
+    assert_eq!(bob[0]["page_title"], Value::Null);
+    assert!(list(CAROL).await.is_empty()); // No org-admin bypass.
+    assert_eq!(
+        s.get(BOB, &format!("{LIST}/{applied}")).await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    // Leave the draft row in place to exercise the access check rather
+    // than the membership-removal handler's normal cleanup.
+    assert_eq!(
+        conn.execute(
+            "DELETE FROM space_members WHERE space_id = ?1 AND user_id = 'bob'",
+            [&sid],
+        )
+        .unwrap(),
+        1
+    );
+    assert!(list(BOB).await.is_empty());
+    assert_eq!(
+        s.get(BOB, &format!("{LIST}/{revoked}")).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        s.delete(
+            ALICE,
+            &format!("/v1/pages/{}", page["id"].as_str().unwrap())
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        s.get(ALICE, &format!("{LIST}/{edit}")).await.0,
+        StatusCode::NOT_FOUND
+    );
+    conn.execute(
+        "UPDATE page_drafts SET expires_at = 0 WHERE id = ?1",
+        [&expired],
+    )
+    .unwrap();
+    assert_eq!(
+        s.get(ALICE, &format!("{LIST}/{expired}")).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        s.delete(ALICE, &format!("{LIST}/{dropped}")).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        s.post(ALICE, &format!("{LIST}/{applied}/apply"), json!({}))
+            .await
+            .0,
+        StatusCode::CREATED
+    );
+    let remaining = list(ALICE).await;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0]["id"], keep);
+    assert_eq!(m.requests.lock().unwrap().len(), request_count);
 }
 
 // ---- Actions ----

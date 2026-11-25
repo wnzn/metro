@@ -88,11 +88,11 @@ The live dev service's profile read endpoints were also checked.
   everyone's per-Space preferences, its agents and its monitoring events.
   Its registered runner is detached, and its dedicated runner token is
   revoked, so queued and claimed jobs fail. Its running agent runs stop.
-  In the source, not released, the same transaction also permanently
+  The same transaction also permanently
   removes the Space's published Pages, their version history,
   recently deleted Pages, and Space Page drafts, including drafts that
   had not yet created a page. [Recently deleted](pages.md#deleting-pages-and-spaces)
-  cannot recover them after Space deletion. This is not a 0.4.0 Pages feature.
+  cannot recover them after Space deletion.
 - A Space holds at most 100 members and 200 rooms, threads included.
 
 | Request | Who | Result |
@@ -176,28 +176,16 @@ your own, or one shared with this Space or the organization. It's checked
 when you save and again on every run. The order a run's model is chosen in
 is in [settings.md](settings.md#which-model-a-run-uses).
 
-The [unified Space settings](next-source.md#space-settings) and
-[guarded runner changes](next-source.md#guarded-runner-changes) are in
-the source, not released. **In the published 0.4.0 app**, a Space's
-settings window has four pages: **General** (name and description; **Leave
-Space…** for members, **Delete Space…** with the typed name for the owner),
-**Members and runner** (a link to the owner's member and runner
-management), **Agents** (cards with picture, handle, description and a
-*Default* tag; the owner adds, edits, makes default and deletes, and the
-editor says that members can read the instructions) and **Your
-preferences** (the classification opt-in, offered only when you have a
-usable System One connection, your default model here and per agent, and
-whether your model routing applies here). In the composer, `@` lists the
-Space's agents and members: **↑**/**↓** move, **Tab** or **Return**
-inserts, **Esc** closes the list.
+Open [Space settings](released-0.5.0.md#space-settings) from the room
+header or sidebar menu. Metro 0.5.0 groups **General**, **Members**,
+**Runner**, **Agents**, and **Your preferences** in one window.
 
 ## Messages and addressing
 
-In the source, not released: [desktop mentions](next-source.md#mentions-in-rooms-and-threads),
-[recipient-safe Dispatch and exact-destination Follow up](next-source.md#recipient-safe-dispatch-and-exact-destination-follow-up),
-[private sender notices](next-source.md#private-sender-notices), and the
-[Space send protocol](next-source.md#space-send-protocol-client-developers).
-The following describes 0.4.0.
+See [desktop mentions](released-0.5.0.md#mentions-in-rooms-and-threads),
+[private sender notices](released-0.5.0.md#private-sender-notices), and the
+[Space send protocol](released-0.5.0.md#space-send-protocol-client-developers)
+for the 0.5.0 composer and API.
 
 | You write | Addressed to | Which agent runs |
 | --- | --- | --- |
@@ -231,7 +219,7 @@ Explicit recipients always decide who a message is addressed to:
   [system-one.md](system-one.md#opt-in-classification-of-unaddressed-messages).
 
 A [scheduled prompt](schedules.md) counts as its creator asking the Space's
-default agent, with no classification. In text, `@agent`, `@<agent handle>`
+default agent, with no classification. In legacy text inference, `@agent`, `@<agent handle>`
 and `@<member id>` count only as standalone handles, and `@<member id>` only
 for current members of the Space. The agent's history shows each message's
 author and recipients, so it can tell a question for Bob from one for itself.
@@ -322,38 +310,23 @@ A room's agent can delegate work to **child threads** with the tools
 
 ## Personal Chat
 
-The behaviour below is for 0.4.0. [Direct Send and explicit Save note](next-source.md#personal-chat)
-are in the source, not released.
-
 - Every user has a private Chat with the agent. Only that user can see it, and
   it works with zero Spaces.
-- `GET /v1/chat/events?after=<id>` and `POST /v1/chat/messages`
-  `{"text", "invoke_agent"?, "provider_connection_id"?}` work like room
-  messages. `provider_connection_id` picks one of your own model connections
-  for that reply only. It's allowed only on a message to the agent, and
-  someone else's connection, or one that doesn't exist, gets `404`. See
-  [settings.md](settings.md#which-model-a-run-uses). Chat has no other
-  members, so only `@agent` or `invoke_agent` addresses anyone. Any other
-  Chat message is a note to yourself and never calls a model. Since 0.3.2, `model_id` and `reasoning_effort` may go with
-  `provider_connection_id` on a message to the agent.
-- In the desktop app (since 0.3.2), when a
-  chat model is ready for your Chat and you haven't set up System One,
-  **Ask agent ↵** is the primary action for a typed message and **Return**
-  asks the agent. **Save note** keeps the text without asking. Files sent
-  without text are only saved to your Library. See the
-  [desktop README](../apps/desktop/README.md#what-it-does).
-- The Chat agent's only tool is `react_to_message`, which acknowledges a
-  message addressed to it in your Chat. It has no runner, workspace or thread
+- **Send** asks your agent directly, even with attachments only. **Save
+  note** keeps the message without starting a run. Attachments go into
+  your personal Library, not to the Chat agent. See [Personal Chat](released-0.5.0.md#personal-chat)
+  for `POST /v1/chat/messages` and compatibility behavior.
+  Read the transcript with `GET /v1/chat/events?after=<id>`.
+- The Chat agent can acknowledge a message with `react_to_message`.
+  Web tools require a separate [opt-in](web-search.md). It has no runner, workspace or thread
   tools, and it can't read Space transcripts. Chat never uses a runner, not
   even your personal registered one, and Chat messages are never forwarded
   into a Space.
 - The cross-Space controls in Chat are for you, not the agent. **Agent runs**
   lists only Space runs, including threads; you can open, follow up on or
-  stop runs where permitted (see [Runs](#runs)). In the 0.4.0 desktop app,
-  **New task** beside Chat's agent runs sends a task right away to the agent
-  of a Space and a room or thread you pick explicitly. It shows the
-  recipient (*To: agent in Acme › #lobby*) before **Send to agent**, and
-  **Follow up** on a run opens the same form. It sends once, now. To send
+  stop runs where permitted (see [Runs](#runs)).
+  [New task and Follow up](released-0.5.0.md#recipient-safe-dispatch-and-exact-destination-follow-up)
+  send once to the generic agent in a verified room or thread. To send
   later or repeatedly, use **Scheduled tasks › New task**
   ([schedules.md](schedules.md)). All of these check your membership.
 
@@ -414,8 +387,10 @@ sharing logs. A read names exactly one scope; nothing combines them.
 
 ## Runner pairing
 
-These are the published 0.4.0 routes and behavior. For the source-only
-desktop and revision-checked API, see [Guarded runner changes](next-source.md#guarded-runner-changes).
+In Metro 0.5.0, use [Space settings → Runner and the guarded assignment
+API](released-0.5.0.md#guarded-runner-changes). The unguarded write
+routes below are for older clients, not a fallback for a failed guarded
+request.
 
 A Space uses **at most one runner**, and only its owner chooses it. There are
 two kinds, described fully in [runners.md](runners.md):
@@ -441,8 +416,9 @@ name, scope and kind), never a credential.
 
 - `runner_paired` means the Space has a dedicated token or an attached
   runner. It doesn't mean a runner is online.
-- Changing the Space's runner in any way makes its queued and claimed jobs
-  fail. They never move to the new runner.
+- Removing or replacing the assignment drops queued and claimed jobs.
+  Rotation invalidates claimed work; unclaimed work can remain queued
+  for the same runner.
 - Without a runner, a Space still works for chat and Ask agent; only the
   workspace tools are missing. Every member can trigger the runner's tools,
   so every member can read the Space's workspace on it. See

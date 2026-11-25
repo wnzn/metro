@@ -1,6 +1,6 @@
 # Update checks and installation
 
-> **In the source, not released.** These controls aren't in Metro 0.4.0.
+> **Released in Metro 0.5.0.**
 > Do not use repository installer scripts to update an installed release.
 > Use the verified prebuilt files and installers from the corresponding
 > published release; see [Install](install.md#check-a-download).
@@ -23,11 +23,11 @@ release, not just a newer version string.
 | --- | --- |
 | Managed Linux desktop | **Update to … → Download and verify** downloads and verifies the signed checksums and archive against the pinned Sigstore workflow identity. **Restart now** starts the trial. Metro can roll back when safe; uncertain recovery blocks startup instead of overwriting live data. The bundled runner updates with the app. |
 | Portable copy or older, unmigrated Linux install | Shows a notice and an official download link. Metro doesn't overwrite a portable folder or silently migrate old install locks. |
-| Windows MSI, script install or ZIP | Manual only. Metro doesn't start an MSI or install helper, or offer Windows rollback. Verify the matching prebuilt files before updating manually. The published 0.4.0 Windows files are unsigned; no native Windows desktop run by a person is recorded. |
+| Windows MSI, script install or ZIP | Manual only. Metro doesn't start an MSI or install helper, or offer Windows rollback. Verify the matching prebuilt files before updating manually. The published 0.5.0 Windows files are unsigned; no native Windows desktop run by a person is recorded. |
 
 An older Linux install needs a one-time, explicit lock migration to use
-managed updates. This is not a 0.4.0 command. Once the feature is published,
-use the matching verified prebuilt archive and verified Linux installer,
+managed updates. Use the matching verified prebuilt archive and Linux installer
+from 0.5.0 or later,
 with Metro, its bundled server and other installers stopped. The installer
 operation is `update --archive FILE --migrate-update-lock`. Retire old
 installer copies; an old script may not honor the new lock. Do not migrate
@@ -41,11 +41,11 @@ gate, live database and backup. Don't remove locks or records, change the
 `current` pointer, overwrite a database, run an old launcher on that
 workspace, or run install, update or uninstall to clear the condition.
 
-When a prebuilt release includes the diagnostic, run
+With the verified 0.5.0 installer, run
 `sh install-metro-linux.sh status` from that **verified official
 installer** for a read-only check. Use the same install and data locations
 as the affected app. A reported phase isn't proof that recovery is safe.
-The 0.4.0 installer does not have this diagnostic. Contact the
+Contact the
 [Metro maintainers](https://github.com/wnzn/metro/issues) with the
 diagnostic message (redact private paths), not private databases, backups
 or credentials.

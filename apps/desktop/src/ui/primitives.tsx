@@ -231,6 +231,7 @@ export function Label(
     variant?: LabelVariant;
     color?: LabelColor;
     lines?: number;
+    tabular?: boolean;
     /** Screen readers treat it as a heading (page and section titles). */
     heading?: boolean;
     /** More words on hover (a description that has no room on screen). */
@@ -240,7 +241,8 @@ export function Label(
 ) {
   return (
     <Text
-      class={cx("shrink min-w-0", labelVariantClass[props.variant ?? "body"], colorClass(props.color ?? (props.variant === "meta" ? "muted" : "default")))}
+      class={cx("shrink min-w-0", labelVariantClass[props.variant ?? "body"], props.tabular && "tabular-nums",
+        colorClass(props.color ?? (props.variant === "meta" ? "muted" : "default")))}
       style={props.lines ? { numberOfLines: props.lines } : undefined}
       role={props.heading ? "header" : undefined}
       testID={props.testID}
@@ -1079,6 +1081,8 @@ export function Disclosure(
     /** Content at the header's end (a badge). Keep it non-interactive. */
     trailing?: JSX.Element;
     disabled?: boolean;
+    /** An authored section with a heading and a dividing rule. */
+    lined?: boolean;
     children?: JSX.Element;
   },
 ) {
@@ -1088,11 +1092,12 @@ export function Disclosure(
       reveal
       class="flex-col"
       testID={props.testID}
-      content={<View class="flex-col gap-(--space-2) pt-(--space-2)">{props.children}</View>}
+      content={<View class={cx("flex-col", props.lined ? "pt-(--space-3)" : "gap-(--space-2) pt-(--space-2)")}>{props.children}</View>}
     >
       <View
         class={cx(
-          "group flex-row items-center gap-(--space-2) min-h-[32px] -mx-2 rounded-(--radius-sm) px-(--space-2) hover:bg-muted active:bg-muted",
+          "group flex-row items-center gap-(--space-2) min-h-[32px] hover:bg-muted active:bg-muted",
+          props.lined ? "border-b border-border py-(--space-1)" : "-mx-2 rounded-(--radius-sm) px-(--space-2)",
           focusRing,
           transitionClass,
           disabledClass,
@@ -1106,7 +1111,7 @@ export function Disclosure(
         testID={props.testID ? `${props.testID}:toggle` : undefined}
       >
         <Icon name={props.open ? "chevron-down" : "chevron-right"} color="muted" size={14} />
-        <Text class={cx(textClass.sm, "font-semibold text-foreground")} style={{ numberOfLines: 1 }}>
+        <Text class={cx(props.lined ? textClass.md : textClass.sm, "font-semibold text-foreground")} style={props.lined ? undefined : { numberOfLines: 1 }}>
           {props.title}
         </Text>
         <If when={props.summary}>
@@ -1211,16 +1216,22 @@ export function ScrollArea(props: StackProps) {
  * A page that scrolls with a footer that doesn't: the footer (an ActionBar of
  * Save / Cancel) stays at the bottom of the page while the content scrolls
  * above it. Content and footer share the content width unless `wide`.
+ * `inset` adds an outer gutter around the content column, and gives the
+ * footer that same horizontal gutter. `pad` is inside the content column.
  * The scrolling region takes `testID`; the footer `${testID}:footer`.
  */
-export function PageLayout(props: StackProps & { footer?: JSX.Element; wide?: boolean }) {
+export function PageLayout(props: StackProps & { footer?: JSX.Element; wide?: boolean; inset?: Space }) {
+  const content = <View class={cx(stackClass(props, "col", false), !props.wide && "w-full max-w-(--content-width) self-center")}>{props.children}</View>;
   return (
     <View class="flex-1 min-h-0 flex-col">
       <Scroll class="flex-1 min-h-0" testID={props.testID}>
-        <View class={cx(stackClass(props, "col", false), !props.wide && "w-full max-w-(--content-width) self-center")}>{props.children}</View>
+        <If when={props.inset !== undefined} else={content}>
+          <View class={cx("flex-col", padClass[props.inset ?? 0])}>{content}</View>
+        </If>
       </Scroll>
       <If when={props.footer}>
-        <View class="border-t border-border bg-background px-(--space-8) max-md:px-(--space-4) py-(--space-3)" testID={props.testID ? `${props.testID}:footer` : undefined}>
+        <View class={cx("border-t border-border bg-background py-(--space-3)", props.inset === undefined
+          ? "px-(--space-8) max-md:px-(--space-4)" : padXClass[props.inset])} testID={props.testID ? `${props.testID}:footer` : undefined}>
           <View class={cx("w-full", !props.wide && "max-w-(--content-width) self-center")}>{props.footer}</View>
         </View>
       </If>
@@ -1262,7 +1273,7 @@ export function FeedList<T>(props: {
 
 // ---------------------------------------------------------------- settings
 
-export type ChoiceOption<T extends string> = { value: T; label: string; description?: string; disabled?: boolean };
+export type ChoiceOption<T extends string> = { value: T; label: string; description?: string; disabled?: boolean; testID?: string };
 
 /**
  * Pick exactly one of a few options (an appearance, a mode). A radio group
@@ -1303,7 +1314,7 @@ export function SegmentedControl<T extends string>(
             disabled={props.disabled || option().disabled}
             onChange={() => props.onChange(option().value)}
             accessibilityLabel={option().description ? `${option().label}. ${option().description}` : option().label}
-            testID={props.testID ? `${props.testID}:${option().value}` : undefined}
+            testID={option().testID ?? (props.testID ? `${props.testID}:${option().value}` : undefined)}
           >
             <Text
               class={cx(
@@ -1496,11 +1507,31 @@ export function ScopeLine(props: Testable & { scope: PageScope }) {
 }
 
 /** The title block at the top of a page (Settings, a Space's management). */
-export function PageHeader(props: Testable & { title: string; subtitle?: string; scope?: PageScope; children?: JSX.Element }) {
+function useHeadingFocus(wanted: () => boolean | undefined) {
+  const ref = signal<ViewRef | undefined>(undefined);
+  effect(() => {
+    if (!wanted()) return;
+    const node = ref();
+    if (!node) return;
+    let live = true;
+    void node.measure().then(layout => {
+      if (!live || !layout || layout.bounds.size.height <= 0) return;
+      node.reveal({ vertical: "start", animated: false });
+      node.focus();
+    });
+    return () => { live = false; };
+  });
+  return ref.set;
+}
+
+export function PageHeader(props: Testable & { title: string; eyebrow?: string; subtitle?: string; scope?: PageScope; focusTitle?: boolean; children?: JSX.Element }) {
+  const titleRef = useHeadingFocus(() => props.focusTitle);
   return (
     <View class="flex-row items-start gap-(--space-4) pb-(--space-2)" testID={props.testID}>
       <View class="flex-1 min-w-0 flex-col gap-(--space-1)">
-        <Text class={cx(textClass["2xl"], "font-semibold tracking-tight text-foreground")} role="header">
+        <If when={props.eyebrow}><Label variant="meta">{props.eyebrow}</Label></If>
+        <Text class={cx(textClass["2xl"], "font-semibold tracking-tight text-foreground")} role="header"
+          ref={props.focusTitle ? titleRef : undefined} focusable={props.focusTitle}>
           {props.title}
         </Text>
         <If when={props.subtitle}>
@@ -1519,27 +1550,15 @@ export function PageHeader(props: Testable & { title: string; subtitle?: string;
  * A titled group of SettingRows on one card. The rows draw the lines between
  * them; the card clips the first one's. `focusTitle` is for navigation to a group.
  */
-export function SettingsGroup(props: Testable & { title?: string; description?: string; focusTitle?: boolean; children?: JSX.Element }) {
-  const titleRef = signal<ViewRef | undefined>(undefined);
-  effect(() => {
-    if (!props.focusTitle) return;
-    const node = titleRef();
-    if (!node) return;
-    let live = true;
-    void node.measure().then((layout) => {
-      if (!live || !layout || layout.bounds.size.height <= 0) return;
-      node.reveal({ vertical: "start", animated: false });
-      node.focus();
-    });
-    return () => { live = false; };
-  });
+export function SettingsGroup(props: Testable & { title?: string; description?: string; focusTitle?: boolean; flat?: boolean; children?: JSX.Element }) {
+  const titleRef = useHeadingFocus(() => props.focusTitle);
   return (
     <View class="flex-col gap-(--space-2)" testID={props.testID} accessibilityLabel={props.accessibilityLabel}>
       <If when={props.title || props.description}>
         <View class="flex-col gap-px px-(--space-1)">
           <If when={props.title}>
-            <Text class={cx(textClass.sm, "font-semibold text-foreground")} role="header"
-              ref={props.focusTitle ? titleRef.set : undefined} focusable={props.focusTitle}>
+            <Text class={cx(props.flat ? textClass.md : textClass.sm, "font-semibold text-foreground")} role="header"
+              ref={props.focusTitle ? titleRef : undefined} focusable={props.focusTitle}>
               {props.title}
             </Text>
           </If>
@@ -1548,11 +1567,45 @@ export function SettingsGroup(props: Testable & { title?: string; description?: 
           </If>
         </View>
       </If>
-      <View class="overflow-hidden rounded-(--radius) border border-border bg-card">
+      <View class={cx("overflow-hidden", props.flat ? "border-y border-border" : "rounded-(--radius) border border-border bg-card")}>
         <View class="-mt-px flex-col">{props.children}</View>
       </View>
     </View>
   );
+}
+
+/** The name and the whole row are a single navigation target. */
+export function SettingsLinkRow(props: Testable & { label: string; description?: string; mark?: string; icon?: IconName; onPress: () => void; trailing?: JSX.Element }) {
+  return <Button class={cx("group", itemRowClass, "hover:bg-muted", focusRing)} onPress={props.onPress} testID={props.testID}
+    accessibilityLabel={props.accessibilityLabel ?? props.label}>
+    <ItemRowBody label={props.label} description={props.description} mark={props.mark} icon={props.icon} />
+    {props.trailing}
+    <Icon name="chevron-right" size={14} color="muted" />
+  </Button>;
+}
+
+/** A non-navigating row aligned with `SettingsLinkRow`; its controls sit on the right. */
+export function SettingsItemRow(props: Testable & { label: string; description?: string; mark?: string; icon?: IconName; children?: JSX.Element }) {
+  return <View class={itemRowClass} testID={props.testID}>
+    <ItemRowBody label={props.label} description={props.description} mark={props.mark} icon={props.icon} />
+    {props.children}
+  </View>;
+}
+
+const itemRowClass = "flex-row items-center gap-(--space-3) min-h-[52px] border-t border-border px-(--space-2) py-(--space-2)";
+
+function ItemRowBody(props: { label: string; description?: string; mark?: string; icon?: IconName }) {
+  return <>
+    <View class="size-[32px] shrink-0 items-center justify-center rounded-(--radius-sm) bg-muted" accessibilityElementsHidden>
+      <If when={props.mark} else={<Icon name={props.icon ?? "file"} size={16} color="muted" />}>
+        <Text class={cx(textClass.sm, "text-foreground")} style={{ numberOfLines: 1 }}>{props.mark}</Text>
+      </If>
+    </View>
+    <View class="flex-1 min-w-0 flex-col gap-px">
+      <Text class={cx(textClass.sm, "font-medium text-foreground")} style={{ numberOfLines: 2 }}>{props.label}</Text>
+      <If when={props.description}><Text class={cx(textClass.xs, "text-muted-foreground")}>{props.description}</Text></If>
+    </View>
+  </>;
 }
 
 /**

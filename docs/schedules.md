@@ -1,8 +1,7 @@
 # Scheduled prompts
 
-The [Daily brief](pages.md#daily-briefs) setup and
-[scheduled web-search behaviour](web-search.md) are in the source,
-not released. The published app uses the scheduled-prompt steps below.
+Metro 0.5.0 also includes [Daily briefs](pages.md#daily-briefs) and
+[web tools for eligible scheduled runs](web-search.md).
 
 A scheduled prompt is a message that the Metro server sends to the agent for
 you, either once or on a recurrence. It goes to your personal Chat, or to a

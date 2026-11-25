@@ -1,9 +1,10 @@
 # Documents & media
 
 > **Status: verified locally with fixtures.** It's in the published
-> [Metro 0.3.2](https://github.com/wnzn/metro/releases/tag/v0.3.2) and
-> [0.4.0](https://github.com/wnzn/metro/releases/tag/v0.4.0) code;
-> the checks below were local runs, not runs of the release files. It's part of the
+> [Metro 0.3.2](https://github.com/wnzn/metro/releases/tag/v0.3.2),
+> [0.4.0](https://github.com/wnzn/metro/releases/tag/v0.4.0) and
+> [0.5.0](https://github.com/wnzn/metro/releases/tag/v0.5.0).
+> The checks below were local runs, not runs of the release files. It's part of the
 > [final local gate](acceptance.md#demonstrated-final-local-gate-with-documents--media-2026-11-22-primary-workspace-local):
 > 497 Rust tests, all seven e2e scripts (`library.py` ran twice), the 83
 > hardened media-service tests, and desktop `nsh test` 106/106. **No
@@ -35,7 +36,7 @@
 >     no weights have been downloaded,
 >   - native audio or video playback or seeking, or the native file picker
 >     (portal), and
->   - any run of the 0.3.2 or 0.4.0 release files or images with this feature.
+>   - any run of the 0.3.2, 0.4.0 or 0.5.0 release files or images with this feature.
 > - **Desktop:** `nsh check` is clean, and `nsh test .` passed 106/106 twice.
 >   Six native Linux screenshots were taken against the real server, with a
 >   scripted media endpoint. See [In the desktop app](#in-the-desktop-app).
@@ -485,7 +486,7 @@ POST {base_url}/media/embeddings        (base_url includes /v1; Bearer key if se
 > play/pause control. The first play asks to start at the match unless
 > you've moved the timeline. Playback and seeking aren't verified (see
 > below). You choose the media model in **Settings ›
-> Model providers › Documents & media** (**Index and search with**, then
+> Model connections › Documents & media** (**Index and search with**, then
 > **Save**). There you'll also find **Where your files go**. To search files, type in the search box at the
 > top of the window (on the Library page it searches documents and media).
 > While you type, [quick results](system-one.md#quick-results-as-you-type)
@@ -505,8 +506,8 @@ POST {base_url}/media/embeddings        (base_url includes /v1; Bearer key if se
 > natively later, at `95a3d2b` ([acceptance](acceptance.md#staged-quick-search-as-you-type-2026-11-23-project-manager-local)).
 
 The screenshots below were retaken on 2026-11-24 from `eea7221` and show
-the current layout: the Library page in the sidebar, the media model in
-Settings › Model providers, and file search in Search › Documents & media.
+the Library page in the sidebar, the media model in Settings (then under
+**Model providers**), and file search in Search › Documents & media.
 They're native Linux captures, taken against the real `metro-server`
 binary, with a **scripted** media endpoint, so the scores show only that
 the wiring works and say nothing about ranking quality. The files in them
@@ -738,7 +739,7 @@ around `google/embeddinggemma-2`. Upload, listing, preview and download work
 without one.
 
 - **The reference service image is published** as
-  `ghcr.io/wnzn/metro-embeddinggemma2:v0.4.0` (`linux/amd64` only, no
+  `ghcr.io/wnzn/metro-embeddinggemma2:v0.5.0` (`linux/amd64` only, no
   weights; pin the digest from the release's `IMAGES.txt`). Running that
   image from the registry hasn't been recorded, and this page doesn't yet
   describe running it outside the `compose.media.yaml` override, which
@@ -747,7 +748,7 @@ without one.
 - **With an endpoint that's already running** (one you or your operator
   trusts, over HTTPS), the operator adds its exact base URL to
   `METRO_PROVIDER_ALLOWED_BASE_URLS`. You then choose **EmbeddingGemma 2 on
-  an approved endpoint** in **Settings → Model providers**, give the base
+  an approved endpoint** in **Settings → Model connections**, give the base
   URL, the model `google/embeddinggemma-2` and its key. Then choose that
   connection as your media model under **Documents & media** on the same
   Settings page.
@@ -791,7 +792,7 @@ This page doesn't claim any of the following until a run is recorded in
 - Native audio or video playback or seeking in the desktop app, and the
   desktop on macOS or Windows.
 - A native (portal) file-picker upload. It was tested headless only.
-- Any run of the published 0.3.2 or 0.4.0 files or images with this feature,
+- Any run of the published 0.3.2, 0.4.0 or 0.5.0 files or images with this feature,
   including the `metro-embeddinggemma2` image.
 - The real-weight smoke, or any run with pretrained weights, and its
   timings, memory and ranking. **No real retrieval quality has been

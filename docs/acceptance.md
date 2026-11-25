@@ -3,6 +3,73 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Published: Metro 0.5.0 (2026-11-25, GitHub release v0.5.0)
+
+**What was published.** The stable
+[Metro 0.5.0 release](https://github.com/wnzn/metro/releases/tag/v0.5.0)
+was published at `2026-11-25T20:56:24Z` (not a draft or prerelease,
+marked latest).
+Tag `v0.5.0` points to `6a038f15dbc6b02d1b29e2aabc3faf942f8601a8`,
+the merge of [PR #17](https://github.com/wnzn/metro/pull/17).
+The push to `main` ran
+[CI 45692417663](https://github.com/wnzn/metro/actions/runs/45692417663)
+successfully, including the native Windows preview gate, asset and
+image signing, and publication. Windows code signing was skipped.
+The Windows preview job installed the unsigned MSI, checked the payload,
+started the server, uninstalled it, and passed its native MSI tests.
+
+The [0.5.0 feature guide](released-0.5.0.md) describes the shipped
+changes. The [local desktop gate at b444379](#source-only-final-local-acceptance-at-b444379)
+and [bounded backend gate at 2cb1beb](#source-only-bounded-backend-gate-at-2cb1beb)
+remain evidence for those source cuts, not runs of the published files.
+[Later Pages work](next-source.md) is not part of this release.
+
+**Assets** (18):
+
+| File | Verification |
+| --- | --- |
+| `Metro-0.5.0-linux-x64.tar.gz` + `.sha256` | `Metro-0.5.0-linux-x64.tar.gz.sigstore.json` |
+| `Metro-0.5.0-windows-x64.zip` + `.sha256` | No Authenticode; check against the signed manifest |
+| `Metro-0.5.0-windows-x64.unsigned-preview.msi` + `.sha256` | No Authenticode; check against the signed manifest |
+| `Metro-runner-0.5.0-linux-x64.tar.gz` + `.sha256` | `Metro-runner-0.5.0-linux-x64.tar.gz.sigstore.json` |
+| `install-metro-linux.sh`, `install-metro-runner-linux.sh`, `install-metro-windows.ps1`, `metro-runner-container.sh`, `metro-runner-container.ps1` | Listed in `SHA256SUMS`; the PowerShell scripts have no Authenticode |
+| `IMAGES.txt` | Listed in `SHA256SUMS` |
+| `SHA256SUMS` | `SHA256SUMS.sigstore.json` |
+
+**Images.** Pin by digest; there is no `latest` tag. The release's
+[`IMAGES.txt`](https://github.com/wnzn/metro/releases/download/v0.5.0/IMAGES.txt)
+records these references and the workflow's keyless Sigstore verification
+of each digest against the exact source commit.
+
+| Reference | Digest | Platforms |
+| --- | --- | --- |
+| `ghcr.io/wnzn/metro-server:v0.5.0` | `sha256:74adbea115a470850fd61edde837db74d903b1e91024d85eb1d3dd467d20efe2` | `linux/amd64`, `linux/arm64` |
+| `ghcr.io/wnzn/metro-server` | `sha256:029c52d8723a549ad3de56d4cc3f585b6114e0d9803e64dd73e20fcde3c3269d` | `linux/amd64` |
+| `ghcr.io/wnzn/metro-server` | `sha256:930517b2b499513a8c6ffd205e577e8f7706c2cc2d0edb19cc4c516911bc6e7e` | `linux/arm64` |
+| `ghcr.io/wnzn/metro-runner:v0.5.0` | `sha256:2f46e87aa518b1e913382eaf7894ad03820e19d615838b081b3ff02871d3ea6d` | `linux/amd64`, `linux/arm64` |
+| `ghcr.io/wnzn/metro-runner` | `sha256:94fe8ab611da48faae332905d58f141940365348fc77aa0209518e43119bbfb5` | `linux/amd64` |
+| `ghcr.io/wnzn/metro-runner` | `sha256:60c77c536f56b516d66ee84d16d61321f66ddbaa33dfe68b3b6ffe7683b5c039` | `linux/arm64` |
+| `ghcr.io/wnzn/metro-embeddinggemma2:v0.5.0` | `sha256:3ecf521cc3c7ca0e48c265286810a87a643480f697542ff59b1f0023d514cc65` | `linux/amd64` (no weights) |
+| `ghcr.io/wnzn/metro-embeddinggemma2` | `sha256:540e6a0d8bad9d5ed5fe962c77e888866dfb4e96e3ba1d9a7ac7340d5f70a111` | `linux/amd64` |
+
+**How it was checked** (2026-11-26, docs lane, read-only):
+
+```sh
+gh release view v0.5.0 --repo wnzn/metro --json assets,tagName,publishedAt,isDraft,isPrerelease,targetCommitish
+gh api repos/wnzn/metro/releases/latest --jq .tag_name
+gh api repos/wnzn/metro/git/ref/tags/v0.5.0
+gh pr view 17 --repo wnzn/metro --json mergeCommit
+gh run view 45692417663 --repo wnzn/metro --json conclusion,event,headSha,jobs
+gh release download v0.5.0 --repo wnzn/metro --pattern IMAGES.txt --output -
+gh release download v0.5.0 --repo wnzn/metro --pattern SHA256SUMS --output -
+```
+
+Local Markdown links and anchors and `git diff --check` passed for this
+documentation change. No release binary or container was run and no
+signature was independently verified in this check. The Windows CI gate
+is unattended, not a desktop or MSI wizard run by a person on native
+Windows. Real vendor accounts and sign-ins remain unverified.
+
 ## Published: Metro 0.4.0 (2026-11-25, GitHub release v0.4.0)
 
 **What was published.** The GitHub release
@@ -105,7 +172,8 @@ Windows files carry no Authenticode signature.
 
 ## Source only: documentation cut at d82c07f
 
-The [source preview](next-source.md) was checked against merged source
+The documentation that later became the [0.5.0 feature guide](released-0.5.0.md)
+was checked against merged source
 `d82c07fed0e4232a45154066ec8430eb2f11ae70`. The documentation pass
 checked local Markdown links and anchors and ran `git diff --check`.
 It did not run builds, runtime tests, live services, or release checks.
@@ -197,7 +265,7 @@ passing desktop gate.
 
 ## Source only: reviewed UX integration at b444379
 
-The [source preview](next-source.md) now describes
+The documentation that later became the [0.5.0 feature guide](released-0.5.0.md) described
 `b44437956e73f2eaa6e8a4d62102352139fa67d2`. This local integration
 includes the reviewed startup HTTP consent, runner selection and Space
 deletion warning, exact **Follow up** confirmation and verification,

@@ -4,10 +4,10 @@ import type { Page, PageDiagnostic, VersionMeta, Definition } from "../../api/pa
 import { isPageStatus, pageFailure, targetOf } from "../../api/pages";
 import { pagesProblem } from "../../pagesState";
 import { apiClient } from "../../store";
-import { Action, ActionBar, Badge, Banner, Column, Field, Label, Modal, PageHeader, PageLayout, Row, ScrollArea, SegmentedControl, Surface, Toggle } from "../../ui";
+import { Action, ActionBar, Badge, Banner, Column, compactWidth, Field, Label, Modal, PageHeader, Row, ScrollArea, SegmentedControl, Surface, Toggle } from "../../ui";
 import { PageCode, PageDiff } from "../../ui/pageBlocks";
 import { profileName } from "../profile/profileState";
-import { Diagnostics, PagesError } from "./controls";
+import { Diagnostics, PagesError, scopeName } from "./controls";
 import { PageRenderer } from "./PageRenderer";
 import type { PageToolProps } from "./PageView";
 import { cell } from "./renderPlan";
@@ -35,6 +35,12 @@ export function SourceEditor(props: PageToolProps) {
   const error = signal(""), busy = signal(false), conflict = signal<number | null>(null);
   const headError = signal(""), reading = signal(false);
   const review = signal<"diff" | "source">("source");
+  const discard = signal(false);
+  function close() {
+    if (!valid() || busy() || discard()) return;
+    if (source() !== target().source) discard.set(true);
+    else props.close();
+  }
   const headReads = pageReadLane<number>();
   let checked = base.source, validationTicket = 0;
   effect(() => {
@@ -92,7 +98,7 @@ export function SourceEditor(props: PageToolProps) {
   });
   async function save() {
     const against = target(), edited = source();
-    if (!client || !valid() || !against.can_edit || busy() || conflict() !== null || status() !== "valid" || edited !== checked || edited === against.source) return;
+    if (!client || !valid() || !against.can_edit || busy() || discard() || conflict() !== null || status() !== "valid" || edited !== checked || edited === against.source) return;
     busy.set(true); error.set("");
     try { finish(await client.savePage(base.id, against.head_version, edited)); }
     catch (e) {
@@ -108,7 +114,7 @@ export function SourceEditor(props: PageToolProps) {
   }
   function useReviewedBase() {
     const head = latest();
-    if (!head?.can_edit || busy() || !valid() || conflict() === null || review() !== "diff") return;
+    if (!head?.can_edit || busy() || discard() || !valid() || conflict() === null || review() !== "diff") return;
     target.set(head);
     conflict.set(null);
     review.set("source");
@@ -118,17 +124,17 @@ export function SourceEditor(props: PageToolProps) {
     const start = { line: d.line - 1, column: d.column - 1 };
     return [{ range: { start, end: { ...start, column: start.column + 1 } }, message: d.message, severity: "error" }];
   });
-  return <Modal open testID="page-source-sheet" title="Edit page source" onClose={() => { if (!busy()) props.close(); }}>
-    <Column grow pad={4} gap={2}>
+  return <Modal open guardDismiss={busy() || source() !== target().source} testID="page-source-sheet" title="Edit page source" onClose={close}>
+    <Column grow pad={compactWidth() ? 4 : 6} gap={4}>
       <PageHeader title="Edit page source" subtitle={`Page TSX · based on version ${target().head_version} · checked by Metro, never run as code.`} />
       <If when={conflict() !== null}>
         <Banner tone="warning" variant="inline" title="The published page changed"
-          message="Your unsaved source is still here. Review the current version and merge any changes you want to keep. Nothing was overwritten." />
+          message="Your unsaved source is still here. Compare it with the current version. Nothing was merged or overwritten." />
         <SegmentedControl testID="page-source-conflict-tab" accessibilityLabel="Review source conflict" value={review()} onChange={review.set}
           options={[{ value: "diff", label: "Compare" }, { value: "source", label: "Your source" }]} />
       </If>
       <If when={review() === "diff" && conflict() !== null} else={
-        <PageCode value={source()} onChange={source.set} readOnly={busy()} diagnostics={codeDiagnostics()} />
+        <PageCode value={source()} onChange={source.set} readOnly={busy() || discard()} diagnostics={codeDiagnostics()} />
       }>
         <If when={latest()} else={<Column gap={2}>
           <If when={reading()}><Label color="muted">Loading current source…</Label></If>
@@ -136,12 +142,12 @@ export function SourceEditor(props: PageToolProps) {
         </Column>}>
           {head => <>
             <Label variant="caption" color="muted">{`Published version ${head().head_version} → your unsaved source`}</Label>
-            <PageDiff before={head().source} after={source()} />
+            <PageDiff before={head().source} after={source()} accessibilityLabel={`Published version ${head().head_version} to your unsaved source`} />
             <If when={!head().can_edit}><Label color="warning">You can no longer edit this page.</Label></If>
             <If when={head().can_edit}>
               <Label variant="caption" color="muted">Using this base keeps your source as-is. Saving later replaces the published source; Metro does not merge the edits.</Label>
               <Row justify="end"><Action testID="page-use-current-base"
-                label={`Use version ${head().head_version} as base`} onPress={useReviewedBase} /></Row>
+                label="Keep my source and review before saving" disabled={discard()} onPress={useReviewedBase} /></Row>
             </If>
           </>}
         </If>
@@ -149,9 +155,13 @@ export function SourceEditor(props: PageToolProps) {
       <If when={status() === "checking"}><Label color="muted">Checking Page TSX…</Label></If>
       <If when={diagnostics().length}><ScrollArea><Diagnostics items={diagnostics()} /></ScrollArea></If>
       <PagesError message={error()} />
-      <ActionBar><Action label="Close" variant="ghost" disabled={busy()} onPress={props.close} />
+      <If when={discard()} else={<ActionBar><Action label="Close" testID="page-close-source" variant="ghost" disabled={busy()} onPress={close} />
         <Action testID="page-save-source" label="Save source" variant="primary" busy={busy()}
-          disabled={!target().can_edit || source() === target().source || status() !== "valid" || conflict() !== null} onPress={() => void save()} /></ActionBar>
+          disabled={!target().can_edit || source() === target().source || status() !== "valid" || conflict() !== null} onPress={() => void save()} /></ActionBar>}>
+        <Banner tone="warning" variant="inline" message="Discard your unsaved source changes?" />
+        <ActionBar><Action label="Keep editing" testID="page-keep-source" onPress={() => discard.set(false)} />
+          <Action label="Discard changes" testID="page-discard-source" variant="danger" onPress={props.close} /></ActionBar>
+      </If>
     </Column>
   </Modal>;
 }
@@ -208,8 +218,8 @@ export function PageHistory(props: PageToolProps) {
   }
   untracked(() => void load());
   return <Modal open title="Page history" testID="page-history-sheet" onClose={() => { if (!busy()) props.close(); }}>
-    <Column grow pad={4} gap={2}>
-      <PageHeader title="Page history" subtitle="Restoring makes a new version instead of changing history." />
+    <Column grow pad={compactWidth() ? 4 : 6} gap={4}>
+      <PageHeader title="Page history" subtitle="Restoring publishes a new version." />
       <PagesError message={error()} />
       <If when={loading()}><Label color="muted">Loading history…</Label></If>
       <If when={version()} else={<ScrollArea gap={2}>
@@ -236,11 +246,14 @@ export function PageHistory(props: PageToolProps) {
           <Label variant="caption" color="muted">Historical layout only. Live data and actions aren’t available in this preview.</Label>
           <PageRenderer spec={v().spec} data={null} readOnly />
         </ScrollArea></If>
-        <If when={tab() === "changes"}><PageDiff before={v().source} after={head().source} /></If>
+        <If when={tab() === "changes"}>
+          <Label variant="caption" color="muted">{`Version ${v().version} → current (version ${head().head_version})`}</Label>
+          <PageDiff before={v().source} after={head().source} accessibilityLabel={`Version ${v().version} to current version ${head().head_version}`} />
+        </If>
         <If when={tab() === "source"}><PageCode value={v().source} readOnly /></If>
         <If when={head().can_edit && v().version !== head().head_version}>
           <If when={confirm()} else={<Action testID="page-restore-version" label="Restore this version…" onPress={() => confirm.set(true)} disabled={busy()} />}>
-            <Banner tone="warning" variant="inline" title={`Restore version ${v().version}?`} message="Current content will be replaced in a new version." />
+            <Banner tone="warning" variant="inline" title={`Restore version ${v().version}?`} message="This publishes the restored content as a new version." />
             <ActionBar><Action label="Cancel" variant="ghost" onPress={() => confirm.set(false)} />
               <Action testID="page-restore-now" label="Restore version" variant="primary" busy={busy()} onPress={() => void restore()} /></ActionBar>
           </If>
@@ -288,6 +301,7 @@ export function PageSettings(props: PageToolProps) {
   return <Modal open size="compact" title="Page settings" testID="page-settings-sheet" onClose={() => { if (!busy()) props.close(); }}>
     <Column pad={4} gap={3}>
       <PageHeader title="Page settings" />
+      <If when={base.space_id}><Label>Everyone in {scopeName(base.space_id)} can view.</Label></If>
       <If when={base.can_edit}>
         <Column gap={1}>
           <Label variant="strong">Title</Label>
@@ -301,7 +315,7 @@ export function PageSettings(props: PageToolProps) {
         </Column>
         <If when={base.space_id}>
           <Toggle label="Members can edit" checked={members()} onChange={members.set} testID="page-members-edit" disabled={busy()} />
-          <Label variant="caption" color="muted">When off, only this page’s creator and the Space owner can edit.</Label>
+          <Label variant="caption" color="muted">Editing doesn’t grant permission to delete or manage the page. When off, only the creator and Space owner can edit.</Label>
         </If>
       </If>
       <PagesError message={error()} />

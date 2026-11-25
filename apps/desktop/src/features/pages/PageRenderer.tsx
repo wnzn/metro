@@ -10,13 +10,15 @@ type Interactions = {
   data: PageValues | null;
   readOnly?: boolean;
   busy?: boolean;
+  waitingForAgent?: boolean;
   changed?: ReadonlySet<string>;
+  highlights?: ReadonlyMap<string, "Added" | "Changed">;
   onAction?: (key: string, kind: ActionKind) => void;
-  onEdit?: (key: string) => void;
+  onEdit?: (key: string, label: string) => void;
   onLink?: (url: string) => void;
   onFile?: (id: string) => void;
   onSchedule?: (block: string) => void;
-  canSchedule?: (block: string) => boolean;
+  scheduling?: (block: string) => "available" | "no-prompt" | undefined;
 };
 
 const toneOf = (v: unknown): Tone => v === "info" ? "system"
@@ -24,7 +26,7 @@ const toneOf = (v: unknown): Tone => v === "info" ? "system"
 
 export function PageRenderer(props: Interactions & { spec: PageSpec; pending?: boolean }) {
   const plan = computed(() => planPage(props.spec, props.data, !!props.pending));
-  return <Column gap={3} testID="page-renderer">
+  return <Column gap={4} testID="page-renderer">
     <If when={!plan().supported}><Label color="warning">This page format is not supported by this version of Metro.</Label></If>
     <If when={plan().richText.limited}>
       <Label color="warning" testID="page-rich-text-limit">Some rich text was shortened because this page reached its display limit.</Label>
@@ -38,14 +40,36 @@ export function PageRenderer(props: Interactions & { spec: PageSpec; pending?: b
 
 function Block(props: { node: PlanBlock; interactions: Interactions }) {
   const key = () => props.node.key;
+  const name = () => blockLabel(props.node);
   return <If when={props.node.type !== "Show" || props.node.issue || props.node.children.length || (!!key() && props.interactions.onEdit)}>
-    <PageBlockFrame blockKey={key()} changed={!!key() && props.interactions.changed?.has(key()!)}
-      onEdit={key() && props.interactions.onEdit ? () => props.interactions.onEdit?.(key()!) : undefined}>
+    <PageBlockFrame blockKey={key()} blockLabel={name()} highlight={key()
+      ? props.interactions.highlights?.get(key()!) ?? (props.interactions.changed?.has(key()!) ? "Changed" : undefined) : undefined}
+      onEdit={key() && props.interactions.onEdit ? () => props.interactions.onEdit?.(key()!, name()) : undefined}>
       <If when={props.node.issue !== undefined} else={<BlockBody node={props.node} interactions={props.interactions} />}>
         <Label variant="caption" color="muted" testID="page-source-state">{props.node.issue}</Label>
       </If>
     </PageBlockFrame>
   </If>;
+}
+
+/** A List's children grouped by the item they were rendered for (`<list>#<index>/…`). */
+export function listItems(node: PlanBlock) {
+  const items: { id: string; blocks: PlanBlock[] }[] = [];
+  for (const child of node.children) {
+    const rest = child.instance.startsWith(`${node.instance}#`) ? child.instance.slice(node.instance.length + 1) : child.instance;
+    const slash = rest.indexOf("/");
+    const id = slash < 0 ? rest : rest.slice(0, slash);
+    const last = items[items.length - 1];
+    if (last?.id === id) last.blocks.push(child);
+    else items.push({ id, blocks: [child] });
+  }
+  return items;
+}
+
+function blockLabel(node: PlanBlock) {
+  const type = node.type.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
+  const title = str(node.p.title) || str(node.p.label) || (node.type === "Heading" ? node.text : "");
+  return title ? `${type}: ${title.slice(0, 120)}` : `${type} block`;
 }
 
 function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
@@ -67,7 +91,7 @@ function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
       }</Each></PageGrid>;
     }
     case "Divider": return <Divider />;
-    case "Heading": return <Label heading variant={p().level === 1 ? "title" : p().level === 3 ? "strong" : "heading"}>{n().text}</Label>;
+    case "Heading": return <Label heading variant={p().level === 1 ? "display" : p().level === 3 ? "heading" : "title"}>{n().text}</Label>;
     case "Text": return <Label color={p().muted === true ? "muted" : tone() === "neutral" ? "default" : tone()}>{n().text}</Label>;
     case "Empty": return <Label variant="caption" color="muted">{n().text || empty()}</Label>;
     case "Markdown": return <If when={n().document}>{document =>
@@ -76,7 +100,7 @@ function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
     case "Badge": return <Row><Badge tone={tone()} label={n().text} /></Row>;
     case "Stat": return <Surface variant="card" pad={3} gap={1}>
       <Label variant="caption" color="muted">{label()}</Label>
-      <Label variant="display" color={n().stat?.tone ?? (tone() === "neutral" ? "default" : tone())}>{n().stat?.label}</Label>
+      <Label variant="display" tabular color={n().stat?.tone ?? (tone() === "neutral" ? "default" : tone())}>{n().stat?.label}</Label>
       <If when={p().hint}><Label variant="caption" color="muted">{str(p().hint)}</Label></If>
     </Surface>;
     case "Progress": {
@@ -90,15 +114,24 @@ function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
       <PageChart points={n().points ?? []} label={label() || "Chart"} kind={p().kind === "bar" ? "bar" : "line"} />
     </If>;
     case "Table": return <If when={n().rows?.length} else={<Label color="muted">{empty()}</Label>}>
-      <PageTable headings={n().headings ?? []} rows={n().rows ?? []} />
+      <PageTable label={label()} headings={n().headings ?? []} rows={n().rows ?? []} numericColumns={n().numericColumns} />
     </If>;
     case "List": return <If when={n().children.length} else={<Label color="muted">{empty()}</Label>}>
-      <Column gap={1}>{children()}</Column>
+      <Column testID="page-list">
+        <Each of={listItems(n())} key={item => item.id}>{(item, index) => <Column gap={1}>
+          <If when={index() > 0}><Divider /></If>
+          <Column padY={2} gap={1} testID="page-list-item">
+            <Each of={item().blocks} key={b => b.instance}>{child => <Block node={child()} interactions={props.interactions} />}</Each>
+          </Column>
+        </Column>}</Each>
+      </Column>
     </If>;
     case "Each": case "Show": return <Column gap={2}>{children()}</Column>;
     case "AgentAnswer": {
       const answer = () => n().answer;
-      return <Column gap={2}>
+      const scheduling = () => !props.interactions.readOnly && n().key ? props.interactions.scheduling?.(n().key!) : undefined;
+      return <Surface variant="card" pad={3} gap={2}>
+        <If when={scheduling()}><Label variant="meta">Latest room answer</Label></If>
         <If when={answer()} else={<Label color="muted">{empty("No answer yet.")}</Label>}>{item => <>
           <Row gap={2} align="center" wrap>
             <Badge tone={item().status.tone ?? "agent"} label={item().status.label} />
@@ -109,32 +142,34 @@ function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
           </If>
           <If when={item().error}>{t => <Label color="warning">{t()}</Label>}</If>
         </>}</If>
-        <If when={!props.interactions.readOnly && props.interactions.onSchedule && n().key && props.interactions.canSchedule?.(n().key!) ? n().key : undefined}>
-          {key => <Row><Action compact variant="ghost" label="Keep this answer fresh…" testID={`page-schedule:${key()}`} onPress={() => props.interactions.onSchedule?.(key())} /></Row>}
-        </If>
-      </Column>;
+        <If when={scheduling() === "available"}><Row><Action compact variant="ghost" label="Schedule brief…"
+          accessibilityLabel="Schedule a brief for this room answer" testID={`page-schedule:${n().key}`}
+          disabled={props.interactions.busy} onPress={() => { if (n().key) props.interactions.onSchedule?.(n().key!); }} /></Row></If>
+        <If when={scheduling() === "no-prompt"}><Label variant="caption" color="muted">Scheduling needs one matching agent button with a prompt.</Label></If>
+      </Surface>;
     }
     case "RunList": case "MessageFeed": case "ScheduleCard": case "FileList":
       return <If when={n().entries?.length} else={<Label color="muted">{empty()}</Label>}>
-        <Column gap={2}>
+        <Column>
           <Each of={n().entries ?? []}>{(item, index) => {
             const status = () => item().status;
-            return <Surface variant="card" pad={2} gap={1}>
-              <Row gap={2} wrap align="center">
-                <Label variant="strong">{item().title || "Untitled"}</Label>
+            return <Column gap={1}>
+              <If when={index() > 0}><Divider /></If>
+              <Row padY={2} gap={3} align="center">
+                <Column grow gap={1}>
+                  <Label variant="strong">{item().title || "Untitled"}</Label>
+                  <If when={n().type === "MessageFeed"} else={<Label variant="meta">{item().metadata}</Label>}>
+                    <If when={n().messages?.[index()]}>{document =>
+                      <PageMarkdown document={document()} onLink={props.interactions.readOnly ? undefined : props.interactions.onLink} />
+                    }</If>
+                  </If>
+                </Column>
                 <If when={status().label && status().label !== "—"}><Badge tone={status().tone ?? "neutral"} label={status().label} /></If>
-              </Row>
-              <If when={n().type === "MessageFeed"} else={
-                <Label variant="meta">{item().metadata}</Label>
-              }>
-                <If when={n().messages?.[index()]}>{document =>
-                  <PageMarkdown document={document()} onLink={props.interactions.readOnly ? undefined : props.interactions.onLink} />
+                <If when={!props.interactions.readOnly && props.interactions.onFile ? item().fileId : undefined}>{id =>
+                  <Action compact variant="ghost" label="Open file" accessibilityLabel={`Open file: ${item().title || "Untitled"}`} onPress={() => props.interactions.onFile?.(id())} />
                 }</If>
-              </If>
-              <If when={!props.interactions.readOnly && props.interactions.onFile ? item().fileId : undefined}>{id =>
-                <Row><Action compact variant="ghost" label="Open file" onPress={() => props.interactions.onFile?.(id())} /></Row>
-              }</If>
-            </Surface>;
+              </Row>
+            </Column>;
           }}</Each>
         </Column>
       </If>;
@@ -144,7 +179,7 @@ function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
       const reason = () => props.interactions.readOnly ? "Preview only" : n().disabledReason || "Action unavailable";
       return <Column gap={1} align="start">
         <Action testID={`page-action:${n().key}`} label={label() || "Action"} variant={n().type === "Link" ? "ghost" : tone() === "danger" ? "destructive" : tone() === "system" ? "primary" : "secondary"}
-          disabled={disabled() || props.interactions.busy}
+          disabled={disabled() || props.interactions.busy || (n().action === "runAgent" && props.interactions.waitingForAgent)}
           onPress={() => { if (!disabled() && !props.interactions.busy && n().key && n().action) props.interactions.onAction?.(n().key!, n().action!); }} />
         <If when={disabled()}><Label variant="caption" color="muted">{reason()}</Label></If>
       </Column>;
@@ -155,9 +190,7 @@ function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
 
 function Section(props: { node: PlanBlock; children?: import("nsh").JSX.Element }) {
   const open = signal(props.node.p.collapsed !== true);
-  return <Surface variant="card" pad={3}>
-    <Disclosure title={str(props.node.p.title) || "Section"} open={open()} onToggle={open.set}>
-      <Column gap={3}>{props.children}</Column>
-    </Disclosure>
-  </Surface>;
+  return <Disclosure lined title={str(props.node.p.title) || "Section"} open={open()} onToggle={open.set}>
+    <Column gap={3}>{props.children}</Column>
+  </Disclosure>;
 }
