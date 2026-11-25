@@ -37,12 +37,16 @@ async function askAgent(app: App) {
   await app.press("id:ask-agent");
 }
 
-test("refuses to send a token over plain HTTP to a remote host", async () => {
+test("asks before sending a token over plain HTTP to a remote host, and sends nothing until confirmed", async () => {
   const f = world();
   const app = await openApp(f);
   await signIn(app, "alice", "http://192.168.1.20:8787");
-  await app.waitFor("id:connect-error");
-  expect(text(app)).toContain("Refusing to send your access token over plain HTTP");
+  await app.waitFor("id:plain-http-consent");
+  expect(text(app)).toContain("This connection isn't encrypted.");
+  expect(app.shows("id:account-menu")).toBe(false);
+  expect(app.requests()).toHaveLength(0);
+  await app.press("id:plain-http-consent:cancel");
+  await app.waitFor("id:connect");
   expect(app.requests()).toHaveLength(0);
 });
 
