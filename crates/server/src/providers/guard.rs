@@ -132,8 +132,9 @@ impl Grant {
             .db
             .call(move |db| {
                 let conn = db.lock();
-                if turn_check.is_some()
-                    && let Some(sid) = &space
+                // A use in a Space needs the caller still in it, whatever
+                // connection runs (their own, or one shared organization-wide).
+                if let Some(sid) = &space
                     && !super::store::is_member(&conn, sid, &caller)?
                 {
                     return Ok(Err(UseError::NotFound));

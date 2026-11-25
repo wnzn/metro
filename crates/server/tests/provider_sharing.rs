@@ -661,7 +661,7 @@ async fn capabilities_are_fixed_and_each_has_its_own_default() {
         // The first connection of each capability is its default.
         assert_eq!(c["is_default"], true, "{c}");
     }
-    let default = providers::default_model(&s.state, "alice")
+    let default = providers::default_model(&s.state, "alice", None)
         .await
         .unwrap()
         .unwrap();
@@ -1782,4 +1782,74 @@ async fn a_device_classifiers_own_text_reaches_no_log_response_or_room() {
         !logs.contains(SENTINEL),
         "a log line carries the device's text:\n{logs}"
     );
+}
+
+#[tokio::test]
+async fn a_member_removed_mid_run_stops_its_next_request() {
+    let s = Server::start().await;
+    // Bob's own default, and an organization-wide share of Alice's: neither
+    // is tied to a Space, and neither run picks an explicit model.
+    s.connect(BOB, "custom", "bob-model", true).await;
+    let shared = s.connect(ALICE, "custom", "alice-model", true).await;
+    let (status, _) = s
+        .share(ALICE, &shared, json!({"visibility": "organization"}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    for (label, selection) in [("own", None), ("shared", Some(shared.clone()))] {
+        let sid = s.space(ALICE, &format!("removal {label}"), &["bob"]).await;
+        if let Some(id) = selection {
+            let (status, body) = s
+                .put(
+                    BOB,
+                    &format!("/v1/spaces/{sid}/prefs"),
+                    json!({"default_model": {"provider_connection_id": id}}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let text = format!("@agent [tool] {label} run");
+        let requests = || {
+            s.fixture
+                .seen("/v1/chat/completions")
+                .iter()
+                .filter(|c| c.body.to_string().contains(&text))
+                .count()
+        };
+        let held = s.fixture.gate.write().await;
+        let (status, sent) = s
+            .post(
+                BOB,
+                &format!("/v1/spaces/{sid}/rooms/lobby/messages"),
+                json!({"text": text}),
+            )
+            .await;
+        assert!(status.is_success(), "{sent}");
+        for _ in 0..400 {
+            if requests() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(requests(), 1, "{label}: the first request arrived");
+        // Bob's membership ends between the run's two requests. (Removal
+        // also stops his runs, but only after it commits: this is that gap.)
+        s.state.db.remove_member(&sid, "bob").unwrap();
+        drop(held);
+        let mut ended = false;
+        for _ in 0..400 {
+            if s.state
+                .runs
+                .list()
+                .iter()
+                .any(|r| r.space_id == sid && r.status.is_terminal())
+            {
+                ended = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ended, "{label}: the run ended");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(requests(), 1, "{label}: no request after the removal");
+    }
 }

@@ -199,7 +199,7 @@ async fn route_model(
                 Err(e) => Err(route.refused(space, &e)),
             }
         }
-        None => match crate::providers::default_model(state, user_id).await {
+        None => match crate::providers::default_model(state, user_id, space).await {
             Ok(Some(selected)) => {
                 note.connection_id = Some(selected.connection_id.clone());
                 note.provider_id = Some(selected.provider_id.clone());

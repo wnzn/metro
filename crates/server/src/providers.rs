@@ -562,12 +562,15 @@ fn read_error(e: anyhow::Error) -> UseError {
     UseError::Internal
 }
 
-/// The model of `user_id`'s default chat connection, `Ok(None)` when they
-/// have none (the caller may then use the environment model), or why the
-/// default cannot be used (the caller must not fall back).
+/// The model of `user_id`'s default chat connection for a run in `space`
+/// (`None`: personal Chat), `Ok(None)` when they have none (the caller may
+/// then use the environment model), or why the default cannot be used (the
+/// caller must not fall back). In a Space, every request rechecks that they
+/// are still a member.
 pub async fn default_model(
     state: &AppState,
     user_id: &str,
+    space: Option<&str>,
 ) -> Result<Option<SelectedModel>, UseError> {
     let user = user_id.to_owned();
     let row = state
@@ -584,7 +587,7 @@ pub async fn default_model(
                 row,
                 access: Access::Own,
             };
-            build_model(state, user_id, None, authorized).map(Some)
+            build_model(state, user_id, space, authorized).map(Some)
         }
     }
 }
@@ -732,6 +735,20 @@ fn build_model_for_turn(
     selection: Option<&turn::TurnSelection>,
 ) -> Result<SelectedModel, UseError> {
     let mut grant = grant_for(state, caller, space, &authorized);
+    // A use in a Space always carries it, so every request rechecks the
+    // caller's membership (own and organization-shared connections too).
+    if grant.is_none() && space.is_some() {
+        grant = Some(Grant {
+            db: state.db.clone(),
+            caller: caller.to_owned(),
+            space: space.map(str::to_owned),
+            chosen: authorized.chosen.clone(),
+            target: authorized.row.id.clone(),
+            turn_check: None,
+            slots: None,
+            config_rev: None,
+        });
+    }
     if let Some(selection) = selection {
         let grant = grant.get_or_insert_with(|| Grant {
             db: state.db.clone(),
@@ -784,7 +801,10 @@ fn build_model_for_turn(
     let model = match entry.adapter {
         // Recheck an explicit model or preset before each relay request and
         // again before the answer is returned.
-        Adapter::Device if grant.is_some() && (selection.is_some() || row.user_id == caller) => {
+        Adapter::Device
+            if grant.is_some()
+                && (selection.is_some() || row.user_id == caller || space.is_some()) =>
+        {
             let mut grant = grant.clone().expect("checked");
             // The authenticated relay already caps borrowed device traffic.
             grant.slots = None;
