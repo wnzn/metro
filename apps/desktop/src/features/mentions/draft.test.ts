@@ -246,6 +246,34 @@ test("authoritative draft keeps quoted addresses plain while normal quoted menti
   expect(prepareMentionSend(email, roster)).toEqual({ ok: true, body: { text: `"local"@agent ` } });
 });
 
+test("quotes in inline and fenced code cannot interfere with quoted addresses", () => {
+  const text = 'See `say "` then <"local"@agent>';
+  expect(scanMentionDraft(draft(text), roster)).toEqual([]);
+  expect(send(text)).toEqual({ ok: true, body: { text } });
+
+  const fenced = '```\nsay "\n<"local"@agent>\n```\n<"local"@agent> then "@bo"';
+  expect(body(send(fenced)).mentions).toEqual([{ kind: "user", id: "bo" }]);
+
+  const directory = { ...roster, members: [{ id: "member", displayName: 'Bó "Ace" Smith' }] };
+  expect(body(send('Then @BÓ "ACE" SMITH, and "@coder".', directory)).mentions).toEqual([
+    { kind: "user", id: "member" }, { kind: "agent", agent_id: coder.agentId },
+  ]);
+});
+
+test("a quote inside a selected label is opaque next to a quoted address", () => {
+  const dev = { kind: "user", id: "dev" } as const;
+  const directory = {
+    ...roster, members: [...roster.members, { id: dev.id, displayName: 'Dev "Ops' }],
+  };
+  const chosen = pick(draft('🌿 @d then <"local"@agent> "@bo"'), 3, 5, dev, directory);
+  expect(scanMentionDraft(chosen, directory).map(m => m.literal)).toEqual(['@Dev "Ops', "@bo"]);
+  expect(body(prepareMentionSend(chosen, directory))).toEqual({
+    text: '🌿 @Dev "Ops then <"local"@agent> "@bo"',
+    mentions: [dev, { kind: "user", id: "bo" }],
+    spans: [{ start: 5, end: 14, index: 0 }, { start: 37, end: 40, index: 1 }],
+  });
+});
+
 test("pasted inline and fenced code is ignored, including open fences and a fence exposed by server trim", () => {
   const text = "    ~~~ js\n@Agent\n~~~\n@bo\n`` @coder ` @agent ``\n```sh\n@alice\n```~~\n@coder\n```\n@agent\n~~~\n@coder";
   expect(scanMentionDraft(draft(text), roster).map(m => m.literal)).toEqual(["@bo", "@agent"]);

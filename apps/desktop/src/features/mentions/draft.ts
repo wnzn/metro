@@ -1,5 +1,5 @@
 import {
-  closesMention, isAgentHandle, isLegacyId, isMemberId, isRange, isTextBoundary, mentionCodeRanges,
+  closesMention, isAgentHandle, isLegacyId, isMemberId, isRange, isTextBoundary, mentionSyntaxRanges,
   opensMention, overlapsRanges, quotedEmailRanges,
   saneExplicitLabel, saneTypedLabel, validMentionSpan,
 } from "./syntax";
@@ -81,7 +81,6 @@ function aliases(directory: MentionDirectory): Alias[] {
 function anchorSyntax(draft: MentionDraft) {
   const { text } = draft;
   const valid = (s: MentionSelection) => validMentionSpan(text, s) && text.slice(s.start, s.end) === s.literal;
-  const email = quotedEmailRanges(text);
   let end = 0;
   let anchors = [...draft.anchors].sort((a, b) => a.start - b.start).filter(a => {
     if (a.start < end || !valid(a)) return false;
@@ -92,7 +91,8 @@ function anchorSyntax(draft: MentionDraft) {
   // edit wrapped some anchors in real code, drop them and unmask their text
   // before checking the remaining anchors.
   for (;;) {
-    const ignored = [...email, ...mentionCodeRanges(text, anchors)];
+    const syntax = mentionSyntaxRanges(text, anchors);
+    const { ignored } = syntax;
     const outside = anchors.filter(a => !overlapsRanges(a, ignored));
     if (outside.length === anchors.length) {
       end = 0;
@@ -101,7 +101,7 @@ function anchorSyntax(draft: MentionDraft) {
         end = d.end;
         return true;
       });
-      return { anchors, decisions, ignored };
+      return { anchors, decisions, ...syntax };
     }
     anchors = outside;
   }
@@ -269,7 +269,7 @@ function retainUncertainDecisions(
   if (!uncertain.size) return after;
   const { text, anchors } = after;
   const decisions = [...(after.decisions ?? [])];
-  const ignored = [...quotedEmailRanges(text), ...mentionCodeRanges(text, anchors)];
+  const { ignored } = mentionSyntaxRanges(text, anchors);
   const changedEnd = lastEnd + text.length - before.text.length;
   // An identical spelling may have survived a broad snapshot diff or may
   // have been pasted anew. Never guess its identity from the new roster.
@@ -331,13 +331,14 @@ export function pickMention(
   const { start, end, literal } = selection;
   if (!isRange(draft.text, selection) || draft.text.slice(start, end) !== literal) return null;
   const append = start === end;
+  const syntax = anchorSyntax(draft);
   if (!append && (!literal.startsWith("@") || !opensMention(draft.text, start)
     || !closesMention(draft.text.slice(end)) || (literal !== "@" && !saneExplicitLabel(literal.slice(1)))
-    || overlapsRanges(selection, anchorSyntax(draft).ignored))) return null;
+    || overlapsRanges(selection, syntax.ignored))) return null;
   if (draft.anchors.some(a => append ? a.start < start && start < a.end
     : start < a.end && a.start < end && !(start === a.start && end === a.end))) return null;
   const wouldCloseQuote = append && /["']/.test(draft.text[start - 1])
-    && quotedEmailRanges(`${draft.text.slice(0, start)}@`).some(r => r.end === start + 1);
+    && quotedEmailRanges(`${draft.text.slice(0, start)}@`, syntax.quoteOpaque).some(r => r.end === start + 1);
   const prefix = append && (!opensMention(draft.text, start) || wouldCloseQuote) ? " " : "";
   const suffix = end === draft.text.length || !closesMention(draft.text.slice(end)) ? " " : "";
   for (const label of displayLabels(directory, mention)) {

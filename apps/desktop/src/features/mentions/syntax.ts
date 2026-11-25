@@ -14,13 +14,13 @@ export function opensMention(text: string, start: number): boolean {
   return start === 0 || opens.test(text[start - 1]);
 }
 
-function escaped(text: string, i: number): boolean {
+function escaped(text: string, i: number, opaque: readonly MentionRange[]): boolean {
   let before = i - 1;
-  while (text[before] === "\\") before--;
+  while (text[before] === "\\" && !overlapsRanges({ start: before, end: before + 1 }, opaque)) before--;
   return (i - before) % 2 === 0;
 }
 
-export function quotedEmailRanges(text: string): MentionRange[] {
+export function quotedEmailRanges(text: string, opaque: readonly MentionRange[]): MentionRange[] {
   // The legacy scanner can read both mentions inside a quoted local part
   // and its closing `"@agent` as addressing. Keep those at-signs plain,
   // without excluding ordinary quoted mentions such as `"@coder"`.
@@ -30,9 +30,11 @@ export function quotedEmailRanges(text: string): MentionRange[] {
     const char = match[0], i = match.index!;
     if (char !== '"' && char !== "'") {
       opens.clear();
-    } else if (!escaped(text, i)) {
+    } else if (!overlapsRanges({ start: i, end: i + 1 }, opaque) && !escaped(text, i, opaque)) {
       const start = opens.get(char);
       if (start !== undefined) {
+        // Inspect the original @ even if anchored: an adjoining edit can
+        // turn a formerly standalone mention into the domain of an email.
         if (text[i + 1] === "@") quoted.push({ start, end: i + 2 });
         opens.delete(char);
       } else if (opensMention(text, i)) opens.set(char, i);
@@ -126,7 +128,7 @@ function codeRanges(text: string, offset: number): MentionRange[] {
   return ranges;
 }
 
-export function mentionCodeRanges(text: string, opaque: readonly MentionRange[] = []): readonly MentionRange[] {
+function mentionCodeRanges(text: string, opaque: readonly MentionRange[]): readonly MentionRange[] {
   // Explicit labels are not Markdown. Use inert non-whitespace placeholders
   // (not indentation) without moving any editor offsets.
   let previousEnd = 0;
@@ -140,6 +142,14 @@ export function mentionCodeRanges(text: string, opaque: readonly MentionRange[] 
   // fence on the first line; use that same view without moving editor offsets.
   const leading = source.match(/^\p{White_Space}+/u)?.[0].length ?? 0;
   return codeRanges(source.slice(leading), leading);
+}
+
+export function mentionSyntaxRanges(text: string, anchors: readonly MentionRange[]) {
+  const code = mentionCodeRanges(text, anchors);
+  // Neither code nor a selected label supplies quotes to the prose parser.
+  // Scan the original text around them so UTF-16 ranges and escapes stay intact.
+  const quoteOpaque = [...code, ...anchors];
+  return { quoteOpaque, ignored: [...code, ...quotedEmailRanges(text, quoteOpaque)] };
 }
 
 export function overlapsRanges(range: MentionRange, ranges: readonly MentionRange[]): boolean {
