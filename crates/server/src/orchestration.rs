@@ -152,7 +152,7 @@ impl Inner {
         let evictable = |e: &Entry| e.info.status.is_terminal() && e.settled;
         let mut terminal = self.entries.iter().filter(|e| evictable(e)).count();
         while terminal > max_history {
-            match self.entries.iter().position(|e| evictable(e)) {
+            match self.entries.iter().position(&evictable) {
                 Some(i) => {
                     self.entries.remove(i);
                     terminal -= 1;

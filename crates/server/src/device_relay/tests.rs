@@ -492,11 +492,13 @@ fn device_errors_are_clear_and_contain_no_payload() {
     assert!(DeviceError::Offline.to_string().contains("offline"));
     assert!(DeviceError::NotPaired.to_string().contains("device token"));
     assert!(DeviceError::TimedOut.to_string().contains("in time"));
-    assert!(
-        DeviceError::Device("quota".into())
-            .to_string()
-            .contains("quota")
-    );
+    // The device's own text never reaches a message: it can echo anything.
+    let reported = DeviceError::Device("quota".into()).to_string();
+    assert!(!reported.contains("quota"), "{reported}");
+    assert!(reported.contains("reported an error"), "{reported}");
+    let malformed = DeviceError::BadResponse("missing choices".into()).to_string();
+    assert!(!malformed.contains("missing choices"), "{malformed}");
+    assert!(malformed.contains("invalid response"), "{malformed}");
 }
 
 fn read_tool() -> ToolDefinition {
@@ -605,7 +607,8 @@ async fn rig_model_reports_device_failures() {
         )
         .unwrap();
     let err = call.await.unwrap().unwrap_err();
-    assert!(err.to_string().contains("rate limited"), "{err}");
+    assert!(err.to_string().contains("reported an error"), "{err}");
+    assert!(!err.to_string().contains("rate limited"), "{err}");
     // Bob's adapter never reaches alice's device.
     let model = f.relay.rig_model(f.db.clone(), "bob", "c1", "m1");
     let err = model.call(CompletionRequest::new("hi")).await.unwrap_err();
