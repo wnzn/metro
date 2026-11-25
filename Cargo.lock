@@ -1589,6 +1589,7 @@ version = "0.4.0"
 dependencies = [
  "libc",
  "metro-connector",
+ "metro-url-policy",
  "serde_json",
  "tokio",
  "windows-sys 0.61.2",

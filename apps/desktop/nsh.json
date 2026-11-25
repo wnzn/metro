@@ -16,7 +16,7 @@
       "read": ["${dataDir}", "${homeDir}/Downloads"],
       "write": ["${dataDir}", "${homeDir}/Downloads"]
     },
-    "process": { "env": ["METRO_DESKTOP_BRIDGE_URL", "METRO_DESKTOP_BRIDGE_TOKEN"] },
+    "process": { "env": ["METRO_DESKTOP_BRIDGE_URL", "METRO_DESKTOP_BRIDGE_TOKEN", "NO_PROXY", "no_proxy", "ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] },
     "openUrl": { "schemes": ["https", "http"] },
     "picker": true,
     "clipboard": true,

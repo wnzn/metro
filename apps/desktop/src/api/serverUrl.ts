@@ -4,13 +4,18 @@
 // - only http: and https: URLs, without embedded credentials, query or fragment;
 // - plain http: works for every host, but the host decides how:
 //   - loopback (localhost, 127.0.0.0/8, ::1) and Tailscale (100.64.0.0/10,
-//     fd7a:115c:a1e0::/48, names ending in .ts.net) are used without asking:
-//     loopback never leaves this computer, and Tailscale encrypts the traffic
-//     between devices itself;
+//     fd7a:115c:a1e0::/48, names ending in .ts.net) are used without asking,
+//     but only while the request goes there directly (api/proxyEnv.ts):
+//     loopback then never leaves this computer, and Tailscale encrypts the
+//     traffic between devices itself. Through a proxy they are asked about
+//     like any other host;
 //   - any other host needs the person's informed, one-time confirmation for
 //     that exact server address first (`needsConsent`), because a bearer
 //     token would cross the network in clear text. Nothing is ever blocked.
 // - the result is the origin plus an optional base path, without a trailing slash.
+
+import { proxyEnv, reachedDirectly } from "./proxyEnv";
+import type { ProxyEnv } from "./proxyEnv";
 
 export const DEFAULT_SERVER_URL = "http://127.0.0.1:8787";
 
@@ -24,7 +29,9 @@ export type ServerUrlResult =
       loopback: boolean;
       /** The host's class (see `classifyHost`). */
       network: HostClass;
-      /** Plain http to a host that is neither loopback nor Tailscale: ask once before sending a token. */
+      /** Requests to it skip any proxy (see api/proxyEnv.ts). */
+      direct: boolean;
+      /** Plain http to a host that is neither loopback nor Tailscale, or to one reached through a proxy: ask once before sending a token. */
       needsConsent: boolean;
     }
   | { ok: false; error: string };
@@ -43,8 +50,9 @@ function isTsNetName(name: string): boolean {
   return labels !== "" && labels.split(".").every((l) => LABEL.test(l));
 }
 
+/** A canonical dotted quad only: resolvers read 077 as octal, 0x64 as hex and 100.64.1 as shorthand. */
 function ipv4(host: string): number[] | null {
-  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  const m = /^(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})$/.exec(host);
   if (!m) return null;
   const octets = m.slice(1).map(Number);
   return octets.every((n) => n <= 255) ? octets : null;
@@ -135,14 +143,21 @@ export function serverHost(baseUrl: string): string {
 }
 
 /** The one-time warning shown before a token goes over plain HTTP to a host that isn't loopback or Tailscale. */
-export function plainHttpWarning(baseUrl: string): string {
+export function plainHttpWarning(baseUrl: string, env: ProxyEnv = proxyEnv()): string {
+  const parsed = parseServerUrl(baseUrl, env);
+  if (parsed.ok && parsed.network !== "other") {
+    return (
+      `This connection goes through a proxy and isn't encrypted. The proxy, and anyone on the network between you and it, could read your sign-in token for ${serverHost(baseUrl)}. ` +
+      "Use it on networks you trust, such as Tailscale or a VPN."
+    );
+  }
   return (
     `This connection isn't encrypted. Anyone on the network between you and ${serverHost(baseUrl)} could read your sign-in token. ` +
     "Use it on networks you trust, such as Tailscale or a VPN."
   );
 }
 
-export function parseServerUrl(input: string): ServerUrlResult {
+export function parseServerUrl(input: string, env: ProxyEnv = proxyEnv()): ServerUrlResult {
   const raw = input.trim();
   if (!raw) return { ok: false, error: "Enter the server URL, for example " + DEFAULT_SERVER_URL + "." };
   if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) {
@@ -166,12 +181,14 @@ export function parseServerUrl(input: string): ServerUrlResult {
   }
   if (!url.hostname) return { ok: false, error: "The server URL has no host." };
   const network = classifyHost(url.hostname);
+  const direct = reachedDirectly(url.hostname, env);
   const path = url.pathname.replace(/\/+$/, "");
   return {
     ok: true,
     baseUrl: `${scheme}//${url.host}${path}`,
     loopback: network === "loopback",
     network,
-    needsConsent: scheme === "http:" && network === "other",
+    direct,
+    needsConsent: scheme === "http:" && (network === "other" || !direct),
   };
 }

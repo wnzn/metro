@@ -172,7 +172,20 @@ fn launches_the_packaged_ui_with_a_private_bridge_and_cleans_up() {
         Value::Null,
         "NSH_APP_DIR must not reach the UI"
     );
-    assert_eq!(r["no_proxy"], "example.com,127.0.0.1,localhost,::1");
+    // The person's entries and loopback first, then loopback and Tailscale in
+    // ureq's NO_PROXY syntax, so the UI reaches them without a proxy.
+    let mut expected = vec![
+        "example.com".to_string(),
+        "127.0.0.1".into(),
+        "localhost".into(),
+        "::1".into(),
+    ];
+    for e in metro_url_policy::direct_no_proxy_entries() {
+        if !expected.contains(&e) {
+            expected.push(e);
+        }
+    }
+    assert_eq!(r["no_proxy"], expected.join(","));
     assert_eq!(r["argv"], serde_json::json!([]));
     let ui_dir = std::fs::canonicalize(dir.join(UI_DIR)).unwrap();
     assert_eq!(Path::new(r["cwd"].as_str().unwrap()), ui_dir);

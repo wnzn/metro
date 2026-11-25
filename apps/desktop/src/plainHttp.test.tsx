@@ -5,7 +5,10 @@
 
 import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
+import vectors from "../../../crates/url-policy/testdata/host_vectors.json";
 import { BASE, TOKENS, world } from "../test/fakeServer";
+
+const LAUNCHER_NO_PROXY = (vectors as unknown as { launcher_no_proxy_entries: string[] }).launcher_no_proxy_entries.join(",");
 
 type F = ReturnType<typeof world>;
 type Req = { method: string; url: string; headers: Record<string, string>; body?: string | null };
@@ -24,10 +27,11 @@ function at(origin: string, server: F) {
   return network;
 }
 
-async function launch(storage: Record<string, string> = {}): Promise<App> {
+async function launch(storage: Record<string, string> = {}, env?: Record<string, string>): Promise<App> {
   const s = world();
   const network = { ...(s.network as any), ...at(LAN, s), ...at(TAILNET_IP, s), ...at(MAGIC_DNS, s) };
-  return open("../App.tsx", { network, platform: "linux", width: 1200, height: 820, storage });
+  const modules = env ? { modules: { process: { "default.env": env } } as any } : {};
+  return open("../App.tsx", { network, platform: "linux", width: 1200, height: 820, storage, ...modules });
 }
 
 async function fill(app: App, url: string, user = "alice") {
@@ -183,4 +187,19 @@ test("Add a server asks before signing in to a plain-HTTP host, and Forget drops
   await app.press("id:add-server-plain-http:cancel");
   await app.waitFor("id:add-server-submit");
   noTokensStored(app);
+});
+
+test("with a proxy configured, Tailscale is asked about unless the launcher's NO_PROXY sends it direct", async () => {
+  const proxied = await launch({}, { HTTPS_PROXY: "http://proxy.invalid:3128" });
+  await fill(proxied, TAILNET_IP);
+  await proxied.press("id:connect");
+  await proxied.waitFor("id:plain-http-consent");
+  expect(proxied.shows("text:This connection goes through a proxy and isn't encrypted. The proxy, and anyone on the network between you and it, could read your sign-in token for 100.101.102.103:8787. Use it on networks you trust, such as Tailscale or a VPN.")).toBe(true);
+  expect(sentTo(proxied, TAILNET_IP)).toBe(0);
+
+  const direct = await launch({}, { HTTPS_PROXY: "http://proxy.invalid:3128", NO_PROXY: "corp.example," + LAUNCHER_NO_PROXY });
+  await fill(direct, TAILNET_IP);
+  await direct.press("id:connect");
+  await direct.waitFor("id:account-menu");
+  expect(direct.shows("id:plain-http-consent")).toBe(false);
 });

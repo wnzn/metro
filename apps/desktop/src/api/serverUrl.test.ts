@@ -23,10 +23,10 @@ test("plain http works for every host; only hosts outside loopback and Tailscale
 });
 
 test("normalizes and rejects malformed URLs", () => {
-  expect(parseServerUrl(" http://127.0.0.1:8787/ ")).toEqual({ ok: true, baseUrl: "http://127.0.0.1:8787", loopback: true, network: "loopback", needsConsent: false });
-  expect(parseServerUrl("https://metro.example.com/api/")).toEqual({ ok: true, baseUrl: "https://metro.example.com/api", loopback: false, network: "other", needsConsent: false });
-  expect(parseServerUrl("http://100.101.102.103:8787/")).toEqual({ ok: true, baseUrl: "http://100.101.102.103:8787", loopback: false, network: "tailscale", needsConsent: false });
-  expect(parseServerUrl("http://192.168.1.5:8787")).toEqual({ ok: true, baseUrl: "http://192.168.1.5:8787", loopback: false, network: "other", needsConsent: true });
+  expect(parseServerUrl(" http://127.0.0.1:8787/ ")).toEqual({ ok: true, baseUrl: "http://127.0.0.1:8787", loopback: true, network: "loopback", direct: true, needsConsent: false });
+  expect(parseServerUrl("https://metro.example.com/api/")).toEqual({ ok: true, baseUrl: "https://metro.example.com/api", loopback: false, network: "other", direct: true, needsConsent: false });
+  expect(parseServerUrl("http://100.101.102.103:8787/")).toEqual({ ok: true, baseUrl: "http://100.101.102.103:8787", loopback: false, network: "tailscale", direct: true, needsConsent: false });
+  expect(parseServerUrl("http://192.168.1.5:8787")).toEqual({ ok: true, baseUrl: "http://192.168.1.5:8787", loopback: false, network: "other", direct: true, needsConsent: true });
   expect(parseServerUrl("").ok).toBe(false);
   expect(parseServerUrl("127.0.0.1:8787").ok).toBe(false);
   expect(parseServerUrl("ftp://127.0.0.1").ok).toBe(false);

@@ -144,6 +144,52 @@ pub fn plain_http_warning(scheme: &str, host: &str, what: &str) -> Option<String
     ))
 }
 
+/// `NO_PROXY` entries that make an HTTP client built on ureq 3 (NSH's
+/// `fetch`, and Metro runners up to 0.4.0) reach loopback and Tailscale hosts
+/// directly, in ureq's own syntax: an exact host, `.suffix` or `*suffix`, and
+/// `prefix.` or `prefix*`. ureq matches them against the URI's host as written
+/// (IPv6 in brackets) and knows no CIDR ranges, so the Tailscale ranges are
+/// spelled as prefixes of the canonical forms. A prefix such as `100.64.` also
+/// matches a DNS name that starts with it; that only means such a name is
+/// reached without the proxy.
+///
+/// A plain-HTTP destination counts as encrypted (Tailscale) or local
+/// (loopback) only while the bytes really go there directly: any transport
+/// that skips the warning for it must also skip proxies for it.
+pub fn direct_no_proxy_entries() -> Vec<String> {
+    let mut v: Vec<String> = ["localhost", "127.", "::1", "[::1]", ".ts.net", "*.ts.net."]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    v.extend((64..=127).map(|b| format!("100.{b}.")));
+    v.push("[fd7a:115c:a1e0:*".to_string());
+    v
+}
+
+/// Whether ureq 3 (3.4.2 in NSH 0.6.1, 3.5.2 in the 0.4.0 runner: the same
+/// code) would skip the proxy for `uri_host` given this `NO_PROXY` value.
+/// `uri_host` is the host as the URI carries it (IPv6 in brackets). For tests
+/// and for anything that must predict what such a client does.
+pub fn ureq_no_proxy_matches(no_proxy: &str, uri_host: &str) -> bool {
+    let host = uri_host.to_ascii_lowercase();
+    no_proxy.split(',').any(|entry| {
+        let e = entry.to_ascii_lowercase();
+        if e == "*" {
+            true
+        } else if let Some(suffix) = e.strip_prefix('*') {
+            host.ends_with(suffix)
+        } else if e.starts_with('.') {
+            host.ends_with(&e)
+        } else if let Some(prefix) = e.strip_suffix('*') {
+            host.starts_with(prefix)
+        } else if e.ends_with('.') {
+            host.starts_with(&e)
+        } else {
+            host == e
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,8 +284,7 @@ mod tests {
 
     #[test]
     fn shared_vectors() {
-        let doc: serde_json::Value =
-            serde_json::from_str(include_str!("../testdata/host_vectors.json")).unwrap();
+        let doc = vectors();
         let hosts = doc["hosts"].as_array().unwrap();
         assert!(hosts.len() >= 40);
         for v in hosts {
@@ -251,6 +296,63 @@ mod tests {
                 c => panic!("unknown class {c}"),
             };
             assert_eq!(classify_host(host), want, "{host:?}");
+        }
+    }
+
+    fn vectors() -> serde_json::Value {
+        serde_json::from_str(include_str!("../testdata/host_vectors.json")).unwrap()
+    }
+
+    #[test]
+    fn ureq_no_proxy_cases() {
+        let doc = vectors();
+        let cases = doc["no_proxy"].as_array().unwrap();
+        assert!(cases.len() >= 10);
+        for c in cases {
+            let (list, host) = (c["no_proxy"].as_str().unwrap(), c["host"].as_str().unwrap());
+            assert_eq!(
+                ureq_no_proxy_matches(list, host),
+                c["match"].as_bool().unwrap(),
+                "{list:?} / {host:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_entries_cover_every_canonical_direct_host() {
+        let list = direct_no_proxy_entries().join(",");
+        let doc = vectors();
+        let listed: Vec<String> = doc["launcher_no_proxy_entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            listed,
+            direct_no_proxy_entries(),
+            "update host_vectors.json"
+        );
+        for h in doc["direct_uri_hosts"].as_array().unwrap() {
+            let h = h.as_str().unwrap();
+            assert!(
+                classify_host(h).plain_http_ok(),
+                "{h} is not loopback or Tailscale"
+            );
+            assert!(
+                ureq_no_proxy_matches(&list, h),
+                "{h} would go through a proxy"
+            );
+        }
+        for h in [
+            "192.168.1.5",
+            "metro.example.com",
+            "100.63.0.1",
+            "100.128.0.1",
+            "[fd7a:115c:a1e1::1]",
+            "ts.net",
+        ] {
+            assert!(!ureq_no_proxy_matches(&list, h), "{h} would skip the proxy");
         }
     }
 
