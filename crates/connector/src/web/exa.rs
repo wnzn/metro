@@ -70,6 +70,7 @@ async fn call(
     let result = mcp::call_tool(&t, c.sessions, tool, args)
         .await
         .map_err(|e| error(c, e))?;
+    let result = super::checked(c, result)?;
     if result["isError"] == true {
         if result["_meta"][RATE_LIMITED_META] == true {
             return Err(Failure::of(Outcome::Limited));
@@ -77,7 +78,8 @@ async fn call(
         return Err(Failure::of(Outcome::Unavailable));
     }
     let text = result_text(&result);
-    if text.trim().is_empty() {
+    // Text, structured output, or both; neither is unusable.
+    if text.trim().is_empty() && !result["structuredContent"].is_object() {
         return Err(Failure::of(Outcome::BadResponse));
     }
     Ok((text, result))
@@ -131,7 +133,7 @@ pub(crate) async fn search(c: &Call<'_>, base: &str, r: &SearchReq) -> Result<An
     results.truncate(r.max_results as usize);
     Ok(Answer {
         results,
-        text: Some(text),
+        text: (!text.trim().is_empty()).then_some(text),
         ..Answer::default()
     })
 }
@@ -144,6 +146,9 @@ pub(crate) async fn fetch(c: &Call<'_>, base: &str, r: &FetchReq) -> Result<Answ
         json!({"urls": r.urls, "maxCharacters": MAX_PAGE_BYTES}),
     )
     .await?;
+    if text.trim().is_empty() {
+        return Err(Failure::of(Outcome::BadResponse));
+    }
     Ok(Answer {
         text: Some(text),
         ..Answer::default()

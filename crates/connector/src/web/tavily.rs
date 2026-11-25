@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use super::{
     Answer, Call, Failure, FetchReq, Hit, Outcome, Page, SearchReq, retry_after, str_of, transport,
-    vendor_json,
+    vendor_ok,
 };
 
 fn request(c: &Call<'_>, url: String, body: Value) -> reqwest::RequestBuilder {
@@ -49,7 +49,7 @@ async fn send(c: &Call<'_>, url: String, body: Value) -> Result<Value, Failure> 
     if !(200..300).contains(&status) {
         return Err(failure(c, status, resp.headers()));
     }
-    vendor_json(resp).await
+    vendor_ok(c, resp).await
 }
 
 pub(crate) async fn search(c: &Call<'_>, base: &str, r: &SearchReq) -> Result<Answer, Failure> {

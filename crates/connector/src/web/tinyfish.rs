@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use super::mcp::auth_header;
 use super::{
     Answer, Call, Failure, FetchReq, Hit, Outcome, Page, SearchReq, retry_after, str_of, transport,
-    until_utc_midnight, vendor_json,
+    until_utc_midnight, vendor_json, vendor_ok,
 };
 
 async fn failure(c: &Call<'_>, resp: reqwest::Response) -> Failure {
@@ -59,7 +59,7 @@ pub(crate) async fn search(c: &Call<'_>, base: &str, r: &SearchReq) -> Result<An
     if !resp.status().is_success() {
         return Err(failure(c, resp).await);
     }
-    let v = vendor_json(resp).await?;
+    let v = vendor_ok(c, resp).await?;
     let list = v["results"]
         .as_array()
         .ok_or(Failure::of(Outcome::BadResponse))?;
@@ -98,7 +98,7 @@ pub(crate) async fn fetch(c: &Call<'_>, base: &str, r: &FetchReq) -> Result<Answ
     if !resp.status().is_success() {
         return Err(failure(c, resp).await);
     }
-    let v = vendor_json(resp).await?;
+    let v = vendor_ok(c, resp).await?;
     let list = v["results"]
         .as_array()
         .ok_or(Failure::of(Outcome::BadResponse))?;

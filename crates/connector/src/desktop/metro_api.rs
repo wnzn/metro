@@ -164,6 +164,22 @@ impl MetroApi {
         Ok((id, t))
     }
 
+    /// Rotate the token of one of the person's web devices
+    /// (`POST /v1/web-devices/{id}/token`); 404 when it isn't theirs (any more).
+    pub async fn rotate_web_device(&self, id: &str) -> Result<Secret, ApiError> {
+        let (_, v) = self
+            .call(
+                reqwest::Method::POST,
+                &format!("/v1/web-devices/{id}/token"),
+            )
+            .await?;
+        let t = Secret::new(v.get("token").and_then(Value::as_str).unwrap_or_default());
+        validate_device_token(&t).map_err(|_| {
+            ApiError::Server("the Metro server returned no valid device token".into())
+        })?;
+        Ok(t)
+    }
+
     /// Remove one of the person's web search devices (revokes its token).
     pub async fn delete_web_device(&self, id: &str) -> Result<(), ApiError> {
         self.call(reqwest::Method::DELETE, &format!("/v1/web-devices/{id}"))

@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use super::{
     Answer, Call, Failure, FetchReq, Hit, Outcome, Page, SearchReq, retry_after, str_of, transport,
-    until_utc_midnight, vendor_json,
+    until_utc_midnight, vendor_json, vendor_ok,
 };
 
 fn request(c: &Call<'_>, url: String, body: Value) -> reqwest::RequestBuilder {
@@ -67,7 +67,7 @@ pub(crate) async fn search(c: &Call<'_>, base: &str, r: &SearchReq) -> Result<An
             .await
             .unwrap_or(Failure::of(Outcome::Unavailable)));
     }
-    let v = vendor_json(resp).await?;
+    let v = vendor_ok(c, resp).await?;
     let list = v["data"]["web"]
         .as_array()
         .or(v["data"].as_array())
@@ -128,7 +128,7 @@ pub(crate) async fn fetch(c: &Call<'_>, base: &str, r: &FetchReq) -> Result<Answ
             ));
             continue;
         }
-        let v = vendor_json(resp).await?;
+        let v = vendor_ok(c, resp).await?;
         let data = &v["data"];
         let code = data["metadata"]["statusCode"].as_u64().unwrap_or(200);
         if code == 404 {

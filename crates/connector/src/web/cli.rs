@@ -8,11 +8,11 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 
+use super::binding::{self, Binding};
 use super::{Endpoints, Engine, ProviderId, keys, settings};
-use crate::desktop::metro_api::MetroApi;
-use crate::fsutil::{read_private, read_secret_input, write_private};
+use crate::desktop::metro_api::{ApiError, MetroApi};
+use crate::fsutil::read_secret_input;
 use crate::metro::MetroClient;
 use crate::netpolicy::validate_base_url;
 use crate::profile::{Profile, root_dir, validate_device_token, validate_profile_name};
@@ -43,7 +43,6 @@ Default profile name: web.
 ";
 
 const DEFAULT_PROFILE: &str = "web";
-const DEVICE_FILE: &str = "web-device.json";
 
 #[derive(Default, Debug)]
 struct Args {
@@ -57,6 +56,8 @@ struct Args {
     positional: Vec<String>,
     /// The connector home (`root_dir()` when `None`); set by tests.
     root: Option<std::path::PathBuf>,
+    /// Tests: fail setup right before the binding is published.
+    fail_before_publish: bool,
 }
 
 fn parse(args: &[String]) -> Result<Args> {
@@ -96,20 +97,6 @@ fn parse(args: &[String]) -> Result<Args> {
     Ok(a)
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Device {
-    v: u32,
-    server_url: String,
-    #[serde(default)]
-    device_id: Option<String>,
-    /// Whose web search this is: `account:<stable id>` when Metro confirmed
-    /// the account at setup, else `device:<token fingerprint>`. Keys,
-    /// settings and cooldowns live under this owner only, so re-pairing a
-    /// profile for someone else never reuses the previous person's keys.
-    owner: String,
-}
-
 fn profile(a: &Args) -> Result<Profile> {
     let name = a.profile.clone().unwrap_or_else(|| DEFAULT_PROFILE.into());
     validate_profile_name(&name)?;
@@ -128,12 +115,15 @@ fn profile(a: &Args) -> Result<Profile> {
     Ok(p)
 }
 
-/// Where `d`'s keys, settings and cooldowns live: one private directory per
-/// (server, owner) inside the profile.
-fn data_dir(p: &Profile, d: &Device) -> Result<std::path::PathBuf> {
+/// Where `b`'s keys, settings and cooldowns live: one private directory per
+/// (server, owner) inside the profile. The owner is `account:<stable id>`
+/// when Metro confirmed the account at setup, else `device:<token
+/// fingerprint>`, so re-pairing a profile for someone else never reuses
+/// the previous person's keys.
+fn data_dir(p: &Profile, b: &Binding) -> Result<std::path::PathBuf> {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    for part in [d.server_url.as_str(), d.owner.as_str()] {
+    for part in [b.server_url.as_str(), b.owner.as_str()] {
         h.update((part.len() as u64).to_be_bytes());
         h.update(part.as_bytes());
     }
@@ -148,14 +138,14 @@ fn data_dir(p: &Profile, d: &Device) -> Result<std::path::PathBuf> {
     Ok(dir)
 }
 
-fn device(p: &Profile) -> Result<Device> {
-    let bytes = read_private(&p.dir.join(DEVICE_FILE), 16 * 1024)?.with_context(|| {
+/// The profile's binding: identity and credential from one record.
+fn device(p: &Profile) -> Result<Binding> {
+    binding::load(&p.dir)?.with_context(|| {
         format!(
             "web search isn't set up in profile {:?}; run `metro-connector web setup`",
             p.name
         )
-    })?;
-    serde_json::from_slice(&bytes).context("web-device.json is not valid")
+    })
 }
 
 fn provider(s: Option<&String>) -> Result<ProviderId> {
@@ -175,7 +165,10 @@ async fn setup(a: Args) -> Result<()> {
             .context("--server-url is required")?,
         "server_url",
     )?;
-    let (token, id, owner) = match (&a.session_token_file, &a.device_token_file) {
+    let existing = binding::load(&p.dir)?;
+    // `created`: a registration this setup made, removed again if the local
+    // part fails.
+    let (token, id, owner, api, created) = match (&a.session_token_file, &a.device_token_file) {
         (Some(f), None) => {
             let session = read_secret_input(f, "session token")?;
             let label = a.label.clone().unwrap_or_else(|| "metro-connector".into());
@@ -185,40 +178,66 @@ async fn setup(a: Args) -> Result<()> {
                 .me()
                 .await
                 .map_err(|e| anyhow::anyhow!("Metro didn't confirm the account: {e:?}"))?;
-            let (id, token) = api
-                .create_web_device(&label)
-                .await
-                .map_err(|e| anyhow::anyhow!("Metro refused to register this computer: {e:?}"))?;
-            (token, Some(id), format!("account:{account}"))
+            let owner = format!("account:{account}");
+            // The same person on the same server keeps one device: its
+            // token is rotated instead of registering another.
+            let reuse = existing
+                .as_ref()
+                .filter(|b| b.server_url == server && b.owner == owner)
+                .and_then(|b| b.device_id.clone());
+            let rotated = match reuse {
+                Some(id) => match api.rotate_web_device(&id).await {
+                    Ok(t) => Some((id, t)),
+                    Err(ApiError::NotFound) => None,
+                    Err(e) => bail!("Metro refused to renew this computer's token: {e:?}"),
+                },
+                None => None,
+            };
+            let (id, token, created) = match rotated {
+                Some((id, t)) => (id, t, false),
+                None => {
+                    let (id, t) = api.create_web_device(&label).await.map_err(|e| {
+                        anyhow::anyhow!("Metro refused to register this computer: {e:?}")
+                    })?;
+                    (id, t, true)
+                }
+            };
+            (token, Some(id), owner, Some(api), created)
         }
         (None, Some(f)) => {
-            // Nobody's account is confirmed: never take over a profile that
-            // is already set up (its keys may be someone else's).
-            if p.dir.join(DEVICE_FILE).exists() {
+            // Nobody's account is confirmed: never take over a profile
+            // that is already set up (its keys may be someone else's).
+            if existing.is_some() {
                 bail!(
                     "profile {:?} is already set up for web search; use another --profile, or \
-                     --session-token-file so Metro confirms whose it is",
+                         --session-token-file so Metro confirms whose it is",
                     p.name
                 );
             }
             let t = read_secret_input(f, "device token")?;
             validate_device_token(&t)?;
             let fp = super::keys::fingerprint(&t);
-            (t, None, format!("device:{fp}"))
+            (t, None, format!("device:{fp}"), None, false)
         }
         _ => bail!("give exactly one of --session-token-file and --device-token-file"),
     };
-    p.save_device_token(&server, &token)?;
-    let d = Device {
-        v: 1,
-        server_url: server.clone(),
-        device_id: id.clone(),
-        owner,
+    let publish = || -> Result<()> {
+        let b = Binding::new(&server, &owner, id.clone(), token)?;
+        let dir = data_dir(&p, &b)?;
+        let s = settings::load(&dir)?;
+        settings::save(&dir, &s)?;
+        if a.fail_before_publish {
+            bail!("setup interrupted (test)");
+        }
+        // One atomic write: identity and credential together.
+        binding::save(&p.dir, &b)
     };
-    write_private(&p.dir.join(DEVICE_FILE), &serde_json::to_vec_pretty(&d)?)?;
-    let dir = data_dir(&p, &d)?;
-    let s = settings::load(&dir)?;
-    settings::save(&dir, &s)?;
+    if let Err(e) = publish() {
+        if let (true, Some(api), Some(id)) = (created, &api, &id) {
+            let _ = api.delete_web_device(id).await;
+        }
+        return Err(e);
+    }
     say(format!(
         "Web search is set up in profile {:?} for {server}{}. Run `metro-connector web run --profile {}`.",
         p.name,
@@ -231,9 +250,8 @@ async fn setup(a: Args) -> Result<()> {
 async fn run(a: Args) -> Result<i32> {
     let p = profile(&a)?;
     let d = device(&p)?;
-    let token = p.device_token_for(&d.server_url)?;
     let engine = Engine::new(&data_dir(&p, &d)?, Endpoints::from_env()?)?;
-    let client = MetroClient::new(&d.server_url, token, Duration::from_secs(30))?;
+    let client = MetroClient::new(&d.server_url, d.token().clone(), Duration::from_secs(30))?;
     let poll = std::env::var(crate::cli::ENV_POLL_MS)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -469,6 +487,7 @@ async fn command(cmd: &str, a: Args) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fsutil::write_private;
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
@@ -495,19 +514,42 @@ mod tests {
 
     use axum::Router;
     use axum::http::HeaderMap;
+    use axum::response::IntoResponse;
     use axum::routing::{get, post};
     use serde_json::{Value, json};
 
     const KEY: &str = "alice-tavily-key-123456";
 
-    async fn fakes() -> (String, Arc<Mutex<Vec<Option<String>>>>) {
-        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
-        let who = |h: &HeaderMap| match h.get("authorization").and_then(|v| v.to_str().ok()) {
+    #[derive(Default)]
+    struct FakeMetro {
+        /// device id -> owner
+        devices: std::collections::HashMap<String, String>,
+        created: u32,
+        rotated: u32,
+        deleted: Vec<String>,
+    }
+
+    fn who(h: &HeaderMap) -> Option<&'static str> {
+        match h.get("authorization").and_then(|v| v.to_str().ok()) {
             Some("Bearer tok-alice") => Some("alice"),
             Some("Bearer tok-bob") => Some("bob"),
             _ => None,
-        };
-        let n = Arc::new(Mutex::new(0u32));
+        }
+    }
+
+    /// A token that names its owner: `metro_pc_` + `aa…`/`bb…` + a counter.
+    fn token_of(owner: &str, n: u32) -> String {
+        let tag = if owner == "alice" { "aa" } else { "bb" };
+        format!("metro_pc_{tag}{n:062x}")
+    }
+
+    type Metro = Arc<Mutex<FakeMetro>>;
+
+    async fn fakes() -> (String, Arc<Mutex<Vec<Option<String>>>>, Metro) {
+        use axum::extract::Path as P;
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+        let metro: Metro = Arc::default();
+        let (m1, m2, m3) = (metro.clone(), metro.clone(), metro.clone());
         let s2 = seen.clone();
         let app = Router::new()
             .route(
@@ -518,15 +560,50 @@ mod tests {
             )
             .route(
                 "/v1/web-devices",
-                post(move || {
-                    let n = n.clone();
+                post(move |h: HeaderMap| {
+                    let m = m1.clone();
                     async move {
-                        let mut n = n.lock().unwrap();
-                        *n += 1;
-                        (
-                            axum::http::StatusCode::CREATED,
-                            axum::Json(json!({"id": format!("wd_{:032x}", *n), "token": format!("metro_pc_{:064x}", *n)})),
-                        )
+                        let owner = who(&h).unwrap_or("nobody").to_owned();
+                        let mut m = m.lock().unwrap();
+                        m.created += 1;
+                        let id = format!("wd_{:032x}", m.created);
+                        m.devices.insert(id.clone(), owner.clone());
+                        let token = token_of(&owner, m.created);
+                        (axum::http::StatusCode::CREATED, axum::Json(json!({"id": id, "token": token})))
+                            .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/v1/web-devices/{id}/token",
+                post(move |h: HeaderMap, P(id): P<String>| {
+                    let m = m2.clone();
+                    async move {
+                        let owner = who(&h).unwrap_or("nobody");
+                        let mut m = m.lock().unwrap();
+                        if m.devices.get(&id).map(String::as_str) != Some(owner) {
+                            return axum::http::StatusCode::NOT_FOUND.into_response();
+                        }
+                        m.rotated += 1;
+                        let token = token_of(owner, 1000 + m.rotated);
+                        (axum::http::StatusCode::CREATED, axum::Json(json!({"token": token})))
+                            .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/v1/web-devices/{id}",
+                axum::routing::delete(move |h: HeaderMap, P(id): P<String>| {
+                    let m = m3.clone();
+                    async move {
+                        let owner = who(&h).unwrap_or("nobody");
+                        let mut m = m.lock().unwrap();
+                        if m.devices.get(&id).map(String::as_str) != Some(owner) {
+                            return axum::http::StatusCode::NOT_FOUND;
+                        }
+                        m.devices.remove(&id);
+                        m.deleted.push(id);
+                        axum::http::StatusCode::NO_CONTENT
                     }
                 }),
             )
@@ -545,7 +622,7 @@ mod tests {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", l.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
-        (base, seen)
+        (base, seen, metro)
     }
 
     fn args(root: &std::path::Path, v: &[&str]) -> Args {
@@ -576,7 +653,7 @@ mod tests {
 
     #[tokio::test]
     async fn re_pairing_for_another_account_never_reuses_the_previous_keys() {
-        let (base, seen) = fakes().await;
+        let (base, seen, _) = fakes().await;
         let t = tempfile::tempdir().unwrap();
         let root = t.path().join("home");
         let file = |name: &str, v: &str| {
@@ -660,5 +737,128 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn session_files(t: &std::path::Path) -> (String, String) {
+        let file = |name: &str, v: &str| {
+            let p = t.join(name);
+            write_private(&p, format!("{v}\n").as_bytes()).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        (file("sa", "tok-alice"), file("sb", "tok-bob"))
+    }
+
+    /// The account a token was issued for, by its tag.
+    fn token_owner(b: &Binding) -> &'static str {
+        if b.token().expose().starts_with("metro_pc_aa") {
+            "account:alice"
+        } else {
+            "account:bob"
+        }
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_re_pair_keeps_one_whole_identity_and_cleans_up() {
+        let (base, _, metro) = fakes().await;
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("home");
+        let (alice, bob) = session_files(t.path());
+        let setup = |session: &str| {
+            args(
+                &root,
+                &["--server-url", &base, "--session-token-file", session],
+            )
+        };
+        assert_eq!(command("setup", setup(&alice)).await.unwrap(), 0);
+        let mut a = setup(&bob);
+        a.fail_before_publish = true;
+        assert!(command("setup", a).await.is_err());
+        let p = profile(&args(&root, &[])).unwrap();
+        let b = device(&p).unwrap();
+        assert_eq!(b.owner, "account:alice");
+        assert_eq!(
+            token_owner(&b),
+            "account:alice",
+            "identity and token from one record"
+        );
+        // Bob's registration made by the failed setup was removed again.
+        let m = metro.lock().unwrap();
+        assert_eq!(m.created, 2);
+        assert_eq!(m.deleted, vec![format!("wd_{:032x}", 2)]);
+        assert_eq!(m.devices.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_setup_for_the_same_account_keeps_one_device() {
+        let (base, _, metro) = fakes().await;
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("home");
+        let (alice, bob) = session_files(t.path());
+        let setup = |session: &str| {
+            args(
+                &root,
+                &["--server-url", &base, "--session-token-file", session],
+            )
+        };
+        for _ in 0..3 {
+            assert_eq!(command("setup", setup(&alice)).await.unwrap(), 0);
+        }
+        {
+            let m = metro.lock().unwrap();
+            assert_eq!((m.created, m.rotated, m.devices.len()), (1, 2, 1));
+        }
+        let p = profile(&args(&root, &[])).unwrap();
+        assert_eq!(
+            device(&p).unwrap().device_id,
+            Some(format!("wd_{:032x}", 1))
+        );
+        // Another account gets its own device; Alice's isn't Bob's to rotate.
+        assert_eq!(command("setup", setup(&bob)).await.unwrap(), 0);
+        assert_eq!(metro.lock().unwrap().created, 2);
+        // The device was removed in Metro meanwhile: setup registers anew.
+        metro.lock().unwrap().devices.clear();
+        assert_eq!(command("setup", setup(&bob)).await.unwrap(), 0);
+        assert_eq!(metro.lock().unwrap().created, 3);
+    }
+
+    #[test]
+    fn a_reader_during_rebinds_never_sees_a_mixed_identity() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().to_path_buf();
+        crate::fsutil::ensure_private_dir(&dir).unwrap();
+        let rec = |who: &str, n: u32| {
+            Binding::new(
+                "https://m.example",
+                &format!("account:{who}"),
+                Some(format!("wd_{n}")),
+                crate::Secret::new(token_of(who, n)),
+            )
+            .unwrap()
+        };
+        binding::save(&dir, &rec("alice", 0)).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (dir, stop) = (dir.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut n = 1;
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    let who = if n % 2 == 0 { "alice" } else { "bob" };
+                    binding::save(&dir, &rec(who, n)).unwrap();
+                    n += 1;
+                }
+            })
+        };
+        let mut seen = std::collections::HashSet::new();
+        let start = std::time::Instant::now();
+        let mut reads = 0;
+        while (reads < 2000 || seen.len() < 2) && start.elapsed() < Duration::from_secs(30) {
+            let b = binding::load(&dir).unwrap().unwrap();
+            assert_eq!(token_owner(&b), b.owner, "mixed identity");
+            seen.insert(b.owner.clone());
+            reads += 1;
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        writer.join().unwrap();
+        assert_eq!(seen.len(), 2, "both identities were observed");
     }
 }

@@ -90,6 +90,10 @@ impl Fixture {
             headers,
             body,
         });
+        let request_id =
+            serde_json::from_str::<Value>(&self.seen.lock().unwrap().last().unwrap().body)
+                .ok()
+                .and_then(|v| v["id"].as_u64());
         let scripted = {
             let mut s = self.script.lock().unwrap();
             rpc.as_ref()
@@ -104,7 +108,7 @@ impl Fixture {
             (None, Some("initialize")) => {
                 let mut r = reply(
                     200,
-                    json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": {"name": "fixture"}}}),
+                    json!({"jsonrpc": "2.0", "id": 2, "result": {"protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": {"name": "fixture"}}}),
                 );
                 if let Some(s) = self.mcp_session.lock().unwrap().clone() {
                     r.headers.push(("mcp-session-id", s));
@@ -118,6 +122,14 @@ impl Fixture {
             },
             _ => reply(500, json!({"error": "unscripted"})),
         };
+        // Scripted JSON-RPC replies say `"id":2` for "the id of this
+        // request"; any other id is sent as written.
+        let mut r = r;
+        if let Some(id) = request_id {
+            let text =
+                String::from_utf8_lossy(&r.body).replace("\"id\":2", &format!("\"id\":{id}"));
+            r.body = text.into_bytes();
+        }
         let mut resp = (StatusCode::from_u16(r.status).unwrap(), r.body).into_response();
         for (k, v) in r.headers {
             resp.headers_mut().insert(k, v.parse().unwrap());
@@ -1154,4 +1166,132 @@ fn private_hosts_match_the_shared_table_the_server_uses() {
     for u in PUBLIC_URL_SAMPLES {
         assert!(public_url(u).is_ok(), "{u}");
     }
+}
+
+#[tokio::test]
+async fn a_key_echoed_at_a_truncation_boundary_or_as_a_prefix_is_refused() {
+    let s = Setup::new(&[ProviderId::Tavily, ProviderId::Exa]).await;
+    s.key(ProviderId::Tavily, CANARY);
+    s.key(ProviderId::Exa, CANARY);
+    // The snippet is cut at 1,000 characters: only "canar" would survive the
+    // cut, so the check must run on the answer as read.
+    let snippet = format!("{}{CANARY}", "x".repeat(995));
+    s.fixture.push(
+        "/tavily/search",
+        reply(
+            200,
+            json!({"results": [{"title": "t", "url": "https://a.example/", "content": snippet}]}),
+        ),
+    );
+    // Exa structured output echoing only three quarters of the key.
+    let prefix = &CANARY[..(CANARY.len() * 3).div_ceil(4).max(16)];
+    s.fixture.push(
+        "/exa#tools/call",
+        reply(200, json!({"jsonrpc": "2.0", "id": 2, "result": {"content": [],
+            "structuredContent": {"results": [{"url": "https://b.example/", "title": format!("p {prefix}")}]}}})),
+    );
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(
+        outcomes(&v),
+        vec![
+            o("tavily", "key", "bad_response"),
+            o("exa", "key", "bad_response")
+        ]
+    );
+    assert!(!v.to_string().contains("canar"), "{v}");
+    // A short coincidental overlap is not a reflection.
+    assert!(!reflects(&json!({"t": &CANARY[..8]}), &Secret::new(CANARY)));
+}
+
+#[tokio::test]
+async fn structured_only_mcp_answers_are_accepted() {
+    let s = Setup::new(&[ProviderId::Exa]).await;
+    s.fixture.push(
+        "/exa#tools/call",
+        reply(
+            200,
+            json!({"jsonrpc": "2.0", "id": 2, "result": {"content": [],
+            "structuredContent": {"results": [{"url": "https://e.example/", "title": "E"}]}}}),
+        ),
+    );
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(v["provider"], "exa", "{v}");
+    assert_eq!(v["results"][0]["url"], "https://e.example/");
+    assert!(v.get("text").is_none());
+
+    let p = Setup::new(&[ProviderId::Parallel]).await;
+    p.fixture.push(
+        "/parallel#tools/call",
+        reply(200, json!({"jsonrpc": "2.0", "id": 2, "result": {"content": [],
+            "structuredContent": {"results": [{"url": "https://p.example/", "title": "P", "excerpts": ["x"]}]}}})),
+    );
+    let v = p.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(v["provider"], "parallel", "{v}");
+    assert_eq!(v["results"][0]["url"], "https://p.example/");
+    // Neither text nor structure: unusable.
+    p.now.store(NOW + 3600, std::sync::atomic::Ordering::SeqCst);
+    p.fixture.push(
+        "/parallel#tools/call",
+        reply(
+            200,
+            json!({"jsonrpc": "2.0", "id": 2, "result": {"content": []}}),
+        ),
+    );
+    let v = p.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(outcomes(&v), vec![o("parallel", "keyless", "bad_response")]);
+}
+
+#[tokio::test]
+async fn mcp_replies_must_answer_the_request_id_and_overlapping_calls_get_their_own() {
+    let s = Setup::new(&[ProviderId::Exa]).await;
+    // A reply to some other request (single JSON, batch, SSE) is not ours.
+    s.fixture.push(
+        "/exa#tools/call",
+        reply(200, json!({"jsonrpc": "2.0", "id": 777777, "result": {"content": [{"type": "text", "text": EXA_TEXT}]}})),
+    );
+    let engine = s.engine();
+    let v = engine.rotate("j", &search("q"), deadline()).await;
+    assert_eq!(outcomes(&v), vec![o("exa", "keyless", "bad_response")]);
+    s.now.store(NOW + 3600, std::sync::atomic::Ordering::SeqCst);
+    s.fixture.push(
+        "/exa#tools/call",
+        reply(200, json!([{"jsonrpc": "2.0", "id": 777777, "result": {"content": [{"type": "text", "text": "x"}]}}])),
+    );
+    let v = engine.rotate("j", &search("q"), deadline()).await;
+    assert_eq!(outcomes(&v), vec![o("exa", "keyless", "bad_response")]);
+    s.now.store(NOW + 7200, std::sync::atomic::Ordering::SeqCst);
+    s.fixture.push(
+        "/exa#tools/call",
+        reply(200, json!({"jsonrpc": "2.0", "id": 2, "result": {"content": [{"type": "text", "text": "x"}]}, "error": {"code": 1}})),
+    );
+    let v = engine.rotate("j", &search("q"), deadline()).await;
+    assert_eq!(
+        outcomes(&v),
+        vec![o("exa", "keyless", "bad_response")],
+        "result and error"
+    );
+
+    // Two overlapping calls on one session carry distinct ids.
+    s.now
+        .store(NOW + 10_800, std::sync::atomic::Ordering::SeqCst);
+    s.fixture.push("/exa#tools/call", mcp_result("first"));
+    s.fixture.push("/exa#tools/call", mcp_sse("second"));
+    let (q1, q2) = (search("q1"), search("q2"));
+    let (a, b) = tokio::join!(
+        engine.rotate("a", &q1, deadline()),
+        engine.rotate("b", &q2, deadline())
+    );
+    assert_eq!(
+        (a["provider"].clone(), b["provider"].clone()),
+        (json!("exa"), json!("exa"))
+    );
+    let ids: Vec<u64> = s
+        .fixture
+        .seen_at("/exa")
+        .iter()
+        .filter(|r| r.json()["method"] == "tools/call" || r.json()["method"] == "initialize")
+        .filter_map(|r| r.json()["id"].as_u64())
+        .collect();
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), ids.len(), "ids reused: {ids:?}");
 }

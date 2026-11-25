@@ -32,9 +32,18 @@ struct Session {
 
 /// Cached MCP sessions, by `provider:mode:key-fingerprint`.
 #[derive(Default)]
-pub struct Sessions(Mutex<HashMap<String, Session>>);
+pub struct Sessions(
+    Mutex<HashMap<String, Session>>,
+    std::sync::atomic::AtomicU64,
+);
 
 impl Sessions {
+    /// A request id never used before by this client, so overlapping calls
+    /// on one session (and their replies) can't be confused.
+    fn next_id(&self) -> u64 {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+    }
+
     fn get(&self, key: &str) -> Option<Session> {
         let mut m = self.0.lock().unwrap_or_else(|p| p.into_inner());
         m.retain(|_, s| s.at.elapsed() < SESSION_TTL);
@@ -128,8 +137,9 @@ async fn post(
         let v: Value = serde_json::from_slice(&bytes).map_err(|_| McpError::Bad)?;
         // A batch is allowed by older servers: find ours.
         match v {
-            Value::Array(list) => list.into_iter().find(|m| m["id"] == json!(want)),
-            v => Some(v),
+            Value::Array(list) => list.into_iter().find(|m| response_to(m, want)),
+            v if response_to(&v, want) => Some(v),
+            _ => return Err(McpError::Bad),
         }
     };
     Ok(Reply {
@@ -214,8 +224,7 @@ async fn read_sse(resp: &mut reqwest::Response, want: u64) -> Result<Option<Valu
                 }
                 for data in parser.push(&chunk) {
                     if let Ok(v) = serde_json::from_str::<Value>(&data)
-                        && v["id"] == json!(want)
-                        && (v.get("result").is_some() || v.get("error").is_some())
+                        && response_to(&v, want)
                     {
                         return Ok(Some(v));
                     }
@@ -229,6 +238,14 @@ async fn read_sse(resp: &mut reqwest::Response, want: u64) -> Result<Option<Valu
     }
 }
 
+/// Whether `v` is a JSON-RPC 2.0 response to request `want`: that id, and
+/// exactly one of `result` and `error`.
+fn response_to(v: &Value, want: u64) -> bool {
+    v["jsonrpc"] == "2.0"
+        && v["id"] == json!(want)
+        && (v.get("result").is_some() != v.get("error").is_some())
+}
+
 fn status_error(r: &Reply, now: u64) -> McpError {
     McpError::Status {
         code: r.status,
@@ -236,16 +253,17 @@ fn status_error(r: &Reply, now: u64) -> McpError {
     }
 }
 
-async fn initialize(t: &Target<'_>) -> Result<Session, McpError> {
+async fn initialize(t: &Target<'_>, ids: &Sessions) -> Result<Session, McpError> {
+    let id = ids.next_id();
     let init = json!({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "jsonrpc": "2.0", "id": id, "method": "initialize",
         "params": {
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {},
             "clientInfo": {"name": "metro-connector", "version": env!("CARGO_PKG_VERSION")}
         }
     });
-    let r = post(t, None, &init, Some(1)).await?;
+    let r = post(t, None, &init, Some(id)).await?;
     if !(200..300).contains(&r.status) {
         return Err(status_error(&r, t.now));
     }
@@ -285,21 +303,22 @@ pub async fn call_tool(
     tool: &str,
     arguments: Value,
 ) -> Result<Value, McpError> {
-    let body = json!({
-        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-        "params": {"name": tool, "arguments": arguments}
-    });
     let mut retried = false;
     loop {
         let session = match sessions.get(&t.cache_key) {
             Some(s) => s,
             None => {
-                let s = initialize(t).await?;
+                let s = initialize(t, sessions).await?;
                 sessions.put(&t.cache_key, s.clone());
                 s
             }
         };
-        let r = post(t, Some(&session), &body, Some(2)).await?;
+        let id = sessions.next_id();
+        let body = json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": tool, "arguments": &arguments}
+        });
+        let r = post(t, Some(&session), &body, Some(id)).await?;
         if r.status == 404 && session.id.is_some() && !retried {
             // The server forgot the session: start a new one, once.
             sessions.drop_key(&t.cache_key);

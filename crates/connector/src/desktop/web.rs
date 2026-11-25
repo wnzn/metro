@@ -21,7 +21,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -30,29 +29,23 @@ use super::core::{BridgeError, WorkerState, err};
 use super::metro_api::{ApiError, MetroApi};
 use super::monitoring::{EventKind, Events};
 use super::store;
-use crate::fsutil::{read_private, remove_private, write_private};
 use crate::metro::MetroClient;
 use crate::profile::Profile;
 use crate::run::{RunOptions, RunState, Stop};
 use crate::secret::clean_line;
+use crate::web::binding::{self, Binding};
 use crate::web::{self, Endpoints, Engine, Mode, ProviderId, keys, settings};
 use crate::{SafeError, Secret};
 
 /// The pseudo connection id the web profile name is derived from.
 const WEB_PROFILE: &str = "web-search";
-const DEVICE_FILE: &str = "web-device.json";
 /// Web jobs this computer runs at once.
 pub const WORKERS: usize = web::WORKERS_PER_DEVICE;
 
 type R<T> = Result<T, BridgeError>;
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DeviceBinding {
-    v: u32,
-    server_url: String,
-    account_id: String,
-    device_id: String,
+fn owner(account: &str) -> String {
+    format!("account:{account}")
 }
 
 #[derive(Default)]
@@ -148,10 +141,13 @@ impl WebSearch {
         Ok(p)
     }
 
-    fn binding(p: &Profile, server: &str, account: &str) -> Option<DeviceBinding> {
-        let bytes = read_private(&p.dir.join(DEVICE_FILE), 16 * 1024).ok()??;
-        let b: DeviceBinding = serde_json::from_slice(&bytes).ok()?;
-        (b.v == 1 && b.server_url == server && b.account_id == account).then_some(b)
+    /// This profile's binding, only when it is exactly (server, account):
+    /// identity and token from the same record.
+    fn binding(p: &Profile, server: &str, account: &str) -> Option<Binding> {
+        binding::load(&p.dir)
+            .ok()
+            .flatten()
+            .filter(|b| b.token_for(server, &owner(account)).is_ok() && b.device_id.is_some())
     }
 
     fn engine(&self, p: &Profile) -> R<Arc<Engine>> {
@@ -178,10 +174,8 @@ impl WebSearch {
         account: &str,
         session: &Secret,
     ) -> R<String> {
-        if let Some(b) = Self::binding(p, server, account)
-            && p.device_token_for(server).is_ok()
-        {
-            return Ok(b.device_id);
+        if let Some(id) = Self::binding(p, server, account).and_then(|b| b.device_id) {
+            return Ok(id);
         }
         let api = MetroApi::new(server, session.clone()).map_err(api_err)?;
         let (id, token) = api
@@ -195,17 +189,14 @@ impl WebSearch {
                 ),
                 e => api_err(e),
             })?;
-        p.save_device_token(server, &token)
-            .map_err(|e| local(e, "The device token can't be saved"))?;
-        let b = DeviceBinding {
-            v: 1,
-            server_url: server.into(),
-            account_id: account.into(),
-            device_id: id.clone(),
-        };
-        let json = serde_json::to_vec_pretty(&b).map_err(|e| local(e.into(), "encoding"))?;
-        write_private(&p.dir.join(DEVICE_FILE), &json)
-            .map_err(|e| local(e, "The web device can't be saved"))?;
+        // One atomic record; a registration that can't be saved here is
+        // removed again so it doesn't linger in Metro.
+        let saved = Binding::new(server, &owner(account), Some(id.clone()), token)
+            .and_then(|b| binding::save(&p.dir, &b));
+        if let Err(e) = saved {
+            let _ = api.delete_web_device(&id).await;
+            return Err(local(e, "The web device can't be saved"));
+        }
         Ok(id)
     }
 
@@ -220,15 +211,17 @@ impl WebSearch {
         let mut problem = None;
         if let Some(b) = Self::binding(p, server, account) {
             match MetroApi::new(server, session.clone()) {
-                Ok(api) => match api.delete_web_device(&b.device_id).await {
+                Ok(api) => match api
+                    .delete_web_device(b.device_id.as_deref().unwrap_or_default())
+                    .await
+                {
                     Ok(()) | Err(ApiError::NotFound) => {}
                     Err(e) => problem = Some(api_err(e).message),
                 },
                 Err(e) => problem = Some(api_err(e).message),
             }
         }
-        let _ = remove_private(&p.dir.join(DEVICE_FILE));
-        let _ = remove_private(&p.dir.join("device-token"));
+        let _ = binding::remove(&p.dir);
         problem
     }
 
@@ -361,9 +354,9 @@ impl WebSearch {
             ));
             return Err(e);
         }
-        let token = p
-            .device_token_for(server)
-            .map_err(|e| local(e, "The device token can't be read"))?;
+        let token = Self::binding(&p, server, account)
+            .map(|b| b.token().clone())
+            .ok_or_else(|| err(500, "local_error", "The device token can't be read"))?;
         self.spawn(server, token, engine);
         Ok(())
     }
@@ -457,8 +450,8 @@ impl WebSearch {
             "enabled": s.enabled,
             "notice_acknowledged": s.notice_acknowledged,
             "device": {
-                "paired": b.is_some() && p.device_token_for(server).is_ok(),
-                "id": b.map(|b| b.device_id),
+                "paired": b.is_some(),
+                "id": b.and_then(|b| b.device_id),
                 "worker": worker,
                 "detail": detail,
             },

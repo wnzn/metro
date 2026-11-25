@@ -25,6 +25,7 @@
 //! - **Logs** name the job, operation, provider, mode and outcome only:
 //!   never a query, URL, key or body.
 
+pub mod binding;
 pub mod cli;
 pub mod keys;
 pub mod mcp;
@@ -526,6 +527,19 @@ fn answer_json(op: &Op, answer: Answer) -> Value {
 /// lower hex, `+` or `%20` for spaces) and base64 (standard and URL-safe, at
 /// each of the three byte alignments a longer encoded value could put it in).
 pub(crate) fn key_forms(key: &str) -> Vec<String> {
+    let mut out = encoded_forms(key);
+    // A truncated echo still leaks most of the key: a long prefix counts
+    // too (at least 16 characters, or three quarters of the key).
+    let n = 16.max((key.len() * 3).div_ceil(4));
+    if n < key.len() && key.is_char_boundary(n) {
+        out.extend(encoded_forms(&key[..n]));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn encoded_forms(key: &str) -> Vec<String> {
     use base64::Engine as _;
     use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
     let mut out = vec![key.to_owned()];
@@ -1023,6 +1037,20 @@ pub(crate) fn transport(e: &reqwest::Error) -> Failure {
     } else {
         Failure::of(Outcome::Unavailable)
     }
+}
+
+/// A vendor's successful answer as read, before any field is cut or
+/// reshaped: refused when it carries the request's key (see [`reflects`]).
+pub(crate) fn checked(c: &Call<'_>, v: Value) -> Result<Value, Failure> {
+    match c.key {
+        Some(k) if reflects(&v, k) => Err(Failure::of(Outcome::BadResponse)),
+        _ => Ok(v),
+    }
+}
+
+/// [`vendor_json`] for a successful answer: read, then [`checked`].
+pub(crate) async fn vendor_ok(c: &Call<'_>, resp: reqwest::Response) -> Result<Value, Failure> {
+    checked(c, vendor_json(resp).await?)
 }
 
 /// Read a vendor JSON body (capped); anything unreadable is `bad_response`.
