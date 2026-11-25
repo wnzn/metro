@@ -251,6 +251,16 @@ def updates(server, runner, timeout):
         # A real runner with rollback due and a missing previous executable
         # must persist intent and exit before sending even its first claim.
         pending = root / ".update-pending.json"
+        for raw, mode in [(b"{bad journal", 0o600), (b"unprotected journal", 0o666)]:
+            pending.write_bytes(raw)
+            pending.chmod(mode)
+            failed = subprocess.run([root / "current" / "metro-runner"], env=runner_env,
+                                    capture_output=True, text=True, timeout=remaining(deadline))
+            require(failed.returncode == 75 and "unreadable or malformed" in failed.stderr,
+                    "runner did not fail closed on a damaged pending record")
+            require(pending.read_bytes() == raw, "runner modified a damaged pending record")
+            require(runner_view()["presence"]["seen_at"] is None, "the failed runner sent a claim")
+            pending.unlink()
         pending.write_text(json.dumps({"version": 1, "from": "0.9.0", "to": OLD,
                                        "attempts": 3, "rolling_back": False}))
         pending.chmod(0o600)
@@ -317,7 +327,7 @@ def updates(server, runner, timeout):
         require(not (root / ".update-pending.json").exists(), "a pending update was left behind")
         for child, label in children:
             require(child.poll() is None, f"{label} exited")
-    print(f"PASS: verified check and notice; owner-only request; failed rollback preparation sent no claim; "
+    print(f"PASS: verified check and notice; owner-only request; damaged pending journals and failed rollback preparation sent no claim; "
           f"runner self-updated {OLD} → {GOOD} in place; "
           f"crashing {BAD} rolled back after {restarts} restarts and reported start_failed.")
 

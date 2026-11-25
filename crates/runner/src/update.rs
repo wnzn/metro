@@ -724,8 +724,10 @@ pub fn on_start(root: &Path, own: &Version) -> io::Result<StartAction> {
         Ok(Some(p)) => p,
         Ok(None) => return Ok(StartAction::Continue),
         Err(()) => {
-            eprintln!("metro-runner: warning: {PENDING} is malformed; left untouched");
-            return Ok(StartAction::Continue);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the pending update record is unreadable or malformed; it was left untouched",
+            ));
         }
     };
     let own_name = own.to_string();
@@ -1347,17 +1349,18 @@ mod tests {
             let root = dir.path();
             fs::write(root.join(PENDING), raw).unwrap();
             assert!(read_pending(root).is_err());
-            assert!(matches!(on_start(root, &new).unwrap(), StartAction::Continue));
+            assert_eq!(on_start(root, &new).err().unwrap().kind(), io::ErrorKind::InvalidData);
             assert_eq!(fs::read(root.join(PENDING)).unwrap(), raw, "untouched");
             assert_eq!(read_current(root), Some(new));
         }
         // Well-formed but about another state of the install (`current` was
         // moved by a manual install): no action, nothing deleted.
-        let dir = managed("0.5.0");
+        let other = Version::parse("0.6.0").unwrap();
+        let dir = managed("0.6.0");
         let root = dir.path();
         pending(root, MAX_STARTS);
         assert!(matches!(
-            on_start(root, &new).unwrap(),
+            on_start(root, &other).unwrap(),
             StartAction::Continue
         ));
         assert_eq!(read_pending(root).unwrap().unwrap().attempts, MAX_STARTS);
