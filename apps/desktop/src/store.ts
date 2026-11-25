@@ -309,8 +309,11 @@ export function adoptConnection(prepared: PreparedConnection, opts: { remember?:
       const current = guard();
       void enterSpace(initial.id, { place: "chat", spaceId: null }).then(() => {
         // A running tick reads the active room after any refreshLists await.
-        // Navigation away may also have scheduled a tick for another view.
-        if (current() && !ticking && (basePlace() === "space" || timer === undefined)) kick();
+        if (!current() || ticking) return;
+        const stillTarget = basePlace() === "space" && activeSpaceId() === initial.id && activeRoomId() !== null && view() === "room";
+        // Don't wake a different Space. If no loop started, kick it anyway
+        // (for example, membership was refused and we fell back to Chat).
+        if (stillTarget || timer === undefined) kick();
       });
     } else {
       kick();
