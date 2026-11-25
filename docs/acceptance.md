@@ -112,6 +112,28 @@ It did not run builds, runtime tests, live services, or release checks.
 The updater results below belong to the earlier cuts named there;
 they are not acceptance for this source.
 
+The first docs review was checked against that same cutoff and the local
+`v0.4.0` tag at `1a743e59d4ec6c1da85d09d92c99457561f64e55`. The tagged
+source lists six Settings sections, including Monitoring. Its workflows
+distinguish unattended `windows-2025` MSI and connector fixture checks
+from the earlier Wine GUI smoke tests. Neither is a GUI verification
+by a person on native Windows. No runtime checks were rerun.
+
+**Runtime copy follow-ups for UX (no code change in this pass):**
+
+- Web Search and About & updates → Privacy use singular provider
+  wording and refer to “this computer.” Explain that each contacted
+  provider sees its request, the server relays the job and bounded
+  results, and the serving device may be another online device of the
+  same account. Align Model choices' privacy summary, and don't promise
+  that adding a free key raises a vendor's limits.
+- Model connections' **Test and save** explains when the endpoint
+  changes, but not that the test sends the configured key to the
+  candidate even if the save fails. Disclose that before the test.
+- The Page confirmation shows the clicked action and says the choice
+  is remembered for that page version. Say explicitly that it also
+  covers other buttons in the version.
+
 **Documentation follow-ups, after integration:**
 
 - Unified Space settings (U9): update owner/member navigation,
@@ -2477,6 +2499,10 @@ server connection and sign-in weren't tested.
 **Not shown:** launching, rendering, input or sign-in on native Windows.
 
 ## Not demonstrated
+
+This is the historical gap list from the local QA cut, not the release
+status. See the [0.4.0 release record](#published-metro-040-2026-11-25-github-release-v040)
+for subsequent publication and native CI evidence.
 
 - Deployment behind a real OIDC provider (Ory Hydra, Authelia or authentik).
   Auth is covered by `crates/auth`'s tests against a local stand-in provider.

@@ -24,8 +24,9 @@ who can manage a page can restore it from **Recently deleted** within
 
 - A **personal page** is visible only to its owner, with no org-admin
   bypass. Its agent button runs as the owner and posts the result only
-  to the page, never into personal Chat or a Space room. Personal pages
-  cannot run schedules from buttons.
+  to the page, never into Personal Chat or a Space room. It has no web
+  tools, even if Personal Chat web search is on. Personal pages cannot
+  run schedules from buttons.
 - A **Space page** is visible only to current members of that Space. The
   creator (while a member) and the Space owner can manage and edit it.
   **Members can edit** grants members editing rights, not the right to
@@ -36,11 +37,20 @@ who can manage a page can restore it from **Recently deleted** within
   already read. Draft previews never execute actions.
 - Actions run as the person clicking. A Space page can ask a named
   agent in one of its own top-level rooms or run one of the clicker's
-  own scheduled tasks for such a room. If someone else authored the
-  action, Metro asks for confirmation and remembers your choice for that
-  page version. For a schedule, Metro checks the task revision shown
-  before accepting the confirmation. Check the prompt, destination and
-  model scope before agreeing.
+  own scheduled tasks for such a room.
+- If you didn't author the action and haven't confirmed that page
+  version, Metro asks for confirmation. **Confirming one action grants
+  consent for the whole page version.** Other agent and schedule
+  buttons on that version can then run when clicked without another
+  version-consent prompt. Review the page as well as the prompt,
+  destination, and model scope in the confirmation. Consent doesn't
+  run the other buttons by itself or carry over to a new version.
+- Each click still checks the current page version, the clicker's
+  access, and the action's destination. Running a schedule still
+  requires the clicker to own it and pass the task's checks. The desktop
+  submits the displayed task revision on schedule clicks; Metro
+  requires the reviewed revision when confirming a schedule and checks
+  any supplied revision even if the page version was already approved.
 
 ## Daily briefs
 
@@ -49,12 +59,17 @@ The **Daily brief** template collects an agent answer in a page block.
 only the answer from its own page button. A Space brief follows the latest
 answer from its selected room and agent, including replies from scheduled
 prompts there. It is not limited to outputs of one particular task.
+An answer block explicitly linked to a Page button is different: it
+shows runs started from that button, not later scheduled room replies.
 
 For a matching Space brief, choose **Keep this answer fresh…**, then
 **Open task form** to open a prefilled scheduled prompt. This works only
 with a top-level room and the Space's default agent. Choose the
 schedule and time zone and save the task yourself;
 opening the form schedules nothing. The task runs as its creator.
+The schedule asks the Space's default agent at run time; a **Run agent**
+button asks the agent named in that button as the clicker. See
+[web-search permissions](web-search.md) for what each run can use.
 The page's regular data refresh reads the latest data while the page is
 visible; it doesn't start agent runs.
 

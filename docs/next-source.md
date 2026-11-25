@@ -48,9 +48,13 @@ theme controls but no preview gallery.
 On a server-stored connection that supports custom endpoints, its owner
 can open **Endpoint → Change… → Test and save**. The new URL must exactly
 match a URL approved by the operator in `METRO_PROVIDER_ALLOWED_BASE_URLS`.
-Metro tests the destination before saving and refuses a stale edit instead
-of overwriting a newer change. A failed test leaves the old endpoint in
-place; a failed model-list refresh after a successful save doesn't undo it.
+**Test and save** sends a test request to that candidate URL **before**
+saving, using the connection's configured API key if it has one. Use
+only a destination you trust with that key. A failed test or save can
+leave the old endpoint in place, but it can't take back a key the
+candidate already received. Metro refuses a stale edit instead of
+overwriting a newer change. A failed model-list refresh after a
+successful save doesn't undo the endpoint change.
 Changing a shared connection changes where borrowers' requests go, without
 giving them access to the endpoint URL or credentials. This is not a change
 to device-connection or web-search provider authentication.

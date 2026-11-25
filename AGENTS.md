@@ -120,8 +120,10 @@ The rules below describe the current source. For behaviour added after
     through the API, encrypted at rest with the operator's master key, and
     never logged or returned. Custom base URLs must match an entry in
     `METRO_PROVIDER_ALLOWED_BASE_URLS` exactly. Only the owner can change
-    a supported endpoint; test the new URL before committing, and don't
-    overwrite a concurrent change or expose the endpoint to borrowers.
+    a supported endpoint. Testing sends the configured key, if any, to
+    the approved candidate before the save. A rejected save cannot undo
+    that disclosure. Don't overwrite a concurrent change or expose the
+    endpoint to borrowers.
 - The providers shown to users are only those the build implements.
   Server-side adapters come from the compiled Rig catalog. Don't claim a
   provider, a vendor sign-in flow or plan limits that nobody has verified, and
@@ -253,25 +255,30 @@ The rules below describe the current source. For behaviour added after
   and no fallback is used. A scheduled prompt counts as the creator
   explicitly asking the agent (in a Space, its default agent, never
   classified).
-- **Web search and fetch** run on the initiator's own web device, never
-  on a server, runner or borrowed connection's device. The computer's
+- **Web search and fetch** run on the initiator's most recently seen
+  online web device on that server, never on the server itself, a runner
+  or a borrowed connection's device. The computer's
   switch is on by default with a notice. A Space owner enables each tool
   in its agent allowlist; personal Chat has a separate per-account opt-in
   for both, off by default. Provider choices and keys stay on the
-  computer; keys are sent only to their provider. Failed attempts can
-  rotate to another eligible provider, but a rejected saved key never
-  silently falls back to keyless for that provider. Run activity shows
-  the provider attempts, and room readers can see the exact queries and
-  URLs. Fetch only public URLs a person wrote in the conversation or a
-  search earlier in the same run returned. If the device is offline,
-  report the tool failure; a scheduled prompt may answer without web data.
+  computer; keys go only to their provider, never to Metro. The server
+  relays job arguments and bounded results. Each contacted provider
+  receives a request, even if it fails; a rejected saved key never
+  silently falls back to keyless for that provider. Room readers can see
+  exact accepted queries and URLs, provider attempts and summaries,
+  not raw tool output. Fetch only public URLs a person wrote in the
+  conversation or a search earlier in the same run returned. If no
+  paired device is online at call time, report the tool failure.
+  A scheduled prompt may answer without web data if its model is usable.
 - **Pages** are validated Page TSX, not executable user code. Reads are
   as the viewer; Space pages see only their own Space, and personal
   pages have no admin bypass. Actions run as the clicker. Personal-page
-  runs are page-only and cannot target Chat or a Space; Space actions are
-  limited to that Space's top-level rooms. Confirm actions authored by
-  someone else per page version, and check the task revision shown on a
-  schedule confirmation. Space Page tools are opt-in per agent, run
+  runs are page-only with no web tools and cannot target Chat or a Space;
+  Space actions are limited to that Space's top-level rooms. Consent
+  from one button covers the entire page version, not just that button.
+  Each click still checks the current version, access and destination;
+  schedules also check the reviewed task revision as applicable.
+  Space Page tools are opt-in per agent, run
   as the initiator, and return only room-safe data. Proposal cards are
   visible in the room; the draft is private to the initiator and applies
   only after they act with current edit rights. The organization limits
@@ -349,10 +356,11 @@ The rules below describe the current source. For behaviour added after
   read-only local tools (`workspace.list`/`workspace.read`) never stand in
   for an operator's separately installed runner. It and the other features
   checked in the 0.2.0 Linux candidate are described as verified in that
-  local candidate, never as released. Anything still unchecked (native
-  Windows, real vendor accounts and sign-ins) is labelled as such. A
-  deployment's own address (such as a dev LAN host) is never a documented
-  default.
+  local candidate, never as released. Keep unattended native Windows CI
+  checks separate from earlier Wine attempts and the still-unverified
+  native GUI by a person. Real vendor accounts and sign-ins remain
+  unverified. A deployment's own address (such as a dev LAN host) is
+  never a documented default.
 - **Metro server transport** in the current source: prefer HTTPS or SSH
   forwarding. The desktop and `/admin` require informed consent before
   sending a token over ordinary plain HTTP; runner and CLI clients warn

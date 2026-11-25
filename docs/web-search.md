@@ -9,21 +9,39 @@ providers. The switch and provider choices are local, not shared from the
 server. The switch is on by default with a notice; **Got it** acknowledges
 that notice, not a requirement to authorize each search.
 
+For each permitted search or fetch, the Metro server picks the run
+starter's most recently seen online web device on that server. That's
+not necessarily the computer where you clicked Send or opened Settings.
+The selected device uses its local provider order, switches, and keys
+for your account. The model connection doesn't determine which web
+device is chosen.
+
 - **In a Space:** The Space owner enables `web_search` and `web_fetch`
   separately for each agent in its tool allowlist. Both are off by default
-  there. The tools use the computer and providers of the person who
-  started the run, not the Space owner or the owner of a shared model
-  connection.
+  there.
 - **In Personal Chat:** **Allow web search in personal Chat** is a
   separate account preference on that server, **off by default**. It
   permits both search and fetch. Turning it on doesn't change the switch
-  on this computer or any Space permissions; the computer still needs to
-  be ready. Clients can read or set it at `/v1/web-search/prefs` with
-  `GET` or `PUT` (`{"personal_chat":true}` or `{"personal_chat":false}`).
-- **When the computer is unavailable:** Web work fails visibly; Metro
-  won't use another person's computer, the server, or a runner in its
-  place. A scheduled prompt can still answer without fresh web data if
-  its model connection is usable. Activity says why web access failed.
+  on this computer or any Space permissions. Clients can read or set it
+  at `/v1/web-search/prefs` with `GET` or `PUT` (`{"personal_chat":true}`
+  or `{"personal_chat":false}`).
+- **Scheduled prompts and Pages:** A scheduled prompt uses its creator's
+  web devices and the permissions of its destination: Personal Chat's
+  opt-in or the Space's current default agent's allowlist. A Space Page
+  button that asks a named agent starts a room run as the clicker, with
+  that agent's permissions and the clicker's web devices. A button that
+  runs a saved schedule follows the schedule's rules. A personal Page's
+  agent run has no web tools, even if the owner opted in for Personal
+  Chat. See [Daily briefs](pages.md#daily-briefs) for which replies a page
+  can display.
+
+If no device is paired, the agent is told web tools aren't available.
+If there is a paired device but none is online when a tool is called,
+the tool fails visibly in activity. Metro never sends the job to a
+different account, a runner, or a server-side web provider. A run,
+including a scheduled prompt, can still answer without fresh web data
+if its model connection is usable. This does not make an offline model
+connection usable.
 
 ## Providers and keys
 
@@ -55,15 +73,30 @@ quotas. Run activity shows the attempts and which provider answered.
 **Test provider** sends the fixed query “Metro web search test” to that
 provider only, in the current mode; it can consume credits.
 
-## What leaves your computer
+## Who receives queries and results
 
-Search queries and page addresses go to the provider that serves them.
-Providers see the originating connection's IP address and, with a saved
-key, can associate requests with your account or charge it. Exact queries
-and fetch URLs from Space runs are visible in activity to current members
-who can read the conversation. Activity records a result summary and
-provider outcomes, not the fetched page text. The model can receive
-bounded results to help answer the request.
+- **The Metro server** relays the tool request to the selected web device
+  and receives a bounded result and provider outcomes back. Search
+  arguments can include the query, keywords, and a result limit; fetch
+  arguments include page URLs and may include a focus. Web provider keys
+  are never uploaded to Metro.
+- **Each contacted provider** receives the query or URLs it is asked to
+  handle, with any extra fields its adapter sends. That includes
+  providers tried before the one that answers, even if they reject the
+  request or don't return usable results. Skipped providers aren't
+  contacted. Each provider sees the originating connection's IP address
+  and, if using its saved key, can associate or charge the request to
+  your account.
+- **The answering model** can receive bounded search snippets or fetched
+  page text as tool output for that run. The tool output isn't added to
+  later conversation history; a model reply can still quote or summarize
+  it.
+- **Conversation activity** records accepted tool arguments, including
+  the exact query or fetch URLs, and a short result summary with provider
+  outcomes. It can show titles, URLs and failure reasons, but not
+  snippets or fetched page text as tool results. Space members who can
+  read the room can see this activity; Personal Chat activity is private
+  to that account in the app.
 
 Fetching is limited to public URLs a person wrote in the conversation or
 a search earlier in the same run returned. Internal destinations are

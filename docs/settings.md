@@ -5,8 +5,7 @@ This guide uses the published 0.4.0 Settings. For the reorganized
 and [About & updates](updates.md), see the source-only guides. They don't
 describe the 0.4.0 app.
 
-The desktop app's **Settings** opens as a window over the app, with five
-sections in this order (as verified in the 0.2.0 Linux candidate):
+In 0.4.0, **Settings** opens over the app, with six sections in this order:
 
 | Section | What it's for |
 | --- | --- |
@@ -14,10 +13,10 @@ sections in this order (as verified in the 0.2.0 Linux candidate):
 | **Runners** | Your registered runners; see [runners.md](runners.md) |
 | **Model providers** | Your model connections, described on this page |
 | **Model routing** | Opt-in use-case routing and personal Chat classification (Spaces have their own opt-in, in each Space's settings); see [system-one.md](system-one.md#how-a-message-reaches-the-agent) |
+| **Monitoring** | Recent events from one source at a time: this computer's helper, My Chat, one owned Space, or the server for org admins |
 | **Appearance** | Color scheme, [below](#appearance) |
 
-Since 0.3.2, **Settings** is still a
-sidebar entry with these sections. **Model providers** also holds
+Open **Settings** from the sidebar. **Model providers** also holds
 **Documents & media**, where you choose the media model that indexes and
 searches your files ([library.md](library.md#in-the-desktop-app)). That
 choice was checked in a native Linux GTK run, in dark and light themes, of the source after 0.2.0 (before 0.3.2; not of the release files). Your account is in the sidebar's account row.
@@ -274,10 +273,11 @@ key. The server relays each request to your machine and the answer back.
 > Verified in a packaged Linux build against a local test endpoint
 > ([acceptance](acceptance.md)): you consent before pairing, you never see
 > or enter a device token, only the models you approve are offered, and
-> replies kept working after signing out and after a restart. No real
-> vendor account or vendor sign-in (such as Sign in with ChatGPT) has been
-> tested, and nor has native Windows. The standalone `metro-connector` CLI remains
-> contributor tooling
+> replies kept working after signing out and after a restart. The 0.4.0
+> release CI ran native Windows connector sign-in and credential-storage
+> fixtures, not a person using the desktop sign-in UI. No real vendor
+> account or vendor sign-in (such as Sign in with ChatGPT) is recorded.
+> The standalone `metro-connector` CLI remains contributor tooling
 > ([development.md](development.md#metro-connector-developer-cli)).
 >
 > Vendor software stays separate. Metro never installs, updates or signs in
