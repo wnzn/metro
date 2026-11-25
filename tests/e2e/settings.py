@@ -362,12 +362,19 @@ def exercise_runners(stack, call, alice, bob, runner, state, env, port, children
     require(worker_post(port, deadline, dedicated, protocol=None)[0] == 401,
             "explicit detachment did not revoke the dedicated credential")
 
+    def without_update_fields(view):
+        # `presence` and `update` are display-only runner data (covered by
+        # crates/server/tests/updates.rs); every view must carry them.
+        require(isinstance(view.get("presence"), dict) and isinstance(view.get("update"), dict),
+                "runner view lacks presence/update")
+        return {k: v for k, v in view.items() if k not in ("presence", "update")}
+
     def attach(owner, space):
         attached = call(owner, "PUT", f"{space}/runner", body={"runner_id": org_id},
                         read_json=True)["runner"]
-        require(attached == {
+        require(without_update_fields(attached) == {
             "id": org_id, "kind": "registered", "visibility": "organization", "name": "Shared runner",
-        } and attached == space_runner(owner, space),
+        } and without_update_fields(attached) == without_update_fields(space_runner(owner, space)),
                 "registered runner attachment was not reflected in the Space")
 
     for owner, space in ((alice, alice_space), (bob, bob_space)):
