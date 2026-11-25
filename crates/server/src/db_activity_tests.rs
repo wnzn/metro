@@ -301,6 +301,33 @@ fn matches_the_reference_on_mixed_history_in_both_scopes() {
     }
 }
 
+/// The same, with the history written across several starts: turn ids
+/// recur after each pass, so later passes run above the mark.
+#[test]
+fn matches_the_reference_across_several_starts() {
+    let tables = ["space_events", "personal_events"];
+    for seed in 11..=14 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh(dir.path());
+        for round in 0..5 {
+            let (before, orphans) = {
+                let c = Connection::open(&path).unwrap();
+                seed_mixed(&c, seed * 100 + round, 80);
+                (
+                    tables.map(|t| rows(&c, t)),
+                    tables.map(|t| reference_orphans(&c, t)),
+                )
+            };
+            drop(Db::open(&path).unwrap());
+            let c = Connection::open(&path).unwrap();
+            for (i, t) in tables.iter().enumerate() {
+                assert_reconciled(&before[i], &rows(&c, t), &orphans[i]);
+                assert_eq!(mark(&c, t), Some(seq(&c, t).to_string()));
+            }
+        }
+    }
+}
+
 #[test]
 fn only_the_latest_event_of_a_turn_in_its_own_scope_counts() {
     let dir = tempfile::tempdir().unwrap();
@@ -474,6 +501,19 @@ fn unreadable_or_legacy_activity_neither_fails_startup_nor_is_made_up() {
         "INSERT INTO personal_events (user_id, kind, actor, text, created_at, activity)
          VALUES ('alice', 'activity', 'agent', '', 1, jsonb(?1))",
         [act("chat_blob", "started")],
+    )
+    .unwrap();
+    // Blobs that aren't strictly valid JSONB: a bad header, an object whose
+    // header is fine but whose content isn't (passes json_valid's
+    // superficial check, yet json_extract rejects it), and a real start cut
+    // short.
+    c.execute_batch(
+        "INSERT INTO personal_events (user_id, kind, actor, text, created_at, activity)
+         VALUES ('alice', 'activity', 'agent', '', 1, x'ff00'), ('alice', 'activity', 'agent', '', 1, x'1cff');
+         INSERT INTO space_events (space_id, room_id, kind, actor, text, created_at, activity)
+         SELECT space_id, room_id, kind, actor, text, created_at,
+                substr(jsonb(activity), 1, length(jsonb(activity)) - 3)
+         FROM space_events WHERE activity = '{\"id\":\"run_odd\",\"phase\":\"started\"}';",
     )
     .unwrap();
     // A real open turn and a real closed turn whose end is unreadable.
@@ -770,21 +810,19 @@ fn grouped_history_reconciles_in_linear_time() {
         let c = Connection::open(&path).unwrap();
         for s in &ACTIVITY_SCOPES {
             let plan: Vec<String> = c
-                .prepare(&format!(
-                    "EXPLAIN QUERY PLAN SELECT MAX(id) FROM {t} WHERE kind = 'activity' AND id > 0
-                       AND CASE WHEN json_valid(activity, 6) THEN json_extract(activity, '$.id') END IS NOT NULL
-                     GROUP BY {scope}, json_extract(activity, '$.id')",
-                    t = s.table,
-                    scope = s.scope
-                ))
+                .prepare(&format!("EXPLAIN QUERY PLAN {}", orphaned_starts_sql(s)))
                 .unwrap()
-                .query_map([], |r| r.get::<_, String>(3))
+                .query_map([0], |r| r.get::<_, String>(3))
                 .unwrap()
                 .collect::<rusqlite::Result<_>>()
                 .unwrap();
             assert!(
                 plan.iter()
                     .any(|p| p.contains(&format!("{}_activity", s.table))),
+                "{plan:?}"
+            );
+            assert!(
+                plan.iter().any(|p| p.contains("INTEGER PRIMARY KEY")),
                 "{plan:?}"
             );
             assert!(!plan.iter().any(|p| p.contains("CORRELATED")), "{plan:?}");

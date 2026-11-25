@@ -1269,41 +1269,50 @@ const ACTIVITY_SCOPES: [ActivityScope; 2] = [
 /// server), so it can't be read back.
 type OrphanedStart = ([String; 2], Option<String>, String, Option<String>);
 
-/// The started event of each turn in `s.table` whose latest lifecycle
-/// event is that start, among turns with an `activity` event above `after`,
+/// The query behind [`orphaned_starts`], with `?1` the high-water mark:
+/// the started event of each turn in `s.table` whose latest lifecycle event
+/// is that start, among turns with an `activity` event above the mark,
 /// oldest first.
 ///
 /// A turn is the scope columns plus `json_extract(activity, '$.id')`, the
 /// same comparison as before this pass was set-based. `activity` that
-/// SQLite can't read as JSON belongs to no turn (it was never written by
-/// this server), and so does one without an id; neither ends a turn nor is
-/// interrupted, and neither can make startup fail.
-fn orphaned_starts(
-    conn: &Connection,
-    s: &ActivityScope,
-    after: i64,
-) -> rusqlite::Result<Vec<OrphanedStart>> {
+/// isn't JSON5 text (canonical JSON included) or strictly valid JSONB
+/// belongs to no turn (this server never writes it), and so does one
+/// without an id; neither ends a turn nor is interrupted, and neither can
+/// make startup fail.
+fn orphaned_starts_sql(s: &ActivityScope) -> String {
     let scope_cols = if s.table == "space_events" {
         "e.space_id, e.room_id"
     } else {
         "e.user_id, ''"
     };
-    // 6 = JSON5 text (which includes canonical JSON) or a JSONB blob: what
-    // json_extract reads. The guard comes first, so json_extract never sees
-    // anything it would reject.
-    let sql = format!(
+    // json_valid flags (SQLite 3.45+; the bundled one is newer): 0x02 JSON5
+    // text, 0x08 strictly valid JSONB. Text that fails it would make
+    // json_extract raise "malformed JSON"; the strict JSONB check, unlike the
+    // superficial one (0x04), also keeps corrupt blobs out. The CASE keeps
+    // json_extract from seeing a row that fails it, and only rows that pass
+    // reach the GROUP BY and the outer json_extract.
+    format!(
         "SELECT {scope_cols}, e.activity, e.actor, e.actor_id
          FROM (SELECT MAX(id) AS last FROM {t}
                WHERE kind = 'activity' AND id > ?1
-                 AND CASE WHEN json_valid(activity, 6) THEN json_extract(activity, '$.id') END IS NOT NULL
+                 AND CASE WHEN json_valid(activity, 10) THEN json_extract(activity, '$.id') END IS NOT NULL
                GROUP BY {scope}, json_extract(activity, '$.id')) m
          JOIN {t} e ON e.id = m.last
          WHERE json_extract(e.activity, '$.phase') = 'started'
          ORDER BY e.id",
         t = s.table,
         scope = s.scope,
-    );
-    let mut stmt = conn.prepare(&sql)?;
+    )
+}
+
+/// The rows of [`orphaned_starts_sql`] above `after`.
+fn orphaned_starts(
+    conn: &Connection,
+    s: &ActivityScope,
+    after: i64,
+) -> rusqlite::Result<Vec<OrphanedStart>> {
+    let mut stmt = conn.prepare(&orphaned_starts_sql(s))?;
     let rows = stmt.query_map([after], |r| {
         Ok((
             [r.get::<_, String>(0)?, r.get::<_, String>(1)?],
@@ -1338,6 +1347,12 @@ fn orphaned_starts(
 /// that is above the sequence (it was reset), is ignored and the whole
 /// table is scanned again. Everything, the mark included, is written in one
 /// transaction, so a crash at any point leaves either nothing or all of it.
+///
+/// Known limit: a start that can't be read back as an [`Activity`] is
+/// skipped (and counted in one warning), and once it is below the mark no
+/// later start looks at it again. That only matters if a future build reads
+/// activity more permissively; such a build must change the mark keys
+/// (`activity_reconciled_through:*`) so its first start scans everything.
 fn interrupt_orphaned_activity(conn: &Connection) -> rusqlite::Result<()> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let now = now_ms();
@@ -1345,6 +1360,7 @@ fn interrupt_orphaned_activity(conn: &Connection) -> rusqlite::Result<()> {
         let a: Activity = serde_json::from_str(activity).ok()?;
         serde_json::to_string(&a.at(activity::INTERRUPTED)).ok()
     };
+    let mut unreadable = 0_usize;
     for s in &ACTIVITY_SCOPES {
         let sequence = |tx: &Transaction<'_>| -> rusqlite::Result<i64> {
             Ok(tx
@@ -1375,6 +1391,7 @@ fn interrupt_orphaned_activity(conn: &Connection) -> rusqlite::Result<()> {
         let mut stmt = tx.prepare(s.insert)?;
         for (ids, activity, actor, actor_id) in orphans {
             let Some(json) = activity.as_deref().and_then(interrupted) else {
+                unreadable += 1;
                 continue;
             };
             stmt.execute(params![ids[0], ids[1], actor, actor_id, now, json])?;
@@ -1389,7 +1406,14 @@ fn interrupt_orphaned_activity(conn: &Connection) -> rusqlite::Result<()> {
             )?;
         }
     }
-    tx.commit()
+    tx.commit()?;
+    if unreadable > 0 {
+        tracing::warn!(
+            count = unreadable,
+            "left turns open at startup whose started event can't be read as activity"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn new_event(
