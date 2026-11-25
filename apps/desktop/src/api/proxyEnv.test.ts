@@ -19,6 +19,12 @@ test("matches NO_PROXY like ureq 3 (shared cases with metro-url-policy)", () => 
   }
 });
 
+test("a Unicode look-alike NO_PROXY entry does not skip consent for a Tailscale host", () => {
+  const r = parseProxyRoute({ METRO_PROXY_ROUTE: "proxied", METRO_PROXY_DIRECT_FOR: "\u212abox.ts.net" });
+  const url = parseServerUrl("http://kbox.ts.net:8787", r);
+  expect(url.ok && url.network === "tailscale" && !url.direct && url.needsConsent).toBe(true);
+});
+
 test("behind a proxy only exact listed hosts go direct: loopback, and what the person listed", () => {
   const r = parseProxyRoute({ METRO_PROXY_ROUTE: "proxied", METRO_PROXY_DIRECT_FOR: "corp.example,box.tail1234.ts.net," + LAUNCHER });
   for (const h of doc.loopback_uri_hosts) expect(reachedDirectly(h, r)).toBe(true);

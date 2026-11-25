@@ -189,10 +189,10 @@ pub fn proxy_route(get: impl Fn(&str) -> Option<String>, windows: bool) -> &'sta
     }
 }
 
-/// Whether ureq 3 (3.4.2 in NSH 0.6.1, 3.5.2 in the 0.4.0 runner: the same
-/// code) would skip the proxy for `uri_host` given this `NO_PROXY` value.
-/// `uri_host` is the host as the URI carries it (IPv6 in brackets). For tests
-/// and for anything that must predict what such a client does.
+/// Whether ureq would skip the proxy, for a canonical ASCII `uri_host`
+/// (IPv6 in brackets, no port). Source: `NoProxy::try_from_env` and
+/// `NoProxyEntry` in ureq 3.4.2 `src/proxy.rs` (NSH 0.6.1). Those routines
+/// are identical in ureq 3.5.2, whose public matcher checks the shared cases.
 pub fn ureq_no_proxy_matches(no_proxy: &str, uri_host: &str) -> bool {
     let host = uri_host.to_ascii_lowercase();
     no_proxy.split(',').any(|entry| {
@@ -333,10 +333,24 @@ mod tests {
         assert!(cases.len() >= 10);
         for c in cases {
             let (list, host) = (c["no_proxy"].as_str().unwrap(), c["host"].as_str().unwrap());
+            let want = c["match"].as_bool().unwrap();
             assert_eq!(
                 ureq_no_proxy_matches(list, host),
-                c["match"].as_bool().unwrap(),
+                want,
                 "{list:?} / {host:?}"
+            );
+            // Same entries as NoProxy::try_from_env, without modifying the
+            // process environment while other tests are running.
+            let mut builder = ureq::Proxy::builder(ureq::ProxyProtocol::Http).host("proxy.invalid");
+            for entry in list.split(',') {
+                builder = builder.no_proxy(entry);
+            }
+            let uri: ureq::http::Uri = format!("http://{host}:8787/").parse().unwrap();
+            assert_eq!(uri.host(), Some(host));
+            assert_eq!(
+                builder.build().unwrap().is_no_proxy(&uri),
+                want,
+                "ureq: {list:?} / {host:?}"
             );
         }
     }

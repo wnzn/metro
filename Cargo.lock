@@ -1678,6 +1678,7 @@ name = "metro-url-policy"
 version = "0.4.0"
 dependencies = [
  "serde_json",
+ "ureq",
 ]
 
 [[package]]

@@ -35,12 +35,21 @@ export function parseProxyRoute(env: Record<string, string | undefined>): ProxyR
   return { route, directFor: typeof env.METRO_PROXY_DIRECT_FOR === "string" ? env.METRO_PROXY_DIRECT_FOR : "" };
 }
 
-/** ureq 3's NO_PROXY matching (see metro_url_policy::ureq_no_proxy_matches). */
+// ureq folds ASCII only. In particular "\u212a".toLowerCase() is "k" in JS.
+function asciiLower(value: string): string {
+  return value.replace(/[A-Z]/g, (c) => c.toLowerCase());
+}
+
+/**
+ * ureq 3.4.2 src/proxy.rs (NoProxy::try_from_env and NoProxyEntry).
+ * The host is the canonical ASCII URL hostname, with IPv6 brackets and no
+ * port. Entries are split on commas, not trimmed or parsed as authorities.
+ */
 export function ureqNoProxyMatches(noProxy: string, uriHost: string): boolean {
-  if (noProxy === "") return false;
-  const host = uriHost.toLowerCase();
+  if (!uriHost || /[^\x00-\x7f]/.test(uriHost)) return false;
+  const host = asciiLower(uriHost);
   return noProxy.split(",").some((entry) => {
-    const e = entry.toLowerCase();
+    const e = asciiLower(entry);
     if (e === "*") return true;
     if (e.startsWith("*")) return host.endsWith(e.slice(1));
     if (e.startsWith(".")) return host.endsWith(e);

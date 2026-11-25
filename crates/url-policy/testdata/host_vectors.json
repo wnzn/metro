@@ -454,6 +454,61 @@
       "no_proxy": "127.",
       "host": "127.0.0.1",
       "match": true
+    },
+    {
+      "no_proxy": "\u212abox.ts.net",
+      "host": "kbox.ts.net",
+      "match": false
+    },
+    {
+      "no_proxy": "*.\u212abox.ts.net",
+      "host": "office.kbox.ts.net",
+      "match": false
+    },
+    {
+      "no_proxy": "\u212abox*",
+      "host": "kbox.ts.net",
+      "match": false
+    },
+    {
+      "no_proxy": "Kbox.TS.NET",
+      "host": "kbox.ts.net",
+      "match": true
+    },
+    {
+      "no_proxy": " kbox.ts.net,kbox.ts.net ,\tkbox.ts.net",
+      "host": "kbox.ts.net",
+      "match": false
+    },
+    {
+      "no_proxy": "kbox.ts.net:8787",
+      "host": "kbox.ts.net",
+      "match": false
+    },
+    {
+      "no_proxy": "[::1]:8787",
+      "host": "[::1]",
+      "match": false
+    },
+    {
+      "no_proxy": ".ts.net,*",
+      "host": "ts.net",
+      "match": true
+    },
+    {
+      "no_proxy": " * ,**,*box*",
+      "host": "kbox.ts.net",
+      "match": false
+    },
+    {
+      "no_proxy": ",,",
+      "host": "kbox.ts.net",
+      "match": false
+    },
+    {
+      "no_proxy": ",kbox.ts.net,,",
+      "host": "kbox.ts.net",
+      "match": true
     }
   ],
   "launcher_no_proxy_entries": [

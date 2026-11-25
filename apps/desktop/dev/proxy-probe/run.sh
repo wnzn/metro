@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Proves what NSH's real fetch does with a proxy configured, using the UI's
 # NO_PROXY exactly as the packaged launcher builds it: the person's entries
-# (here corp.example and one Tailscale name they listed) plus this machine's
+# (here corp.example, one Tailscale name, and a Unicode look-alike) plus this machine's
 # exact hosts (metro_url_policy::loopback_no_proxy_entries, listed in
 # crates/url-policy/testdata/host_vectors.json). Loopback and the listed name
 # must be reached directly; everything else through the proxy, including
@@ -47,11 +47,11 @@ trap cleanup EXIT
 chmod 755 "$tmp"
 : >"$tmp/proxy.log"; chmod 666 "$tmp/proxy.log"
 cp -R "$here/app" "$tmp/app"; mkdir -p "$tmp/app/.nsh"; chmod -R a+rX "$tmp/app"
-printf '127.0.0.1 localhost\n::1 localhost\n127.0.0.1 box.tail1234.ts.net other.tail1234.ts.net ordinary.example 100.64.office.example 127.foo.example\n' >"$tmp/hosts"
+printf '127.0.0.1 localhost\n::1 localhost\n127.0.0.1 box.tail1234.ts.net other.tail1234.ts.net kbox.ts.net ordinary.example 100.64.office.example 127.foo.example\n' >"$tmp/hosts"
 
 loopback="$(python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["launcher_no_proxy_entries"]))' \
   "$repo/crates/url-policy/testdata/host_vectors.json")"
-person="corp.example,box.tail1234.ts.net"
+person="corp.example,box.tail1234.ts.net,"$'\u212abox.ts.net'
 if [ "${CONTROL:-0}" = 1 ]; then
   prefixes=".ts.net,*.ts.net.,127."
   for b in $(seq 64 127); do prefixes="$prefixes,100.$b."; done
@@ -70,6 +70,7 @@ cases=(
   "http://box.tail1234.ts.net:8787/ direct"
   "http://box.tail1234.ts.net.:8787/ $ctl"
   "http://other.tail1234.ts.net:8787/ $ctl"
+  "http://kbox.ts.net:8787/ $ctl"
   "http://100.101.102.103:8787/ $ctl"
   "http://[fd7a:115c:a1e0::9]:8787/ proxied"
   "http://100.64.office.example:8787/ $ctl"
