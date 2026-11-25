@@ -23,7 +23,7 @@ use crate::db::{
     activity, actor, kind,
 };
 use crate::jobs::{CompleteError, JobOutcome};
-use crate::mentions::{self, Mention};
+use crate::mentions::{self, Mention, MentionSpan, ValidatedSpans};
 use crate::model_routing::{
     self as routing, AddressedBy, Addressing, AddressingNote, RoutingSettings,
 };
@@ -232,6 +232,7 @@ fn addressed(resolved: &[Mention]) -> Addressed {
     Addressed {
         mentions: serde_json::to_value(resolved).unwrap_or_else(|_| json!([])),
         audience: mentions::audience(resolved).to_owned(),
+        spans: Vec::new(),
     }
 }
 
@@ -552,6 +553,14 @@ pub struct PostMessage {
     agent_id: Option<String>,
     #[serde(default)]
     mentions: Vec<Mention>,
+    /// Set to false when the client has resolved addressing itself. Only
+    /// structured mentions and Ask agent can explicitly address recipients.
+    #[serde(default = "default_infer_text_mentions")]
+    infer_text_mentions: bool,
+    /// Optional display ranges in the decoded, untrimmed `text`; each
+    /// index refers to the explicit `mentions` list as submitted.
+    #[serde(default)]
+    spans: Vec<MentionSpan>,
     /// Answer with this model connection instead of the sender's routing or
     /// default: their own, or one shared with this Space or the
     /// organization. Never falls back.
@@ -562,6 +571,10 @@ pub struct PostMessage {
     /// Library files of this Space to attach (see [`crate::attachments`]).
     #[serde(default)]
     asset_ids: Vec<String>,
+}
+
+fn default_infer_text_mentions() -> bool {
+    true
 }
 
 /// A model chosen for one turn, checked before anything is stored so a bad
@@ -647,6 +660,8 @@ pub async fn post_message(
     let Json(body) = body?;
     let space = member_of(&state, &sid, &who).await?;
     let room = room_of(&state, &space, &rid).await?;
+    let spans = ValidatedSpans::new(&body.text, body.mentions.len(), body.spans)
+        .map_err(ApiError::bad_request)?;
     let text = check_message(
         &state,
         &who.id,
@@ -669,13 +684,14 @@ pub async fn post_message(
         .iter()
         .map(|a| (a.id.clone(), a.handle.clone()))
         .collect();
-    let resolved = mentions::resolve_with_agents(
-        &text,
+    let (resolved, spans) = mentions::resolve_with_spans(
+        body.infer_text_mentions.then_some(text.as_str()),
         &body.mentions,
         body.invoke_agent,
         body.agent_id.as_deref(),
         &member_ids,
         &agent_handles,
+        spans,
     )
     .map_err(ApiError::bad_request)?;
     let addressing = Addressing::of(&resolved);
@@ -710,10 +726,13 @@ pub async fn post_message(
         &state, &who.id, &space.id, &text, &resolved, addressing, &settings, &prefs, &agents,
     )
     .await;
-    let addressed = plan
-        .classified
-        .clone()
-        .unwrap_or_else(|| addressed(&resolved));
+    // Only an unaddressed message can acquire a recipient here. Explicit
+    // spans keep their canonical indices even if @agent's target is picked
+    // by the classifier (that choice is run activity, not an edit to To:).
+    let addressed = plan.classified.clone().unwrap_or_else(|| Addressed {
+        spans,
+        ..addressed(&resolved)
+    });
     let author = who.author();
     let event = if body.asset_ids.is_empty() {
         let (sid, rid, author, text) = (
@@ -723,9 +742,10 @@ pub async fn post_message(
             text.clone(),
         );
         db(&state, move |db| {
-            db.append_event(&sid, &rid, kind::MESSAGE, &author, &text, &addressed)
+            db.append_event_as_member(&sid, &rid, kind::MESSAGE, &author, &text, &addressed)
         })
         .await?
+        .ok_or_else(|| ApiError::not_found("no such room"))?
     } else {
         let place = Place::Space {
             space_id: space.id.clone(),

@@ -112,6 +112,7 @@ pub async fn plan(
                     mentions: json!([{"kind": "agent", "addressed_by": "classifier",
                                       "agent_id": agent.id}]),
                     audience: "agent".to_owned(),
+                    spans: Vec::new(),
                 });
                 plan.targets.push(Target {
                     pick: format!("Picked by classifier: {}", agent.name),

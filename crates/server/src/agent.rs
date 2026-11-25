@@ -274,6 +274,7 @@ pub fn agent_addressed() -> Addressed {
     Addressed {
         mentions: json!([{"kind": "agent"}]),
         audience: "agent".to_owned(),
+        spans: Vec::new(),
     }
 }
 
@@ -1973,6 +1974,7 @@ mod tests {
             actor_id: Some("alice".to_owned()),
             text: text.to_owned(),
             mentions: json!([{"kind": "agent"}]),
+            spans: Vec::new(),
             audience: "agent".to_owned(),
             activity: None,
             created_at,
