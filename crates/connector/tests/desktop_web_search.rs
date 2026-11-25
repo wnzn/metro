@@ -381,23 +381,23 @@ async fn an_enable_that_lands_after_sign_out_starts_nothing() {
         ..Default::default()
     };
     settings::save(&p.dir, &st).unwrap();
-    web.session_bound(&base, "alice", &session).await;
+    web.session_bound(&base, "alice", &session, 1).await;
     assert!(s.lock().unwrap().created.is_empty());
 
-    // The UI's enable captured (server, account, token) and is paused while
-    // the person signs out; then it runs.
+    // The UI's enable captured (server, account, epoch, token) and is
+    // paused while the person signs out; then it runs.
     web.session_ended().await;
     let r = web
-        .update(&base, "alice", &session, Some(true), None, None)
+        .update(&base, "alice", 1, &session, Some(true), None, None)
         .await;
     assert_eq!(r.unwrap_err().code, "no_session");
     for (id, k) in [("tavily", "set"), ("tavily", "test")] {
         let r = match k {
             "set" => {
-                web.set_key(&base, "alice", id, metro_connector::Secret::new(CANARY))
+                web.set_key(&base, "alice", 1, id, metro_connector::Secret::new(CANARY))
                     .await
             }
-            _ => web.test(&base, "alice", id).await,
+            _ => web.test(&base, "alice", 1, id).await,
         };
         assert_eq!(r.unwrap_err().code, "no_session");
     }
@@ -409,11 +409,30 @@ async fn an_enable_that_lands_after_sign_out_starts_nothing() {
     assert_eq!(created, 0, "registered after sign-out");
     assert_eq!(claims, 0, "a worker ran after sign-out");
     // Another account bound now: the stale change is still refused.
-    web.session_bound(&base, "bob", &metro_connector::Secret::new("tok-bob"))
+    web.session_bound(&base, "bob", &metro_connector::Secret::new("tok-bob"), 2)
         .await;
     let r = web
-        .update(&base, "alice", &session, Some(true), None, None)
+        .update(&base, "alice", 1, &session, Some(true), None, None)
         .await;
     assert_eq!(r.unwrap_err().code, "no_session");
+    web.session_ended().await;
+
+    // Sign-out, then the same account signs in again (a new epoch) before
+    // the delayed change runs: still refused, nothing registered.
+    web.session_bound(&base, "alice", &session, 3).await;
+    web.session_ended().await;
+    web.session_bound(&base, "alice", &session, 4).await;
+    let r = web
+        .update(&base, "alice", 3, &session, Some(true), None, None)
+        .await;
+    assert_eq!(r.unwrap_err().code, "no_session");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(s.lock().unwrap().created.len(), 0);
+    // The current session's own change goes through.
+    let r = web
+        .update(&base, "alice", 4, &session, Some(true), None, None)
+        .await;
+    assert!(r.is_ok(), "{:?}", r.err());
+    assert_eq!(s.lock().unwrap().created.len(), 1);
     web.session_ended().await;
 }

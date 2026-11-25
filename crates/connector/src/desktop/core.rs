@@ -72,6 +72,7 @@ mod tests {
             server_url: server.into(),
             account_id: account.into(),
             token: Secret::new("private-token-canary"),
+            epoch: 1,
         });
         let profile = store::profile_for(&root, server, account, connection).unwrap();
         profile
@@ -236,6 +237,9 @@ struct Session {
     server_url: String,
     account_id: String,
     token: Secret,
+    /// Increases with every new binding (sign-in, account switch), never
+    /// with a token refresh of the same binding.
+    epoch: u64,
 }
 
 #[derive(Default)]
@@ -247,6 +251,8 @@ struct State {
     /// started before then is aborted, never kept or acted on.
     session_gen: u64,
     next_attempt: u64,
+    /// The last session epoch handed out.
+    session_epoch: u64,
 }
 
 impl State {
@@ -843,11 +849,23 @@ impl Desktop {
             }
         }
         let session_token_copy = session_token.clone();
-        lock(&self.state).session = Some(Session {
-            server_url: server.clone(),
-            account_id: account.clone(),
-            token: session_token,
-        });
+        let epoch = {
+            let mut st = lock(&self.state);
+            let epoch = match (&st.session, same) {
+                (Some(s), true) => s.epoch,
+                _ => {
+                    st.session_epoch += 1;
+                    st.session_epoch
+                }
+            };
+            st.session = Some(Session {
+                server_url: server.clone(),
+                account_id: account.clone(),
+                token: session_token,
+                epoch,
+            });
+            epoch
+        };
         if !same {
             let bound = store::bound_profiles(&self.cfg.root, &server, &account);
             if !bound.is_empty() {
@@ -888,7 +906,7 @@ impl Desktop {
         if !same {
             // Web search is on by default; failures show in its Settings.
             self.web
-                .session_bound(&server, &account, &session_token_copy)
+                .session_bound(&server, &account, &session_token_copy, epoch)
                 .await;
         }
         self.start_monitor();
@@ -1533,6 +1551,20 @@ impl Desktop {
 
     // ---------------------------------------------------------------- web search
 
+    /// The bound session with its epoch, read together.
+    fn session_epoch(&self) -> R<(String, String, Secret, u64)> {
+        let st = lock(&self.state);
+        match &st.session {
+            Some(s) => Ok((
+                s.server_url.clone(),
+                s.account_id.clone(),
+                s.token.clone(),
+                s.epoch,
+            )),
+            None => Err(err(409, "no_session", "Sign in to a Metro server first")),
+        }
+    }
+
     /// `GET /v1/web-search`.
     pub async fn web_state(&self) -> R<Value> {
         let (server, account, _) = self.session()?;
@@ -1546,7 +1578,7 @@ impl Desktop {
         notice_acknowledged: Option<bool>,
         providers: Option<Vec<(String, bool)>>,
     ) -> R<Value> {
-        let (server, account, token) = self.session()?;
+        let (server, account, token, epoch) = self.session_epoch()?;
         if !self.cfg.primary && enabled.is_some() {
             return Err(err(
                 409,
@@ -1558,6 +1590,7 @@ impl Desktop {
             .update(
                 &server,
                 &account,
+                epoch,
                 &token,
                 enabled,
                 notice_acknowledged,
@@ -1568,26 +1601,26 @@ impl Desktop {
 
     /// `PUT /v1/web-search/providers/{id}/key`.
     pub async fn web_set_key(&self, id: &str, key: Secret) -> R<Value> {
-        let (server, account, _) = self.session()?;
-        self.web.set_key(&server, &account, id, key).await
+        let (server, account, _, epoch) = self.session_epoch()?;
+        self.web.set_key(&server, &account, epoch, id, key).await
     }
 
     /// `DELETE /v1/web-search/providers/{id}/key`.
     pub async fn web_delete_key(&self, id: &str) -> R<Value> {
-        let (server, account, _) = self.session()?;
-        self.web.delete_key(&server, &account, id).await
+        let (server, account, _, epoch) = self.session_epoch()?;
+        self.web.delete_key(&server, &account, epoch, id).await
     }
 
     /// `POST /v1/web-search/providers/{id}/test`.
     pub async fn web_test(&self, id: &str) -> R<Value> {
-        let (server, account, _) = self.session()?;
-        self.web.test(&server, &account, id).await
+        let (server, account, _, epoch) = self.session_epoch()?;
+        self.web.test(&server, &account, epoch, id).await
     }
 
     /// `POST /v1/web-search/providers/{id}/clear-cooldown`.
     pub async fn web_clear_cooldown(&self, id: &str) -> R<Value> {
-        let (server, account, _) = self.session()?;
-        self.web.clear_cooldown(&server, &account, id).await
+        let (server, account, _, epoch) = self.session_epoch()?;
+        self.web.clear_cooldown(&server, &account, epoch, id).await
     }
 
     pub async fn open_local(&self) -> R<(String, Secret)> {

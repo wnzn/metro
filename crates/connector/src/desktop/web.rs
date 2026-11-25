@@ -69,7 +69,7 @@ pub struct WebSearch {
     /// (server, account) of the bound session, `None` after sign-out, so a
     /// change that captured an older session before waiting here is refused
     /// instead of pairing or starting workers for nobody.
-    ops: tokio::sync::Mutex<Option<(String, String)>>,
+    ops: tokio::sync::Mutex<Option<(String, String, u64)>>,
 }
 
 fn lock(m: &Mutex<Live>) -> std::sync::MutexGuard<'_, Live> {
@@ -366,18 +366,19 @@ impl WebSearch {
         &self,
         server: &str,
         account: &str,
-    ) -> R<tokio::sync::MutexGuard<'_, Option<(String, String)>>> {
+        epoch: u64,
+    ) -> R<tokio::sync::MutexGuard<'_, Option<(String, String, u64)>>> {
         let g = self.ops.lock().await;
         match &*g {
-            Some((s, a)) if s == server && a == account => Ok(g),
+            Some((s, a, e)) if s == server && a == account && *e == epoch => Ok(g),
             _ => Err(err(409, "no_session", "Sign in to a Metro server first")),
         }
     }
 
     /// A session was bound: serve web search for it, unless it's off here.
-    pub async fn session_bound(&self, server: &str, account: &str, session: &Secret) {
+    pub async fn session_bound(&self, server: &str, account: &str, session: &Secret, epoch: u64) {
         let mut g = self.ops.lock().await;
-        *g = Some((server.to_owned(), account.to_owned()));
+        *g = Some((server.to_owned(), account.to_owned(), epoch));
         let _ = self.start_locked(server, account, session).await;
     }
 
@@ -468,16 +469,18 @@ impl WebSearch {
     }
 
     /// `PUT /v1/web-search`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn update(
         &self,
         server: &str,
         account: &str,
+        epoch: u64,
         session: &Secret,
         enabled: Option<bool>,
         notice_acknowledged: Option<bool>,
         providers: Option<Vec<(String, bool)>>,
     ) -> R<Value> {
-        let _g = self.bound_ops(server, account).await?;
+        let _g = self.bound_ops(server, account, epoch).await?;
         let p = self.profile(server, account)?;
         let list = match providers {
             Some(list) => Some(
@@ -527,8 +530,15 @@ impl WebSearch {
     }
 
     /// `PUT /v1/web-search/providers/{id}/key`: saved on this computer only.
-    pub async fn set_key(&self, server: &str, account: &str, id: &str, key: Secret) -> R<Value> {
-        let _g = self.bound_ops(server, account).await?;
+    pub async fn set_key(
+        &self,
+        server: &str,
+        account: &str,
+        epoch: u64,
+        id: &str,
+        key: Secret,
+    ) -> R<Value> {
+        let _g = self.bound_ops(server, account, epoch).await?;
         let pid = provider(id)?;
         let p = self.profile(server, account)?;
         keys::validate_key(&key).map_err(|e| err(422, "invalid", e.as_str()))?;
@@ -541,8 +551,8 @@ impl WebSearch {
     }
 
     /// `DELETE /v1/web-search/providers/{id}/key`: back to the free mode.
-    pub async fn delete_key(&self, server: &str, account: &str, id: &str) -> R<Value> {
-        let _g = self.bound_ops(server, account).await?;
+    pub async fn delete_key(&self, server: &str, account: &str, epoch: u64, id: &str) -> R<Value> {
+        let _g = self.bound_ops(server, account, epoch).await?;
         let pid = provider(id)?;
         let p = self.profile(server, account)?;
         let engine = self.engine(&p)?;
@@ -554,9 +564,9 @@ impl WebSearch {
     }
 
     /// `POST /v1/web-search/providers/{id}/test`: one fixed query, now.
-    pub async fn test(&self, server: &str, account: &str, id: &str) -> R<Value> {
+    pub async fn test(&self, server: &str, account: &str, epoch: u64, id: &str) -> R<Value> {
         // Checked, not held: a vendor call mustn't delay a sign-out.
-        drop(self.bound_ops(server, account).await?);
+        drop(self.bound_ops(server, account, epoch).await?);
         let pid = provider(id)?;
         let p = self.profile(server, account)?;
         let engine = self.engine(&p)?;
@@ -567,8 +577,14 @@ impl WebSearch {
     }
 
     /// `POST /v1/web-search/providers/{id}/clear-cooldown` ("Try again now").
-    pub async fn clear_cooldown(&self, server: &str, account: &str, id: &str) -> R<Value> {
-        let _g = self.bound_ops(server, account).await?;
+    pub async fn clear_cooldown(
+        &self,
+        server: &str,
+        account: &str,
+        epoch: u64,
+        id: &str,
+    ) -> R<Value> {
+        let _g = self.bound_ops(server, account, epoch).await?;
         let pid = provider(id)?;
         let p = self.profile(server, account)?;
         let engine = self.engine(&p)?;
