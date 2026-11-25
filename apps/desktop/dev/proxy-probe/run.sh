@@ -1,25 +1,29 @@
 #!/usr/bin/env bash
 # Proves what NSH's real fetch does with a proxy configured, using the UI's
-# NO_PROXY exactly as the packaged launcher builds it (the person's entries
-# plus metro_url_policy::direct_no_proxy_entries, listed in
-# crates/url-policy/testdata/host_vectors.json): loopback and Tailscale
-# destinations must be reached directly, any other one through the proxy.
+# NO_PROXY exactly as the packaged launcher builds it: the person's entries
+# (here corp.example and one Tailscale name they listed) plus this machine's
+# exact hosts (metro_url_policy::loopback_no_proxy_entries, listed in
+# crates/url-policy/testdata/host_vectors.json). Loopback and the listed name
+# must be reached directly; everything else through the proxy, including
+# unlisted Tailscale hosts and ordinary names that merely start like a trusted
+# range (100.64.office.example, 127.foo.example).
 #
 # Everything runs in containers with no network of their own: a Metro-server
 # stand-in and a recording proxy (servers.py) on the namespace's 127.0.0.1,
 # and NSH's native Linux host on a private Xvfb display, sharing that
 # namespace. Names resolve through a private hosts file to 127.0.0.1. With no
 # route out, a direct request to a Tailscale address fails at once without
-# touching the proxy, while a proxied one shows up in the proxy's log. No
-# token or real server is involved.
+# touching the proxy, while a proxied one shows up in the proxy's log by its
+# exact authority. Every URL must produce exactly one result. No token or
+# real server is involved.
 #
 #   docker build -t metro-desktop-shots:trixie apps/desktop/dev/screenshots
 #   apps/desktop/dev/proxy-probe/run.sh
 #
-# Env: NSH_DIST (default: from `nsh` on PATH). CONTROL=1 uses the launcher's
-# NO_PROXY from before the Tailscale entries (loopback only): the Tailscale
-# cases are then expected to go through the proxy, which shows the probe
-# tells the two apart.
+# Env: NSH_DIST (default: from `nsh` on PATH). CONTROL=1 uses a NO_PROXY with
+# prefix entries instead (.ts.net, *.ts.net., 127., 100.64. ... 100.127.):
+# the Tailscale cases and the look-alike names then go direct, which shows the
+# probe tells the two apart, and why the launcher uses exact hosts only.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -43,26 +47,35 @@ trap cleanup EXIT
 chmod 755 "$tmp"
 : >"$tmp/proxy.log"; chmod 666 "$tmp/proxy.log"
 cp -R "$here/app" "$tmp/app"; mkdir -p "$tmp/app/.nsh"; chmod -R a+rX "$tmp/app"
-printf '127.0.0.1 localhost\n::1 localhost\n127.0.0.1 box.tail1234.ts.net ordinary.example\n' >"$tmp/hosts"
+printf '127.0.0.1 localhost\n::1 localhost\n127.0.0.1 box.tail1234.ts.net other.tail1234.ts.net ordinary.example 100.64.office.example 127.foo.example\n' >"$tmp/hosts"
 
-if [ "${CONTROL:-0}" = 1 ]; then
-  no_proxy="corp.example,127.0.0.1,localhost,::1"
-else
-no_proxy="corp.example,$(python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["launcher_no_proxy_entries"]))' \
+loopback="$(python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["launcher_no_proxy_entries"]))' \
   "$repo/crates/url-policy/testdata/host_vectors.json")"
+person="corp.example,box.tail1234.ts.net"
+if [ "${CONTROL:-0}" = 1 ]; then
+  prefixes=".ts.net,*.ts.net.,127."
+  for b in $(seq 64 127); do prefixes="$prefixes,100.$b."; done
+  no_proxy="$person,$loopback,$prefixes"
+  ctl=direct
+else
+  no_proxy="$person,$loopback"
+  ctl=proxied
 fi
 
 # url expected
 cases=(
-  "http://box.tail1234.ts.net:8787/ $( [ "${CONTROL:-0}" = 1 ] && echo proxied || echo direct )"
-  "http://box.tail1234.ts.net.:8787/ $( [ "${CONTROL:-0}" = 1 ] && echo proxied || echo direct )"
   "http://127.0.0.1:8787/ direct"
-  "http://[::1]:8787/ $( [ "${CONTROL:-0}" = 1 ] && echo proxied || echo direct )"
-  "http://100.101.102.103:8787/ $( [ "${CONTROL:-0}" = 1 ] && echo proxied || echo direct )"
-  "http://[fd7a:115c:a1e0::9]:8787/ $( [ "${CONTROL:-0}" = 1 ] && echo proxied || echo direct )"
+  "http://localhost:8787/ direct"
+  "http://[::1]:8787/ direct"
+  "http://box.tail1234.ts.net:8787/ direct"
+  "http://box.tail1234.ts.net.:8787/ $ctl"
+  "http://other.tail1234.ts.net:8787/ $ctl"
+  "http://100.101.102.103:8787/ $ctl"
+  "http://[fd7a:115c:a1e0::9]:8787/ proxied"
+  "http://100.64.office.example:8787/ $ctl"
+  "http://127.foo.example:8787/ $ctl"
   "http://ordinary.example:8787/ proxied"
   "http://192.168.77.9:8787/ proxied"
-  "http://[::ffff:6464:6464]:8787/ proxied"
 )
 urls=""; for c in "${cases[@]}"; do urls="$urls ${c%% *}"; done
 
@@ -81,27 +94,4 @@ printf '%s\n' "$steps" | docker run --rm -i --init --network "container:$net" --
   -v "$shots/with-display.sh:/with-display.sh:ro" -w /app "$image" \
   sh /with-display.sh /opt/nsh/bin/nsh test App.tsx --target linux >"$tmp/nsh.out" 2>&1 || true
 
-python3 - "$tmp/nsh.out" "$tmp/proxy.log" "${cases[@]}" <<'EOF'
-import sys
-out = open(sys.argv[1]).read()
-log = open(sys.argv[2]).read()
-if "PROBE-BEGIN" not in out:
-    print(out[-3000:]); sys.exit("the probe app did not finish")
-results = {}
-for line in out.split("PROBE-BEGIN", 1)[1].split("PROBE-END", 1)[0].splitlines():
-    if " => " in line:
-        u, r = line.split(" => ", 1)
-        results[u.strip()] = r.strip()
-failed = 0
-for case in sys.argv[3:]:
-    url, want = case.rsplit(" ", 1)
-    host = url.split("//", 1)[1].split("/", 1)[0]
-    bare = host.rsplit(":", 1)[0]
-    through_proxy = any(bare.strip("[]").rstrip(".") in l for l in log.splitlines())
-    got = "proxied" if through_proxy else "direct"
-    ok = got == want and (want == "proxied" or not results.get(url, "").startswith("ERROR TypeError: Network request failed: CONNECT proxy failed"))
-    failed += not ok
-    print(f"{'ok  ' if ok else 'FAIL'} {url:42} expected {want:8} got {got:8} | {results.get(url, '(no result)')[:90]}")
-print(f"\n{len(sys.argv) - 3 - failed} passed, {failed} failed")
-sys.exit(1 if failed else 0)
-EOF
+python3 "$here/check.py" "$tmp/nsh.out" "$tmp/proxy.log" "${cases[@]}"

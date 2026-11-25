@@ -6,11 +6,12 @@ import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, TOKENS } from "../../../test/fakeServer";
 import { spaceWorld } from "./test/fixtures";
+import { launched } from "../../../test/launched";
 
 type W = ReturnType<typeof spaceWorld>;
 
 async function signIn(w: W, user: "alice" | "bob" | "carol" = "alice"): Promise<App> {
-  const app = await open("./test/Harness.tsx", { network: w.network as any, platform: "linux", width: 1280, height: 900 });
+  const app = await open("./test/Harness.tsx", { modules: launched(), network: w.network as any, platform: "linux", width: 1280, height: 900 });
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS[user]!);

@@ -7,6 +7,7 @@ import type { App, ColorScheme } from "nsh/test";
 import theme from "../../theme/theme.json";
 import { APPEARANCE_KEY } from "./appearance";
 import { spaceTileClass, spaceTileFor } from "./tokens";
+import { launched } from "../../test/launched";
 
 type Palette = Record<string, string>;
 const light = theme.cssVars.light as Palette;
@@ -53,7 +54,7 @@ test("dark is the default, even when the system is light", async () => {
 });
 
 test("the real Connect screen opens dark on a light system", async () => {
-  const app = await open("../../App.tsx", { platform: "linux", width: 1100, height: 760, colorScheme: "light" });
+  const app = await open("../../App.tsx", { modules: launched(), platform: "linux", width: 1100, height: 760, colorScheme: "light" });
   await app.waitFor("id:connect-screen");
   await app.waitUntil(() => bg(app, "id:connect-screen") === rgba(dark.background));
   expect(fg(app, "text:Connect to Metro")).toBe(rgba(dark.foreground));

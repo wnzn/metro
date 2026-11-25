@@ -5,41 +5,39 @@
 // whatever network the proxy is on. So the app skips the plain-HTTP question
 // for such a host only when this says the request won't use a proxy.
 //
-// NSH 0.6.1's fetch is ureq 3 (3.4.2): it takes one proxy from ALL_PROXY,
-// HTTPS_PROXY or HTTP_PROXY (or their lowercase forms) and skips it for hosts
-// matched by NO_PROXY (or no_proxy, when NO_PROXY is unset), matched against
-// the URI's host as written (IPv6 in brackets): `*`, an exact host, `.suffix`
-// or `*suffix`, `prefix.` or `prefix*`. No CIDR ranges. On Windows it may also
-// use the system proxy, which the app can't see, so there only a NO_PROXY
-// match counts as direct. The packaged launcher puts loopback and the
-// Tailscale ranges into the UI's NO_PROXY (metro_url_policy::
-// direct_no_proxy_entries), so normally every such host matches.
-//
-// The proxy variables' values are only ever tested for being set: never
-// shown, stored or logged (they can hold a user name and password).
+// The app never sees the proxy settings themselves (their URLs can hold a
+// user name and password). The packaged launcher passes two non-secret
+// values instead (crates/desktop/src/main.rs):
+// - METRO_PROXY_ROUTE: `direct` (no proxy applies), `proxied` (a proxy
+//   variable is set) or `unknown` (Windows without one: a system proxy may
+//   apply);
+// - METRO_PROXY_DIRECT_FOR: the UI's NO_PROXY, whose matches always go
+//   direct. NSH 0.6.1's fetch is ureq 3, which matches NO_PROXY against the
+//   URI's host as written (IPv6 in brackets): `*`, an exact host, `.suffix`
+//   or `*suffix`, `prefix.` or `prefix*`. The launcher adds only this
+//   machine's exact hosts, so a Tailscale server behind a proxy is direct
+//   only when the person lists it in their own NO_PROXY.
+// Anything missing or unrecognised (no launcher: `nsh run`, a hand-started
+// UI) is `unknown`: only a NO_PROXY match counts as direct then.
 
 import proc from "process";
 
-export const PROXY_VARS = ["ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] as const;
-
-export type ProxyEnv = Readonly<{
-  /** Some proxy variable is set. */
-  proxied: boolean;
-  /** The NO_PROXY value ureq reads. */
-  noProxy: string;
-  /** Windows: a system proxy the app can't see may apply. */
-  windows: boolean;
+export type ProxyRoute = Readonly<{
+  route: "direct" | "proxied" | "unknown";
+  /** NO_PROXY entries (ureq syntax) that always go direct. */
+  directFor: string;
 }>;
 
 /** Pure, for tests. */
-export function parseProxyEnv(env: Record<string, string | undefined>, platform: string): ProxyEnv {
-  const proxied = PROXY_VARS.some((k) => typeof env[k] === "string" && env[k] !== "");
-  const noProxy = env.NO_PROXY !== undefined ? env.NO_PROXY : env.no_proxy ?? "";
-  return { proxied, noProxy, windows: platform === "windows" };
+export function parseProxyRoute(env: Record<string, string | undefined>): ProxyRoute {
+  const r = env.METRO_PROXY_ROUTE;
+  const route = r === "direct" || r === "proxied" || r === "unknown" ? r : "unknown";
+  return { route, directFor: typeof env.METRO_PROXY_DIRECT_FOR === "string" ? env.METRO_PROXY_DIRECT_FOR : "" };
 }
 
 /** ureq 3's NO_PROXY matching (see metro_url_policy::ureq_no_proxy_matches). */
 export function ureqNoProxyMatches(noProxy: string, uriHost: string): boolean {
+  if (noProxy === "") return false;
   const host = uriHost.toLowerCase();
   return noProxy.split(",").some((entry) => {
     const e = entry.toLowerCase();
@@ -53,23 +51,20 @@ export function ureqNoProxyMatches(noProxy: string, uriHost: string): boolean {
 }
 
 /** Whether a request to `uriHost` (as in a URL: IPv6 in brackets) goes there without a proxy. */
-export function reachedDirectly(uriHost: string, env: ProxyEnv): boolean {
-  if (ureqNoProxyMatches(env.noProxy, uriHost)) return true;
-  return !env.proxied && !env.windows;
+export function reachedDirectly(uriHost: string, r: ProxyRoute): boolean {
+  return r.route === "direct" || ureqNoProxyMatches(r.directFor, uriHost);
 }
 
-/** This process's proxy settings, read once (the launcher sets them before the UI starts). */
-let current: ProxyEnv | null = null;
-export function proxyEnv(): ProxyEnv {
+/** This process's route, read once (the launcher sets it before the UI starts). */
+let current: ProxyRoute | null = null;
+export function proxyRoute(): ProxyRoute {
   if (current) return current;
   let env: Record<string, string> = {};
-  let platform = "";
   try {
     env = proc.env ?? {};
-    platform = proc.platform ?? "";
   } catch {
     env = {};
   }
-  current = parseProxyEnv(env, platform);
+  current = parseProxyRoute(env);
   return current;
 }

@@ -144,26 +144,49 @@ pub fn plain_http_warning(scheme: &str, host: &str, what: &str) -> Option<String
     ))
 }
 
-/// `NO_PROXY` entries that make an HTTP client built on ureq 3 (NSH's
-/// `fetch`, and Metro runners up to 0.4.0) reach loopback and Tailscale hosts
-/// directly, in ureq's own syntax: an exact host, `.suffix` or `*suffix`, and
-/// `prefix.` or `prefix*`. ureq matches them against the URI's host as written
-/// (IPv6 in brackets) and knows no CIDR ranges, so the Tailscale ranges are
-/// spelled as prefixes of the canonical forms. A prefix such as `100.64.` also
-/// matches a DNS name that starts with it; that only means such a name is
-/// reached without the proxy.
+/// `NO_PROXY` entries for this machine, exact hosts in ureq 3's syntax (NSH's
+/// `fetch`, and Metro runners up to 0.4.0), which matches them against the
+/// URI's host as written (IPv6 in brackets, hence `[::1]` beside `::1`).
 ///
-/// A plain-HTTP destination counts as encrypted (Tailscale) or local
-/// (loopback) only while the bytes really go there directly: any transport
-/// that skips the warning for it must also skip proxies for it.
-pub fn direct_no_proxy_entries() -> Vec<String> {
-    let mut v: Vec<String> = ["localhost", "127.", "::1", "[::1]", ".ts.net", "*.ts.net."]
+/// Only exact hosts: a prefix such as `127.` or `100.64.` would also send an
+/// ordinary name like `100.64.office.example` around the operator's proxy.
+/// So a Tailscale server is reached directly only when the person's own
+/// `NO_PROXY` lists it (or no proxy is set); otherwise the apps treat it as
+/// proxied and ask before sending a token over plain HTTP.
+pub fn loopback_no_proxy_entries() -> Vec<String> {
+    ["localhost", "127.0.0.1", "::1", "[::1]"]
         .iter()
         .map(|s| s.to_string())
-        .collect();
-    v.extend((64..=127).map(|b| format!("100.{b}.")));
-    v.push("[fd7a:115c:a1e0:*".to_string());
-    v
+        .collect()
+}
+
+/// The proxy variables ureq 3 reads (the first set one wins).
+pub const PROXY_VARS: [&str; 6] = [
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+];
+
+/// How a ureq 3 client in this environment routes requests, as non-secret
+/// metadata for a process that must not see the proxy URLs themselves (they
+/// can carry credentials): `proxied` when a proxy variable is set; `unknown`
+/// on Windows otherwise (a system proxy may apply that the environment
+/// doesn't show); `direct` otherwise. Hosts matched by the `NO_PROXY` value
+/// are direct in every case.
+pub fn proxy_route(get: impl Fn(&str) -> Option<String>, windows: bool) -> &'static str {
+    if PROXY_VARS
+        .iter()
+        .any(|k| get(k).is_some_and(|v| !v.is_empty()))
+    {
+        "proxied"
+    } else if windows {
+        "unknown"
+    } else {
+        "direct"
+    }
 }
 
 /// Whether ureq 3 (3.4.2 in NSH 0.6.1, 3.5.2 in the 0.4.0 runner: the same
@@ -319,8 +342,8 @@ mod tests {
     }
 
     #[test]
-    fn direct_entries_cover_every_canonical_direct_host() {
-        let list = direct_no_proxy_entries().join(",");
+    fn loopback_entries_are_exact_and_cover_loopback_only() {
+        let list = loopback_no_proxy_entries().join(",");
         let doc = vectors();
         let listed: Vec<String> = doc["launcher_no_proxy_entries"]
             .as_array()
@@ -330,29 +353,43 @@ mod tests {
             .collect();
         assert_eq!(
             listed,
-            direct_no_proxy_entries(),
+            loopback_no_proxy_entries(),
             "update host_vectors.json"
         );
-        for h in doc["direct_uri_hosts"].as_array().unwrap() {
+        for h in doc["loopback_uri_hosts"].as_array().unwrap() {
             let h = h.as_str().unwrap();
-            assert!(
-                classify_host(h).plain_http_ok(),
-                "{h} is not loopback or Tailscale"
-            );
+            assert_eq!(classify_host(h), HostClass::Loopback, "{h}");
             assert!(
                 ureq_no_proxy_matches(&list, h),
                 "{h} would go through a proxy"
             );
         }
-        for h in [
-            "192.168.1.5",
-            "metro.example.com",
-            "100.63.0.1",
-            "100.128.0.1",
-            "[fd7a:115c:a1e1::1]",
-            "ts.net",
-        ] {
+        // No prefixes: ordinary names that start like a trusted range, and
+        // Tailscale hosts the person didn't list, keep the proxy.
+        for h in doc["not_exempted_by_default"].as_array().unwrap() {
+            let h = h.as_str().unwrap();
             assert!(!ureq_no_proxy_matches(&list, h), "{h} would skip the proxy");
+        }
+    }
+
+    #[test]
+    fn route() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert_eq!(proxy_route(env(&[]), false), "direct");
+        assert_eq!(proxy_route(env(&[]), true), "unknown");
+        assert_eq!(proxy_route(env(&[("HTTP_PROXY", "")]), false), "direct");
+        for k in PROXY_VARS {
+            let pairs: &'static [(&'static str, &'static str)] =
+                Box::leak(vec![(k, "http://user:secret@proxy:3128")].into_boxed_slice());
+            assert_eq!(proxy_route(env(pairs), false), "proxied", "{k}");
+            assert_eq!(proxy_route(env(pairs), true), "proxied", "{k}");
         }
     }
 

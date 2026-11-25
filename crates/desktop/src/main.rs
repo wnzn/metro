@@ -105,14 +105,15 @@ fn component(path: &Path) -> Option<PathBuf> {
     (m.is_file() && !m.file_type().is_symlink()).then(|| path.to_path_buf())
 }
 
-/// The UI's `NO_PROXY`: the person's own entries, the loopback hosts, and
-/// the loopback and Tailscale entries in ureq's syntax
-/// (`metro_url_policy::direct_no_proxy_entries`). NSH's fetch (ureq 3)
-/// honours `HTTP_PROXY` and friends, which must never see the bridge bearer
-/// or a local server's token, and plain HTTP to a loopback or Tailscale
-/// server is only used without asking while it goes there directly: the UI
-/// checks this same value before it skips that question
-/// (apps/desktop/src/api/proxyEnv.ts).
+/// The UI's `NO_PROXY`: the person's own entries plus this machine's exact
+/// hosts in ureq's syntax (`metro_url_policy::loopback_no_proxy_entries`).
+/// NSH's fetch (ureq 3) honours `HTTP_PROXY` and friends, which must never
+/// see the bridge bearer or a local server's token. No prefixes (`127.`,
+/// `100.64.`): those would send ordinary names around the person's proxy.
+/// The UI gets this value as `METRO_PROXY_DIRECT_FOR` and the route as
+/// `METRO_PROXY_ROUTE` (never the proxy URLs, which can hold credentials),
+/// and only skips the plain-HTTP question for a loopback or Tailscale server
+/// it will reach directly (apps/desktop/src/api/proxyEnv.ts).
 fn no_proxy() -> String {
     ui_no_proxy(&metro_connector::http::no_proxy_with_loopback())
 }
@@ -124,7 +125,7 @@ fn ui_no_proxy(base: &str) -> String {
         .filter(|p| !p.is_empty())
         .collect();
     if !parts.iter().any(|p| p == "*") {
-        for e in metro_url_policy::direct_no_proxy_entries() {
+        for e in metro_url_policy::loopback_no_proxy_entries() {
             if !parts.iter().any(|p| p.eq_ignore_ascii_case(&e)) {
                 parts.push(e);
             }
@@ -321,6 +322,11 @@ async fn launch(events: Option<&Events>) -> Result<u8, (EventKind, String)> {
         .env(ENV_TOKEN, bridge.token.expose())
         .env("NO_PROXY", no_proxy())
         .env("no_proxy", no_proxy())
+        .env(
+            "METRO_PROXY_ROUTE",
+            metro_url_policy::proxy_route(|k| std::env::var(k).ok(), cfg!(windows)),
+        )
+        .env("METRO_PROXY_DIRECT_FOR", no_proxy())
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
     // The guardian's stdin is its liveness pipe: when it closes (this
@@ -476,24 +482,30 @@ mod no_proxy_tests {
     use metro_url_policy::ureq_no_proxy_matches;
 
     #[test]
-    fn keeps_the_persons_entries_and_sends_loopback_and_tailscale_direct() {
-        let v = ui_no_proxy("corp.example,127.0.0.1,localhost,::1");
+    fn keeps_the_persons_entries_and_adds_only_exact_loopback_hosts() {
+        let v = ui_no_proxy("corp.example,box.tail1234.ts.net,127.0.0.1,localhost,::1");
         assert!(
-            v.starts_with("corp.example,127.0.0.1,localhost,::1,"),
+            v.starts_with("corp.example,box.tail1234.ts.net,127.0.0.1,localhost,::1,"),
             "{v}"
         );
         for direct in [
             "127.0.0.1",
             "[::1]",
-            "100.101.102.103",
-            "[fd7a:115c:a1e0::1]",
+            "localhost",
             "box.tail1234.ts.net",
-            "box.tail1234.ts.net.",
             "corp.example",
         ] {
             assert!(ureq_no_proxy_matches(&v, direct), "{direct}");
         }
-        for proxied in ["192.168.1.5", "metro.example.com", "100.128.0.1"] {
+        // Not listed by the person: through the proxy (the UI then asks).
+        for proxied in [
+            "100.101.102.103",
+            "[fd7a:115c:a1e0::1]",
+            "other.tail1234.ts.net",
+            "100.64.office.example",
+            "127.foo.example",
+            "192.168.1.5",
+        ] {
             assert!(!ureq_no_proxy_matches(&v, proxied), "{proxied}");
         }
         assert_eq!(v.matches("localhost").count(), 1, "no duplicates");

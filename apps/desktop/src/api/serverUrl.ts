@@ -14,8 +14,8 @@
 //     token would cross the network in clear text. Nothing is ever blocked.
 // - the result is the origin plus an optional base path, without a trailing slash.
 
-import { proxyEnv, reachedDirectly } from "./proxyEnv";
-import type { ProxyEnv } from "./proxyEnv";
+import { proxyRoute, reachedDirectly } from "./proxyEnv";
+import type { ProxyRoute } from "./proxyEnv";
 
 export const DEFAULT_SERVER_URL = "http://127.0.0.1:8787";
 
@@ -143,11 +143,11 @@ export function serverHost(baseUrl: string): string {
 }
 
 /** The one-time warning shown before a token goes over plain HTTP to a host that isn't loopback or Tailscale. */
-export function plainHttpWarning(baseUrl: string, env: ProxyEnv = proxyEnv()): string {
+export function plainHttpWarning(baseUrl: string, env: ProxyRoute = proxyRoute()): string {
   const parsed = parseServerUrl(baseUrl, env);
   if (parsed.ok && parsed.network !== "other") {
     return (
-      `This connection goes through a proxy and isn't encrypted. The proxy, and anyone on the network between you and it, could read your sign-in token for ${serverHost(baseUrl)}. ` +
+      `This connection ${env.route === "proxied" ? "goes" : "may go"} through a proxy and isn't encrypted. The proxy, and anyone on the network between you and it, could read your sign-in token for ${serverHost(baseUrl)}. ` +
       "Use it on networks you trust, such as Tailscale or a VPN."
     );
   }
@@ -157,7 +157,7 @@ export function plainHttpWarning(baseUrl: string, env: ProxyEnv = proxyEnv()): s
   );
 }
 
-export function parseServerUrl(input: string, env: ProxyEnv = proxyEnv()): ServerUrlResult {
+export function parseServerUrl(input: string, env: ProxyRoute = proxyRoute()): ServerUrlResult {
   const raw = input.trim();
   if (!raw) return { ok: false, error: "Enter the server URL, for example " + DEFAULT_SERVER_URL + "." };
   if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) {

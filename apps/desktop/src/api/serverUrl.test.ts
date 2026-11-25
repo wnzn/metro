@@ -1,6 +1,10 @@
 import { expect, test } from "nsh/test";
 import vectors from "../../../../crates/url-policy/testdata/host_vectors.json";
 import { classifyHost, isLoopbackHost, parseServerUrl, plainHttpWarning } from "./serverUrl";
+import type { ProxyRoute } from "./proxyEnv";
+
+/** As the launcher passes it when no proxy applies (proxyEnv.test.ts covers the others). */
+const DIRECT: ProxyRoute = { route: "direct", directFor: "" };
 
 test("plain http works for every host; only hosts outside loopback and Tailscale need consent", () => {
   for (const quiet of [
@@ -8,7 +12,7 @@ test("plain http works for every host; only hosts outside loopback and Tailscale
     "http://100.64.0.1", "http://100.127.255.254:8787", "http://[fd7a:115c:a1e0::1]:8787", "http://metro.tail1234.ts.net",
     "https://192.168.1.5", "https://metro.tail1234.ts.net",
   ]) {
-    const r = parseServerUrl(quiet);
+    const r = parseServerUrl(quiet, DIRECT);
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.needsConsent).toBe(false);
   }
@@ -16,17 +20,17 @@ test("plain http works for every host; only hosts outside loopback and Tailscale
     "http://192.168.1.5:8787", "http://metro.example.com", "http://10.0.0.1", "http://127.0.0.1.evil.com", "http://[::ffff:c0a8:1]",
     "http://100.63.255.255", "http://100.128.0.1", "http://[fd7a:115c:a1e1::1]", "http://ts.net", "http://evil-ts.net", "http://metro.ts.net.evil.com",
   ]) {
-    const r = parseServerUrl(asks);
+    const r = parseServerUrl(asks, DIRECT);
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.needsConsent).toBe(true);
   }
 });
 
 test("normalizes and rejects malformed URLs", () => {
-  expect(parseServerUrl(" http://127.0.0.1:8787/ ")).toEqual({ ok: true, baseUrl: "http://127.0.0.1:8787", loopback: true, network: "loopback", direct: true, needsConsent: false });
-  expect(parseServerUrl("https://metro.example.com/api/")).toEqual({ ok: true, baseUrl: "https://metro.example.com/api", loopback: false, network: "other", direct: true, needsConsent: false });
-  expect(parseServerUrl("http://100.101.102.103:8787/")).toEqual({ ok: true, baseUrl: "http://100.101.102.103:8787", loopback: false, network: "tailscale", direct: true, needsConsent: false });
-  expect(parseServerUrl("http://192.168.1.5:8787")).toEqual({ ok: true, baseUrl: "http://192.168.1.5:8787", loopback: false, network: "other", direct: true, needsConsent: true });
+  expect(parseServerUrl(" http://127.0.0.1:8787/ ", DIRECT)).toEqual({ ok: true, baseUrl: "http://127.0.0.1:8787", loopback: true, network: "loopback", direct: true, needsConsent: false });
+  expect(parseServerUrl("https://metro.example.com/api/", DIRECT)).toEqual({ ok: true, baseUrl: "https://metro.example.com/api", loopback: false, network: "other", direct: true, needsConsent: false });
+  expect(parseServerUrl("http://100.101.102.103:8787/", DIRECT)).toEqual({ ok: true, baseUrl: "http://100.101.102.103:8787", loopback: false, network: "tailscale", direct: true, needsConsent: false });
+  expect(parseServerUrl("http://192.168.1.5:8787", DIRECT)).toEqual({ ok: true, baseUrl: "http://192.168.1.5:8787", loopback: false, network: "other", direct: true, needsConsent: true });
   expect(parseServerUrl("").ok).toBe(false);
   expect(parseServerUrl("127.0.0.1:8787").ok).toBe(false);
   expect(parseServerUrl("ftp://127.0.0.1").ok).toBe(false);
@@ -93,7 +97,7 @@ test("matches the shared host vectors (crates/url-policy/testdata/host_vectors.j
 test("a URL is classified by the host the app will connect to", () => {
   // WHATWG URL parsing turns 100.64.0.1. into the IP literal, so the
   // request goes straight to that address; localhost. stays a name.
-  const ts = parseServerUrl("http://100.64.0.1.:8787");
+  const ts = parseServerUrl("http://100.64.0.1.:8787", DIRECT);
   expect(ts.ok && ts.baseUrl === "http://100.64.0.1:8787" && ts.network === "tailscale").toBe(true);
   const name = parseServerUrl("http://localhost.:8787");
   expect(name.ok && name.network === "other" && name.needsConsent).toBe(true);

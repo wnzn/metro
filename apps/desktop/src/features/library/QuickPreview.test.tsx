@@ -11,12 +11,13 @@ import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, TOKENS } from "../../../test/fakeServer";
 import { libraryWorld } from "./test/fixtures";
+import { launched } from "../../../test/launched";
 
 type W = ReturnType<typeof libraryWorld>;
 
 /** Signs in. The Connect press is returned, not awaited: the driver's press waits for in-flight reads, which a test may hold. */
 async function signIn(w: W, user = "alice"): Promise<{ app: App; connecting: Promise<void> }> {
-  const app = await open("./test/QuickHarness.tsx", { network: w.network as any, platform: "linux", width: 1100, height: 900 });
+  const app = await open("./test/QuickHarness.tsx", { modules: launched(), network: w.network as any, platform: "linux", width: 1100, height: 900 });
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS[user]!);
