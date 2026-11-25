@@ -66,12 +66,18 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 
 /// `METRO_UPDATE_CHECK`: `on` (default) or `off`.
 pub fn check_enabled_from_env() -> bool {
-    match std::env::var("METRO_UPDATE_CHECK") {
-        Ok(v) => !matches!(
+    parse_check_setting(std::env::var("METRO_UPDATE_CHECK").ok().as_deref())
+}
+
+/// `METRO_UPDATE_CHECK`: `off`, `0`, `false` or `no` (any case, spaces
+/// ignored) turn the check off; unset or anything else leaves it on.
+pub fn parse_check_setting(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "off" | "0" | "false" | "no"
         ),
-        Err(_) => true,
+        None => true,
     }
 }
 
@@ -667,48 +673,60 @@ pub fn spawn(state: AppState) {
     }
     #[cfg(feature = "e2e-test-release")]
     if let Some((source, verifier, every)) = test_release() {
-        tokio::spawn(async move {
-            let Ok(fetcher) = AsyncFetcher::new(source, Duration::from_secs(30)) else {
-                return;
-            };
-            loop {
-                check_once(&state, &fetcher, verifier.as_ref()).await;
-                tokio::time::sleep(every).await;
-            }
-        });
+        if let Ok(fetcher) = AsyncFetcher::new(source, Duration::from_secs(30)) {
+            spawn_checks(state, fetcher, verifier, None, Duration::ZERO, every);
+        }
         return;
     }
-    tokio::spawn(async move {
-        // The trust cache lives next to the database (private folder).
-        let trust_dir = state
-            .config
-            .db_path
-            .parent()
-            .map(|d| {
-                if d.as_os_str().is_empty() {
-                    std::path::Path::new(".")
-                } else {
-                    d
-                }
-            })
-            .map(|d| d.join("sigstore-trust"));
-        let trust = trust_dir
-            .and_then(|d| metro_release::trust_refresh::TrustRefresh::new(&d).ok())
-            .map(Arc::new);
-        let verifier: Arc<dyn ReleaseVerifier> = match &trust {
-            Some(t) => t.verifier.clone(),
-            None => match metro_release::sigstore::SigstoreVerifier::vendored() {
-                Ok(v) => Arc::new(v),
-                Err(e) => {
-                    tracing::error!(error = %e, "release check unavailable");
-                    return;
-                }
-            },
-        };
-        let Ok(fetcher) = AsyncFetcher::new(Source::github(), Duration::from_secs(60)) else {
-            return;
-        };
-        tokio::time::sleep(CHECK_FIRST_DELAY + jitter(Duration::from_secs(60))).await;
+    // The trust cache lives next to the database (private folder).
+    let trust_dir = state
+        .config
+        .db_path
+        .parent()
+        .map(|d| {
+            if d.as_os_str().is_empty() {
+                std::path::Path::new(".")
+            } else {
+                d
+            }
+        })
+        .map(|d| d.join("sigstore-trust"));
+    let trust = trust_dir
+        .and_then(|d| metro_release::trust_refresh::TrustRefresh::new(&d).ok())
+        .map(Arc::new);
+    let verifier: Arc<dyn ReleaseVerifier> = match &trust {
+        Some(t) => t.verifier.clone(),
+        None => match metro_release::sigstore::SigstoreVerifier::vendored() {
+            Ok(v) => Arc::new(v),
+            Err(e) => {
+                tracing::error!(error = %e, "release check unavailable");
+                return;
+            }
+        },
+    };
+    let Ok(fetcher) = AsyncFetcher::new(Source::github(), Duration::from_secs(60)) else {
+        return;
+    };
+    let first = CHECK_FIRST_DELAY + jitter(Duration::from_secs(60));
+    let every = CHECK_INTERVAL + jitter(Duration::from_secs(3600));
+    spawn_checks(state, fetcher, verifier, trust, first, every);
+}
+
+/// The check loop. With the check off (`METRO_UPDATE_CHECK=off`) it starts
+/// nothing and makes no request at all.
+pub fn spawn_checks(
+    state: AppState,
+    fetcher: AsyncFetcher,
+    verifier: Arc<dyn ReleaseVerifier>,
+    trust: Option<Arc<metro_release::trust_refresh::TrustRefresh>>,
+    first: Duration,
+    every: Duration,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !state.updates.check_enabled {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        tokio::time::sleep(first).await;
         loop {
             check_once(&state, &fetcher, verifier.as_ref()).await;
             // Sigstore rotated keys since this build: refresh the trusted root
@@ -720,9 +738,9 @@ pub fn spawn(state: AppState) {
             {
                 check_once(&state, &fetcher, verifier.as_ref()).await;
             }
-            tokio::time::sleep(CHECK_INTERVAL + jitter(Duration::from_secs(3600))).await;
+            tokio::time::sleep(every).await;
         }
-    });
+    }))
 }
 
 fn jitter(max: Duration) -> Duration {
@@ -734,6 +752,17 @@ fn jitter(max: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_setting() {
+        for off in ["off", "OFF", " off ", "0", "false", "False", "no"] {
+            assert!(!parse_check_setting(Some(off)), "{off:?}");
+        }
+        for on in ["on", "1", "true", "yes", "", "maybe"] {
+            assert!(parse_check_setting(Some(on)), "{on:?}");
+        }
+        assert!(parse_check_setting(None), "unset means on");
+    }
 
     #[test]
     fn presence_is_lenient_and_bounded() {

@@ -605,3 +605,96 @@ async fn check_once_records_verified_latest_and_images() {
     );
     assert_eq!(b["latest"]["version"], "9.1.0");
 }
+
+/// `METRO_UPDATE_CHECK=off`: the loop starts nothing and the fixture
+/// server sees no request; on, it does check.
+#[tokio::test]
+async fn check_off_makes_no_outbound_request() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let s = Server::start().await;
+    let rel = FixtureRelease::new("9.1.0", BTreeMap::new());
+    let files = rel.files.clone();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            counter.fetch_add(1, Ordering::SeqCst);
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            loop {
+                let mut h = String::new();
+                if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                    break;
+                }
+            }
+            let name = line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let body = files.get(&name).cloned().unwrap_or_default();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(&body);
+        }
+    });
+    let fetcher = || {
+        AsyncFetcher::new(
+            Source::loopback_fixture(&base).unwrap(),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+    };
+    let tick = Duration::from_millis(50);
+
+    let mut off = s.state.clone();
+    off.updates = metro_server::updates::Updates::new(false);
+    let handle = metro_server::updates::spawn_checks(
+        off.clone(),
+        fetcher(),
+        Arc::new(TestVerifier),
+        None,
+        Duration::ZERO,
+        tick,
+    );
+    assert!(handle.is_none());
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "a request was made with the check off"
+    );
+    assert!(off.updates.latest().is_none());
+
+    let mut on = s.state.clone();
+    on.updates = metro_server::updates::Updates::new(true);
+    let handle = metro_server::updates::spawn_checks(
+        on.clone(),
+        fetcher(),
+        Arc::new(TestVerifier),
+        None,
+        Duration::ZERO,
+        tick,
+    )
+    .unwrap();
+    for _ in 0..100 {
+        if on.updates.latest().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    handle.abort();
+    assert!(hits.load(Ordering::SeqCst) > 0);
+    assert_eq!(on.updates.latest().unwrap().version.to_string(), "9.1.0");
+}
