@@ -67,11 +67,17 @@ test("a live turn is one line with its current step that settles into the summar
   // The question and the final answer stay visible, with their reactions.
   const question = `id:event:${ask.id}`;
   expect(shown(app, `${question} >> id:mention-token:${ask.id}:0 >> text:@agent`)).toBe(true);
-  // The native mention line wraps individual words, not a single body node.
+  // The native line wraps individual words. Each exact token occurs only in
+  // this row, so the screen-order slice below can't match a different row.
   for (const word of ["what", "is", "in", "the", "workspace\\?"]) {
-    expect(shown(app, `${question} >> text:/^${word}\\s*$/`)).toBe(true);
+    const token = `text:/^${word}\\s*$/`;
+    expect(app.count(`${question} >> ${token}`)).toBe(1);
+    expect(app.count(token)).toBe(1);
   }
-  expect(app.texts().join("")).toContain("@agent what is in the workspace?");
+  const words = app.texts();
+  const start = words.indexOf("what ");
+  expect(start).toBeGreaterThan(-1);
+  expect(words.slice(start, start + 5)).toEqual(["what ", "is ", "in ", "the ", "workspace?"]);
   expect(shown(app, `id:recipient:${ask.id}:agent`)).toBe(true);
   expect(shown(app, `id:react:${reply.id}`)).toBe(true);
   expect(shown(app, `id:react:${result.id}`)).toBe(false);

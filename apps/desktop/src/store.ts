@@ -1510,10 +1510,13 @@ export async function openRun(run: Run): Promise<void> {
 }
 
 let dispatchIntent = 0;
+let dispatchDraftRevision = 0;
+const sameRoomDispatchCheck = signal<(() => boolean) | null>(null);
+export const dispatchRevalidating = () => sameRoomDispatchCheck()?.() === true;
 
 export function setDispatchDraft(text: string) {
   if (text === dispatchDraft()) return;
-  dispatchIntent++;
+  dispatchDraftRevision++;
   dispatchDraft.set(text);
 }
 
@@ -1523,37 +1526,59 @@ export function followUp(run: Run) {
   const intent = ++dispatchIntent;
   const original = dispatchTarget();
   const text = dispatchDraft();
-  if (!client || !spaces().some(s => s.id === spaceId)) return;
-  const ok = guard(spaceId);
-  const navigation = navigationGeneration;
-  const inChat = () => ok() && basePlace() === "chat" && navigation === navigationGeneration;
-  if (!text || (original?.spaceId === spaceId && original.roomId === roomId)) {
-    const pending = { spaceId, roomId: null };
-    dispatchTarget.set(pending);
-    void verifyDispatchRoom(client, spaceId, roomId, () => inChat() && dispatchTarget() === pending);
+  const revision = dispatchDraftRevision;
+  const c = client;
+  if (!c) return;
+  if (!spaces().some(s => s.id === spaceId)) {
+    dispatchError.set("That run's Space is no longer available.");
     return;
   }
-  const current = () => inChat() && intent === dispatchIntent &&
-    dispatchTarget() === original && dispatchDraft() === text && spaces().some(s => s.id === spaceId);
+  const ok = guard(spaceId);
+  const navigation = navigationGeneration;
+  const sameVisit = () => ok() && basePlace() === "chat" && navigation === navigationGeneration;
+  const latest = () => sameVisit() && intent === dispatchIntent;
+  if (original?.spaceId === spaceId && original.roomId === roomId) {
+    // Keep the selected recipient visible but don't send while checking it.
+    // Success must not replace its identity or interrupt a newer choice.
+    const check = () => sameVisit() && dispatchTarget() === original;
+    sameRoomDispatchCheck.set(check);
+    void verifyDispatchRoom(c, spaceId, roomId, () => intent === dispatchIntent && check()).finally(() => {
+      if (sameRoomDispatchCheck() === check) sameRoomDispatchCheck.set(null);
+    });
+    return;
+  }
+  const selectExactRoom = () => dispatchTarget.set({ spaceId, roomId });
+  if (!text) {
+    const pending = { spaceId, roomId: null };
+    dispatchTarget.set(pending);
+    void verifyDispatchRoom(c, spaceId, roomId, () => latest() && dispatchTarget() === pending, selectExactRoom);
+    return;
+  }
+  const current = () => latest() && dispatchTarget() === original && dispatchDraft() === text &&
+    dispatchDraftRevision === revision && spaces().some(s => s.id === spaceId);
   let used = false;
   return {
     current,
+    lookup(stillHere: () => boolean) {
+      return current() && stillHere() && verifyDispatchRoom(c, spaceId, roomId, () => current() && stillHere());
+    },
     async move(stillHere: () => boolean) {
-      if (used || !client || !current() || !stillHere() || dispatching()) return;
+      if (used || !current() || !stillHere() || dispatching()) return;
       used = true;
-      await verifyDispatchRoom(client, spaceId, roomId, () => current() && stillHere());
+      await verifyDispatchRoom(c, spaceId, roomId, () => current() && stillHere(), selectExactRoom);
     },
   };
 }
 
 export async function setDispatchSpace(spaceId: string): Promise<void> {
   if (!client || !spaces().some((s) => s.id === spaceId)) return;
-  dispatchIntent++;
+  const intent = ++dispatchIntent;
   const ok = guard(spaceId);
   const sameSession = guard();
   const navigation = navigationGeneration;
   const pending = { spaceId, roomId: null };
-  const here = () => basePlace() === "chat" && navigation === navigationGeneration && dispatchTarget() === pending;
+  const here = () => basePlace() === "chat" && navigation === navigationGeneration &&
+    intent === dispatchIntent && dispatchTarget() === pending;
   dispatchError.set(null);
   dispatchNotice.set(null);
   dispatchTarget.set(pending);
@@ -1566,7 +1591,7 @@ export async function setDispatchSpace(spaceId: string): Promise<void> {
   }
 }
 
-async function verifyDispatchRoom(c: Client, spaceId: string, roomId: string, here: () => boolean) {
+async function verifyDispatchRoom(c: Client, spaceId: string, roomId: string, here: () => boolean, select?: () => void): Promise<boolean> {
   const ok = guard(spaceId);
   const sameSession = guard();
   dispatchError.set(null);
@@ -1576,20 +1601,23 @@ async function verifyDispatchRoom(c: Client, spaceId: string, roomId: string, he
   try {
     // Verify the exact destination from this read, never from a cached fallback.
     const list = read.finishRooms(await c.listRooms(spaceId));
-    if (!ok()) return;
+    if (!ok()) return false;
     const key = scopeKey(spaceId, roomId);
-    const found = list?.some(r => r.id === roomId);
+    const found = list?.some(r => r.id === roomId) === true;
     const stale = !list || (!found && (roomDeniedAtOrAfter(key, read.request) || newerAccess(key, read.request)));
+    const show = here();
     batch(() => {
       if (list && !stale) {
-        // An unrelated active room is left for its own poll to confirm.
-        read.publishRooms(list, roomId);
+        // Still settle access evidence and exact denials for superseded reads,
+        // but don't repaint a newer Dispatch choice with their positive data.
+        if (show) read.publishRooms(list, roomId);
         if (!found) void dropLostRoom(spaceId, roomId, read.request, false);
       }
-      if (found && here()) dispatchTarget.set({ spaceId, roomId });
-      else if (!found && here()) dispatchError.set(stale ? unverified
+      if (found && show) select?.();
+      else if (!found && show) dispatchError.set(stale ? unverified
         : "That room or thread is no longer available. Choose another destination.");
     });
+    return found && show;
   } catch (error) {
     if (sameSession() && error instanceof ApiError && error.kind === "auth") {
       read.finish();
@@ -1605,6 +1633,7 @@ async function verifyDispatchRoom(c: Client, spaceId: string, roomId: string, he
       read.finish();
       if (ok() && here()) dispatchError.set(describe(error, "Could not load that Space's rooms"));
     }
+    return false;
   }
 }
 
@@ -1622,7 +1651,7 @@ export async function sendDispatch(): Promise<void> {
   const text = dispatchDraft();
   const target = dispatchTarget();
   const c = client;
-  if (!text.trim() || !target?.roomId || !c || dispatching()) return;
+  if (!text.trim() || !target?.roomId || !c || dispatching() || dispatchRevalidating()) return;
   const space = spaces().find((s) => s.id === target.spaceId);
   const room = roomsBySpace()[target.spaceId]?.find((r) => r.id === target.roomId);
   if (!space || !room) {
@@ -1688,9 +1717,9 @@ export function isActiveRun(run: Run) {
 }
 
 /** Display names for a run's scope, from what is cached. */
-export function runScope(run: Run): { space: string; room: string } {
-  const space = spaces().find((s) => s.id === run.spaceId)?.name ?? run.spaceId;
-  const room = roomsBySpace()[run.spaceId]?.find((r) => r.id === run.roomId)?.name ?? run.roomId;
+export function runScope(run: Run) {
+  const space = spaces().find((s) => s.id === run.spaceId)?.name;
+  const room = space && roomsOf(run.spaceId).find((r) => r.id === run.roomId)?.name;
   return { space, room };
 }
 

@@ -113,9 +113,8 @@ for (const width of [1200, 780]) {
     lobbyRuns(f);
     const app = await inChat(f, width);
     if (width === 780) await app.press("id:runs-toggle");
-    await app.waitFor("id:run:run-acme");
-    expect(app.shows("id:run:run-acme >> label:Open Acme › #lobby")).toBe(true);
-    expect(app.shows("id:run:run-side >> label:Open Side project › #lobby")).toBe(true);
+    await app.waitFor("id:run:run-acme >> label:Open Acme › #lobby");
+    await app.waitFor("id:run:run-side >> label:Open Side project › #lobby");
     await app.press("label:Follow up in Acme › #lobby");
     await app.waitFor("text:To: agent in Acme › #lobby");
     const draft = "\u2003🌿 @bob\nDraft  \t";
@@ -154,6 +153,170 @@ for (const width of [1200, 780]) {
     ]);
   });
 }
+
+test("a held same-room Follow up keeps its recipient visible and can't repaint a newer confirmed move", async () => {
+  const f = world();
+  lobbyRuns(f);
+  const get = `GET ${BASE}/v1/*`, base = f.network[get]!;
+  let holdSame = false, holdMove = false;
+  let sameRead = false, moveRead = false;
+  f.network[get] = req => {
+    const result = base(req);
+    if (holdSame && req.url.endsWith("/acme/rooms")) {
+      holdSame = false;
+      sameRead = true;
+      return { status: 200, body: { rooms: [{ id: "lobby", name: "Older label from held check" }] }, delay: 1_500 };
+    }
+    if (holdMove && req.url.endsWith("/side/rooms")) {
+      holdMove = false;
+      moveRead = true;
+      return { ...(result as object), delay: 3_000 };
+    }
+    return result;
+  };
+  const app = await inChat(f, 1200, "alice", true);
+  await app.waitFor("label:Open Side project › #lobby");
+  await app.press("id:run-follow:run-acme");
+  await app.waitFor("text:To: agent in Acme › #lobby");
+  const draft = "\u2003🌿 @bob\nDraft  \t";
+  await app.paste("id:dispatch-text", { text: draft });
+
+  holdSame = true;
+  await app.press("id:run-follow:run-acme");
+  await app.waitUntil(() => sameRead);
+  expect(app.shows("text:To: agent in Acme › #lobby")).toBe(true);
+  expect(app.shows("text:Checking the selected destination…")).toBe(true);
+  expect(app.shows("id:dispatch-move-confirm")).toBe(false);
+  expect(app.enabled("id:dispatch-send")).toBe(false);
+
+  await app.press("id:run-follow:run-side");
+  await app.waitFor("id:dispatch-move-confirm");
+  expect(app.shows("id:dispatch-move-confirm >> text:To: agent in Acme › #lobby")).toBe(true);
+  await app.press("id:dispatch-keep-draft");
+  expect(app.shows("text:Checking the selected destination…")).toBe(true);
+  expect(app.enabled("id:dispatch-send")).toBe(false);
+
+  holdMove = true;
+  await app.press("id:run-follow:run-side");
+  await app.waitFor("id:dispatch-move-confirm");
+  await app.press("id:dispatch-move-draft");
+  await app.waitUntil(() => moveRead);
+  await app.clock!.runFor(1_600); // Release the older same-room read first.
+  expect(app.shows("text:To: agent in Acme › #lobby")).toBe(true);
+  expect(app.shows("text:/Older label from held check/")).toBe(false);
+  expect(app.shows("text:Checking the new destination…")).toBe(true);
+  expect(app.enabled("id:dispatch-send")).toBe(false);
+  await app.clock!.runFor(1_500);
+  await app.waitFor("text:To: agent in Side project › #lobby");
+  expect(app.value("id:dispatch-text")).toBe(draft);
+  expect(sentAnything(f)).toBe(false);
+  await app.press("id:dispatch-send");
+  await app.waitFor("id:dispatch-notice");
+  expect(f.posts().filter(p => p.path.endsWith("/messages"))).toMatchObject([
+    { path: "/v1/spaces/side/rooms/lobby/messages", body: { text: draft, invoke_agent: true, infer_text_mentions: false } },
+  ]);
+});
+
+test("same-room Follow up keeps the draft but clears a room authoritatively missing from its recheck", async () => {
+  const f = world();
+  lobbyRuns(f);
+  const get = `GET ${BASE}/v1/*`, base = f.network[get]!;
+  let omitRoom = false;
+  f.network[get] = req => omitRoom && req.url.endsWith("/acme/rooms")
+    ? { status: 200, body: { rooms: [{ id: "backup", name: "Backup" }] } } : base(req);
+  const app = await inChat(f, 1200, "alice", true);
+  await app.waitFor("id:run-follow:run-acme");
+  await app.press("id:run-follow:run-acme");
+  await app.waitFor("text:To: agent in Acme › #lobby");
+  await app.type("id:dispatch-text", "Original draft");
+  omitRoom = true;
+  await app.press("id:run-follow:run-acme");
+  await app.waitFor("text:/That room or thread is no longer available/");
+  expect(app.shows("text:Choose a Space and a room.")).toBe(true);
+  expect(app.shows("id:dispatch-room:backup")).toBe(true);
+  expect(app.value("id:dispatch-text")).toBe("Original draft");
+  expect(app.enabled("id:dispatch-send")).toBe(false);
+  expect(sentAnything(f)).toBe(false);
+});
+
+test("an older same-room denial still removes lost access without touching the newly verified destination", async () => {
+  const f = world();
+  lobbyRuns(f);
+  const get = `GET ${BASE}/v1/*`, base = f.network[get]!;
+  let deny = false;
+  f.network[get] = req => deny && req.url.endsWith("/acme/rooms")
+    ? { status: 404, body: { error: "no such space" }, delay: 2_000 } : base(req);
+  const app = await inChat(f, 1200, "alice", true);
+  await app.waitFor("label:Open Side project › #lobby");
+  await app.press("id:run-follow:run-acme");
+  await app.waitFor("text:To: agent in Acme › #lobby");
+  await app.type("id:dispatch-text", "Keep the new destination");
+  deny = true;
+  f.state.spaces.get("acme")!.members.delete("alice");
+  await app.press("id:run-follow:run-acme");
+  await app.waitFor("text:Checking the selected destination…");
+  await app.press("id:run-follow:run-side");
+  await app.press("id:dispatch-move-draft");
+  await app.waitFor("text:To: agent in Side project › #lobby");
+  await app.clock!.runFor(2_100);
+  await app.waitFor("id:space:acme", { state: "gone" });
+  expect(app.shows("text:To: agent in Side project › #lobby")).toBe(true);
+  expect(app.shows("id:dispatch-error")).toBe(false);
+  expect(app.value("id:dispatch-text")).toBe("Keep the new destination");
+  expect(sentAnything(f)).toBe(false);
+});
+
+test("Follow up resolves an uncached thread in a cached Space before asking and checks it again on consent", async () => {
+  const f = world();
+  lobbyRuns(f);
+  const thread = "th_opaque_fixture_291", roomName = "Release review";
+  f.state.runs.push({ id: "new-thread", space_id: "acme", room_id: thread, status: "completed", actor: "alice", task: "Earlier thread task" });
+  const get = `GET ${BASE}/v1/*`, base = f.network[get]!;
+  let held = false, holdNext = false;
+  f.network[get] = req => {
+    const result = base(req);
+    if (holdNext && req.url.endsWith("/acme/rooms")) {
+      holdNext = false;
+      held = true;
+      return { ...(result as object), delay: 1_500 };
+    }
+    return result;
+  };
+  const app = await inChat(f, 1200, "alice", true);
+  await app.waitFor("label:Open Side project › #lobby"); // Let both Spaces' initial room reads finish.
+  await app.press("id:run-follow:run-acme");
+  await app.waitFor("text:To: agent in Acme › #lobby");
+  await app.type("id:dispatch-text", "Preserve this draft");
+  expect(app.shows("id:run:new-thread >> label:Open run destination in Acme")).toBe(true);
+  expect(app.shows("id:run:new-thread >> label:Look up the follow-up destination in Acme")).toBe(true);
+  expect(app.texts().join(" ")).not.toContain(thread);
+  const roomReads = () => app.requests().filter(r => r.method === "GET" && new URL(r.url).pathname.endsWith("/rooms"));
+  const before = roomReads().length;
+
+  f.addRoom("acme", { id: thread, name: roomName, parent_room_id: "lobby" });
+  holdNext = true;
+  await app.press("id:run-follow:new-thread");
+  await app.waitUntil(() => held);
+  expect(app.shows("text:Looking up the room or thread…")).toBe(true);
+  expect(app.shows("id:dispatch-move-confirm")).toBe(false);
+  expect(app.shows("text:To: agent in Acme › #lobby")).toBe(true);
+  await app.clock!.runFor(1_600);
+  await app.waitFor("id:dispatch-move-confirm");
+  expect(app.shows("id:run:new-thread >> label:Open Acme › #Release review")).toBe(true);
+  expect(app.shows("id:run:new-thread >> label:Follow up in Acme › #Release review")).toBe(true);
+  expect(app.shows("id:dispatch-move-confirm >> text:/Follow up in Acme › #Release review instead/")).toBe(true);
+  expect(app.texts().join(" ")).not.toContain(thread);
+
+  f.state.rooms.set("acme", f.state.rooms.get("acme")!.filter(r => r.id !== thread));
+  await app.press("id:dispatch-move-draft");
+  await app.waitFor("text:/That room or thread is no longer available/");
+  expect(roomReads().slice(before).map(r => new URL(r.url).pathname)).toEqual([
+    "/v1/spaces/acme/rooms", "/v1/spaces/acme/rooms",
+  ]);
+  expect(app.shows("text:To: agent in Acme › #lobby")).toBe(true);
+  expect(app.value("id:dispatch-text")).toBe("Preserve this draft");
+  expect(sentAnything(f)).toBe(false);
+});
 
 test("a held confirmed Follow up can't move a draft edited away and back; an omitted room doesn't replace its target", async () => {
   const f = world();

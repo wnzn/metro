@@ -38,7 +38,7 @@ export function webFailureText(note: WebToolNote, own: boolean, offlineOwner?: s
   switch (note.failure) {
     case "offline": return `${tool} needs ${own ? "your" : offlineOwner ? `${offlineOwner}'s` : "the starter's"} Metro app, which is offline. Nothing was sent.`;
     case "no_device": return `${tool} couldn't run: ${own ? "you haven't" : "the starter hasn't"} set up a computer for web search.`;
-    case "exhausted": return `${tool} failed: ${note.attempts.length && note.attempts.every((a) => a.outcome === "skipped_disabled") ? "all providers were off" : "every provider was at its limit or unavailable"}.`;
+    case "exhausted": return "No provider returned a usable result.";
     case "busy": return `${tool} couldn't run: the starter's computer is busy. Try again shortly.`;
     case "timed_out": return `${tool} couldn't run: the starter's computer didn't answer in time.`;
     case "revoked": return `${tool} was interrupted because access changed.`;

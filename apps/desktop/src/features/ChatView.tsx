@@ -18,6 +18,7 @@ import {
   dispatchError,
   dispatching,
   dispatchNotice,
+  dispatchRevalidating,
   dispatchTarget,
   draft,
   followUp,
@@ -166,15 +167,34 @@ function Onboarding() {
 function RunsPanel(props: { visible: boolean; onClose?: () => void }) {
   type Move = NonNullable<ReturnType<typeof followUp>>;
   const choice = signal<{ run: Run; decision: Move; opener?: ViewRef } | null>(null);
+  const resolving = signal<Move | null>(null);
   const moving = signal<Move | null>(null);
-  const cancelMove = () => { choice.set(null); moving.set(null); };
+  const cancelMove = () => { choice.set(null); resolving.set(null); moving.set(null); };
+  const visibleForm = () => props.visible && dispatchOpen();
+  const activeChoice = () => {
+    const item = choice();
+    return visibleForm() && item?.decision.current() && runDestination(item.run) ? item : null;
+  };
+  const verification = () => moving()?.current() ? "Checking the new destination…"
+    : resolving()?.current() ? "Looking up the room or thread…"
+    : dispatchRevalidating() ? "Checking the selected destination…" : null;
   effect(() => { if (!props.visible) cancelMove(); });
   cleanup(cancelMove);
-  const follow = (run: Run, opener?: ViewRef) => {
+  const follow = async (run: Run, opener?: ViewRef) => {
     cancelMove();
     dispatchOpen.set(true);
     const decision = followUp(run);
-    if (decision) choice.set({ run, decision, opener });
+    if (!decision) return;
+    if (!runDestination(run)) {
+      resolving.set(decision);
+      const stillHere = () => resolving() === decision && visibleForm();
+      try {
+        if (!await decision.lookup(stillHere) || !stillHere()) return;
+      } finally {
+        if (resolving() === decision) resolving.set(null);
+      }
+    }
+    if (visibleForm() && decision.current() && runDestination(run)) choice.set({ run, decision, opener });
   };
   const closeChoice = () => {
     const opener = choice()?.opener;
@@ -184,11 +204,11 @@ function RunsPanel(props: { visible: boolean; onClose?: () => void }) {
     });
   };
   const move = async (decision: Move) => {
-    if (choice()?.decision !== decision || !decision.current()) return;
+    if (activeChoice()?.decision !== decision) return;
     closeChoice();
     moving.set(decision);
     try {
-      await decision.move(() => moving() === decision && props.visible && dispatchOpen());
+      await decision.move(() => moving() === decision && visibleForm());
     } finally {
       if (moving() === decision) moving.set(null);
     }
@@ -213,7 +233,7 @@ function RunsPanel(props: { visible: boolean; onClose?: () => void }) {
       </Column>
       <ScrollArea padX={4} padY={1} gap={2} testID="runs-list">
         <If when={dispatchOpen()}>
-          <Dispatch moving={!!moving()?.current()} onEdit={cancelMove} onClose={() => {
+          <Dispatch verification={verification()} onEdit={cancelMove} onClose={() => {
             cancelMove();
             dispatchOpen.set(false);
           }} />
@@ -226,13 +246,13 @@ function RunsPanel(props: { visible: boolean; onClose?: () => void }) {
           )}
         </If>
         <Each of={runs()} key={(run) => run.id}>
-          {(run) => <RunCard run={run} onFollow={follow} onLeave={props.onClose} />}
+          {(run) => <RunCard run={run} onFollow={(next, opener) => void follow(next, opener)} onLeave={props.onClose} />}
         </Each>
         <If when={runsLoaded() && runs().length === 0 && !runsError()}>
           <RunsEmpty />
         </If>
       </ScrollArea>
-      <If when={props.visible && choice()?.decision.current() ? choice() : null}>
+      <If when={activeChoice()}>
         {item => (
           <Modal open size="compact" title="Move task draft" testID="dispatch-move-confirm" onClose={closeChoice}>
             <Column pad={4} gap={3}>
@@ -313,12 +333,14 @@ function RunsEmpty() {
 
 function runDestination(run: Run) {
   const { space, room } = runScope(run);
-  return `${space} › #${room}`;
+  return space && room ? `${space} › #${room}` : undefined;
 }
 
 function RunCard(props: { run: () => Run; onFollow: (run: Run, opener?: ViewRef) => void; /** Opening the run leaves the Chat: close the dialog first. */ onLeave?: () => void }) {
   const run = () => props.run();
+  const scope = () => runScope(run());
   const destination = () => runDestination(run());
+  const lookupScope = () => scope().space ? ` in ${scope().space}` : "";
   let followButton: ViewRef | undefined;
   return (
     <Surface variant="card" pad={3} gap={2} testID={`run:${run().id}`}>
@@ -326,7 +348,7 @@ function RunCard(props: { run: () => Run; onFollow: (run: Run, opener?: ViewRef)
         <Badge tone={runTone(run().status)} label={runStatusLabel(run().status)} />
         <Column grow>
           <Label variant="caption" color="muted" lines={1}>
-            {destination()}
+            {destination() ?? (scope().space ? `${scope().space} › Room or thread not loaded` : "Destination unavailable")}
           </Label>
         </Column>
       </Row>
@@ -341,7 +363,7 @@ function RunCard(props: { run: () => Run; onFollow: (run: Run, opener?: ViewRef)
           compact
           testID={`run-open:${run().id}`}
           label="Open"
-          accessibilityLabel={`Open ${destination()}`}
+          accessibilityLabel={destination() ? `Open ${destination()}` : `Open run destination${lookupScope()}`}
           onPress={() => {
             props.onLeave?.();
             void openRun(run());
@@ -351,7 +373,7 @@ function RunCard(props: { run: () => Run; onFollow: (run: Run, opener?: ViewRef)
           compact
           testID={`run-follow:${run().id}`}
           label="Follow up"
-          accessibilityLabel={`Follow up in ${destination()}`}
+          accessibilityLabel={destination() ? `Follow up in ${destination()}` : `Look up the follow-up destination${lookupScope()}`}
           viewRef={node => { followButton = node; }}
           onPress={() => props.onFollow(run(), followButton)}
         />
@@ -380,9 +402,9 @@ function dispatchRecipient() {
   return space && room ? `To: agent in ${space.name} › #${room.name}` : "Choose a Space and a room.";
 }
 
-function Dispatch(props: { moving: boolean; onEdit: () => void; onClose: () => void }) {
+function Dispatch(props: { verification: string | null; onEdit: () => void; onClose: () => void }) {
   const target = () => dispatchTarget();
-  const ready = () => !!dispatchSpace() && !!dispatchRoom() && dispatchDraft().trim().length > 0 && !dispatching() && !props.moving;
+  const ready = () => !!dispatchSpace() && !!dispatchRoom() && dispatchDraft().trim().length > 0 && !dispatching() && !props.verification;
   return (
     <Surface variant="card" pad={3} gap={2} testID="dispatch">
       <Row align="center" gap={2}>
@@ -447,7 +469,9 @@ function Dispatch(props: { moving: boolean; onEdit: () => void; onClose: () => v
           <Label variant="caption" color={dispatchRoom() ? "default" : "muted"} testID="dispatch-recipient">
             {dispatchRecipient()}
           </Label>
-          <If when={props.moving}><Label variant="caption" color="muted" testID="dispatch-verifying">Checking the new destination…</Label></If>
+          <If when={props.verification}>
+            {message => <Label variant="caption" color="muted" testID="dispatch-verifying">{message()}</Label>}
+          </If>
           <Row align="center" gap={2}>
             <Spacer />
             <Action

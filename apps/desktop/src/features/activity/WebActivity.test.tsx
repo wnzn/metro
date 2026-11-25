@@ -2,7 +2,7 @@ import { expect, open, test } from "nsh/test";
 import { BASE, TOKENS, world } from "../../../test/fakeServer";
 import { launched } from "../../../test/launched";
 import { parseWebTool } from "../../api/webSearch";
-import { webAttemptRows } from "./web";
+import { webAttemptRows, webFailureText } from "./web";
 
 type F = ReturnType<typeof world>;
 const secret = "fixture-only-refusal-value";
@@ -66,9 +66,10 @@ test("after run eviction only the server-attributed starter is offered Settings;
     attempts: [attempt("exa", "keyless", "out_of_credits"), attempt("tavily", "key", "key_rejected")] });
   const refuse = event(f, "run_refuse", "error", `web_fetch refused: ${secret}`, { name: "web_fetch", failure: "not_allowed" });
   const other = await room(f, "bob");
-  await other.waitFor("text:/every provider was at its limit or unavailable/");
+  await other.waitFor("text:No provider returned a usable result.");
   await other.press("id:activity-toggle:agent:run_exhausted");
   await other.waitFor(`id:activity-web-failure:${e.id}`);
+  expect(other.shows("id:activity-details:agent:run_exhausted >> text:No provider returned a usable result.")).toBe(true);
   expect(other.shows("id:activity-open-websearch")).toBe(false);
   expect(other.texts().join(" ")).not.toContain("before configuring an API key");
   await other.press("id:activity-toggle:agent:run_refuse");
@@ -83,6 +84,13 @@ test("after run eviction only the server-attributed starter is offered Settings;
   expect(own.texts().join(" ")).not.toContain("higher limits");
   await own.press("id:activity-open-websearch");
   await own.waitFor("text:Opened Web search settings");
+});
+
+test("exhaustion doesn't imply contact when the attempt list is empty or only contains skips", () => {
+  for (const attempts of [[], [attempt("exa", "keyless", "skipped_disabled"), attempt("tinyfish", "key", "skipped_no_key")]]) {
+    const note = parseWebTool({ name: "web_search", failure: "exhausted", attempts })!;
+    expect(webFailureText(note, false)).toBe("No provider returned a usable result.");
+  }
 });
 
 test("offline names the starter to other members but says your for the same stable account", async () => {
