@@ -467,6 +467,64 @@ mod tests {
         assert_eq!((rows, creds), (0, 0));
     }
 
+    #[tokio::test]
+    async fn a_late_older_publication_leaves_newer_work_alone() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let id = new_id();
+        let i = id.clone();
+        db.call(move |db| {
+            db.lock().execute(
+                "INSERT INTO web_devices (id, owner_id, label, created_at) VALUES (?1, 'alice', 'l', 0)",
+                [&i],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let relay = crate::device_relay::DeviceRelay::new(
+            Default::default(),
+            std::sync::Arc::new(crate::providers::DeviceDirectory),
+        );
+        relay.issue_token(&db, "alice", &id).await.unwrap();
+        relay.issue_token(&db, "alice", &id).await.unwrap();
+        assert_eq!(relay.known_generation(&id), 2);
+        let device = crate::device_relay::Device {
+            connection: id.clone(),
+            owner: "alice".into(),
+            generation: 2,
+        };
+        assert!(relay.claim(&device).is_none());
+        let pending = {
+            let (relay, db, id) = (relay.clone(), db.clone(), id.clone());
+            tokio::spawn(async move {
+                relay
+                    .dispatch_web(
+                        &db,
+                        "alice",
+                        &id,
+                        Operation::WebSearch,
+                        json!({"v": 1}),
+                        std::time::Duration::from_secs(5),
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // The revocation of generation 1 is published only now.
+        relay.retire(&id, 1);
+        assert_eq!(relay.known_generation(&id), 2);
+        let job = relay.claim(&device).expect("the newer job survived");
+        assert_eq!(job.operation, Operation::WebSearch);
+        relay
+            .complete_job(&device, &job.id, Ok(json!({"v": 1, "attempts": []})))
+            .unwrap();
+        assert!(pending.await.unwrap().is_ok());
+        // A newer publication invalidates older work and polls.
+        relay.retire(&id, 3);
+        assert!(relay.claim(&device).is_none());
+        assert!(!relay.status(&id).online);
+    }
+
     #[test]
     fn ids_have_one_shape() {
         assert!(is_web_device_id(&new_id()));

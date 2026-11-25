@@ -1618,9 +1618,7 @@ impl DeviceRelay {
             })
             .await
             .map_err(IssueError::Internal)??;
-        let mut inner = self.lock();
-        inner.flush(connection);
-        inner.observe(connection, generation);
+        self.retire(connection, generation);
         Ok(token)
     }
 
@@ -1643,9 +1641,9 @@ impl DeviceRelay {
             })
             .await
             .map_err(IssueError::Internal)??;
-        match generation {
-            Some(g) => self.retire(connection, g),
-            None => self.lock().flush(connection),
+        // No credential, nothing was revoked: the relay keeps what it has.
+        if let Some(g) = generation {
+            self.retire(connection, g);
         }
         Ok(())
     }
@@ -1653,10 +1651,17 @@ impl DeviceRelay {
     /// Publish a committed revocation to the relay: fail every pending job of
     /// `connection` and refuse polls and queueing under any generation
     /// before `generation`, before the caller returns.
-    fn retire(&self, connection: &str, generation: u64) {
+    ///
+    /// Conditional on the generation, under the relay lock: only jobs and
+    /// polls of *older* generations are invalidated. A publication that
+    /// arrives late (an older generation than the relay already knows)
+    /// changes nothing, so a newer token's queued work survives it.
+    pub(crate) fn retire(&self, connection: &str, generation: u64) {
         let mut inner = self.lock();
-        inner.flush(connection);
-        inner.observe(connection, generation);
+        let known = inner.conns.get(connection).map_or(0, |q| q.generation);
+        if generation > known {
+            inner.observe(connection, generation);
+        }
     }
 
     /// The newest token generation the relay knows for `connection`.
@@ -1692,9 +1697,8 @@ impl DeviceRelay {
         match removed {
             None => Ok(false),
             Some(generation) => {
-                match generation {
-                    Some(g) => self.retire(id, g),
-                    None => self.lock().flush(id),
+                if let Some(g) = generation {
+                    self.retire(id, g);
                 }
                 Ok(true)
             }
