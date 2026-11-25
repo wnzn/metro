@@ -1,6 +1,6 @@
 import {
   closesMention, isAgentHandle, isLegacyId, isMemberId, isRange, isTextBoundary, mentionSyntaxRanges,
-  opensMention, overlapsRanges, quotedEmailRanges,
+  opensMention, overlapsRanges, quotedLocalStart,
   saneExplicitLabel, saneTypedLabel, validMentionSpan,
 } from "./syntax";
 import type { MentionRange } from "./syntax";
@@ -337,8 +337,7 @@ export function pickMention(
     || overlapsRanges(selection, syntax.ignored))) return null;
   if (draft.anchors.some(a => append ? a.start < start && start < a.end
     : start < a.end && a.start < end && !(start === a.start && end === a.end))) return null;
-  const wouldCloseQuote = append && /["']/.test(draft.text[start - 1])
-    && quotedEmailRanges(`${draft.text.slice(0, start)}@`, syntax.quoteOpaque).some(r => r.end === start + 1);
+  const wouldCloseQuote = append && quotedLocalStart(draft.text, start - 1, syntax.quoteOpaque) !== null;
   const prefix = append && (!opensMention(draft.text, start) || wouldCloseQuote) ? " " : "";
   const suffix = end === draft.text.length || !closesMention(draft.text.slice(end)) ? " " : "";
   for (const label of displayLabels(directory, mention)) {

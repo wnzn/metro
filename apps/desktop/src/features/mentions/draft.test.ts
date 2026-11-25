@@ -260,6 +260,37 @@ test("quotes in inline and fenced code cannot interfere with quoted addresses", 
   ]);
 });
 
+test("quoted addresses are recognized independently of unmatched prose quotes", () => {
+  for (const text of [
+    'Say "`quote`" then <"local"@agent>',
+    'Say "`quote"` then <"local"@agent>',
+    'Say "something unfinished, then <"local"@agent>',
+    "Say 'something unfinished, then <'local'@agent>",
+  ]) {
+    expect(scanMentionDraft(draft(text), roster)).toEqual([]);
+    expect(send(text)).toEqual({ ok: true, body: { text } });
+  }
+});
+
+test("escaped local parts and multiple quoted addresses stay plain without shifting real mentions", () => {
+  const text = String.raw`🌿 "unfinished prose, <"a \"quote\" @agent"@coder> and <"b \\"@agent>, then "@bo".`;
+  const out = body(send(text));
+  expect(out.text).toBe(text);
+  expect(out.mentions).toEqual([{ kind: "user", id: "bo" }]);
+  const bytes = new TextEncoder().encode(text);
+  expect(out.spans?.map(s => new TextDecoder().decode(bytes.slice(s.start, s.end)))).toEqual(["@bo"]);
+});
+
+test("an incomplete or implausible address suffix does not hide an ordinary mention", () => {
+  for (const text of ['Say "ask @bo now"@', 'Say "ask @bo now"@.', 'Say "ask @bo now"\n"@']) {
+    expect(body(send(text)).mentions).toEqual([{ kind: "user", id: "bo" }]);
+  }
+  expect(body(send(' an unmatched quote before "@coder')).mentions).toEqual([{ kind: "agent", agent_id: coder.agentId }]);
+  expect(body(send('Say "ask @bo now\n"@coder')).mentions)
+    .toEqual([{ kind: "user", id: "bo" }, { kind: "agent", agent_id: coder.agentId }]);
+  expect(body(send('Say "route <"local"@agent>" then "@bo,"')).mentions).toEqual([{ kind: "user", id: "bo" }]);
+});
+
 test("a quote inside a selected label is opaque next to a quoted address", () => {
   const dev = { kind: "user", id: "dev" } as const;
   const directory = {
