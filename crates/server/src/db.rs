@@ -106,6 +106,10 @@ pub struct MessageMeta {
     /// A copy of another message, posted by the forwarder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarded: Option<Forwarded>,
+    /// Only on a `compaction` event: the range it summarizes and who
+    /// triggered it ([`crate::compaction`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<crate::compaction::Meta>,
 }
 
 impl MessageMeta {
@@ -126,6 +130,7 @@ impl MessageMeta {
             reply_to: key(m, "reply_to"),
             via: key(m, "via"),
             forwarded: key(m, "forwarded"),
+            compaction: key(m, "compaction"),
         }
     }
 }
@@ -480,6 +485,12 @@ pub mod kind {
     /// (`activity.space_post`). The text is exactly what was sent. Never
     /// model history, never indexed, never in any Space.
     pub const SPACE_POST: &str = "space_post";
+    /// A model-written summary of earlier events of the same room, thread or
+    /// Chat (`compaction` metadata: the range, trigger and who asked; see
+    /// [`crate::compaction`]). Visible to every reader of the place; given
+    /// to later runs as untrusted background, never as an ordinary turn.
+    /// Never indexed, never searched.
+    pub const COMPACTION: &str = "compaction";
 }
 
 /// Actors the server writes for non-human events.
@@ -666,6 +677,7 @@ impl Db {
         crate::space_prefs::init(&conn)?;
         // After spaces (exclusions reference them).
         crate::meta::prefs::init(&conn)?;
+        crate::compaction::init(&conn)?;
         // After spaces (Space pages reference them).
         crate::pages::init(&conn)?;
         let version: Option<String> = conn
@@ -1315,7 +1327,7 @@ impl Db {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn insert_event_in(
+    pub(crate) fn insert_event_in(
         conn: &Connection,
         space_id: &str,
         room_id: &str,
@@ -1471,7 +1483,7 @@ impl Db {
         let mut stmt = conn.prepare_cached(
             "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at FROM space_events
              WHERE space_id = ?1 AND room_id = ?2 AND id < ?3
-               AND kind NOT IN ('activity', 'reasoning_summary', 'page_draft')
+               AND kind NOT IN ('activity', 'reasoning_summary', 'page_draft', 'compaction')
              ORDER BY id DESC LIMIT ?4",
         )?;
         let rows = stmt.query_map(params![space_id, room_id, before, limit as i64], row_event)?;
@@ -1555,7 +1567,8 @@ impl Db {
         let conn = self.lock();
         let mut stmt = conn.prepare_cached(
             "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at FROM personal_events
-             WHERE user_id = ?1 AND id < ?2 AND kind NOT IN ('activity', 'reasoning_summary')
+             WHERE user_id = ?1 AND id < ?2
+               AND kind NOT IN ('activity', 'reasoning_summary', 'compaction')
              ORDER BY id DESC LIMIT ?3",
         )?;
         let rows = stmt.query_map(params![user_id, before, limit as i64], row_event)?;
@@ -1630,7 +1643,7 @@ pub(crate) fn row_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
     let metadata: Option<String> = r.get(7)?;
     let kind: String = r.get(1)?;
     let (spans, meta) = match metadata.as_deref() {
-        Some(raw) if kind == kind::MESSAGE => {
+        Some(raw) if kind == kind::MESSAGE || kind == kind::COMPACTION => {
             match serde_json::from_str::<serde_json::Value>(raw) {
                 Ok(serde_json::Value::Object(mut m)) => (
                     // Unknown/malformed spans must not turn into legacy text inference.
@@ -2312,6 +2325,7 @@ mod tests {
                     event_id: 3,
                 }),
             }),
+            compaction: None,
         };
         let addressed = Addressed {
             spans: Some(Vec::new()),

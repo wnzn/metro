@@ -43,6 +43,8 @@ pub const MAX_DISPLAY_NAME_CHARS: usize = 128;
 pub const MAX_EFFORTS: usize = 8;
 /// Longest effort value.
 pub const MAX_EFFORT_CHARS: usize = 32;
+/// Bounds of an owner-set context window, in tokens.
+pub const CONTEXT_TOKENS: std::ops::RangeInclusive<u32> = 1_024..=10_000_000;
 
 /// How a selected effort is sent to a self-hosted OpenAI-compatible model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -151,6 +153,8 @@ pub struct ModelRow {
     pub source: Source,
     pub position: i64,
     pub thinking: Option<Thinking>,
+    /// The model's context window in tokens, when known (owner-set).
+    pub context_tokens: Option<u32>,
 }
 
 impl ModelRow {
@@ -184,9 +188,11 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
              source        TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('listed', 'manual')),
              position      INTEGER NOT NULL DEFAULT 0,
              thinking      TEXT,
+             context_tokens INTEGER,
              PRIMARY KEY (connection_id, model_id)
          );",
     )?;
+    add_context_tokens(conn)?;
     if !existed {
         conn.execute_batch(
             "INSERT OR IGNORE INTO provider_connection_models
@@ -197,8 +203,24 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-const COLUMNS: &str =
-    "model_id, display_name, listed_name, enabled, available, source, position, thinking";
+/// Additive: older lists gain a nullable `context_tokens` (unknown).
+fn add_context_tokens(conn: &Connection) -> rusqlite::Result<()> {
+    let has: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('provider_connection_models')
+                        WHERE name = 'context_tokens')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has {
+        conn.execute_batch(
+            "ALTER TABLE provider_connection_models ADD COLUMN context_tokens INTEGER",
+        )?;
+    }
+    Ok(())
+}
+
+const COLUMNS: &str = "model_id, display_name, listed_name, enabled, available, source, position, \
+                       thinking, context_tokens";
 
 fn read(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRow> {
     let source: String = r.get(5)?;
@@ -217,7 +239,16 @@ fn read(r: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRow> {
         position: r.get(6)?,
         // A stored value is always valid; anything else reads as none.
         thinking: thinking.and_then(|t| serde_json::from_str(&t).ok()),
+        context_tokens: r
+            .get::<_, Option<i64>>(8)?
+            .and_then(|n| u32::try_from(n).ok()),
     })
+}
+
+/// The context window of `model` on connection `id`, when its owner set it.
+/// A number only: no access check is needed to read it for a run.
+pub fn context_tokens(conn: &Connection, id: &str, model: &str) -> rusqlite::Result<Option<u32>> {
+    Ok(get(conn, id, model)?.and_then(|m| m.context_tokens))
 }
 
 /// The models of connection `id`, in order.
@@ -393,6 +424,7 @@ pub struct Patch {
     pub enabled: Option<bool>,
     pub thinking: Option<Option<Thinking>>,
     pub position: Option<i64>,
+    pub context_tokens: Option<Option<u32>>,
 }
 
 /// Apply `patch` to `model` of connection `id`; `false` when there is none.
@@ -412,9 +444,12 @@ pub fn patch(conn: &Connection, id: &str, model: &str, p: &Patch) -> rusqlite::R
     if let Some(pos) = p.position {
         m.position = pos;
     }
+    if let Some(n) = p.context_tokens {
+        m.context_tokens = n;
+    }
     conn.execute(
         "UPDATE provider_connection_models
-         SET display_name = ?3, enabled = ?4, thinking = ?5, position = ?6
+         SET display_name = ?3, enabled = ?4, thinking = ?5, position = ?6, context_tokens = ?7
          WHERE connection_id = ?1 AND model_id = ?2",
         params![
             id,
@@ -422,7 +457,8 @@ pub fn patch(conn: &Connection, id: &str, model: &str, p: &Patch) -> rusqlite::R
             m.display_name,
             m.enabled,
             thinking_json(m.thinking.as_ref()),
-            m.position
+            m.position,
+            m.context_tokens
         ],
     )?;
     Ok(true)
@@ -589,6 +625,9 @@ pub struct ModelView {
     pub thinking: Option<Thinking>,
     /// The efforts a turn can pick for it on this connection.
     pub reasoning_efforts: Vec<String>,
+    /// The owner-set context window in tokens; `null` when unknown
+    /// (compaction then assumes 32,000).
+    pub context_tokens: Option<u32>,
 }
 
 pub fn views(row: &Row, models: &[ModelRow]) -> Vec<ModelView> {
@@ -607,6 +646,7 @@ pub fn views(row: &Row, models: &[ModelRow]) -> Vec<ModelView> {
             is_default: m.model_id == row.model,
             thinking: m.thinking.clone(),
             reasoning_efforts: entry.map_or_else(Vec::new, |e| efforts_of(row, e, m, true).0),
+            context_tokens: m.context_tokens,
         })
         .collect()
 }
@@ -638,6 +678,17 @@ pub(super) fn check_display_name(name: &str) -> ApiResult<Option<String>> {
 /// dropped rather than refused.
 pub(super) fn clean_listed_name(name: Option<&str>) -> Option<String> {
     name.and_then(|n| check_display_name(n).ok().flatten())
+}
+
+fn check_context_tokens(n: Option<u32>) -> ApiResult<Option<u32>> {
+    match n {
+        Some(n) if !CONTEXT_TOKENS.contains(&n) => Err(bad_request(format!(
+            "context_tokens must be {}..={} (or null when unknown)",
+            CONTEXT_TOKENS.start(),
+            CONTEXT_TOKENS.end()
+        ))),
+        n => Ok(n),
+    }
 }
 
 fn model_id(raw: &str) -> ApiResult<String> {
@@ -719,6 +770,9 @@ pub struct AddBody {
     /// Also make it the connection's default model.
     #[serde(default)]
     default: bool,
+    /// The model's context window in tokens, when known.
+    #[serde(default)]
+    context_tokens: Option<u32>,
 }
 
 /// `POST /v1/providers/{id}/model-list`: add a model id by hand.
@@ -738,6 +792,7 @@ pub async fn add(
         .transpose()?
         .flatten();
     let thinking = thinking_for(entry, body.thinking)?;
+    let context_tokens = check_context_tokens(body.context_tokens)?;
     let enabled = body.enabled.unwrap_or(true);
     if body.default && !enabled {
         return Err(conflict("the default model must be enabled"));
@@ -756,6 +811,13 @@ pub async fn add(
                 enabled,
                 thinking.as_ref(),
             )?;
+            if outcome == AddOutcome::Added && context_tokens.is_some() {
+                let set = Patch {
+                    context_tokens: Some(context_tokens),
+                    ..Patch::default()
+                };
+                patch(&tx, &cid, &model, &set)?;
+            }
             tx.commit()?;
             if outcome != AddOutcome::Added {
                 return Ok(Err(outcome));
@@ -809,6 +871,9 @@ pub struct PatchBody {
     /// `true` makes it the connection's default model.
     #[serde(default)]
     default: Option<bool>,
+    /// A number sets the context window in tokens; `null` makes it unknown.
+    #[serde(default, deserialize_with = "explicit_null")]
+    context_tokens: Option<Option<u32>>,
 }
 
 fn is_default_model_error() -> ApiError {
@@ -846,11 +911,13 @@ pub async fn patch_one(
     {
         return Err(bad_request("position is out of range"));
     }
+    let context_tokens = body.context_tokens.map(check_context_tokens).transpose()?;
     let p = Patch {
         display_name,
         enabled: body.enabled,
         thinking,
         position: body.position,
+        context_tokens,
     };
     let (user, cid, make_default) = (who.id.clone(), row.id.clone(), body.default == Some(true));
     let outcome = state
@@ -1039,6 +1106,50 @@ mod tests {
             .unwrap();
         init(&conn).unwrap();
         assert!(list(&conn, "pc_a").unwrap().is_empty());
+    }
+
+    #[test]
+    fn context_tokens_is_added_to_older_lists_as_unknown() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        store::init(&conn).unwrap();
+        conn.execute_batch(
+            "DROP TABLE provider_connection_models;
+             CREATE TABLE provider_connection_models (
+                 connection_id TEXT NOT NULL, model_id TEXT NOT NULL, display_name TEXT,
+                 listed_name TEXT, enabled INTEGER NOT NULL DEFAULT 1,
+                 available INTEGER NOT NULL DEFAULT 1, source TEXT NOT NULL DEFAULT 'manual',
+                 position INTEGER NOT NULL DEFAULT 0, thinking TEXT,
+                 PRIMARY KEY (connection_id, model_id));
+             INSERT INTO provider_connection_models (connection_id, model_id) VALUES ('pc_a', 'm');",
+        )
+        .unwrap();
+        init(&conn).unwrap();
+        init(&conn).unwrap();
+        assert_eq!(
+            get(&conn, "pc_a", "m").unwrap().unwrap().context_tokens,
+            None
+        );
+        let set = Patch {
+            context_tokens: Some(Some(16_384)),
+            ..Patch::default()
+        };
+        assert!(patch(&conn, "pc_a", "m", &set).unwrap());
+        assert_eq!(context_tokens(&conn, "pc_a", "m").unwrap(), Some(16_384));
+        // Other patches keep it; `null` clears it.
+        let rename = Patch {
+            display_name: Some(Some("M".into())),
+            ..Patch::default()
+        };
+        patch(&conn, "pc_a", "m", &rename).unwrap();
+        assert_eq!(context_tokens(&conn, "pc_a", "m").unwrap(), Some(16_384));
+        let clear = Patch {
+            context_tokens: Some(None),
+            ..Patch::default()
+        };
+        patch(&conn, "pc_a", "m", &clear).unwrap();
+        assert_eq!(context_tokens(&conn, "pc_a", "m").unwrap(), None);
+        assert_eq!(context_tokens(&conn, "pc_a", "other").unwrap(), None);
     }
 
     #[test]

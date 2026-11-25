@@ -230,6 +230,11 @@ impl ChatTurns {
         (rx, TurnGuard(self.clone(), turn.to_owned()))
     }
 
+    /// Whether `user` has a Chat turn running.
+    pub fn running_for(&self, user: &str) -> bool {
+        self.lock().values().any(|(owner, _)| owner == user)
+    }
+
     /// Stop `user`'s running turn `turn`. `false` for anyone else's or one
     /// that isn't running.
     pub fn stop(&self, turn: &str, user: &str) -> bool {
