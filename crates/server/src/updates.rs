@@ -128,10 +128,14 @@ pub struct CheckStatus {
     /// `never`, `ok` or `error`.
     pub result: &'static str,
     pub error: Option<&'static str>,
+    /// A verified release older than one verified before was served as
+    /// latest (the newer one stays offered).
+    pub anomaly: Option<&'static str>,
 }
 
 #[derive(Default)]
 struct Inner {
+    floor: Option<Version>,
     latest: Option<Latest>,
     status: CheckStatus,
     presence: HashMap<String, Presence>,
@@ -144,6 +148,8 @@ struct Inner {
 pub struct Updates {
     pub check_enabled: bool,
     inner: Arc<Mutex<Inner>>,
+    /// Where the highest version ever verified is kept across restarts.
+    floor_file: Option<std::path::PathBuf>,
 }
 
 impl Updates {
@@ -158,6 +164,48 @@ impl Updates {
         Updates {
             check_enabled,
             inner: Arc::new(Mutex::new(inner)),
+            floor_file: None,
+        }
+    }
+
+    /// Persist the version floor in `path` (a malformed file is ignored:
+    /// stored state is untrusted, and the floor only ever rises).
+    pub fn with_floor_file(mut self, path: std::path::PathBuf) -> Updates {
+        let floor = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| Version::parse(t.trim()));
+        if path.exists() && floor.is_none() {
+            tracing::warn!("the stored release floor is malformed; ignored");
+        }
+        self.lock().floor = floor;
+        self.floor_file = Some(path);
+        self
+    }
+
+    /// The highest version verified so far (persisted when configured).
+    pub fn floor(&self) -> Option<Version> {
+        let inner = self.lock();
+        match (inner.floor, inner.latest.as_ref().map(|l| l.version)) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn raise_floor(&self, v: Version) {
+        let changed = {
+            let mut inner = self.lock();
+            if inner.floor.is_some_and(|f| f >= v) {
+                false
+            } else {
+                inner.floor = Some(v);
+                true
+            }
+        };
+        if changed
+            && let Some(path) = &self.floor_file
+            && let Err(e) = metro_release::write_atomic(path, v.to_string().as_bytes())
+        {
+            tracing::error!(error = %e.kind(), "could not store the release floor");
         }
     }
 
@@ -425,6 +473,7 @@ pub async fn server_update(
         "checked_at": status.checked_at,
         "result": status.result,
         "error": status.error,
+        "anomaly": status.anomaly,
         "available": available,
         "latest": latest.as_ref().map(|l| json!({
             "version": l.version.to_string(),
@@ -595,6 +644,12 @@ pub async fn check_once(state: &AppState, fetcher: &AsyncFetcher, verifier: &dyn
             .await?;
         release.check_bytes("IMAGES.txt", &raw)?;
         let images = metro_release::images::parse(&raw, &release.version)?;
+        if images.commit != release.commit {
+            return Err(metro_release::Error::new(
+                metro_release::ErrorCode::Inconsistent,
+                "IMAGES.txt names another commit than the signed release",
+            ));
+        }
         Ok(Latest {
             version: release.version,
             commit: release.commit,
@@ -605,6 +660,16 @@ pub async fn check_once(state: &AppState, fetcher: &AsyncFetcher, verifier: &dyn
     .await;
     let now = now_ms();
     match outcome {
+        Ok(latest) if state.updates.floor().is_some_and(|f| latest.version < f) => {
+            // Never hides the newer verified release; reported separately.
+            tracing::warn!(seen = %latest.version, "an older release was served as latest; ignored");
+            state.updates.lock().status = CheckStatus {
+                checked_at: Some(now),
+                result: "ok",
+                error: None,
+                anomaly: Some("older_release_served"),
+            };
+        }
         Ok(latest) => {
             let running = Version::parse(env!("CARGO_PKG_VERSION"));
             let before = state.updates.latest().map(|l| l.version);
@@ -619,11 +684,13 @@ pub async fn check_once(state: &AppState, fetcher: &AsyncFetcher, verifier: &dyn
                     .monitor(Scope::Instance, Code::ServerUpdateAvailable)
                     .await;
             }
+            state.updates.raise_floor(latest.version);
             state.updates.set_latest(latest);
             state.updates.lock().status = CheckStatus {
                 checked_at: Some(now),
                 result: "ok",
                 error: None,
+                anomaly: None,
             };
         }
         Err(e) => {
@@ -635,6 +702,7 @@ pub async fn check_once(state: &AppState, fetcher: &AsyncFetcher, verifier: &dyn
                 checked_at: Some(now),
                 result: "error",
                 error: Some(e.code()),
+                anomaly: None,
             };
         }
     }

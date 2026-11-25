@@ -105,7 +105,17 @@ impl AppState {
         db.call(move |db| crate::monitoring::prune(db, retention))
             .await?;
         let state = Self {
-            updates: crate::updates::Updates::new(crate::updates::check_enabled_from_env()),
+            updates: {
+                let updates =
+                    crate::updates::Updates::new(crate::updates::check_enabled_from_env());
+                // The highest verified release survives restarts (beside the DB).
+                match config.db_path.to_str() {
+                    Some(":memory:") | None => updates,
+                    Some(_) => {
+                        updates.with_floor_file(config.db_path.with_extension("release-floor"))
+                    }
+                }
+            },
             avatar_encodes: Arc::new(Semaphore::new(crate::profiles::MAX_AVATAR_ENCODES)),
             managed,
             library,

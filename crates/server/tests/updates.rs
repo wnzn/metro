@@ -698,3 +698,121 @@ async fn check_off_makes_no_outbound_request() {
     assert!(hits.load(Ordering::SeqCst) > 0);
     assert_eq!(on.updates.latest().unwrap().version.to_string(), "9.1.0");
 }
+
+/// Serve a fixture release (optionally with its IMAGES.txt commit changed).
+fn fixture_github(version: &str, images_commit: Option<&str>) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let mut overrides = BTreeMap::new();
+    if let Some(c) = images_commit {
+        let v = Version::parse(version).unwrap();
+        let text = metro_release::testing::fixture_images(&v)
+            .replace(metro_release::testing::TEST_COMMIT, c);
+        overrides.insert("IMAGES.txt".to_string(), text.into_bytes());
+    }
+    let files = FixtureRelease::new(version, overrides).files;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            loop {
+                let mut h = String::new();
+                if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                    break;
+                }
+            }
+            let name = line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let body = files.get(&name).cloned().unwrap_or_default();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(&body);
+        }
+    });
+    base
+}
+
+/// A persisted floor: after a restart, an older verified release served as
+/// latest neither replaces nor hides the newer one; it's reported apart.
+#[tokio::test]
+async fn the_release_floor_survives_restarts_and_never_hides_an_offer() {
+    let s = Server::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let floor = dir.path().join("metro.release-floor");
+    let check = |state: &AppState, base: &str| {
+        let fetcher = AsyncFetcher::new(
+            Source::loopback_fixture(base).unwrap(),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        let state = state.clone();
+        async move { metro_server::updates::check_once(&state, &fetcher, &TestVerifier).await }
+    };
+    let mut a = s.state.clone();
+    a.updates = metro_server::updates::Updates::new(true).with_floor_file(floor.clone());
+    check(&a, &fixture_github("9.2.0", None)).await;
+    assert_eq!(a.updates.latest().unwrap().version.to_string(), "9.2.0");
+    assert_eq!(std::fs::read_to_string(&floor).unwrap(), "9.2.0");
+    // "Restart": a fresh state with the same floor file sees an older release.
+    let mut b = s.state.clone();
+    b.updates = metro_server::updates::Updates::new(true).with_floor_file(floor.clone());
+    check(&b, &fixture_github("9.1.0", None)).await;
+    assert!(
+        b.updates.latest().is_none(),
+        "an older release is never taken as latest"
+    );
+    // In the same process, the newer offer stays and the anomaly is reported.
+    check(&a, &fixture_github("9.1.0", None)).await;
+    assert_eq!(a.updates.latest().unwrap().version.to_string(), "9.2.0");
+    // A malformed floor file is ignored, never trusted.
+    std::fs::write(&floor, "not a version").unwrap();
+    let mut c = s.state.clone();
+    c.updates = metro_server::updates::Updates::new(true).with_floor_file(floor.clone());
+    assert_eq!(c.updates.floor(), None);
+}
+
+#[tokio::test]
+async fn images_must_name_the_signed_commit() {
+    let s = Server::start().await;
+    let base = fixture_github("9.1.0", Some(&"f".repeat(40)));
+    let fetcher = AsyncFetcher::new(
+        Source::loopback_fixture(&base).unwrap(),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    metro_server::updates::check_once(&s.state, &fetcher, &TestVerifier).await;
+    assert!(s.state.updates.latest().is_none());
+    let (_, b) = s.get(ALICE, "/v1/server/update").await;
+    assert_eq!(
+        (b["result"].as_str(), b["error"].as_str()),
+        (Some("error"), Some("inconsistent"))
+    );
+}
+
+#[tokio::test]
+async fn an_older_latest_is_reported_as_an_anomaly() {
+    let s = Server::start().await;
+    s.set_latest("9.2.0");
+    let base = fixture_github("9.1.0", None);
+    let fetcher = AsyncFetcher::new(
+        Source::loopback_fixture(&base).unwrap(),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    metro_server::updates::check_once(&s.state, &fetcher, &TestVerifier).await;
+    let (_, b) = s.get(ALICE, "/v1/server/update").await;
+    assert_eq!(b["latest"]["version"], "9.2.0");
+    assert_eq!(b["anomaly"], "older_release_served");
+}
