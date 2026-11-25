@@ -117,6 +117,7 @@ class SegmentTests(GitFixture):
             "compose.prebuilt.yaml": only("containers", "packaging"),
             "compose.provider-key-file.yaml": only("containers", "packaging"),
             "packaging/package.py": only("packaging", "previews"),
+            "packaging/nsh_ci_tests.py": only("desktop", "packaging", "previews"),
             "packaging/README.md": NOTHING,
             "packaging/windows-msi/README.md": only("packaging", "previews"),
             "packaging/windows-msi/build_msi.py": only("packaging", "previews"),

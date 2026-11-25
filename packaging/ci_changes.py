@@ -65,6 +65,7 @@ RULES = tuple((re.compile(pattern.encode()), frozenset(segments)) for pattern, s
     # package.py and the packaging tests read the icon modules, icons and font.
     (r"apps/desktop/src/ui/.+", {"packaging"}),
     (DESKTOP_SOURCE, {"desktop", "previews"}),
+    (r"packaging/nsh_ci_tests\.py", {"desktop"}),
     # The container images, the media service and the Compose files.
     (r"Dockerfile|\.dockerignore|services/.+", {"containers", "previews"}),
     # test_image_release.py reads compose.yaml and compose.prebuilt.yaml.
