@@ -112,10 +112,11 @@ pub fn instantiate(t: &Template, space: Option<(&str, &str, &str)>) -> String {
     // One pass over the template: values inserted (room names can contain
     // anything a name may) are never scanned for placeholders again.
     let (with_space, plain) = (" __ROOM_ONLY__", "__ROOM_ONLY__");
+    let personal_button = " __PERSONAL_BRIEF_BUTTON__";
     let mut out = String::with_capacity(body.len() + 64);
     let mut rest = body.as_str();
     loop {
-        let next = ["__TARGET__", with_space, plain]
+        let next = ["__TARGET__", with_space, plain, personal_button]
             .iter()
             .filter_map(|p| rest.find(p).map(|at| (at, *p)))
             .min_by_key(|(at, p)| (*at, std::cmp::Reverse(p.len())));
@@ -126,6 +127,11 @@ pub fn instantiate(t: &Template, space: Option<(&str, &str, &str)>) -> String {
         out.push_str(&rest[..at]);
         match p {
             "__TARGET__" => out.push_str(&target),
+            " __PERSONAL_BRIEF_BUTTON__" => {
+                if space.is_none() {
+                    out.push_str(" block=\"ask\"");
+                }
+            }
             _ if room_only.is_empty() => {}
             " __ROOM_ONLY__" => {
                 out.push(' ');
