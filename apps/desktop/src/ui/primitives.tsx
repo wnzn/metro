@@ -133,7 +133,13 @@ const surfaceClass: Record<SurfaceVariant, string> = {
   popover: "bg-popover border border-border rounded-(--radius-lg) shadow-lg",
 };
 
-export function Surface(props: StackProps & { variant: SurfaceVariant; hidden?: boolean; /** A side panel's width the user chose (points), over the variant's own. */ width?: number }) {
+export function Surface(props: StackProps & {
+  variant: SurfaceVariant; hidden?: boolean;
+  /** A side panel's width the user chose (points), over the variant's own. */
+  width?: number;
+  /** Called after a nonempty layout; may fire again on resize. */
+  onLaidOut?: () => void;
+}) {
   return (
     <View
       class={cx(surfaceClass[props.variant], stackClass({ ...props, grow: false }, props.variant === "toolbar" || props.variant === "topbar" || props.variant === "app" ? "row" : "col"), props.grow && "flex-1 min-h-0", props.hidden && "hidden", props.width !== undefined && "shrink-0")}
@@ -141,6 +147,9 @@ export function Surface(props: StackProps & { variant: SurfaceVariant; hidden?: 
       accessibilityElementsHidden={props.hidden}
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel}
+      onLayout={props.onLaidOut ? ({ bounds }) => {
+        if (bounds.size.width > 0 && bounds.size.height > 0) props.onLaidOut?.();
+      } : undefined}
     >
       {props.children}
     </View>
