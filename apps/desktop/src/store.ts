@@ -246,17 +246,36 @@ const verifiedAccess = new Map<string, number>();
 // Keep Space denials past purgeSpace: an older positive list may still be
 // in flight. A newer authoritative list can grant access again.
 const deniedSpaceAccess = new Map<string, number>();
+// Room losses likewise outlive cache eviction and rejoin: even after a
+// fresh positive, a read started before the loss must not select that room.
+const deniedRoomAccess = new Map<string, number>();
 const accessProbes = new Map<string, { request: number }>();
 let chatAvailabilityRequest = 0;
 let chatProbeAfter = 0;
 const nextAccessRequest = () => ++accessSequence;
 const newerAccess = (key: string, request: number) => (verifiedAccess.get(key) ?? 0) > request;
+const roomDeniedAtOrAfter = (key: string, request: number) => (deniedRoomAccess.get(key) ?? 0) >= request;
 function verifyAccess(key: string, request: number) {
   if (!newerAccess(key, request)) verifiedAccess.set(key, request);
 }
 function verifyRoomAccess(sid: string, rid: string, request: number) {
   verifyAccess(scopeKey(sid, ""), request);
-  verifyAccess(scopeKey(sid, rid), request);
+  const key = scopeKey(sid, rid);
+  if (!roomDeniedAtOrAfter(key, request)) verifyAccess(key, request);
+}
+/** Positive rows usable by this request, not rows verified by another read. */
+function verifyRoomList(sid: string, list: readonly Room[], request: number): Room[] {
+  verifyAccess(scopeKey(sid, ""), request);
+  return list.filter(room => {
+    if (roomDeniedAtOrAfter(scopeKey(sid, room.id), request)) return false;
+    verifyRoomAccess(sid, room.id, request);
+    return true;
+  });
+}
+
+function keepNewerRooms(sid: string, list: readonly Room[], request: number): Room[] {
+  const listed = new Set(list.map(r => r.id));
+  return [...list, ...roomsOf(sid).filter(r => !listed.has(r.id) && newerAccess(scopeKey(sid, r.id), request))];
 }
 const deniedAtOrAfter = (sid: string, request: number) => (deniedSpaceAccess.get(sid) ?? 0) >= request;
 function recordSpaceDenial(sid: string, request: number) {
@@ -511,13 +530,16 @@ export async function openExactRoom(spaceId: string, roomId: string, stillHere: 
   if (!c || switchingSpace() || !roomId || !spaces().some(s => s.id === spaceId)) return false;
   const valid = guard(spaceId);
   const generation = navigationGeneration;
-  const list = await c.listRooms(spaceId);
-  if (!valid() || switchingSpace() || generation !== navigationGeneration || !stillHere() || !list.some(r => r.id === roomId)) return false;
+  const request = nextAccessRequest();
+  const result = await c.listRooms(spaceId);
+  if (!valid() || switchingSpace() || generation !== navigationGeneration || !stillHere()) return false;
+  const list = verifyRoomList(spaceId, result, request);
+  if (!list.some(r => r.id === roomId)) return false;
   navigationGeneration++;
   lastRoomBySpace.set(spaceId, roomId);
   batch(() => {
     clearTransient();
-    roomsBySpace.set({ ...roomsBySpace(), [spaceId]: list });
+    roomsBySpace.set({ ...roomsBySpace(), [spaceId]: keepNewerRooms(spaceId, list, request) });
     activeSpaceId.set(spaceId);
     activeRoomId.set(roomId);
     view.set("room");
@@ -719,10 +741,9 @@ async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId
   try {
     if (!roomsBySpace()[spaceId]) {
       request = nextAccessRequest();
-      const list = await c.listRooms(spaceId);
+      const result = await c.listRooms(spaceId);
       if (!ok()) return;
-      verifyAccess(scopeKey(spaceId, ""), request);
-      for (const r of list) verifyRoomAccess(spaceId, r.id, request);
+      const list = keepNewerRooms(spaceId, verifyRoomList(spaceId, result, request), request);
       batch(() => {
         roomsBySpace.set({ ...roomsBySpace(), [spaceId]: list });
         if (activeSpaceId() === spaceId) activeRoomId.set(pickRoom(spaceId, list));
@@ -771,8 +792,7 @@ async function ensureRooms(spaceId: string): Promise<readonly Room[]> {
     throw error;
   }
   if (!ok()) return EMPTY_ROOMS;
-  verifyAccess(scopeKey(spaceId, ""), request);
-  for (const r of list) verifyRoomAccess(spaceId, r.id, request);
+  list = keepNewerRooms(spaceId, verifyRoomList(spaceId, list, request), request);
   roomsBySpace.set({ ...roomsBySpace(), [spaceId]: list });
   return list;
 }
@@ -881,8 +901,11 @@ export async function createRoom(nameInput: string): Promise<boolean> {
     actionError.set(null);
   });
   try {
+    const request = nextAccessRequest();
     const room = await c.createRoom(sid, name);
     if (!ok()) return false;
+    if (roomDeniedAtOrAfter(scopeKey(sid, room.id), request)) return true;
+    verifyRoomAccess(sid, room.id, request);
     const list = roomsBySpace()[sid] ?? EMPTY_ROOMS;
     batch(() => {
       if (!list.some((r) => r.id === room.id)) roomsBySpace.set({ ...roomsBySpace(), [sid]: [...list, room] });
@@ -1285,11 +1308,11 @@ export async function setDispatchSpace(spaceId: string, roomId?: string): Promis
     if (roomId === undefined) {
       if (dispatchTarget() === pending) dispatchTarget.set({ spaceId, roomId: pickRoom(spaceId, list) });
     } else {
-      verifyAccess(scopeKey(spaceId, ""), request);
-      for (const r of list) verifyRoomAccess(spaceId, r.id, request);
-      const listed = new Set(list.map(r => r.id));
+      const verified = verifyRoomList(spaceId, list, request);
+      const listed = new Set(verified.map(r => r.id));
       const found = listed.has(roomId);
-      const stale = !found && newerAccess(scopeKey(spaceId, roomId), request);
+      const key = scopeKey(spaceId, roomId);
+      const stale = !found && (roomDeniedAtOrAfter(key, request) || newerAccess(key, request));
       batch(() => {
         if (!stale) {
           // Keep newer verified rooms and leave other active room views
@@ -1297,7 +1320,7 @@ export async function setDispatchSpace(spaceId: string, roomId?: string): Promis
           const keep = roomsOf(spaceId).filter(r => !listed.has(r.id) &&
             (newerAccess(scopeKey(spaceId, r.id), request) ||
               (r.id !== roomId && activeSpaceId() === spaceId && activeRoomId() === r.id)));
-          roomsBySpace.set({ ...roomsBySpace(), [spaceId]: [...list, ...keep] });
+          roomsBySpace.set({ ...roomsBySpace(), [spaceId]: [...verified, ...keep] });
           if (!found) dropLostRoom(spaceId, roomId, request, false);
         }
         if (found && dispatchTarget() === pending) dispatchTarget.set({ spaceId, roomId });
@@ -1957,6 +1980,7 @@ function endSession() {
   pendingSenderNotices.clear();
   verifiedAccess.clear();
   deniedSpaceAccess.clear();
+  deniedRoomAccess.clear();
   accessProbes.clear();
   chatAvailabilityRequest = 0;
   chatProbeAfter = 0;
@@ -2131,13 +2155,23 @@ async function recheckRoomAccess(c: Client, to: Extract<SendDestination, { kind:
   }
 }
 
+function recordRoomDenial(key: string, request: number) {
+  if (roomDeniedAtOrAfter(key, request) || newerAccess(key, request)) return false;
+  deniedRoomAccess.set(key, request);
+  return true;
+}
+
 function dropLostRoom(spaceId: string, roomId: string, request: number, show: boolean) {
   const key = scopeKey(spaceId, roomId);
-  if (newerAccess(key, request)) return;
+  if (!recordRoomDenial(key, request)) return;
   cursors.delete(key);
   batch(() => {
     forgetSenderNotices(key);
     roomsBySpace.set({ ...roomsBySpace(), [spaceId]: roomsOf(spaceId).filter(r => r.id !== roomId) });
+    const target = dispatchTarget();
+    if (target?.spaceId === spaceId && target.roomId === roomId) {
+      dispatchTarget.set({ spaceId, roomId: null });
+    }
     const { [key]: _e, ...events } = eventsByScope();
     eventsByScope.set(events);
     if (activeSpaceId() === spaceId && activeRoomId() === roomId) {
@@ -2243,22 +2277,24 @@ async function refreshLists(force = false) {
       throw error;
     }
     if (!okSpace()) return;
-    verifyAccess(scopeKey(active, ""), roomRequest);
-    for (const r of rooms) verifyRoomAccess(active, r.id, roomRequest);
+    const snapshotIds = new Set(rooms.map(r => r.id));
+    rooms = verifyRoomList(active, rooms, roomRequest);
     const previous = roomsBySpace()[active] ?? EMPTY_ROOMS;
     const current = activeRoomId();
-    const listed = new Set(rooms.map(r => r.id));
+    const next = keepNewerRooms(active, rooms, roomRequest);
     batch(() => {
-      const keep = previous.filter(r => {
-        const scope = scopeKey(active, r.id);
-        if (listed.has(r.id)) return false;
-        if (newerAccess(scope, roomRequest)) return true;
-        forgetSenderNotices(scope);
-        return activeSpaceId() === active && current === r.id;
-      });
-      // Keep a room we just created even if the list is a moment behind; the
-      // events poll will say 404 if it really is gone.
-      roomsBySpace.set({ ...roomsBySpace(), [active]: [...rooms, ...keep] });
+      // Newer room access, including a successful create, wins over an
+      // older omission. An authoritative loss must also clear Dispatch.
+      roomsBySpace.set({ ...roomsBySpace(), [active]: next });
+      for (const r of previous) {
+        if (!snapshotIds.has(r.id)) dropLostRoom(active, r.id, roomRequest, true);
+      }
+      // An absent room can have an intermediate positive read still in
+      // flight. Advance existing tombstones even when no row is cached.
+      const prefix = scopeKey(active, "");
+      for (const key of deniedRoomAccess.keys()) {
+        if (key.startsWith(prefix) && !snapshotIds.has(key.slice(prefix.length))) recordRoomDenial(key, roomRequest);
+      }
       if (activeSpaceId() === active && (!current || !roomsBySpace()[active].some((r) => r.id === current))) {
         activeRoomId.set(pickRoom(active, roomsBySpace()[active]));
       }

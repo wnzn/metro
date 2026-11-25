@@ -738,6 +738,57 @@ test("an exact Follow up list omitting the thread invalidates only that room and
   expect(w.messages()).toHaveLength(3);
 });
 
+test("a held positive Follow up cannot resurrect a thread after a newer authoritative omission", async () => {
+  const { w, app, arm, omitThread, lobby, thread } = await cachedFollowUp();
+  const clock = app.clock!;
+  const text = "\u2003  🌿 @bob, résumé\nfollow up  \t";
+  const path = "/v1/spaces/side/rooms/follow-thread/messages";
+  const posts = () => app.requests().filter(r => r.method === "POST" && r.url.endsWith("/messages"));
+
+  // A denied composer POST starts an independent room access recheck.
+  // Unlike starting another Follow up, this leaves the original form's
+  // pending destination in place, so its identity guard alone cannot help.
+  w.deny("recheck the thread", 404, 2_000);
+  await send(app, "recheck the thread");
+  await app.waitUntil(() => w.denied.has("recheck the thread"));
+  await app.press("id:nav-chat");
+  await app.waitFor("id:run-follow:follow-run");
+  const first = arm({ status: 200, body: { rooms: [...w.f.state.rooms.get("side")!] }, delay: 6_000 });
+  await app.press("id:run-follow:follow-run");
+  await app.waitUntil(first);
+  await app.paste("id:dispatch-text", { text });
+  const omission = arm(omitThread());
+  await app.waitUntil(omission);
+  await app.waitFor("id:dispatch-room:follow-thread", { state: "gone" });
+  await clock.runFor(6_100);
+  expect(app.shows("id:dispatch-room:follow-thread")).toBe(false);
+  expect(app.shows("id:dispatch-room:lobby")).toBe(true);
+  expect(app.shows("text:Choose a Space and a room.")).toBe(true);
+  expect(app.shows("text:/Couldn't verify that destination/")).toBe(true);
+  expect(app.enabled("id:dispatch-send")).toBe(false);
+  expect(app.value("id:dispatch-text")).toBe(text);
+  expect(posts()).toHaveLength(3); // Two seeded notices and the denied composer POST.
+
+  // An actual newer read can rejoin the thread, but never revive its old notice.
+  await app.press("id:run-follow:follow-run");
+  await app.waitFor("text:To: agent in Side project › #Follow-up");
+  w.reply(text, { addressing_note: generic });
+  await app.press("id:dispatch-send");
+  await app.waitFor("id:dispatch-notice");
+  expect(app.value("id:dispatch-text")).toBe("");
+  expect(posts()).toHaveLength(4);
+  const posted = posts()[3]!;
+  expect(new URL(posted.url).pathname).toBe(path);
+  expect(JSON.parse(posted.body!)).toEqual({ text, invoke_agent: true, infer_text_mentions: false });
+  await app.press("id:space:side");
+  await app.press("id:room:lobby");
+  await app.waitFor(note(lobby));
+  await app.press("id:room:follow-thread");
+  await app.waitFor(`id:event:${thread}`);
+  await app.waitFor(note(w.sent.get(text)!.id));
+  expect(app.shows(note(thread))).toBe(false);
+});
+
 for (const denied of [false, true]) {
   test(`a held Follow up ${denied ? "denial" : "omission"} cannot evict newer verified access or touch another view`, async () => {
     const { w, app, arm, omitThread, thread } = await cachedFollowUp();
