@@ -715,16 +715,16 @@ export async function createRoom(nameInput: string): Promise<boolean> {
 export type SendDestination = { kind: "chat" } | { kind: "room"; spaceId: string; roomId: string };
 
 /**
- * Files staged in the composer, uploaded at Send. Registered by
+ * Files staged in the composer, uploaded on submission. Registered by
  * src/features/attachments so this module needs no library code. `upload`
  * puts every staged file of `scope` in the destination's library (reusing
  * ids a failed attempt already got) and resolves to their ids, or to the
- * message to show when one failed (nothing is posted then, the draft and
- * files stay). `sent` drops the files a message carried.
+ * message to show when one failed, naming the action to retry (nothing is
+ * posted then, the draft and files stay). `sent` drops the files a message carried.
  */
 export type AttachmentHook = {
   pending(scope: string): boolean;
-  upload(scope: string, to: SendDestination, ok: () => boolean): Promise<{ ids: string[]; keys: string[] } | { error: string }>;
+  upload(scope: string, to: SendDestination, retryAction: "Send" | "Save note", ok: () => boolean): Promise<{ ids: string[]; keys: string[] } | { error: string }>;
   sent(scope: string, keys: string[], to: SendDestination): void;
 };
 let attachments: AttachmentHook | null = null;
@@ -761,6 +761,7 @@ async function sendDraft(intent: DraftSend): Promise<void> {
   const chat = basePlace() === "chat";
   const saveNote = intent.kind === "chat-note";
   if (saveNote && !chat) return;
+  const retryAction = saveNote ? "Save note" : "Send";
   const { invokeAgent, choice, agentId } = saveNote ? { invokeAgent: false } : intent;
   const text = draft().trim();
   const sid = activeSpaceId();
@@ -797,7 +798,7 @@ async function sendDraft(intent: DraftSend): Promise<void> {
     let ids: string[] = [];
     let keys: string[] = [];
     if (files && attachments) {
-      const up = await attachments.upload(scope, to, ok);
+      const up = await attachments.upload(scope, to, retryAction, ok);
       if (!ok()) return;
       if ("error" in up) {
         if (here()) actionError.set(up.error);
@@ -831,7 +832,7 @@ async function sendDraft(intent: DraftSend): Promise<void> {
     if (!here()) return;
     handleActionError(error, saveNote ? "Could not save the note" : invokeAgent ? (chat ? "Could not ask your agent" : "Could not ask the agent") : "Could not send the message", chat ? undefined : sid!);
     const shown = actionError();
-    if (files && shown) actionError.set(`${shown} Its files are already in the Library; ${saveNote ? "Save note" : "Send"} again won't upload them twice.`);
+    if (files && shown) actionError.set(`${shown} Its files are already in the Library; ${retryAction} again won't upload them twice.`);
   } finally {
     if (sameSession()) sending.set(null);
   }
