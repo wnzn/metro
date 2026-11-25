@@ -124,7 +124,7 @@ function compareIdentities(a: MentionRecipient, b: MentionRecipient): number {
 }
 
 function inspect(
-  draft: MentionDraft, directory: MentionDirectory, ignored: readonly MentionRange[],
+  draft: MentionDraft, directory: MentionDirectory, { ignored, uncertain }: ReturnType<typeof mentionSyntaxRanges>,
   { finalize = false, caret = draft.text.length }: CaptureOptions = {},
 ): MentionMatch[] {
   const { text } = draft;
@@ -171,7 +171,11 @@ function inspect(
         choices.set(mentionIdentityKey(mention), mention);
       }
       const distinct = [...choices.values()];
-      matches.push(distinct.length === 1
+      // A quoted token can be valid as either an address-like string or
+      // an intentional agent mention. Keep the explicit picker available.
+      const needsChoice = distinct.length !== 1
+        || (distinct[0].kind === "agent" && overlapsRanges({ start, end: start + 1 }, uncertain));
+      matches.push(!needsChoice
         ? { kind: "resolved", start, end, literal, mention: distinct[0] }
         : { kind: "ambiguous", start, end, literal, choices: distinct });
       continue;
@@ -196,8 +200,8 @@ function bindings(draft: MentionDraft, anchors: readonly MentionAnchor[], decisi
 export function scanMentionDraft(
   draft: MentionDraft, directory: MentionDirectory, options?: CaptureOptions,
 ): MentionMatch[] {
-  const { anchors, decisions, ignored } = anchorSyntax(draft);
-  return inspect(bindings(draft, anchors, decisions), directory, ignored, options);
+  const syntax = anchorSyntax(draft);
+  return inspect(bindings(draft, syntax.anchors, syntax.decisions), directory, syntax, options);
 }
 
 /**
@@ -211,12 +215,13 @@ export function scanMentionDraft(
 export function captureTypedMentions(
   draft: MentionDraft, directory: MentionDirectory, options?: CaptureOptions,
 ): MentionDraft {
-  const { anchors, decisions, ignored } = anchorSyntax(draft);
+  const syntax = anchorSyntax(draft);
+  const { anchors, decisions } = syntax;
   if (anchors.length !== draft.anchors.length || decisions.length !== (draft.decisions?.length ?? 0)) return draft;
   const known = new Set([...anchors, ...decisions].map(a => a.start));
   const nextAnchors = [...anchors];
   const nextDecisions = [...decisions];
-  for (const match of inspect(bindings(draft, anchors, decisions), directory, ignored, options)) {
+  for (const match of inspect(bindings(draft, anchors, decisions), directory, syntax, options)) {
     if (known.has(match.start)) continue;
     if (match.kind === "resolved") {
       const { start, end, literal, mention } = match;
@@ -340,7 +345,13 @@ export function pickMention(
   const wouldCloseQuote = append && quotedLocalStart(draft.text, start - 1, syntax.quoteOpaque) !== null;
   const prefix = append && (!opensMention(draft.text, start) || wouldCloseQuote) ? " " : "";
   const suffix = end === draft.text.length || !closesMention(draft.text.slice(end)) ? " " : "";
-  for (const label of displayLabels(directory, mention)) {
+  const labels = displayLabels(directory, mention);
+  if (!append && labels.length && overlapsRanges({ start, end: start + 1 }, syntax.uncertain)) {
+    // A new name or handle might make this look like a definite address.
+    // If so, keep the spelling the user explicitly chose to bind by ID.
+    labels.push(literal.slice(1));
+  }
+  for (const label of labels) {
     if (!saneExplicitLabel(label)) continue;
     const picked = `@${label}`;
     const text = draft.text.slice(0, start) + prefix + picked + suffix + draft.text.slice(end);
@@ -365,7 +376,8 @@ export function prepareMentionSend(
 ): MentionSend {
   const { text } = draft;
   if (/\p{Cs}/u.test(text)) return { ok: false, reason: "invalid-text" };
-  const { anchors, decisions, ignored } = anchorSyntax(draft);
+  const syntax = anchorSyntax(draft);
+  const { anchors, decisions } = syntax;
   if (anchors.length !== draft.anchors.length || decisions.length !== (draft.decisions?.length ?? 0)) {
     return { ok: false, reason: "invalid-anchor" };
   }
@@ -374,7 +386,7 @@ export function prepareMentionSend(
   }
   const ask: MentionRecipient | undefined = askAgent && { kind: "agent", agentId: askAgent.agentId };
   if (ask && !hasRecipient(directory, ask)) return { ok: false, reason: "stale-recipient" };
-  const matches = inspect(bindings(draft, anchors, decisions), directory, ignored, { finalize: true });
+  const matches = inspect(bindings(draft, anchors, decisions), directory, syntax, { finalize: true });
   const ambiguous = matches.find(m => m.kind === "ambiguous");
   if (ambiguous) return { ok: false, reason: "ambiguous", match: ambiguous };
   const resolved = matches.filter(m => m.kind === "resolved");
