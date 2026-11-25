@@ -107,7 +107,20 @@ export type Me = { id: string; isOrgAdmin: boolean };
 
 /** A registered runner the user can see (GET /v1/runners). */
 export type RunnerVisibility = "personal" | "organization";
-export type RegisteredRunner = { id: string; name: string; visibility: RunnerVisibility; canManage: boolean };
+export type RunnerPresence = {
+  seenAt: number | null; online: boolean; version: string | null;
+  install: "managed" | "unmanaged" | "container" | "desktop" | null; selfUpdate: boolean;
+};
+export type RunnerPending = { target: string; requestedAt: number };
+export type RunnerUpdate = {
+  latest: string | null; available: boolean; action: "none" | "self_update" | "container" | "with_app" | "install_script";
+  containerImage: string | null; pending: RunnerPending | null;
+  lastResult: { target: string; state: "updated" | "failed"; code: string | null; at: number } | null;
+};
+export type RegisteredRunner = {
+  id: string; name: string; visibility: RunnerVisibility; canManage: boolean;
+  presence?: RunnerPresence; update?: RunnerUpdate;
+};
 
 /**
  * Who serves a Space (GET /v1/spaces/{sid}/runner): a registered runner, the
@@ -477,6 +490,14 @@ export function createClient(options: ClientOptions) {
     };
   }
 
+  async function listRunnerInventory() {
+    const data = await request("GET", "/v1/runners");
+    if (!isObject(data) || !Array.isArray(data.runners)) {
+      throw new ApiError("protocol", "GET /v1/runners did not return { runners: [...] }.");
+    }
+    return { runners: data.runners.filter(isRegisteredRunner).map(toRegisteredRunner), attachIfEmpty: data.attach_if_empty === true };
+  }
+
   return {
     baseUrl: options.baseUrl,
     // Search and scheduled prompts (src/api/discovery.ts), on the same transport.
@@ -502,12 +523,8 @@ export function createClient(options: ClientOptions) {
 
     // ---- registered runners (personal or organization), reusable across Spaces
 
-    async listRunners(): Promise<RegisteredRunner[]> {
-      const data = await request("GET", "/v1/runners");
-      const runners = isObject(data) ? data.runners : undefined;
-      if (!Array.isArray(runners)) throw new ApiError("protocol", "GET /v1/runners did not return { runners: [...] }.");
-      return runners.filter(isRegisteredRunner).map(toRegisteredRunner);
-    },
+    listRunnerInventory,
+    async listRunners(): Promise<RegisteredRunner[]> { return (await listRunnerInventory()).runners; },
 
     /** Registers a runner. The token is shown once; the caller must not keep it longer than it is shown. */
     async createRunner(name: string, visibility: RunnerVisibility): Promise<{ runner: RegisteredRunner; token: string }> {
@@ -538,6 +555,23 @@ export function createClient(options: ClientOptions) {
     async attachRunner(spaceId: string, runnerId: string): Promise<SpaceRunner | null> {
       const data = await request("PUT", `${sp(spaceId)}/runner`, { runner_id: runnerId });
       return isObject(data) && "runner" in data ? toSpaceRunner(data.runner) : null;
+    },
+
+    /** No fallback to PUT: on an older server this must fail without changing anything. */
+    async attachRunnerIfEmpty(spaceId: string, runnerId: string) {
+      const data = await request("POST", `${sp(spaceId)}/runner/attach-if-empty`, { runner_id: runnerId });
+      const attached = isObject(data) && "runner" in data ? toSpaceRunner(data.runner) : null;
+      if (attached?.kind !== "registered" || attached.id !== runnerId) {
+        throw new ApiError("protocol", "The server did not confirm which runner was attached.");
+      }
+      return attached;
+    },
+
+    async requestRunnerUpdate(runnerId: string, version: string): Promise<RunnerPending> {
+      const data = await request("POST", `/v1/runners/${encodeURIComponent(runnerId)}/update`, { version });
+      const pending = isObject(data) ? toRunnerPending(data.pending) : null;
+      if (!pending || pending.target !== version) throw new ApiError("protocol", "The server did not confirm the update request.");
+      return pending;
     },
 
     /** Detaches the Space's registered runner (or revokes its dedicated token). */
@@ -852,8 +886,47 @@ function isRegisteredRunner(v: unknown): v is { id: string | number; name: strin
   return isObject(v) && isId(v.id) && typeof v.name === "string" && isVisibility(v.visibility);
 }
 
-function toRegisteredRunner(v: { id: string | number; name: string; visibility: RunnerVisibility; can_manage?: unknown }): RegisteredRunner {
-  return { id: String(v.id), name: v.name, visibility: v.visibility, canManage: v.can_manage === true };
+function toRegisteredRunner(v: { id: string | number; name: string; visibility: RunnerVisibility; can_manage?: unknown; presence?: unknown; update?: unknown }): RegisteredRunner {
+  const presence = isObject(v.presence) ? v.presence : undefined;
+  const update = isObject(v.update) ? v.update : undefined;
+  const install = presence?.install;
+  const action = update?.action;
+  const last = update?.last_result;
+  const target = isObject(last) ? runnerVersion(last.target) : null;
+  const at = isObject(last) ? runnerTimestamp(last.at) : null;
+  return {
+    id: String(v.id), name: v.name, visibility: v.visibility, canManage: v.can_manage === true,
+    presence: presence && {
+      seenAt: runnerTimestamp(presence.seen_at), online: presence.online === true, version: runnerVersion(presence.version),
+      install: install === "managed" || install === "unmanaged" || install === "container" || install === "desktop" ? install : null,
+      selfUpdate: presence.self_update === true,
+    },
+    update: update && {
+      latest: runnerVersion(update.latest), available: update.available === true,
+      action: action === "self_update" || action === "container" || action === "with_app" || action === "install_script" ? action : "none",
+      containerImage: typeof update.container_image === "string" && update.container_image.length <= 160 ? update.container_image : null,
+      pending: toRunnerPending(update.pending),
+      lastResult: target && at !== null && isObject(last) && (last.state === "updated" || last.state === "failed")
+        ? { target, at, state: last.state, code: typeof last.code === "string" && /^[a-z_]{1,40}$/.test(last.code) ? last.code : null }
+        : null,
+    },
+  };
+}
+
+function runnerVersion(v: unknown): string | null {
+  return typeof v === "string" && v === v.trim() && /^(0|[1-9]\d{0,9})(\.(0|[1-9]\d{0,9})){2}$/.test(v)
+    && v.split(".").every((part) => Number(part) <= 0xffffffff) ? v : null;
+}
+
+function runnerTimestamp(v: unknown): number | null {
+  return typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : null;
+}
+
+function toRunnerPending(v: unknown): RunnerPending | null {
+  if (!isObject(v)) return null;
+  const target = runnerVersion(v.target);
+  const requestedAt = runnerTimestamp(v.requested_at);
+  return target && requestedAt !== null ? { target, requestedAt } : null;
 }
 
 /** null: nobody serves the Space. Unknown shapes are a protocol error, never "no runner". */

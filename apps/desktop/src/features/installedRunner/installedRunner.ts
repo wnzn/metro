@@ -12,7 +12,7 @@
 //   runner; never by name) and a Space's folder (which creates it on this
 //   computer) are POSTs, sent only from an explicit press. Adopting a chosen
 //   runner (`{runner_id}`) isn't offered here.
-// - Metro never attaches it: the Space owner does that in Manage Space. The
+// - Metro never attaches it without an explicit owner action. The
 //   folder is offered only for Spaces this user owns whose runner, by stable
 //   id, is this one.
 // - Separate from the per-Space dedicated "Local tools" switch.
@@ -21,7 +21,7 @@
 
 import { signal } from "nsh";
 import { BridgeError, scrub } from "../../device/bridge";
-import { apiClient, connectedTo, me, sessionGuard, spaces } from "../../store";
+import { apiClient, connectedTo, me, onSessionEnd, sessionGuard, spaces } from "../../store";
 import { localRunnerCall } from "../localtools/localTools";
 
 export type InstalledRunnerState =
@@ -81,6 +81,9 @@ export function parseFolder(v: unknown, sid: string): RunnerFolder {
 
 /** The status, or null (hidden: no launcher, not requested, not the own server, unknown). */
 export const installedRunner = signal<InstalledRunner | null>(null);
+/** A bridge id verified against the current account's personal runners. */
+export const ownedInstalledRunner = signal<{ id: string; attachIfEmpty: boolean } | null>(null);
+export const checkingInstalledScope = signal(false);
 /** Owned Spaces whose runner is this one, by stable id. */
 export const runnerSpaces = signal<{ id: string; name: string }[]>([]);
 export const installedBusy = signal<null | "reconnect" | `folder:${string}`>(null);
@@ -89,6 +92,7 @@ export const installedNotice = signal<string | null>(null);
 export const folders = signal<Record<string, RunnerFolder>>({});
 
 let gen = 0;
+let attachedSeq = 0;
 const sessionKey = () => `${connectedTo() ?? ""}\n${me() ?? ""}`;
 
 /** Still the same session and the latest request. */
@@ -101,11 +105,20 @@ function stillValid(): () => boolean {
 
 function reset() {
   installedRunner.set(null);
+  ownedInstalledRunner.set(null);
+  checkingInstalledScope.set(false);
   runnerSpaces.set([]);
   folders.set({});
   installedError.set(null);
   installedNotice.set(null);
 }
+
+onSessionEnd(() => {
+  gen++;
+  inflight = null;
+  installedBusy.set(null);
+  reset();
+});
 
 function message(error: unknown, what: string): string {
   return error instanceof BridgeError ? error.message : `${what} didn't work.`;
@@ -115,14 +128,21 @@ function message(error: unknown, what: string): string {
 async function loadAttached(runnerId: string, valid: () => boolean): Promise<void> {
   const c = apiClient();
   if (!c) return;
+  const seq = ++attachedSeq;
   const owned = spaces().filter((s) => s.role === "owner" && SPACE_ID_RE.test(s.id));
   const checks = await Promise.allSettled(owned.map(async (s) => ({ s, r: await c.getSpaceRunner(s.id) })));
-  if (!valid() || installedRunner()?.runner?.id !== runnerId) return;
+  if (!valid() || seq !== attachedSeq || installedRunner()?.runner?.id !== runnerId) return;
   const list: { id: string; name: string }[] = [];
   for (const res of checks) {
     if (res.status === "fulfilled" && res.value.r?.kind === "registered" && res.value.r.id === runnerId) list.push({ id: res.value.s.id, name: res.value.s.name });
   }
   runnerSpaces.set(list);
+}
+
+/** Don't allow an older folder-list read to undo a just-confirmed attachment. */
+export function recordAttachedFolder(space: { id: string; name: string }) {
+  attachedSeq++;
+  if (!runnerSpaces().some((s) => s.id === space.id)) runnerSpaces.set([...runnerSpaces(), space]);
 }
 
 // One read per session at a time: the page may mount more than once as it opens.
@@ -132,6 +152,7 @@ let inflight: { key: string; done: Promise<void> } | null = null;
 export function loadInstalledRunner(): Promise<void> {
   const key = sessionKey();
   if (inflight && inflight.key === key) return inflight.done;
+  if (installedBusy()) return Promise.resolve();
   const done = readStatus().finally(() => {
     if (inflight?.done === done) inflight = null;
   });
@@ -140,19 +161,47 @@ export function loadInstalledRunner(): Promise<void> {
 }
 
 async function readStatus(): Promise<void> {
-  const call = localRunnerCall();
   const valid = stillValid();
-  reset();
-  if (!call || !apiClient()) return;
-  let next: InstalledRunner | null;
-  try {
-    next = parseInstalledRunner(await call("GET", "/v1/local-tools/runner"));
-  } catch {
-    next = null;
-  }
+  const next = await readInstalledRunner();
   if (!valid()) return;
+  if (!next || next.runner?.id !== installedRunner()?.runner?.id) reset();
   installedRunner.set(next);
-  if (next?.runner) await loadAttached(next.runner.id, valid);
+  if (next?.runner) await loadInstalledScope(next.runner.id, valid);
+}
+
+/** Read the bridge again at the point of an explicit action, without changing the UI. */
+export async function readInstalledRunner(): Promise<InstalledRunner | null> {
+  const call = localRunnerCall();
+  if (!call || !apiClient() || !me()) return null;
+  try {
+    return parseInstalledRunner(await call("GET", "/v1/local-tools/runner"));
+  } catch {
+    return null;
+  }
+}
+
+async function loadInstalledScope(runnerId: string, valid: () => boolean) {
+  const c = apiClient();
+  if (!c) return;
+  checkingInstalledScope.set(true);
+  try {
+    const list = await c.listRunnerInventory();
+    if (!valid()) return;
+    if (list.runners.some((r) => r.id === runnerId && r.visibility === "personal" && r.canManage)) {
+      ownedInstalledRunner.set({ id: runnerId, attachIfEmpty: list.attachIfEmpty });
+      await loadAttached(runnerId, valid);
+    } else {
+      ownedInstalledRunner.set(null);
+      runnerSpaces.set([]);
+    }
+  } catch {
+    if (valid()) {
+      ownedInstalledRunner.set(null);
+      runnerSpaces.set([]);
+    }
+  } finally {
+    if (valid()) checkingInstalledScope.set(false);
+  }
 }
 
 /** The person pressed Reconnect and confirmed. */
@@ -168,13 +217,16 @@ export async function reconnectInstalledRunner(): Promise<void> {
     if (!valid()) return;
     installedRunner.set(next);
     folders.set({});
-    installedNotice.set("Reconnected. Attach it to a Space in that Space's Manage view if it isn't attached already.");
-    if (next?.runner) await loadAttached(next.runner.id, valid);
-    else runnerSpaces.set([]);
+    installedNotice.set("Reconnected. Choose Spaces without a runner below to attach it.");
+    if (next?.runner) await loadInstalledScope(next.runner.id, valid);
+    else {
+      ownedInstalledRunner.set(null);
+      runnerSpaces.set([]);
+    }
   } catch (error) {
     if (valid()) installedError.set(message(error, "Reconnecting this computer's runner"));
   } finally {
-    installedBusy.set(null);
+    if (valid()) installedBusy.set(null);
   }
 }
 
@@ -198,6 +250,6 @@ export async function showRunnerFolder(sid: string): Promise<void> {
   } catch (error) {
     if (valid()) installedError.set(message(error, "Opening the Space's folder"));
   } finally {
-    installedBusy.set(null);
+    if (valid()) installedBusy.set(null);
   }
 }

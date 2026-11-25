@@ -9,6 +9,7 @@ import { BASE, header, TOKENS, world } from "../../../test/fakeServer";
 import { BRIDGE, BRIDGE_TOKEN, bridgeEnv, fakeBridge } from "../../device/test/fakeBridge";
 import { installedRunnerBadge } from "./InstalledRunnerSection";
 import { parseInstalledRunner } from "./installedRunner";
+import { runnerOfferStorageKey } from "../../runnersState";
 import { launched } from "../../../test/launched";
 
 type F = ReturnType<typeof world>;
@@ -68,9 +69,9 @@ function bridgeWithRunner(f: F, runnerId: string | null, name: string, opts: Opt
   return { log, network, st };
 }
 
-async function openWith(f: F, t: ReturnType<typeof bridgeWithRunner> | null) {
+async function openWith(f: F, t: ReturnType<typeof bridgeWithRunner> | null, manualClock = false) {
   const network = { ...(f.network as any), ...(t ? t.network : {}) };
-  return open("../../../App.tsx", { network, platform: "linux", width: 1280, height: 900, modules: (t ? bridgeEnv() : launched()) as any });
+  return open("../../../App.tsx", { network, platform: "linux", width: 1280, height: 900, modules: (t ? bridgeEnv() : launched()) as any, ...(manualClock ? { clock: {} } : {}) });
 }
 
 async function signInToRunners(app: App, user: string) {
@@ -106,7 +107,7 @@ test("shows the installer's runner, read-only tools and how to attach; opening o
   expect(app.shows("id:installed-runner-space:side")).toBe(false); // Bob's Space
   expect(text(app)).toContain("workspace.list, workspace.read");
   expect(text(app)).toContain("Online");
-  expect(text(app)).toContain("open Manage and choose it under Runner");
+  expect(text(app)).toContain("Every Space you own has a runner.");
   expect(app.shows("id:installed-runner-reconnect")).toBe(false);
   await sleep(300);
   expect(posts(t)).toEqual([]);
@@ -138,15 +139,15 @@ test("reconnect is offered only when allowed, explains itself, and posts only af
   await app.waitFor("id:installed-runner-reconnect");
   expect(text(app)).toContain("Token no longer accepted");
   await app.press("id:installed-runner-reconnect");
-  await app.waitFor("id:installed-runner-impact");
+  await app.waitFor("id:installed-runner-reconnect:warning");
   expect(text(app)).toContain("its old token stops working at once");
   expect(text(app)).toContain("If it no longer exists, Metro creates a new personal runner instead");
   expect(posts(t)).toEqual([]);
-  await app.press("id:installed-runner-cancel");
+  await app.press("id:installed-runner-reconnect:cancel");
   expect(posts(t)).toEqual([]);
 
   await app.press("id:installed-runner-reconnect");
-  await app.press("id:installed-runner-confirm-reconnect");
+  await app.press("id:installed-runner-reconnect:confirm");
   await app.waitFor("id:installed-runner-notice");
   // Plain `{}`: never a chosen runner id.
   expect(posts(t).map((l) => [l.path, l.body])).toEqual([["/v1/local-tools/runner/reconnect", "{}"]]);
@@ -163,10 +164,10 @@ test("an interrupted setup with no known id: reconnect creates a new runner and 
   expect(text(app)).toContain("Not confirmed (asked for “Metro desktop abc”)");
   expect(app.shows("id:installed-runner-spaces")).toBe(false);
   await app.press("id:installed-runner-reconnect");
-  await app.waitFor("id:installed-runner-impact");
+  await app.waitFor("id:installed-runner-reconnect:warning");
   expect(text(app)).toContain("Reconnecting creates a new personal runner");
   expect(text(app)).toContain("may have left an unused runner");
-  expect(text(app)).toContain("attach it in each Space's Manage view");
+  expect(text(app)).toContain("You can choose where to attach it afterward.");
   expect(posts(t)).toEqual([]);
 });
 
@@ -220,4 +221,210 @@ test("parse and badge are strict and honest", () => {
   expect(r.runner).toEqual({ id: "rn1", name: "PC" });
   expect(installedRunnerBadge(r).tone).toBe("warning");
   expect(installedRunnerBadge({ ...r, state: "revoked" }).tone).toBe("danger");
+});
+
+test("bulk attach starts checked, respects picks, and loses safely to both kinds of concurrent pairing", async () => {
+  const f = world();
+  for (const [id, name] of [["a", "First"], ["b", "Second"], ["c", "Third"], ["d", "Unchecked"]]) f.addSpace(id!, name!, "alice");
+  const mine = f.addRunner("This PC", "personal", "alice");
+  const other = f.addRunner("Shared", "organization", "alice");
+  f.state.beforeEmptyAttach = (sid) => {
+    if (sid === "b") f.state.attached.set(sid, other.id);
+    if (sid === "c") f.state.spaces.get(sid)!.runnerToken = "local-fixture";
+  };
+  const app = await openWith(f, bridgeWithRunner(f, mine.id, mine.name));
+  await signInToRunners(app, "alice");
+  await app.waitFor("id:runner-attach-pick:d");
+  expect(app.shows("id:runner-attach-pick:acme")).toBe(false);
+  expect(app.shows("id:runner-attach-pick:side")).toBe(false);
+  expect(text(app)).toContain("Attach to 4 Spaces");
+  for (const id of ["a", "b", "c", "d"]) await app.press(`id:runner-attach-pick:${id}`);
+  expect(app.enabled("id:runner-attach-many")).toBe(false);
+  for (const id of ["a", "b", "c"]) await app.press(`id:runner-attach-pick:${id}`);
+  expect(f.posts().filter((p) => p.path.includes("/runner"))).toEqual([]);
+  await app.press("id:runner-attach-many");
+  await app.waitFor("id:runner-attach-result");
+  expect(text(app)).toContain("Attached to 1 of 3 Spaces.");
+  expect(text(app)).toContain("Second: Already has a runner.");
+  expect(text(app)).toContain("Third: Already has a runner.");
+  expect(f.state.attached.get("a")).toBe(mine.id);
+  expect(f.state.attached.get("b")).toBe(other.id);
+  expect(f.state.spaces.get("c")!.runnerToken).toBe("local-fixture");
+  expect(f.state.attached.has("d")).toBe(false);
+  expect(app.shows("id:installed-runner-folder:a")).toBe(true);
+  expect(f.posts().filter((p) => p.path.includes("/runner")).map((p) => [p.method, p.path, p.body])).toEqual(
+    ["a", "b", "c"].map((id) => ["POST", `/v1/spaces/${id}/runner/attach-if-empty`, { runner_id: mine.id }]),
+  );
+  await app.waitUntil(() => app.storage()[runnerOfferStorageKey(BASE, "alice")] === "dismissed");
+  expect(app.storage()[runnerOfferStorageKey(BASE, "bob")]).toBe(undefined);
+  expect(app.storage()[runnerOfferStorageKey("https://other.example", "alice")]).toBe(undefined);
+  expect(app.shows("id:runner-attach-pick:d")).toBe(true); // dismissal does not remove the permanent action
+});
+
+test("legacy server or a launcher runner from another scope can't use bulk attach", async () => {
+  for (const mode of ["legacy", "organization", "other account"]) {
+    const f = world();
+    f.addSpace("solo", "Solo", "alice");
+    f.state.attachIfEmpty = mode !== "legacy";
+    const mine = f.addRunner("This PC", mode === "organization" ? "organization" : "personal", mode === "other account" ? "bob" : "alice");
+    const app = await openWith(f, bridgeWithRunner(f, mine.id, mine.name));
+    await signInToRunners(app, "alice");
+    await app.waitFor(mode === "legacy" ? "text:/This server doesn't support attaching only/" : "text:/runner isn't available to attach for this account/");
+    expect(app.shows("id:runner-attach-many")).toBe(false);
+    expect(f.posts().filter((p) => p.path.includes("/runner"))).toEqual([]);
+  }
+});
+
+test("a missing safe attach route never falls back to replacement", async () => {
+  const f = world();
+  f.addSpace("solo", "Solo", "alice");
+  const mine = f.addRunner("This PC", "personal", "alice");
+  f.state.missingEmptyAttachRoute = true;
+  const app = await openWith(f, bridgeWithRunner(f, mine.id, mine.name));
+  await signInToRunners(app, "alice");
+  await app.waitFor("id:runner-attach-pick:solo");
+  await app.press("id:runner-attach-many");
+  await app.waitFor("id:runner-attach-result");
+  expect(text(app)).toContain("Attached to 0 of 1 Space.");
+  expect(f.state.attached.has("solo")).toBe(false);
+  expect(f.posts().filter((p) => p.path.includes("/runner")).map((p) => [p.method, p.path])).toEqual([
+    ["POST", "/v1/spaces/solo/runner/attach-if-empty"],
+  ]);
+  expect(app.storage()[runnerOfferStorageKey(BASE, "alice")]).toBe(undefined);
+});
+
+test("an account change during the live check cannot run the old batch or set its dismissal", async () => {
+  const f = world();
+  f.addSpace("solo", "Solo", "alice");
+  const mine = f.addRunner("This PC", "personal", "alice");
+  const app = await openWith(f, bridgeWithRunner(f, mine.id, mine.name));
+  await signInToRunners(app, "alice");
+  await app.waitFor("id:runner-attach-pick:solo");
+  const path = "/v1/spaces/solo/runner";
+  const late = f.answerLate(path, TOKENS.alice!, 1600);
+  await app.press("id:runner-attach-many");
+  await app.waitUntil(() => late.arrived() > 0);
+  await app.press("id:settings-close");
+  await app.press("id:account-menu");
+  await app.press("id:disconnect");
+  await app.waitFor("id:connect");
+  await signInToRunners(app, "bob");
+  await app.waitFor("text:/runner isn't available to attach for this account/");
+  expect(f.state.attached.has("solo")).toBe(false);
+  expect(f.posts().filter((p) => p.path.includes("/runner/attach-if-empty"))).toEqual([]);
+  expect(app.shows("id:runner-attach-result")).toBe(false);
+  expect(app.storage()[runnerOfferStorageKey(BASE, "alice")]).toBe(undefined);
+});
+
+const fixtureRelease = (install: string, action: string, extra = {}) => ({
+  presence: { version: "0.4.0", online: true, seen_at: Date.now(), install, self_update: install === "managed" },
+  update: { latest: "0.5.0", available: true, action, pending: null, last_result: null, ...extra },
+});
+
+test("managed runner updates require confirmation, report denial and accepted progress, and retry only on another confirmation", async () => {
+  const f = world();
+  const mine = f.addRunner("Build box", "personal", "alice");
+  const release = fixtureRelease("managed", "self_update");
+  f.state.runnerRelease.set(mine.id, release);
+  const app = await openWith(f, null, true);
+  await signInToRunners(app, "alice");
+  const id = `id:runner-update:${mine.id}`;
+  const posts = () => f.posts().filter((p) => p.path.endsWith("/update"));
+  await app.waitFor(id);
+  expect(text(app)).toContain("v0.4.0 · Online");
+  expect(posts()).toEqual([]);
+  await app.press(id);
+  expect(text(app)).toContain("Build box downloads 0.5.0 from GitHub, verifies the signature itself and restarts.");
+  await app.press(`${id}:cancel`);
+  expect(posts()).toEqual([]);
+
+  f.state.rejectRunnerUpdate.add(mine.id);
+  await app.press(id);
+  await app.press(`${id}:confirm`);
+  await app.waitFor(`id:runner-update-error:${mine.id}`);
+  expect(text(app)).toContain("Build box: You no longer have permission");
+  expect(text(app)).not.toContain("Update to 0.5.0 requested");
+  expect(posts()).toHaveLength(1);
+
+  f.state.rejectRunnerUpdate.delete(mine.id);
+  await app.press(id);
+  await app.press(`${id}:confirm`);
+  await app.waitFor("text:Update to 0.5.0 requested");
+  expect(posts()).toHaveLength(2);
+  expect(posts().at(-1)).toMatchObject({ user: "alice", path: `/v1/runners/${mine.id}/update`, body: { version: "0.5.0" } });
+  f.state.runnerRelease.set(mine.id, fixtureRelease("managed", "self_update", {
+    last_result: { target: "0.5.0", state: "failed", code: "verify_failed", at: Date.now() },
+  }));
+  await app.clock!.runFor(5100);
+  await app.waitFor(`id:runner-update-failed:${mine.id}`);
+  expect(text(app)).toContain("Build box: The runner could not verify the release. Last reported version: v0.4.0.");
+  expect(text(app)).toContain("Try again…");
+  expect(posts()).toHaveLength(2);
+
+  await app.press(id);
+  await app.press(`${id}:confirm`);
+  await app.waitFor("text:Update to 0.5.0 requested");
+  const completed = fixtureRelease("managed", "none", {
+    available: false, last_result: { target: "0.5.0", state: "updated", code: null, at: Date.now() },
+  });
+  completed.presence.version = "0.5.0";
+  f.state.runnerRelease.set(mine.id, completed);
+  await app.clock!.runFor(5100);
+  await app.waitFor("text:v0.5.0 · Online");
+  expect(app.shows(id)).toBe(false);
+  expect(posts()).toHaveLength(3);
+});
+
+test("an update offer changed while confirming never requests a different target", async () => {
+  const f = world();
+  const mine = f.addRunner("Build box", "personal", "alice");
+  f.state.runnerRelease.set(mine.id, fixtureRelease("managed", "self_update"));
+  const app = await openWith(f, null);
+  await signInToRunners(app, "alice");
+  const id = `id:runner-update:${mine.id}`;
+  await app.press(id);
+  await app.waitFor(`${id}:warning`);
+  f.state.runnerRelease.set(mine.id, fixtureRelease("managed", "self_update", { latest: "0.6.0" }));
+  await app.press(`${id}:confirm`);
+  await app.waitFor(`id:runner-update-error:${mine.id}`);
+  expect(text(app)).toContain("This runner is no longer eligible for that update. Nothing was requested.");
+  expect(f.posts().filter((p) => p.path.endsWith("/update"))).toEqual([]);
+  await app.press(id);
+  expect(text(app)).toContain("Build box downloads 0.6.0 from GitHub");
+});
+
+test("Docker guidance only exposes official version-matched pinned images; embedded, unsupported and non-admin rows can't update", async () => {
+  const f = world();
+  const embedded = f.addRunner("Laptop", "personal", "bob");
+  const old = f.addRunner("Old", "personal", "bob");
+  const docker = f.addRunner("Container", "personal", "bob");
+  const wrong = f.addRunner("Bad image", "personal", "bob");
+  const org = f.addRunner("Shared", "organization", "alice");
+  const offline = f.addRunner("Offline", "personal", "bob");
+  const manual = f.addRunner("Manual binary", "personal", "bob");
+  const image = `ghcr.io/wnzn/metro-runner:v0.5.0@sha256:${"a".repeat(64)}`;
+  f.state.runnerRelease.set(embedded.id, fixtureRelease("desktop", "with_app"));
+  f.state.runnerRelease.set(docker.id, fixtureRelease("container", "container", { container_image: image }));
+  f.state.runnerRelease.set(wrong.id, fixtureRelease("container", "container", { container_image: image.replace("v0.5.0", "v0.4.0") }));
+  f.state.runnerRelease.set(org.id, fixtureRelease("managed", "self_update"));
+  f.state.runnerRelease.set(manual.id, fixtureRelease("unmanaged", "install_script"));
+  const disconnected = fixtureRelease("managed", "self_update");
+  disconnected.presence.online = false;
+  f.state.runnerRelease.set(offline.id, disconnected);
+  const app = await openWith(f, null);
+  await signInToRunners(app, "bob");
+  await app.waitFor(`id:runner-update-docker:${docker.id}:toggle`);
+  expect(text(app)).toContain("Version unknown until it connects");
+  expect(text(app)).toContain("Updates with Metro.");
+  expect(text(app)).toContain("An org admin can update it.");
+  expect(text(app)).toContain("Bring this runner online to request an update.");
+  expect(app.shows(`id:runner-update-release:${manual.id}`)).toBe(true);
+  for (const r of [docker, wrong, embedded, old, org, offline, manual]) expect(app.shows(`id:runner-update:${r.id}`)).toBe(false);
+  await app.press(`id:runner-update-docker:${docker.id}:toggle`);
+  await app.press(`id:runner-copy-image:${docker.id}`);
+  expect(app.clipboard()).toBe(image);
+  await app.press(`id:runner-update-docker:${wrong.id}:toggle`);
+  expect(app.shows(`id:runner-copy-image:${wrong.id}`)).toBe(false);
+  expect(text(app)).toContain("The server did not provide a valid pinned Metro runner image.");
+  expect(f.posts().filter((p) => p.path.endsWith("/update"))).toEqual([]);
 });

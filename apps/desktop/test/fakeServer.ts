@@ -68,6 +68,11 @@ export function fakeServer() {
     afters: [] as string[],
     runners: new Map<string, Runner>(),
     attached: new Map<string, string>(), // space id -> runner id
+    attachIfEmpty: true,
+    missingEmptyAttachRoute: false,
+    beforeEmptyAttach: null as ((sid: string) => void) | null,
+    runnerRelease: new Map<string, { presence: Record<string, unknown>; update: Record<string, unknown> }>(),
+    rejectRunnerUpdate: new Set<string>(),
     connections: new Map<string, Conn>(),
     /** Device connection ids whose metro-connector is online. */
     online: new Set<string>(),
@@ -121,7 +126,11 @@ export function fakeServer() {
   const spaceJson = (s: Space, user: string) => ({ id: s.id, name: s.name, role: s.owner === user ? "owner" : "member", runner_paired: !!s.runnerToken || state.attached.has(s.id) });
   const admin = (user: string) => ORG_ADMINS.includes(user);
   const visibleRunner = (r: Runner | undefined, user: string) => !!r && (r.visibility === "organization" || r.owner === user);
-  const runnerJson = (r: Runner, user: string) => ({ id: r.id, name: r.name, visibility: r.visibility, can_manage: r.visibility === "personal" ? r.owner === user : admin(user) });
+  const runnerJson = (r: Runner, user: string) => ({
+    id: r.id, name: r.name, visibility: r.visibility,
+    can_manage: r.visibility === "personal" ? r.owner === user : admin(user),
+    ...state.runnerRelease.get(r.id),
+  });
   /** Self-hosted OpenAI-compatible connections take per-model thinking options. */
   const customThinking = (c: Conn) => c.provider_id === "custom" || c.provider_id === "device-openai-compatible";
   const modelViews = (c: Conn) =>
@@ -221,7 +230,10 @@ export function fakeServer() {
     }
     if (path === "/v1/me" && req.method === "GET") return ok({ id: user, actor: user, is_org_admin: admin(user) });
     if (path === "/v1/runners" && req.method === "GET") {
-      return ok({ runners: [...state.runners.values()].filter((x) => visibleRunner(x, user)).map((x) => runnerJson(x, user)) });
+      return ok({
+        runners: [...state.runners.values()].filter((x) => visibleRunner(x, user)).map((x) => runnerJson(x, user)),
+        ...(state.attachIfEmpty ? { attach_if_empty: true } : {}),
+      });
     }
     if (path === "/v1/runners" && req.method === "POST") {
       if (!body?.name?.trim()) return err(400, "name is required");
@@ -229,11 +241,22 @@ export function fakeServer() {
       const created = addRunner(body.name.trim(), body.visibility, user);
       return ok({ runner: runnerJson(created, user), token: created.token }, 201);
     }
-    if ((r = m(/^\/v1\/runners\/([^/]+)(\/token)?$/))) {
+    if ((r = m(/^\/v1\/runners\/([^/]+)(\/token|\/update)?$/))) {
       const runner = state.runners.get(decodeURIComponent(r[1]));
       if (!visibleRunner(runner, user)) return err(404, "no such runner");
       if (!runnerJson(runner!, user).can_manage) return err(403, "only an organization admin can manage an organization runner");
-      if (r[2] && req.method === "POST") {
+      if (r[2] === "/update" && req.method === "POST") {
+        if (state.rejectRunnerUpdate.has(runner!.id)) return err(403, "not permitted to update this runner");
+        const release = state.runnerRelease.get(runner!.id);
+        if (!release || !release.update.available || release.update.latest !== body?.version ||
+            !release.presence.online || !release.presence.self_update || release.update.pending) {
+          return err(409, "runner isn't eligible");
+        }
+        const pending = { target: body.version, requested_at: Date.now() };
+        release.update.pending = pending;
+        return ok({ pending }, 202);
+      }
+      if (r[2] === "/token" && req.method === "POST") {
         runner!.token = `metro_rt_v2_secret${nextId++}`;
         return ok({ token: runner!.token });
       }
@@ -457,6 +480,16 @@ export function fakeServer() {
         }
         space.runnerToken = null;
         return ok({});
+      }
+      if (rest === "/runner/attach-if-empty" && req.method === "POST") {
+        if (!state.attachIfEmpty || state.missingEmptyAttachRoute) return err(404, "unknown route");
+        if (!owner) return err(403, "only the owner manages the runner");
+        const runner = state.runners.get(body?.runner_id ?? "");
+        if (!visibleRunner(runner, user)) return err(404, "no such runner");
+        state.beforeEmptyAttach?.(space.id);
+        if (space.runnerToken || state.attached.has(space.id)) return err(409, "this Space already has a runner");
+        state.attached.set(space.id, runner!.id);
+        return ok({ runner: spaceRunnerJson(space) });
       }
       if (rest === "/runner") {
         if (req.method === "GET") return ok({ runner: spaceRunnerJson(space) });
