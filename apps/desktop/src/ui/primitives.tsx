@@ -3,8 +3,8 @@
 // in theme/theme.json. To swap the design system, replace this module while
 // keeping its exports' props.
 
-import { effect, keymap, List, Scroll, signal, Text, View } from "nsh";
-import type { JSX, ListRef, ViewRef } from "nsh";
+import { effect, keymap, List, Scroll, signal, Text, untracked, View } from "nsh";
+import type { InputRef, JSX, ListRef, ViewRef } from "nsh";
 import { Button, Checkbox as BaseCheckbox, Collapsible, ContextMenu, Input, Menu, MenuItem, MenuSeparator, Radio, RadioGroup, Select, Switch } from "nsh/base";
 import { Icon, SpaceTile } from "./chrome";
 import type { IconColor, IconName } from "./chrome";
@@ -306,6 +306,8 @@ export function Action(
     edgeAligned?: boolean;
     /** An icon of the app's family before the label (secondary, ghost and destructive only). */
     icon?: IconName;
+    /** For focus handoffs to this action, such as returning from an inline confirmation. */
+    viewRef?: (node: ViewRef) => void;
   },
 ) {
   const variant = () => props.variant ?? "secondary";
@@ -313,6 +315,7 @@ export function Action(
   const quiet = () => variant() === "ghost" || variant() === "destructive";
   return (
     <Button
+      ref={props.viewRef}
       class={cx(
         "group flex-row items-center justify-center",
         props.compact ? cx(controlHeightClass.compact, "rounded-(--radius-sm) gap-(--space-1) px-(--space-2)") : cx(controlHeightClass.default, "rounded-(--radius-md) gap-(--space-2) px-(--space-3)"),
@@ -640,6 +643,8 @@ export function Field(
     multiline?: boolean;
     disabled?: boolean;
     autoFocus?: boolean;
+    /** For handing focus to the field when opening inline content. */
+    inputRef?: (node: InputRef) => void;
     /** Keep the text exactly as typed (names and confirmation phrases). */
     verbatim?: boolean;
     grow?: boolean;
@@ -659,6 +664,7 @@ export function Field(
   });
   return (
     <Input
+      ref={props.inputRef}
       onFocus={() => focused.set(true)}
       onBlur={() => focused.set(false)}
       class={cx(
@@ -785,23 +791,28 @@ export function Banner(
   );
 }
 
+type ConfirmTrigger =
+  | { triggerLabel: string; open?: boolean; onOpenChange?: (open: boolean) => void; returnFocus?: () => ViewRef | null | undefined }
+  | { triggerLabel?: never; open: boolean; onOpenChange: (open: boolean) => void; returnFocus: () => ViewRef | null | undefined };
+
 /**
  * A confirmation scoped to one row. `testID` names the trigger; the panel,
  * warning, input, Cancel and final action use `:panel`, `:warning`, `:input`,
  * `:cancel` and `:confirm`. For a menu trigger or a saving state, control
- * `open` and `onOpenChange`; omit `triggerLabel` for an external trigger.
+ * `open` and `onOpenChange`. For an external trigger, omit `triggerLabel`
+ * and pass `returnFocus`, which captures the opener when `open` turns true.
+ * Use the persistent menu button as the opener for a menu item that unmounts.
+ * Clear controlled `open` when changing targets, and set it again only on
+ * a new user request. Scope invalidation does not write to the parent's state.
  */
-export function ConfirmInline(props: Testable & {
-  triggerLabel?: string;
+export function ConfirmInline(props: Testable & ConfirmTrigger & {
   confirmLabel: string;
   title?: string;
   message: string;
   /** The exact (case- and space-sensitive) text needed to enable the action. */
   typeToConfirm?: string;
-  /** Identity of the target if the same row is reused for another one. */
+  /** A changed target closes the panel. A controlled reopen needs `open` to go false, then true. */
   scopeKey?: string;
-  open?: boolean;
-  onOpenChange?: (open: boolean) => void;
   onConfirm: () => void;
   /** Non-destructive actions (such as starting an update) use `primary`. */
   variant?: "destructive" | "primary";
@@ -809,46 +820,76 @@ export function ConfirmInline(props: Testable & {
   busy?: boolean;
   busyLabel?: string;
 }) {
-  const localOpen = signal<{ key?: string } | null>(null);
+  const localOpen = signal(false);
+  const session = signal<{ key?: string; opener?: ViewRef | null } | null>(null);
   const typed = signal("");
-  const open = () => props.open ?? (localOpen() !== null && localOpen()?.key === props.scopeKey);
+  const open = () => {
+    const active = session();
+    return !!active && (props.open ?? localOpen()) && active.key === props.scopeKey;
+  };
   const ready = () => !props.disabled && !props.busy && (props.typeToConfirm === undefined || typed() === props.typeToConfirm);
   const id = (part: string) => props.testID ? `${props.testID}:${part}` : undefined;
   let trigger: ViewRef | undefined;
-  // Reopening, retargeting, or changing what must be typed always starts fresh.
+  let wasRequested = false;
+  const changeOpen = (next: boolean) => {
+    if (props.open === undefined) localOpen.set(next);
+    props.onOpenChange?.(next);
+  };
+  const restore = (active: { opener?: ViewRef | null }) => (active.opener ?? trigger)?.focus();
+  // A true prop is a request to open only on its rising edge. Retargeting
+  // invalidates the session even if the parent keeps requesting it, or the
+  // original target comes back before the parent clears its request.
   effect(() => {
-    open();
+    const requested = props.open ?? localOpen();
     const key = props.scopeKey;
+    const opening = requested && !wasRequested;
+    wasRequested = requested;
+    const active = untracked(session);
+    if (opening) {
+      session.set({ key, opener: untracked(() => props.returnFocus?.() ?? trigger) });
+    } else if (active && active.key !== key) {
+      session.set(null);
+      if (props.open === undefined) localOpen.set(false);
+    } else if (active && !requested) {
+      session.set(null);
+      restore(active);
+    }
+  });
+  effect(() => {
+    session();
     props.typeToConfirm;
-    const local = localOpen();
-    if (local && local.key !== key) localOpen.set(null);
     typed.set("");
   });
-  const changeOpen = (next: boolean) => {
-    if (props.open === undefined) localOpen.set(next ? { key: props.scopeKey } : null);
-    props.onOpenChange?.(next);
+  const close = () => {
+    const active = session();
+    session.set(null);
+    changeOpen(false);
+    if (active) restore(active);
   };
   const cancel = () => {
     if (!open() || props.busy) return;
-    typed.set("");
-    changeOpen(false);
-    if (!props.disabled) trigger?.focus();
+    close();
   };
   const confirm = () => {
     if (!open() || !ready()) return;
     typed.set("");
-    if (props.open === undefined) {
-      changeOpen(false);
-      trigger?.focus();
-    }
+    if (props.open === undefined) close();
     props.onConfirm();
   };
   const variant = () => props.variant ?? "destructive";
   const unavailable = () => !!(props.disabled || props.busy);
+  const focusOnOpen = (node: ViewRef) => {
+    const active = session();
+    // The menu may still be releasing focus during the mount. Focus the
+    // new control after layout, and never if that open session has ended.
+    void node.measure().then((layout) => {
+      if (layout && active === session() && open() && !props.busy) node.focus();
+    });
+  };
   return (
     <View
       class="min-w-0 flex-col"
-      captureKeys={open() && !props.busy ? ["escape"] : undefined}
+      captureKeys={open() ? ["escape"] : undefined}
       onKeyDown={(e) => {
         if (e.key === "Escape" && e.defaultPrevented) cancel();
       }}
@@ -886,14 +927,19 @@ export function ConfirmInline(props: Testable & {
                 accessibilityLabel={`Type “${props.typeToConfirm}” to confirm`}
                 testID={id("input")}
                 disabled={unavailable()}
-                autoFocus={!unavailable()}
+                inputRef={(node) => {
+                  if (!unavailable()) focusOnOpen(node);
+                }}
                 onCancel={cancel}
                 verbatim
               />
             </FormRow>
           </If>
           <ActionBar>
-            <Action label="Cancel" variant="ghost" testID={id("cancel")} onPress={cancel} disabled={props.busy} />
+            <Action label="Cancel" variant="ghost" testID={id("cancel")} onPress={cancel} disabled={props.busy}
+              viewRef={(node) => {
+                if (!props.busy && (props.typeToConfirm === undefined || props.disabled)) focusOnOpen(node);
+              }} />
             <Action label={props.confirmLabel} variant={variant() === "destructive" ? "danger" : "primary"} testID={id("confirm")}
               onPress={confirm} disabled={!ready()} busy={props.busy} busyLabel={props.busyLabel}
               accessibilityLabel={props.busy ? props.busyLabel : undefined} />

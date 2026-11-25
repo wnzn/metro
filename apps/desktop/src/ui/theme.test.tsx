@@ -420,21 +420,104 @@ test("Settings primitives: exact inline confirmation is scoped, cancellable and 
   expect(app.shows("id:fx-confirm:panel")).toBe(false);
 });
 
-test("Settings primitives: controlled confirmation supports an external trigger and disables actions while busy", async () => {
+test("Settings primitives: externally opened confirmation focuses Cancel, restores the opener, and handles Escape in the modal", async () => {
   const app = await openSettingsFixture();
   expect(app.shows("id:fx-external:panel")).toBe(false);
   await app.press("id:fx-external-open");
   expect(app.shows("id:fx-external:warning")).toBe(true);
   expect(app.shows("id:fx-external:input")).toBe(false);
-  await app.press("id:fx-external:cancel");
+  await app.keyboard.press("enter"); // The first focused action is Cancel.
   expect(app.shows("id:fx-external:panel")).toBe(false);
-  await app.press("id:fx-external-open");
+  expect(app.shows("id:fx-modal")).toBe(true);
+  await app.keyboard.press("enter"); // Focus returned to the button that opened it.
+  expect(app.shows("id:fx-external:panel")).toBe(true);
+  await app.keyboard.press("tab"); // Cancel → Confirm
+  await app.keyboard.press("escape");
+  expect(app.shows("id:fx-external:panel")).toBe(false);
+  expect(app.shows("id:fx-modal")).toBe(true);
+  await app.keyboard.press("enter");
   expect(bg(app, "id:fx-external:confirm")).toBe(rgba(dark.primary));
-  await app.press("id:fx-external:confirm");
+  await app.keyboard.press("tab");
+  await app.keyboard.press("enter");
   await app.waitFor("id:fx-external:confirm >> text:Downloading…");
   expect(app.shows("label:Downloading…")).toBe(true);
   expect(app.enabled("id:fx-external:confirm")).toBe(false);
   expect(app.enabled("id:fx-external:cancel")).toBe(false);
+  await app.press("id:fx-reset-open"); // The caller closes after its action completes.
+  expect(app.shows("id:fx-external:panel")).toBe(false);
+  await app.keyboard.press("enter");
+  expect(app.shows("id:fx-external:panel")).toBe(true);
+});
+
+test("Settings primitives: a no-text confirmation opened from a menu focuses Cancel and returns to the menu button", async () => {
+  const app = await openSettingsFixture();
+  await app.press("id:fx-external-menu");
+  await app.press("id:fx-external-menu-item");
+  await app.keyboard.press("enter");
+  expect(app.shows("id:fx-external:panel")).toBe(false);
+  expect(app.shows("id:fx-modal")).toBe(true);
+  await app.keyboard.press("enter");
+  await app.waitFor("id:fx-external-menu-item");
+  await app.press("id:fx-external-menu-item");
+  await app.keyboard.press("escape");
+  expect(app.shows("id:fx-external:panel")).toBe(false);
+  expect(app.shows("id:fx-modal")).toBe(true);
+});
+
+test("Settings primitives: a menu-opener handoff preserves focus and Escape in a typed confirmation", async () => {
+  const app = await openSettingsFixture(720, 900);
+  await app.press("id:fx-external-typed");
+  await app.press("id:fx-external-menu");
+  await app.press("id:fx-external-menu-item");
+  await app.keyboard.press("x"); // The exact-text field, not the menu trigger, has focus.
+  expect(app.value("id:fx-external:input")).toBe("x");
+  expect(app.enabled("id:fx-external:confirm")).toBe(false);
+  await app.keyboard.press("escape");
+  expect(app.shows("id:fx-modal")).toBe(true);
+  expect(app.shows("id:fx-external:panel")).toBe(false);
+  await app.keyboard.press("enter");
+  await app.waitFor("id:fx-external-menu-item"); // Returned to the menu button, not the nearby ordinary opener.
+  await app.press("id:fx-external-menu-item");
+  expect(app.value("id:fx-external:input")).toBe("");
+  await app.keyboard.press("tab"); // Field → Cancel
+  await app.keyboard.press("enter");
+  expect(app.shows("id:fx-external:panel")).toBe(false);
+  expect(app.shows("id:fx-modal")).toBe(true);
+});
+
+test("Settings primitives: retargeting a controlled confirmation invalidates a stuck-open request", async () => {
+  const app = await openSettingsFixture();
+  await app.press("id:fx-danger-external");
+  await app.press("id:fx-external-open");
+  expect(app.enabled("id:fx-external:confirm")).toBe(true);
+  expect(bg(app, "id:fx-external:confirm")).toBe(rgba(dark.destructive));
+  await app.press("id:fx-retarget");
+  expect(app.shows("text:Parent open: true")).toBe(true);
+  await expect(app.press("id:fx-external:confirm")).rejects.toMatchObject({ code: "ERR_NSH_TEST_NOT_FOUND" });
+  await app.press("id:fx-retarget");
+  await app.press("id:fx-external-open"); // Still true: even returning to the old target doesn't re-arm it.
+  expect(app.shows("id:fx-external:panel")).toBe(false);
+  expect(app.shows("text:Parent open: true")).toBe(true);
+  await app.press("id:fx-reset-open");
+  await app.press("id:fx-retarget");
+  await app.press("id:fx-external-open");
+  await app.press("id:fx-external:confirm");
+  await app.waitFor("label:Downloading…");
+});
+
+test("Settings primitives: retargeting an uncontrolled confirmation without text closes it until reopened", async () => {
+  const app = await openSettingsFixture();
+  await app.press("id:fx-local");
+  expect(app.enabled("id:fx-local:confirm")).toBe(true);
+  await app.press("id:fx-retarget");
+  await expect(app.press("id:fx-local:confirm")).rejects.toMatchObject({ code: "ERR_NSH_TEST_NOT_FOUND" });
+  await app.press("id:fx-retarget");
+  expect(app.shows("id:fx-local:panel")).toBe(false);
+  expect(app.shows("text:Removed runner: -")).toBe(true);
+  await app.press("id:fx-retarget");
+  await app.press("id:fx-local");
+  await app.press("id:fx-local:confirm");
+  await app.waitFor("text:Removed runner: B");
 });
 
 test("Settings primitives: the whole checkbox toggles with keyboard or pointer, until disabled", async () => {
@@ -460,10 +543,15 @@ test("Settings primitives: tagged and passive list rows keep their trailing acti
   expect(bg(app, "id:fx-update-tag")).toBe(rgba(dark.accent));
   expect(app.shows("id:fx-problem")).toBe(true);
   expect(app.shows("id:fx-passive:open")).toBe(false);
+  expect(app.shows("id:fx-passive >> label:Passive provider name")).toBe(true);
+  expect(app.shows("id:fx-passive >> label:Organization runner")).toBe(true);
+  expect(app.shows("id:fx-passive >> text:Off")).toBe(true);
   await app.press("id:fx-row-action");
   await app.waitFor("text:Last row action: trailing");
   await app.press("id:fx-row:open");
   await app.waitFor("text:Last row action: open");
+  await app.press("id:fx-custom-name");
+  await app.waitFor("label:Open provider details, Update 0.5.0");
 });
 
 test("Settings primitives: reorder buttons report one step and disable impossible moves", async () => {

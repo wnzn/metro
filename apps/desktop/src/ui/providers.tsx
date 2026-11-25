@@ -5,7 +5,7 @@
 // passes only semantic props; every class lives here.
 
 import { Text, View } from "nsh";
-import type { JSX } from "nsh";
+import type { JSX, ViewRef } from "nsh";
 import { Button, Menu, MenuItem, MenuSeparator } from "nsh/base";
 import { BrandMark, Icon } from "./chrome";
 import type { Mark } from "./chrome";
@@ -104,28 +104,34 @@ export function DefaultsLine(props: { entries: readonly DefaultEntry[]; testID?:
 
 // ------------------------------------------------------------------ saved connections
 
+type ConnectionItemTags =
+  | { onPress?: () => void; tags?: undefined; tagsLabel?: never }
+  | { onPress?: undefined; tags: JSX.Element; tagsLabel?: never }
+  | { onPress: () => void; tags: JSX.Element; tagsLabel: string };
+
 /**
  * A compact list row: a provider mark (or custom `leading`), name with tags,
  * and a status line. Supply `onPress` for a row that opens details; otherwise
- * only the trailing controls are interactive. `children` go under the row.
+ * only the trailing controls are interactive. Non-interactive `tags` beside
+ * the name are read on their own in passive rows; pressable rows need a
+ * `tagsLabel` to include them in the button name, even with a custom label.
+ * `children` go under the row.
  */
-export function ConnectionItem(props: {
+export function ConnectionItem(props: ConnectionItemTags & {
   mark?: Mark;
   leading?: JSX.Element;
   name: string;
   isDefault?: boolean;
-  /** Non-interactive badges beside the name. */
-  tags?: JSX.Element;
-  /** The badges' meaning when the identity area is a single accessible button. */
-  tagsLabel?: string;
   status: { tone: Tone; text: string };
-  onPress?: () => void;
   trailing?: JSX.Element;
   children?: JSX.Element;
   testID?: string;
   accessibilityLabel?: string;
 }) {
   const identityClass = "flex-1 min-w-0 flex-row items-center gap-(--space-3) px-(--space-2) py-(--space-2)";
+  const buttonLabel = () => (props.accessibilityLabel !== undefined
+    ? [props.accessibilityLabel, props.tagsLabel]
+    : [props.name, props.isDefault ? "default" : undefined, props.tagsLabel, props.status.text]).filter(Boolean).join(", ");
   const identity = (
     <>
       <If when={props.leading} else={<If when={props.mark}>{(mark) => <BrandMark mark={mark()} size="md" />}</If>}>
@@ -133,7 +139,8 @@ export function ConnectionItem(props: {
       </If>
       <View class="flex-1 min-w-0 flex-col gap-px">
         <View class={cx("flex-row items-center gap-(--space-2)", !!props.tags && "flex-wrap gap-y-px")}>
-          <Text class={cx(textClass.sm, "font-medium text-foreground", !!props.tags && "shrink min-w-0")} style={{ numberOfLines: 1 }}>
+          <Text class={cx(textClass.sm, "font-medium text-foreground", !!props.tags && "shrink min-w-0")} style={{ numberOfLines: 1 }}
+            accessibilityLabel={props.onPress ? undefined : props.accessibilityLabel}>
             {props.name}
           </Text>
           <If when={props.isDefault}>
@@ -148,11 +155,11 @@ export function ConnectionItem(props: {
   return (
     <View class="flex-col" testID={props.testID}>
       <View class="flex-row items-center gap-(--space-2) px-(--space-2) py-(--space-1)">
-        <If when={!!props.onPress} else={<View class={identityClass} accessibilityLabel={props.accessibilityLabel}>{identity}</View>}>
+        <If when={!!props.onPress} else={<View class={identityClass}>{identity}</View>}>
           <Button
             class={cx(identityClass, "rounded-(--radius-sm) hover:bg-muted active:bg-muted", transitionClass, focusRingClass)}
             onPress={() => props.onPress?.()}
-            accessibilityLabel={props.accessibilityLabel ?? [props.name, props.isDefault ? "default" : undefined, props.tagsLabel, props.status.text].filter(Boolean).join(", ")}
+            accessibilityLabel={buttonLabel()}
             testID={props.testID ? `${props.testID}:open` : undefined}
           >
             {identity}
@@ -207,7 +214,14 @@ export type MoreMenuItem = {
  * `accessibilityLabel`) and its items in a popover, with a separator before
  * the first destructive item. Keyboard as NSH's Menu.
  */
-export function MoreMenu(props: { items: readonly MoreMenuItem[]; accessibilityLabel: string; testID?: string; disabled?: boolean }) {
+export function MoreMenu(props: {
+  items: readonly MoreMenuItem[];
+  accessibilityLabel: string;
+  testID?: string;
+  disabled?: boolean;
+  /** The persistent opener to return to from an action's inline confirmation. */
+  triggerRef?: (node: ViewRef) => void;
+}) {
   const rows = () => props.items.map((item, i) => ({ item, separated: !!item.destructive && i > 0 && !props.items[i - 1].destructive }));
   return (
     <Menu
@@ -219,6 +233,7 @@ export function MoreMenu(props: { items: readonly MoreMenuItem[]; accessibilityL
       popupEndingClass={popoverMotion.ending}
       trigger={
         <Button
+          ref={props.triggerRef}
           class={cx("items-center justify-center size-[32px] rounded-(--radius-sm) hover:bg-muted active:bg-muted aria-expanded:bg-muted", focusRingClass, transitionClass, disabledClass)}
           disabled={props.disabled}
           accessibilityLabel={props.accessibilityLabel}

@@ -1,8 +1,9 @@
 // Standalone UI fixture: no Settings features, server or desktop bridge.
-import { mount, signal } from "nsh";
+import { mount, signal, View } from "nsh";
+import type { ViewRef } from "nsh";
 import {
-  Action, Badge, Checkbox, Column, ConfirmInline, ConnectionItem, Field, Label, Modal, ModalNav, ModalNavSection,
-  ModalTab, ModalTabRow, PageHeader, ProblemNote, ProgressLine, RailButton, RailDivider, ReorderButtons, Row,
+  Action, Badge, Checkbox, ConfirmInline, ConnectionItem, Field, Label, Modal, ModalNav, ModalNavSection,
+  ModalTab, ModalTabRow, MoreMenu, PageHeader, ProblemNote, ProgressLine, RailButton, RailDivider, ReorderButtons, Row,
   ScrollArea, Surface, compactWidth,
 } from "./index";
 import type { PageScope } from "./index";
@@ -15,6 +16,12 @@ const scopes: PageScope[] = [
   { kind: "organization" },
 ];
 
+// Checked by nsh check: a custom name doesn't excuse missing tag text.
+function invalidPressableTags() {
+  // @ts-expect-error tagged button needs tagsLabel
+  return <ConnectionItem name="Missing tag text" accessibilityLabel="Open details" status={{ tone: "neutral", text: "Off" }} onPress={() => {}} tags={<Badge tone="info" label="Update" />} />;
+}
+
 function Fixture() {
   const visible = signal(true);
   const selected = signal("profile");
@@ -25,10 +32,17 @@ function Fixture() {
   const disabled = signal(false);
   const target = signal("A");
   const confirmed = signal(0);
+  const localConfirmed = signal("-");
   const open = signal(false);
+  const destructive = signal(false);
+  const typedExternal = signal(false);
+  let actionOpener: ViewRef | undefined;
+  let menuOpener: ViewRef | undefined;
+  let opener: ViewRef | undefined;
   const busy = signal(false);
   const position = signal(0);
   const rowAction = signal("none");
+  const customName = signal(false);
   const progress = signal<number | undefined>(42);
   const notice = () => update() ? "Update available" : undefined;
   const tabs = (compact: boolean) => (
@@ -56,18 +70,34 @@ function Fixture() {
       <ConfirmInline triggerLabel="Delete…" confirmLabel="Delete Space" message="This deletes the Space for everyone."
         typeToConfirm="Exact Name" scopeKey={target()} onConfirm={() => confirmed.set(confirmed() + 1)} testID="fx-confirm" />
       <Label>{`Confirmations: ${confirmed()}`}</Label>
-      <Action label="Open update confirmation" testID="fx-external-open" onPress={() => open.set(true)} />
-      <ConfirmInline open={open()} onOpenChange={open.set} variant="primary" confirmLabel="Download and verify" message="The app will restart."
+      <Row gap={2} wrap>
+        <Action label="Open update confirmation" testID="fx-external-open" viewRef={(node) => (actionOpener = node)}
+          onPress={() => { opener = actionOpener; open.set(true); }} />
+        <MoreMenu testID="fx-external-menu" accessibilityLabel="Update actions" triggerRef={(node) => (menuOpener = node)}
+          items={[{ id: "fx-external-menu-item", label: "Update…", onPress: () => { opener = menuOpener; open.set(true); } }]} />
+        <Action label="Require text" testID="fx-external-typed" onPress={() => typedExternal.set(true)} />
+        <Action label="Use destructive confirmation" testID="fx-danger-external" onPress={() => destructive.set(true)} />
+        <Action label="Reset parent open" testID="fx-reset-open" onPress={() => open.set(false)} />
+      </Row>
+      <Label>{`Parent open: ${open()}`}</Label>
+      <ConfirmInline open={open()} onOpenChange={open.set} returnFocus={() => opener} scopeKey={target()} typeToConfirm={typedExternal() ? "Exact Name" : undefined}
+        variant={destructive() ? "destructive" : "primary"} confirmLabel="Download and verify" message="The app will restart."
         onConfirm={() => busy.set(true)} busy={busy()} busyLabel="Downloading…" testID="fx-external" />
+      <ConfirmInline triggerLabel="Remove…" confirmLabel="Remove runner" message="This disconnects the runner." scopeKey={target()}
+        onConfirm={() => localConfirmed.set(target())} testID="fx-local" />
+      <Label>{`Removed runner: ${localConfirmed()}`}</Label>
       <ConnectionItem name="Test provider" mark={{ letters: "TP", tone: "neutral" }} isDefault status={{ tone: "success", text: "Online" }}
         tags={<Badge tone="info" label="Update 0.5.0" testID="fx-update-tag" />} tagsLabel="Update 0.5.0"
+        accessibilityLabel={customName() ? "Open provider details" : undefined}
         onPress={() => rowAction.set("open")} trailing={<Action label="Details" testID="fx-row-action" onPress={() => rowAction.set("trailing")} />}
         testID="fx-row">
         <ProblemNote text="A problem below the tagged row." testID="fx-problem" />
       </ConnectionItem>
-      <ConnectionItem name="Passive provider" leading={<Label>PP</Label>} status={{ tone: "neutral", text: "Off" }} testID="fx-passive">
+      <ConnectionItem name="Passive provider" leading={<Label>PP</Label>} status={{ tone: "neutral", text: "Off" }} testID="fx-passive"
+        tags={<Label accessibilityLabel="Organization runner">Organization</Label>} accessibilityLabel="Passive provider name">
         <Label>{`Last row action: ${rowAction()}`}</Label>
       </ConnectionItem>
+      <Action label="Use custom name" testID="fx-custom-name" onPress={() => customName.set(true)} />
       <ReorderButtons label="Test provider" canMoveUp={position() > 0} canMoveDown={position() < 1} disabled={disabled()}
         onMove={(step) => position.set(position() + step)} testID="fx-reorder" />
       <Label>{`Provider position: ${position() + 1}`}</Label>
@@ -78,18 +108,13 @@ function Fixture() {
   return (
     <Surface variant="app">
       <Modal title="Fixture settings" testID="fx-modal" open={visible()} onClose={() => visible.set(false)}>
-        <If when={compactWidth()} else={
-          <Row grow>
+        <View class={compactWidth() ? "flex-1 min-h-0 flex-col" : "flex-1 min-h-0 flex-row"}>
+          <If when={!compactWidth()} else={<ModalTabRow testID="fx-nav" accessibilityLabel="Fixture sections">{tabs(true)}</ModalTabRow>}>
             <ModalNav testID="fx-nav" accessibilityLabel="Fixture sections">{tabs(false)}</ModalNav>
             <Surface variant="rail"><RailDivider /><RailButton label="Settings" icon="settings" dot={notice()} dotTestID="fx-rail-dot" onPress={() => selected.set("about")} /></Surface>
-            {page}
-          </Row>
-        }>
-          <Column grow>
-            <ModalTabRow testID="fx-nav" accessibilityLabel="Fixture sections">{tabs(true)}</ModalTabRow>
-            {page}
-          </Column>
-        </If>
+          </If>
+          {page}
+        </View>
       </Modal>
     </Surface>
   );
