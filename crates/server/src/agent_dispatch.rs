@@ -121,6 +121,7 @@ pub async fn plan(
             }
         }
         Addressing::Agent => {
+            let mut generic_failed = None;
             for m in resolved {
                 match m {
                     Mention::AgentId { agent_id } => {
@@ -142,10 +143,8 @@ pub async fn plan(
                             Ok(t) => push(&mut plan.targets, t),
                             Err(why) => {
                                 // The room reads one category; the sender
-                                // alone gets the reason.
-                                if plan.addressing_note.is_none() {
-                                    plan.addressing_note = Some(why.into());
-                                }
+                                // alone gets the reason (below).
+                                generic_failed.get_or_insert(why);
                                 let why = why.shared();
                                 plan.errors.push(format!(
                                     "Your classifier could not choose an agent for this message: \
@@ -157,6 +156,12 @@ pub async fn plan(
                     }
                     Mention::User { .. } => {}
                 }
+            }
+            if let Some(why) = generic_failed {
+                plan.addressing_note = Some(AddressingNote::generic_agent_unavailable(
+                    why,
+                    !plan.targets.is_empty(),
+                ));
             }
         }
     }

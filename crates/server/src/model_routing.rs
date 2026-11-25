@@ -881,17 +881,25 @@ impl DecisionFailure {
 /// Extra metadata on the sender's POST response only; never on an Event
 /// and never stored.
 ///
-/// `addressing_note` carries `classification_failed`. `routing_note`
-/// carries the other two, for a turn the message started in a Space room
-/// whose room error is generic: `routing_failed` (use-case routing could
-/// not decide) and `model_unavailable` (the turn's model connection can't
-/// be used). Both have a stable `reason` code and the full, actionable
-/// `message`.
+/// `addressing_note` carries `classification_failed` (an unaddressed
+/// message's classification failed; nothing ran) or
+/// `generic_agent_unavailable` (no agent could be chosen for `@agent`;
+/// agents the message named by handle still ran). `routing_note` carries
+/// the other two, for a turn the message started in a Space room whose
+/// room error is generic: `routing_failed` (use-case routing could not
+/// decide) and `model_unavailable` (the turn's model connection can't be
+/// used). All but `classification_failed` have a stable `reason` code and
+/// the full, actionable `message`.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AddressingNote {
     ClassificationFailed {
         reason: &'static str,
+    },
+    /// `reason` as for `classification_failed`.
+    GenericAgentUnavailable {
+        reason: &'static str,
+        message: String,
     },
     /// `reason` as for `classification_failed`.
     RoutingFailed {
@@ -905,6 +913,26 @@ pub enum AddressingNote {
         reason: &'static str,
         message: String,
     },
+}
+
+impl AddressingNote {
+    /// `@agent` could not be resolved: `others_ran` when agents the message
+    /// named by handle still run.
+    pub fn generic_agent_unavailable(why: DecisionFailure, others_ran: bool) -> Self {
+        let others = if others_ran {
+            " The agents you mentioned by handle still answer."
+        } else {
+            ""
+        };
+        Self::GenericAgentUnavailable {
+            reason: why.reason(),
+            message: format!(
+                "Your classifier could not choose an agent for @agent: {why}. No agent ran for \
+                 @agent; mention an agent by its handle, or check your System One connection \
+                 in Settings.{others}"
+            ),
+        }
+    }
 }
 
 impl From<DecisionFailure> for AddressingNote {

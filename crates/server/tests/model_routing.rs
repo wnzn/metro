@@ -1779,10 +1779,15 @@ async fn the_classifier_picks_among_agents_only_for_the_sender_who_opted_in() {
         let reason = "the System One call failed";
         let calls = h.model_calls().len();
         let e = h.say("alice", Some(&sid), json!({"text": text})).await;
-        assert_eq!(
-            e["addressing_note"],
-            json!({"kind": "classification_failed", "reason": private}),
-            "{text}"
+        // Not an unaddressed classification: its own kind, for the sender.
+        let note = &e["addressing_note"];
+        assert_eq!(note["kind"], "generic_agent_unavailable", "{text}: {note}");
+        assert_eq!(note["reason"], private, "{text}");
+        let message = note["message"].as_str().unwrap();
+        assert!(message.contains("No agent ran for @agent"), "{message}");
+        assert!(
+            !message.contains("still answer"),
+            "nothing else ran: {message}"
         );
         seen_by_bob.push(
             h.answer_after("bob", Some(&sid), e["id"].as_i64().unwrap())
@@ -1818,6 +1823,32 @@ async fn the_classifier_picks_among_agents_only_for_the_sender_who_opted_in() {
         seen_by_bob.iter().all(|t| t == &seen_by_bob[0]),
         "{seen_by_bob:?}"
     );
+    // `@agent @coder` with a failed decision: @coder still runs, the room
+    // shows the same generic error, and the sender's note says @coder ran.
+    let e = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({"text": "@agent @coder [err] both"}),
+        )
+        .await;
+    let note = &e["addressing_note"];
+    assert_eq!(note["kind"], "generic_agent_unavailable", "{note}");
+    assert_eq!(note["reason"], "unreachable");
+    assert!(
+        note["message"].as_str().unwrap().contains("still answer"),
+        "{note}"
+    );
+    let started = h
+        .started_after("alice", &sid, e["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(started["agent"]["handle"], "coder", "{started}");
+    let room = h
+        .answers_after("bob", &sid, e["id"].as_i64().unwrap(), 2)
+        .await;
+    let errors: Vec<&Value> = room.iter().filter(|x| x["kind"] == "error").collect();
+    assert_eq!(errors.len(), 1, "{room:?}");
+    assert_eq!(errors[0]["text"], seen_by_bob[0]);
     // A specific handle skips classification.
     let before = h.fake.calls();
     let e = h
@@ -1894,10 +1925,8 @@ async fn the_classifier_picks_among_agents_only_for_the_sender_who_opted_in() {
             json!({"text": "@agent access changed"}),
         )
         .await;
-    assert_eq!(
-        e["addressing_note"],
-        json!({"kind": "classification_failed", "reason": "not_allowed"})
-    );
+    assert_eq!(e["addressing_note"]["kind"], "generic_agent_unavailable");
+    assert_eq!(e["addressing_note"]["reason"], "not_allowed");
     let err = h
         .answer_after("bob", Some(&sid), e["id"].as_i64().unwrap())
         .await;
