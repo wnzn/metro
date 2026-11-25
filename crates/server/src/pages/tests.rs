@@ -912,6 +912,7 @@ mod store_tests {
                 prompt: "x",
             },
         )
+        .unwrap()
         .unwrap();
         db.remove_member(&sid, "bob").unwrap();
         assert!(!store::prefs(&db, "bob", &p.id).unwrap().pinned);

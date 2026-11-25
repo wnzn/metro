@@ -987,7 +987,13 @@ async fn create_draft(
             },
         )
     })
-    .await?;
+    .await?
+    .ok_or_else(|| {
+        ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "you already have pages being generated; wait for them to finish",
+        )
+    })?;
     let job = generate::Job {
         draft_id: draft.id.clone(),
         user: who.id.clone(),

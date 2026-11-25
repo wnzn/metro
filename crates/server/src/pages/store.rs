@@ -18,6 +18,8 @@ pub const DELETED_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 pub const DRAFT_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// Most drafts one person keeps at once (the oldest go first).
 pub const MAX_DRAFTS_PER_PERSON: usize = 20;
+/// Drafts one person may have generating at once.
+pub const MAX_GENERATING_PER_PERSON: i64 = 2;
 /// Page-only Chat events kept per page and person.
 pub const MAX_PAGE_EVENTS: usize = 500;
 
@@ -864,9 +866,19 @@ pub struct NewDraft<'a> {
     pub prompt: &'a str,
 }
 
-pub fn create_draft(db: &Db, d: &NewDraft<'_>) -> anyhow::Result<DraftRow> {
+/// Create a draft in `generating`; `None` when its author already has
+/// [`MAX_GENERATING_PER_PERSON`] drafts generating.
+pub fn create_draft(db: &Db, d: &NewDraft<'_>) -> anyhow::Result<Option<DraftRow>> {
     let mut conn = db.lock();
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let busy: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM page_drafts WHERE author_id = ?1 AND status = 'generating'",
+        [d.author_id],
+        |r| r.get(0),
+    )?;
+    if busy >= MAX_GENERATING_PER_PERSON {
+        return Ok(None);
+    }
     let id = format!("pgd_{}", uuid::Uuid::new_v4().simple());
     let now = now_ms();
     let scope = if d.space_id.is_some() {
@@ -903,7 +915,7 @@ pub fn create_draft(db: &Db, d: &NewDraft<'_>) -> anyhow::Result<DraftRow> {
         row_draft,
     )?;
     tx.commit()?;
-    Ok(row)
+    Ok(Some(row))
 }
 
 pub fn draft(db: &Db, id: &str) -> anyhow::Result<Option<DraftRow>> {
