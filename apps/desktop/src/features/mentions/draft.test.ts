@@ -260,6 +260,54 @@ test("quotes in inline and fenced code cannot interfere with quoted addresses", 
   ]);
 });
 
+test("quoted names do not pair backward through inline or fenced code", () => {
+  for (const text of [
+    '>"`quote"` then "@Alice Moreno"',
+    '>"``🌿 quote"`` then "@Alice Moreno"',
+    '>"`quote"` then <"local"@agent> and "@Alice Moreno"',
+    '>"`quote"`"local"@agent and "@Alice Moreno"',
+    '>"prose\n```text\nquote" @agent\n```\nthen <"local"@agent> and "@Alice Moreno"',
+  ]) {
+    const mention = "@Alice Moreno";
+    const start = new TextEncoder().encode(text.slice(0, text.indexOf(mention))).length;
+    expect(send(text)).toEqual({
+      ok: true, body: { text, mentions: [alice], spans: [{ start, end: start + mention.length, index: 0 }] },
+    });
+  }
+});
+
+test("a picked label is a quote boundary; an address that opens after it still stays plain", () => {
+  const ops = { kind: "user", id: "ops" } as const;
+  const directory = { ...roster, members: [...roster.members, { id: ops.id, displayName: 'Ops "desk' }] };
+  const picked = pick(draft('>" @o'), 3, 5, ops, directory);
+  for (const suffix of ['then "@Alice Moreno"', 'then <"local"@agent> and "@Alice Moreno"']) {
+    const edited = updateMentionDraft(picked, `${picked.text}${suffix}`);
+    expect(edited.anchors[0]?.picked).toBe(true);
+    const out = body(prepareMentionSend(edited, directory));
+    expect(out.mentions).toEqual([ops, alice]);
+    const bytes = new TextEncoder().encode(edited.text);
+    expect(out.spans?.map(s => new TextDecoder().decode(bytes.slice(s.start, s.end))))
+      .toEqual(['@Ops "desk', "@Alice Moreno"]);
+  }
+});
+
+test("an agent at an interrupted quote boundary requires an explicit choice", () => {
+  const source = draft('>"`quote"` then "@agent"');
+  const [match] = scanMentionDraft(source, roster);
+  expect(match.kind).toBe("ambiguous");
+  const blocked = prepareMentionSend(source, roster);
+  expect(blocked.ok ? null : blocked.reason).toBe("ambiguous");
+  const chosen = pickMention(source, match, generic, roster)!;
+  expect(body(prepareMentionSend(chosen, roster)).mentions).toEqual([generic]);
+
+  const before = '>"`quote"` then @agent ';
+  const captured = captureTypedMentions(draft(before), roster);
+  const start = before.indexOf("@agent");
+  const edited = editMentionDraft(captured, { start, end: start, replacement: '"' })!;
+  const afterEdit = prepareMentionSend(edited, roster);
+  expect(!afterEdit.ok && afterEdit.reason === "ambiguous" ? afterEdit.match.choices : null).toEqual([generic]);
+});
+
 test("quoted addresses are recognized independently of unmatched prose quotes", () => {
   for (const text of [
     'Say "`quote`" then <"local"@agent>',

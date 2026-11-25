@@ -25,17 +25,27 @@ function visibleQuote(text: string, i: number, opaque: readonly MentionRange[]):
   return !overlapsRanges({ start: i, end: i + 1 }, opaque) && !escaped(text, i, opaque);
 }
 
-function previousQuote(text: string, before: number, opaque: readonly MentionRange[]): number | null {
+type QuoteLookback = number | "opaque" | null;
+const lineBreak = /[\r\n\u0085\u2028\u2029]/u;
+
+function previousQuote(text: string, before: number, opaque: readonly MentionRange[]): QuoteLookback {
   const quote = text[before];
-  for (let i = before - 1; i >= 0; i--) {
-    if (/[\r\n\u0085\u2028\u2029]/u.test(text[i])) break;
+  let floor = 0;
+  for (const range of opaque) {
+    if (range.start < before) floor = Math.max(floor, Math.min(range.end, before));
+  }
+  // Code and selected labels split the line into quote-pairing regions.
+  // A hidden delimiter must not join visible quotes on opposite sides.
+  for (let i = before - 1; i >= floor; i--) {
+    if (lineBreak.test(text[i])) return null;
     if (text[i] === quote && visibleQuote(text, i, opaque)) return i;
   }
-  return null;
+  return floor > 0 && !lineBreak.test(text[floor - 1]) ? "opaque" : null;
 }
 
-function startsEmailToken(text: string, start: number): boolean {
-  if (start === 0 || sharedOpen.test(text[start - 1])) return true;
+function startsEmailToken(text: string, start: number, opaque: readonly MentionRange[]): boolean {
+  // The right edge of opaque text can start a new token without a space.
+  if (start === 0 || sharedOpen.test(text[start - 1]) || opaque.some(range => range.end === start)) return true;
   if (text[start - 1] !== ">") return false;
   // A no-space `>` is an email boundary only at a Markdown line prefix.
   // Do not admit a prose closing angle bracket or widen wire mention spans.
@@ -45,33 +55,38 @@ function startsEmailToken(text: string, start: number): boolean {
     && /^ {0,3}>(?:(?: {0,4}|\t {0,3})>)*$/.test(text.slice(prefix, start));
 }
 
-function openingUnderscores(text: string, quote: number): number {
+function openingUnderscores(text: string, quote: number, opaque: readonly MentionRange[]): number {
   // Underscore emphasis can wrap mail, but is not wire mention punctuation:
   // underscores are legal in handles and the server treats them as part of one.
   let start = quote;
   while (start > 0 && text[start - 1] === "_") start--;
-  return start < quote && startsEmailToken(text, start) ? quote - start : 0;
+  return start < quote && startsEmailToken(text, start, opaque) ? quote - start : 0;
 }
 
-function startsQuotedToken(text: string, start: number): boolean {
+function startsQuotedToken(text: string, start: number, opaque: readonly MentionRange[]): boolean {
   // Narrower than a mention boundary: the quote in `hello!"`, for example,
   // closes prose rather than starting a new local-part token.
-  return startsEmailToken(text, start) || openingUnderscores(text, start) > 0;
+  return startsEmailToken(text, start, opaque) || openingUnderscores(text, start, opaque) > 0;
 }
 
 function endsDelimitedToken(text: string, end: number): boolean {
   return end === text.length || space.test(text[end]) || trailing.test(text[end]);
 }
 
-/** Find a complete local part ending at this quote, without pairing unrelated prose quotes. */
-export function quotedLocalStart(text: string, close: number, opaque: readonly MentionRange[]): number | null {
+function quotedLocalBoundary(text: string, close: number, opaque: readonly MentionRange[]): QuoteLookback {
   if (close < 1 || close >= text.length) return null;
   const quote = text[close];
   if ((quote !== '"' && quote !== "'") || !visibleQuote(text, close, opaque)) return null;
   const start = previousQuote(text, close, opaque);
   // An unescaped inner quote makes this local part incomplete; do not
   // skip it to grab an earlier quote with a better boundary.
-  return start !== null && startsQuotedToken(text, start) ? start : null;
+  return typeof start === "number" && !startsQuotedToken(text, start, opaque) ? null : start;
+}
+
+/** Find a complete local part ending at this quote, without pairing unrelated prose quotes. */
+export function quotedLocalStart(text: string, close: number, opaque: readonly MentionRange[]): number | null {
+  const start = quotedLocalBoundary(text, close, opaque);
+  return typeof start === "number" ? start : null;
 }
 
 function couldCloseProse(text: string, start: number, opaque: readonly MentionRange[]): boolean {
@@ -81,7 +96,7 @@ function couldCloseProse(text: string, start: number, opaque: readonly MentionRa
   const earlier = previousQuote(text, start, opaque);
   // The preceding quote may already close a local part, as in
   // `"first"@host," second"@host`; it cannot open prose at the separator.
-  return earlier !== null && startsQuotedToken(text, earlier) && text[earlier + 1] !== "@";
+  return typeof earlier === "number" && startsQuotedToken(text, earlier, opaque) && text[earlier + 1] !== "@";
 }
 
 function quotedEmailSyntax(text: string, opaque: readonly MentionRange[]) {
@@ -93,11 +108,11 @@ function quotedEmailSyntax(text: string, opaque: readonly MentionRange[]) {
   const domainLabel = /^[\p{L}\p{N}](?:[\p{L}\p{N}\p{M}-]*[\p{L}\p{N}\p{M}])?$/u;
   for (const match of text.matchAll(/["']@/gu)) {
     const close = match.index!;
-    const start = quotedLocalStart(text, close, opaque);
+    const start = quotedLocalBoundary(text, close, opaque);
     if (start === null) continue;
     // Use the original @ even when it starts an anchor: an adjoining
     // edit can turn a formerly standalone mention into an email domain.
-    const range = { start, end: close + 2 };
+    const range = { start: start === "opaque" ? close : start, end: close + 2 };
     domain.lastIndex = close + 2;
     const host = domain.exec(text)?.[0];
     if (!host) {
@@ -105,9 +120,15 @@ function quotedEmailSyntax(text: string, opaque: readonly MentionRange[]) {
       if (/[_-]/.test(text[close + 2])) uncertain.push(range);
       continue;
     }
+    if (start === "opaque") {
+      // Do not suppress a person's quoted mention or auto-dispatch an
+      // agent on the strength of an interrupted, unproven local part.
+      uncertain.push(range);
+      continue;
+    }
     const end = domain.lastIndex;
     const completeHost = host.startsWith("[") || host.replace(/\.$/, "").split(".").every(label => domainLabel.test(label));
-    const underscores = text[end] === "_" ? openingUnderscores(text, start) : 0;
+    const underscores = text[end] === "_" ? openingUnderscores(text, start, opaque) : 0;
     const closesEmphasis = underscores > 0 && text.startsWith("_".repeat(underscores), end)
       && endsDelimitedToken(text, end + underscores);
     const boundary = endsDelimitedToken(text, end) || closesEmphasis;
