@@ -356,7 +356,7 @@ fn validate_server_url(raw: &str) -> Result<String, ConfigError> {
 
 /// The host part of a validated `scheme://authority[/path]` URL, with IPv6
 /// brackets, without the port.
-fn url_host(url: &str) -> &str {
+pub(crate) fn url_host(url: &str) -> &str {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
     let authority = rest.split('/').next().unwrap_or("");
     if authority.starts_with('[') {
