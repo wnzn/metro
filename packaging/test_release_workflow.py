@@ -622,7 +622,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         rust = jobs["rust"]["steps"]
         build, = [i for i, s in enumerate(rust) if str(s.get("run", "")).startswith("cargo build --locked --bin ")]
         for fixture, timeout in (("pages.py", 60), ("agent_pages.py", 90), ("web_search.py", 90),
-                                 ("messaging.py", 60), ("meta_agent.py", 90)):
+                                 ("messaging.py", 60), ("meta_agent.py", 90), ("compaction.py", 60)):
             path = f"tests/e2e/{fixture}"
             with self.subTest(fixture=fixture):
                 (job, index, step), = [(name, i, step) for name, job in jobs.items()

@@ -155,6 +155,7 @@ class SegmentTests(GitFixture):
             "tests/e2e/messaging.py": only("rust", "containers"),
             "tests/e2e/messaging_fixture.py": only("rust", "containers"),
             "tests/e2e/meta_agent.py": only("rust", "containers"),
+            "tests/e2e/compaction.py": only("rust", "containers"),
             "tests/e2e/web_search.py": only("rust", "containers"),
         }
         for path, expected in cases.items():

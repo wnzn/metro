@@ -65,6 +65,13 @@ class Script:
         require(not any(secret in json.dumps(payload) for secret in HIDDEN),
                 "an excluded Space, nonmember Space or DM reached the model")
         system = "\n".join(role_text(payload, "system"))
+        if "Summarize the conversation below" in system:
+            require("Focus: Only conversation" in latest, "tool activity triggered automatic compaction")
+            require(all(text not in latest for text in (POST, WAIT, STOP, "Budget send ", "space_send", ROOM_TEXT)),
+                    "summary input included a receipt or tool activity")
+            require("fixture:gate!" in latest and "Finished read." in latest,
+                    "summary input omitted actual Chat messages")
+            return text_reply("Chat summary fixture.")
         if "private personal Chat" not in system:
             if STOP in latest:
                 self.stop_delegated.set()
@@ -126,7 +133,10 @@ def place(sid):
 
 
 def receipt(f, after, room, sid, agent, text):
-    [record] = [e for e in f.events("bob", CHAT, after) if e["kind"] == "space_post"]
+    records = f.wait("sender's space_post receipt", lambda: [
+        e for e in f.events("bob", CHAT, after) if e["kind"] == "space_post"
+    ] or None)
+    [record] = records
     details = activity(record)["space_post"]
     event = next(e for e in f.events("alice", room) if e["id"] == details["event_id"])
     require(record["text"] == text == event["text"] and event["actor_id"] == "bob"
@@ -304,6 +314,9 @@ def exercise(binary, timeout):
         read, search = reads(f, script, sid, room, archive, foreign, target, target_room)
         delegation(f, script, sid, room, agent, search)
         retry_and_leave(f, script, sid, room, read)
+        summary = f.call("bob", "POST", CHAT + "/compact", {"focus": "Only conversation"}, 201)
+        require(summary["kind"] == "compaction" and summary["text"] == "Chat summary fixture.",
+                "manual Chat compact did not summarize its real conversation")
         require(not f.events("alice", CHAT) and not f.events("carol", CHAT)
                 and not any(e["kind"] == "space_post" for e in f.events("alice", room)),
                 "sender-only receipts appeared in someone else's Chat or a room")

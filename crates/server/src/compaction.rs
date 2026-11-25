@@ -423,16 +423,6 @@ fn summary_input<'a>(
 
 const COLUMNS: &str = "id, kind, actor, actor_id, text, mentions, audience, activity, created_at";
 
-/// History kinds of a place, as its window reads them.
-fn window_kinds(place: &Place) -> &'static str {
-    match place {
-        Place::Room { .. } => {
-            "kind NOT IN ('activity', 'reasoning_summary', 'page_draft', 'compaction')"
-        }
-        Place::Chat { .. } => "kind NOT IN ('activity', 'reasoning_summary', 'compaction')",
-    }
-}
-
 /// `(table, scope condition, scope params)` of a place.
 fn scope(place: &Place) -> (&'static str, &'static str, Vec<SqlValue>) {
     match place {
@@ -465,8 +455,9 @@ pub fn latest(conn: &Connection, place: &Place, before: i64) -> anyhow::Result<O
     Ok(event.filter(|e| e.meta.compaction.is_some()))
 }
 
-/// The newest `limit` history events of `place` with ids in
-/// `(after, before)`, oldest first.
+/// The newest `limit` model-history events of `place` with ids in
+/// `(after, before)`, oldest first. As in `agent::event_message`, activity,
+/// private send receipts and other transcript-only events are not model input.
 fn suffix(
     conn: &Connection,
     place: &Place,
@@ -477,9 +468,9 @@ fn suffix(
     let (table, cond, mut args) = scope(place);
     let n = args.len();
     let sql = format!(
-        "SELECT {COLUMNS} FROM {table} WHERE {cond} AND {} AND id > ?{} AND id < ?{}
+        "SELECT {COLUMNS} FROM {table} WHERE {cond} AND kind IN ('message', 'agent', 'thread')
+           AND id > ?{} AND id < ?{}
          ORDER BY id DESC LIMIT ?{}",
-        window_kinds(place),
         n + 1,
         n + 2,
         n + 3
