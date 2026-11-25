@@ -137,21 +137,18 @@ def prepare(app, scratch, nsh, env):
     return schedule(app, files), contexts
 
 
-def report_counts(report, file):
-    root = ET.parse(report).getroot()
+def check_counts(element, counts):
+    expected = {"tests": sum(counts.values()), "failures": counts["failed"],
+                "errors": counts["errors"], "skipped": counts["skipped"] + counts["todo"]}
+    if any(element.get(key) != str(value) for key, value in expected.items()):
+        raise ValueError("inconsistent JUnit test counts")
+
+
+def suite_counts(suite, file):
     counts = dict.fromkeys(RESULTS, 0)
     failed_cases = []
-    if root.tag != "testsuites" or root.get("name") != "nsh test" or len(root) > 1:
-        raise ValueError("expected at most one NSH JUnit suite")
-    if not len(root):
-        # NSH runs files with no registered test cases, but omits their suite
-        # entirely. This is only success with all-zero counts and exit 0.
-        if any(root.get(key) != "0" for key in ("tests", "failures", "errors", "skipped")):
-            raise ValueError("inconsistent empty JUnit report")
-        return counts, failed_cases
-    suite = root[0]
-    if suite.tag != "testsuite" or suite.get("name") != file or not len(suite):
-        raise ValueError("missing or wrong per-file JUnit suite")
+    if suite.tag != "testsuite" or not file or not len(suite):
+        raise ValueError("invalid NSH JUnit suite")
     for case in suite:
         if case.tag != "testcase" or case.get("classname") != file or "name" not in case.attrib:
             raise ValueError("unexpected JUnit test case")
@@ -166,25 +163,47 @@ def report_counts(report, file):
             failed_cases.append(case.attrib["name"])
         else:
             raise ValueError("unknown JUnit test result")
-    expected = {"tests": sum(counts.values()), "failures": counts["failed"],
-                "errors": counts["errors"], "skipped": counts["skipped"] + counts["todo"]}
-    if any(element.get(key) != str(value) for element in (root, suite) for key, value in expected.items()):
-        raise ValueError("inconsistent JUnit test counts")
+    check_counts(suite, counts)
     return counts, failed_cases
 
 
-def run_file(nsh, file, report, app, env, export):
+def report_counts(report, file=None):
+    root = ET.parse(report).getroot()
+    if root.tag != "testsuites" or root.get("name") != "nsh test":
+        raise ValueError("invalid NSH JUnit report")
+    if file is not None and (len(root) > 1 or (len(root) and root[0].get("name") != file)):
+        raise ValueError("wrong per-file JUnit suite")
+    counts = dict.fromkeys(RESULTS, 0)
+    failed_cases = []
+    # NSH omits suites with no registered cases. An empty report is only
+    # valid with all-zero counts.
+    for suite in root:
+        source = suite.get("name")
+        suite_totals, names = suite_counts(suite, source)
+        for key, count in suite_totals.items():
+            counts[key] += count
+        failed_cases.extend((source, name) for name in names)
+    check_counts(root, counts)
+    return counts, failed_cases
+
+
+def run_tests(nsh, report, app, env, *, file=None, export=None):
     counts = dict.fromkeys(RESULTS, 0)
     problems = []
     failed_cases = []
+    status = 1
+    command = [nsh, "test"]
+    if file is not None:
+        command.append(str(app / file))
     try:
-        with subprocess.Popen([nsh, "test", str(app / file), "--junit", str(report)],
+        with subprocess.Popen([*command, "--junit", str(report)],
                               cwd=app, env=env, stdin=subprocess.DEVNULL,
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                               start_new_session=True) as process:
             try:
                 status = process.wait(timeout=FILE_TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
+                status = 124
                 problems.append(f"NSH timed out after {FILE_TIMEOUT_SECONDS} seconds")
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
@@ -196,21 +215,37 @@ def run_file(nsh, file, report, app, env, export):
     except OSError:
         problems.append("could not run NSH")
     try:
-        counts, failed_cases = report_counts(report, file.as_posix())
+        counts, failed_cases = report_counts(report, file.as_posix() if file is not None else None)
         if failed_cases:
             problems.append("JUnit recorded failures")
+    except (ET.ParseError, LookupError, OSError, ValueError):
+        problems.append("missing or invalid JUnit report")
+    else:
         if export is not None:
-            shutil.copyfile(report, export / report.name)
-    except (ET.ParseError, OSError, ValueError):
-        problems.append("missing, invalid or unwritable JUnit report")
+            try:
+                shutil.copyfile(report, export / report.name)
+            except OSError:
+                problems.append("could not export JUnit report")
     # Do not emit raw NSH output or JUnit failure text (screens/assertions).
-    return file, counts, problems, failed_cases
+    return status if status >= 0 else 128 - status, counts, problems, failed_cases
 
 
 def log_label(value):
     # Repr escapes line breaks. The NSH prefix blocks `::` commands, but the
     # runner also recognizes legacy `##[` commands anywhere on a line.
-    return repr(str(value)).replace("##[", r"\x23#[")
+    # Escape percent-encoded command syntax such as `%0A` as well.
+    return repr(str(value)).replace("##[", r"\x23#[").replace("%", r"\x25")
+
+
+def print_problems(label, problems, failed_cases):
+    for problem in problems:
+        print(f"NSH: {label}: {problem}", file=sys.stderr)
+    for file, name in failed_cases:
+        print(f"NSH: {log_label(file)} › {log_label(name)}: failure", file=sys.stderr)
+
+
+def counts_text(counts):
+    return ", ".join(f"{value} {key}" for key, value in counts.items())
 
 
 def run_shards(nsh, files, contexts, export):
@@ -223,7 +258,9 @@ def run_shards(nsh, files, contexts, export):
         results = []
         while True:
             index, file = job
-            results.append(run_file(nsh, file, junit / f"{index:03}.xml", app, env, export))
+            _, counts, problems, failed_cases = run_tests(
+                nsh, junit / f"{index:03}.xml", app, env, file=file, export=export)
+            results.append((file, counts, problems, failed_cases))
             try:
                 job = queue.get_nowait()
             except Empty:
@@ -240,12 +277,8 @@ def run_shards(nsh, files, contexts, export):
             totals[key] += value
         if problems:
             failures += 1
-            label = log_label(file)
-            print(f"NSH: {label}: {', '.join(problems)}", file=sys.stderr)
-            for name in failed_cases:
-                print(f"NSH: {label} › {log_label(name)}: failure", file=sys.stderr)
-    print(f"NSH: {len(results)}/{len(files)} files, {failures} unsuccessful; " +
-          ", ".join(f"{value} {key}" for key, value in totals.items()))
+            print_problems(log_label(file), problems, failed_cases)
+    print(f"NSH: {len(results)}/{len(files)} files, {failures} unsuccessful; {counts_text(totals)}")
     return int(bool(failures) or len(results) != len(files))
 
 
@@ -276,11 +309,14 @@ def main():
             return run_shards(nsh, files, contexts, export)
     print(f"NSH: {reason}; running plain nsh test", flush=True)
     try:
-        result = subprocess.run([nsh or "nsh", "test"], cwd=app, env=env).returncode
+        with tempfile.TemporaryDirectory(prefix="metro-nsh-fallback-") as scratch:
+            status, counts, problems, failed_cases = run_tests(nsh or "nsh", Path(scratch) / "unfiltered.xml", app, env)
     except OSError:
-        print("NSH: could not start plain nsh test", file=sys.stderr)
+        print("NSH: unfiltered: could not prepare JUnit report", file=sys.stderr)
         return 1
-    return result if result >= 0 else 128 - result
+    print_problems("unfiltered", problems, failed_cases)
+    print(f"NSH: unfiltered; {counts_text(counts)}")
+    return status or int(bool(problems))
 
 
 if __name__ == "__main__":

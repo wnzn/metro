@@ -28,8 +28,44 @@ if sys.argv[1:] == ["--version"]:
     print(os.environ.get("FAKE_VERSION", "nsh 0.6.1 (fake)"))
     sys.exit(0)
 audit = Path(os.environ["FAKE_AUDIT"])
-if sys.argv[1:] == ["test"]:
+
+def hang():
+    child = os.fork()
+    if child == 0:
+        (audit / "timeout-child").write_text(str(os.getpid()))
+    time.sleep(15)
+    sys.exit(0)
+
+if sys.argv[1:3] == ["test", "--junit"] and len(sys.argv) == 4:
     (audit / "unfiltered").write_text(str(Path.cwd()))
+    os.write(1, b"raw fallback stdout\r::error::from stdout\n")
+    os.write(2, b"raw fallback stderr\r##[error]from stderr%0A\n")
+    output = Path(sys.argv[3])
+    mode = os.environ.get("FAKE_PLAIN_MODE", "valid")
+    if mode == "timeout":
+        hang()
+    if mode == "missing":
+        sys.exit(int(os.environ.get("FAKE_PLAIN_STATUS", "0")))
+    if mode == "malformed":
+        output.write_text("<untrusted")
+        sys.exit(0)
+    if mode == "encoding":
+        output.write_text('<?xml version="1.0" encoding="untrusted-encoding"?><testsuites/>')
+        sys.exit(0)
+    failed = mode == "failure"
+    attrs = {"tests": "2" if mode != "bad-count" else "3", "failures": str(int(failed)),
+             "errors": "0", "skipped": "0"}
+    root = ET.Element("testsuites", name="nsh test", **attrs)
+    for i in range(2):
+        name = "fallback ##[error].test.ts" if i == 1 else "regular.test.ts"
+        bad = failed and i == 1
+        suite = ET.SubElement(root, "testsuite", name=name, tests="1", failures=str(int(bad)),
+                              errors="0", skipped="0")
+        label = "fallback case\r::error::%0A ##[error]" if bad else "plain pass"
+        case = ET.SubElement(suite, "testcase", name=label, classname=name)
+        if bad:
+            ET.SubElement(case, "failure", message="sentinel assertion header").text = "sentinel assertion body"
+    ET.ElementTree(root).write(output)
     sys.exit(int(os.environ.get("FAKE_PLAIN_STATUS", "0")))
 _, action, path, option, output = sys.argv
 assert action == "test" and option == "--junit"
@@ -46,11 +82,7 @@ assert (Path.cwd() / "target" / "fixture").read_text() == "fixture"
     state | {"app": str(Path.cwd()), "work": str(work), "report": str(output)}))
 mode = Path(path).read_text()
 if mode == "timeout":
-    child = os.fork()
-    if child == 0:
-        (audit / "timeout-child").write_text(str(os.getpid()))
-    time.sleep(15)
-    sys.exit(0)
+    hang()
 if mode == "missing":
     sys.exit(0)
 if mode == "malformed":
@@ -115,6 +147,24 @@ class ShardTests(unittest.TestCase):
     def run_helper(self, *args, **overrides):
         return subprocess.run([sys.executable, "-B", policy.__file__, *args],
                               cwd=self.app, env=self.env | overrides, capture_output=True, text=True)
+
+    def run_with_short_timeout(self, **overrides):
+        # Exercise the real Popen timeout path without waiting ten minutes.
+        code = (f"import sys; sys.path.insert(0, {str(Path(policy.__file__).parent)!r}); "
+                "import nsh_ci_tests as policy; policy.FILE_TIMEOUT_SECONDS = 1; sys.exit(policy.main())")
+        return subprocess.run([sys.executable, "-B", "-c", code], cwd=self.app,
+                              env=self.env | overrides, capture_output=True, text=True, timeout=10)
+
+    def assert_timeout_descendant_killed(self):
+        child = int((self.audit / "timeout-child").read_text())
+        try:
+            fd = os.pidfd_open(child)
+        except ProcessLookupError:
+            return  # The descendant is already gone.
+        try:
+            self.assertEqual(select.select([fd], [], [], 2)[0], [fd], "timed-out descendant still running")
+        finally:
+            os.close(fd)
 
     def test_discovery_matches_nsh_suffixes_and_directory_exclusions(self):
         for name in (".dot.test.ts", "dev/-fresh.test.ts", "dir.test.ts/inner.test.tsx",
@@ -190,24 +240,12 @@ class ShardTests(unittest.TestCase):
 
     def test_timed_out_file_kills_its_process_group_and_never_falls_back(self):
         self.write("a.test.ts", "timeout")
-        # Exercise the real Popen timeout path without waiting ten minutes.
-        code = (f"import sys; sys.path.insert(0, {str(Path(policy.__file__).parent)!r}); "
-                "import nsh_ci_tests as policy; policy.FILE_TIMEOUT_SECONDS = 1; sys.exit(policy.main())")
-        result = subprocess.run([sys.executable, "-B", "-c", code], cwd=self.app,
-                                env=self.env, capture_output=True, text=True, timeout=10)
+        result = self.run_with_short_timeout()
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("'a.test.ts': NSH timed out", result.stderr)
         self.assertIn("2/2 files, 1 unsuccessful; 2 passed", result.stdout)
         self.assertFalse((self.audit / "unfiltered").exists())
-        child = int((self.audit / "timeout-child").read_text())
-        try:
-            fd = os.pidfd_open(child)
-        except ProcessLookupError:
-            return  # The descendant is already gone.
-        try:
-            self.assertEqual(select.select([fd], [], [], 2)[0], [fd], "timed-out descendant still running")
-        finally:
-            os.close(fd)
+        self.assert_timeout_descendant_killed()
 
     def test_empty_but_successful_test_file_matches_plain_nsh(self):
         self.write("a.test.ts", "empty")
@@ -223,6 +261,40 @@ class ShardTests(unittest.TestCase):
         self.assertEqual([p.name for p in self.audit.iterdir()], ["unfiltered"])
         self.assertIn("running plain nsh test", result.stdout)
         self.assertEqual((self.audit / "unfiltered").read_text(), str(self.app))
+
+    def test_unfiltered_failure_suppresses_both_streams_and_sanitizes_names(self):
+        (self.app / "nested/b.test.tsx").unlink()
+        result = self.run_helper(FAKE_PLAIN_MODE="failure", FAKE_PLAIN_STATUS="7")
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertIn("NSH: unfiltered; 1 passed, 1 failed, 0 errors, 0 skipped, 0 todo", result.stdout)
+        self.assertIn(
+            r"NSH: 'fallback \x23#[error].test.ts' › 'fallback case\r::error::\x250A \x23#[error]': failure",
+            result.stderr.splitlines(),
+        )
+        log = result.stdout + result.stderr
+        for sentinel in ("raw fallback stdout", "raw fallback stderr", "from stdout", "from stderr",
+                         "sentinel assertion", "##[", "%0A"):
+            self.assertNotIn(sentinel, log)
+        self.assertTrue(all(line.startswith("NSH: ") for line in log.splitlines()))
+        self.assertEqual([p.name for p in self.audit.iterdir()], ["unfiltered"])
+
+    def test_unfiltered_missing_or_invalid_report_fails_without_printing_it(self):
+        for mode, code, expected in (("missing", 0, 1), ("missing", 8, 8), ("malformed", 0, 1), ("encoding", 0, 1),
+                                     ("bad-count", 0, 1), ("failure", 0, 1)):
+            with self.subTest(mode=mode, code=code):
+                result = self.run_helper(METRO_NSH_WORKERS="1", FAKE_PLAIN_MODE=mode, FAKE_PLAIN_STATUS=str(code))
+                self.assertEqual(result.returncode, expected, result.stderr)
+                message = "JUnit recorded failures" if mode == "failure" else "missing or invalid JUnit report"
+                self.assertIn(f"NSH: unfiltered: {message}", result.stderr.splitlines())
+                self.assertNotIn("untrusted", result.stderr)
+
+    def test_unfiltered_timeout_kills_the_process_group(self):
+        result = self.run_with_short_timeout(METRO_NSH_WORKERS="1", FAKE_PLAIN_MODE="timeout")
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertIn("NSH: unfiltered: NSH timed out", result.stderr)
+        self.assertIn("NSH: unfiltered: missing or invalid JUnit report", result.stderr.splitlines())
+        self.assertNotIn("raw fallback", result.stdout + result.stderr)
+        self.assert_timeout_descendant_killed()
 
     def test_layout_that_cannot_be_reproduced_falls_back_before_any_shards(self):
         for name in ("nested/App.tsx", "nested/nsh.json", "target/fixture-link"):
