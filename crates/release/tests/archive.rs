@@ -501,6 +501,9 @@ fn staged_trees_are_checked_against_the_authentic_archive() {
     );
     std::fs::remove_file(dest.join("enable-local-runner")).unwrap();
     for change in ["edit", "extra", "missing", "link", "release"] {
+        if change == "link" && !cfg!(unix) {
+            continue;
+        }
         let d = dir.path().join(change);
         std::fs::create_dir(&d).unwrap();
         extract_tar_gz(archive.as_slice(), TOP, &d, &expect(&v)).unwrap();
@@ -508,6 +511,7 @@ fn staged_trees_are_checked_against_the_authentic_archive() {
             "edit" => std::fs::write(d.join("run-runner"), b"#!/bin/sh\nevil\n").unwrap(),
             "extra" => std::fs::write(d.join("evil.so"), b"x").unwrap(),
             "missing" => std::fs::remove_file(d.join("run-runner")).unwrap(),
+            #[cfg(unix)]
             "link" => {
                 std::fs::remove_file(d.join("run-runner")).unwrap();
                 std::os::unix::fs::symlink("/bin/sh", d.join("run-runner")).unwrap();
@@ -520,6 +524,26 @@ fn staged_trees_are_checked_against_the_authentic_archive() {
             "{change}"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn extraction_refuses_a_link_in_the_staging_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(outside.join("nested")).unwrap();
+    let alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(&outside, &alias).unwrap();
+    let archive = good_archive();
+    for dest in [alias.clone(), alias.join("nested")] {
+        assert!(extract_tar_gz(archive.as_slice(), TOP, &dest, &expect(&v())).is_err());
+    }
+    assert!(
+        std::fs::read_dir(outside.join("nested"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
 }
 
 #[test]

@@ -111,18 +111,8 @@ pub fn is_commit(text: &str) -> bool {
 /// target, fsync the parent folder. Errors are returned, never swallowed.
 pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let name = path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64)
-        ^ COUNTER.fetch_add(1, Ordering::Relaxed).rotate_left(32);
-    let tmp = path.with_file_name(format!(".{name}.{}.{nonce:016x}.tmp", std::process::id()));
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = path.with_file_name(atomic_temp_name(&name));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -130,8 +120,8 @@ pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
+    let mut f = options.open(&tmp)?;
     let result = (|| {
-        let mut f = options.open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
@@ -143,6 +133,19 @@ pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
     }
     result
 }
+
+fn atomic_temp_name(name: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!(".{name}.{}.{time:x}.{count:x}.tmp", std::process::id())
+}
+
+#[cfg(unix)]
+mod unix_fs;
 
 /// fsync a path's parent folder (Unix; Windows has no folder handles to sync).
 pub fn sync_parent(path: &std::path::Path) -> std::io::Result<()> {

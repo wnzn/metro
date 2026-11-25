@@ -46,6 +46,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls"], o
 # Archive extraction opens files with O_NOFOLLOW.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.180"
+rustix = { version = "1.1.6", features = ["fs"] }
 
 [dev-dependencies]
 metro-release = { path = ".", features = ["testing", "blocking", "async"] }

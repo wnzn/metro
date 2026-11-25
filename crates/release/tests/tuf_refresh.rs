@@ -91,6 +91,12 @@ fn now() -> jiff::Timestamp {
 }
 
 fn cache(repo: &Repo, dir: &std::path::Path, root: &[u8]) -> TrustCache {
+    // Some fixtures put the cache directly in the temporary directory.
+    #[cfg(unix)]
+    if dir.is_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     TrustCache::with_source(dir, Source::loopback_tuf_fixture(&repo.base).unwrap(), root)
 }
 
@@ -516,6 +522,12 @@ fn unsafe_cache_folders_are_refused() {
     assert!(c.cached_verifier(now()).is_some());
     std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(c.cached_verifier(now()).is_none(), "readable by others");
+    assert!(c.reserve(now()).is_err());
+    assert!(rt().block_on(c.refresh(now())).is_err());
+    assert_eq!(
+        std::fs::metadata(&cache_dir).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
     std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let tuf = cache_dir.join("tuf");
     std::fs::set_permissions(&tuf, std::fs::Permissions::from_mode(0o777)).unwrap();
@@ -525,6 +537,7 @@ fn unsafe_cache_folders_are_refused() {
     std::fs::rename(&tuf, dir.path().join("elsewhere")).unwrap();
     std::os::unix::fs::symlink(dir.path().join("elsewhere"), &tuf).unwrap();
     assert!(c.cached_verifier(now()).is_none(), "link");
+    assert!(rt().block_on(c.refresh(now())).is_err());
     std::fs::remove_file(&tuf).unwrap();
     std::fs::rename(dir.path().join("elsewhere"), &tuf).unwrap();
     // A linked cached root.
@@ -539,13 +552,36 @@ fn the_weekly_reservation_is_atomic_and_clock_conservative() {
     let repo = serve(real_files());
     let dir = tempfile::tempdir().unwrap();
     let c = cache(&repo, dir.path(), VENDORED_TUF_ROOT);
-    // Another process is deciding.
-    std::fs::create_dir_all(dir.path()).unwrap();
-    std::fs::write(dir.path().join("refresh.lock"), b"").unwrap();
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options.open(dir.path().join("refresh.lock")).unwrap();
+    lock.try_lock().unwrap();
     assert!(!c.reserve(now()).unwrap());
-    std::fs::remove_file(dir.path().join("refresh.lock")).unwrap();
-    assert!(c.reserve(now()).unwrap());
-    // The clock went back a day: nothing is reserved, and the week restarts now.
+    drop(lock);
+    let barrier = std::sync::Barrier::new(8);
+    std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    c.reserve(now()).unwrap()
+                })
+            })
+            .collect();
+        assert_eq!(
+            threads
+                .into_iter()
+                .map(|t| t.join().unwrap() as usize)
+                .sum::<usize>(),
+            1
+        );
+    });
+    // Going back a day doesn't shorten the original waiting period.
     let earlier = now()
         .checked_sub(jiff::SignedDuration::from_hours(24))
         .unwrap();
@@ -562,6 +598,7 @@ fn the_weekly_reservation_is_atomic_and_clock_conservative() {
         )
         .unwrap()
     );
-    assert!(c.reserve(earlier.checked_add(week).unwrap()).unwrap());
-    assert!(!dir.path().join("refresh.lock").exists());
+    assert!(!c.reserve(earlier.checked_add(week).unwrap()).unwrap());
+    assert!(c.reserve(now().checked_add(week).unwrap()).unwrap());
+    assert!(dir.path().join("refresh.lock").is_file());
 }

@@ -17,7 +17,9 @@ use crate::version::Version;
 use crate::{MAX_ARCHIVE, hex, parse_hex32};
 use sha2::Digest;
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+#[cfg(not(unix))]
+use std::fs;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -127,13 +129,14 @@ fn windows_alias(part: &str) -> bool {
 
 /// Create the folders of `rel` under `dest` one by one, never following a
 /// link (refusing anything that isn't a plain folder we can see).
+#[cfg(not(unix))]
 fn make_parents(dest: &Path, rel: &str) -> Result<PathBuf, Error> {
     let mut path = dest.to_path_buf();
     let parts: Vec<&str> = rel.split('/').collect();
     for part in &parts[..parts.len() - 1] {
         path.push(part);
         match fs::symlink_metadata(&path) {
-            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
+            Ok(m) if plain_dir(&m) => {}
             Ok(_) => return Err(archive_error("an entry's folder is not a plain folder")),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 fs::create_dir(&path).map_err(|e| io_error("creating a folder", e))?
@@ -145,8 +148,19 @@ fn make_parents(dest: &Path, rel: &str) -> Result<PathBuf, Error> {
     Ok(path)
 }
 
-/// A new file for an archive entry: never replaces anything, never follows
-/// a link, synced to disk when the writer is dropped by `Sink::file`.
+#[cfg(not(unix))]
+fn plain_dir(m: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if m.file_attributes() & 0x400 != 0 {
+            return false;
+        }
+    }
+    m.is_dir() && !m.file_type().is_symlink()
+}
+
+/// A new, exclusively created archive entry. Flushing makes it durable.
 struct NewFile(File);
 
 impl Write for NewFile {
@@ -158,29 +172,82 @@ impl Write for NewFile {
     }
 }
 
-fn open_new(path: &Path, executable: bool) -> Result<NewFile, Error> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
+struct StageDir {
+    path: PathBuf,
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(if executable { 0o755 } else { 0o644 });
-        options.custom_flags(libc::O_NOFOLLOW);
+    dir: File,
+}
+
+impl StageDir {
+    fn new(path: &Path) -> Result<Self, Error> {
+        let io = |e| io_error("staging folder", e);
+        #[cfg(unix)]
+        let dir = crate::unix_fs::open_dir(path).map_err(io)?;
+        #[cfg(unix)]
+        let empty = crate::unix_fs::empty(&dir).map_err(io)?;
+        #[cfg(not(unix))]
+        let empty = plain_dir(&fs::symlink_metadata(path).map_err(io)?)
+            && fs::read_dir(path).map_err(io)?.next().is_none();
+        require(
+            empty,
+            ErrorCode::Io,
+            "staging folder isn't a plain empty directory",
+        )?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            #[cfg(unix)]
+            dir,
+        })
     }
-    #[cfg(not(unix))]
-    let _ = executable;
-    options.open(path).map(NewFile).map_err(|e| {
-        if e.kind() == io::ErrorKind::AlreadyExists {
-            archive_error("archive repeats an entry")
-        } else {
-            io_error("writing a file", e)
-        }
-    })
+
+    fn open_new(&self, rel: &str, executable: bool) -> Result<NewFile, Error> {
+        #[cfg(unix)]
+        let file = {
+            use rustix::fs::{Mode, OFlags, openat};
+            use std::ffi::OsStr;
+            let (parents, name) = rel.rsplit_once('/').unwrap_or(("", rel));
+            let mut parent = self
+                .dir
+                .try_clone()
+                .map_err(|e| io_error("staging folder", e))?;
+            for component in parents.split('/').filter(|p| !p.is_empty()) {
+                parent = crate::unix_fs::child_dir(&parent, OsStr::new(component), true)
+                    .map_err(|e| io_error("opening an entry's folder", e))?;
+            }
+            let flags =
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+            let mode = Mode::from_bits_truncate(if executable { 0o755 } else { 0o644 });
+            let file = openat(&parent, name, flags, mode)
+                .map(File::from)
+                .map_err(io::Error::from);
+            if file.is_ok() {
+                parent
+                    .sync_all()
+                    .map_err(|e| io_error("syncing an entry's folder", e))?;
+            }
+            file
+        };
+        #[cfg(not(unix))]
+        let file = {
+            let _ = executable;
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(make_parents(&self.path, rel)?)
+        };
+        file.map(NewFile).map_err(|e| {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                archive_error("archive repeats an entry")
+            } else {
+                io_error("writing a file", e)
+            }
+        })
+    }
 }
 
 struct Sink<'a> {
     /// `None`: inspect only (hash every file, write nothing).
-    dest: Option<&'a Path>,
+    dest: Option<StageDir>,
     top: &'a str,
     files: BTreeMap<String, [u8; 32]>,
     release_json: Option<Vec<u8>>,
@@ -188,19 +255,10 @@ struct Sink<'a> {
 }
 
 impl<'a> Sink<'a> {
-    fn new(dest: &'a Path, top: &'a str) -> Result<Self, Error> {
-        let mut entries = fs::read_dir(dest).map_err(|e| io_error("staging folder", e))?;
-        require(
-            entries.next().is_none(),
-            ErrorCode::Io,
-            "staging folder isn't empty",
-        )?;
-        Ok(Sink::inspect(top).with_dest(dest))
-    }
-
-    fn with_dest(mut self, dest: &'a Path) -> Self {
-        self.dest = Some(dest);
-        self
+    fn new(dest: &Path, top: &'a str) -> Result<Self, Error> {
+        let mut sink = Sink::inspect(top);
+        sink.dest = Some(StageDir::new(dest)?);
+        Ok(sink)
     }
 
     fn inspect(top: &'a str) -> Self {
@@ -237,9 +295,9 @@ impl<'a> Sink<'a> {
             ErrorCode::Archive,
             "archive repeats an entry",
         )?;
-        let mut out: Box<dyn Write> = match self.dest {
+        let mut out: Box<dyn Write> = match &self.dest {
             None => Box::new(io::sink()),
-            Some(dest) => Box::new(open_new(&make_parents(dest, &rel)?, executable)?),
+            Some(dest) => Box::new(dest.open_new(&rel, executable)?),
         };
         let keep = rel == RELEASE_JSON;
         if keep {
@@ -336,7 +394,7 @@ impl<'a> Sink<'a> {
             "archive lacks a file RELEASE.json lists",
         )?;
         Ok(VerifiedTree {
-            root: self.dest.map(Path::to_path_buf).unwrap_or_default(),
+            root: self.dest.map(|dir| dir.path).unwrap_or_default(),
             files: have,
             release,
             release_json_sha256,
@@ -881,6 +939,12 @@ pub fn verify_tree(
     empty_markers: &[&str],
 ) -> Result<(), Error> {
     let mut seen = BTreeMap::new();
+    #[cfg(unix)]
+    {
+        let root = crate::unix_fs::open_dir(root).map_err(|_| changed_tree())?;
+        walk_at(&root, "", &mut seen, &mut 0, &mut 0)?;
+    }
+    #[cfg(not(unix))]
     walk(root, root, &mut seen)?;
     for (rel, (digest, len)) in &seen {
         if rel == RELEASE_JSON {
@@ -928,7 +992,67 @@ pub fn verify_tree(
     Ok(())
 }
 
+fn changed_tree() -> Error {
+    Error::new(
+        ErrorCode::NotVerified,
+        "the staged tree isn't a plain release directory",
+    )
+}
+
+#[cfg(unix)]
+fn walk_at(
+    dir: &File,
+    prefix: &str,
+    out: &mut BTreeMap<String, ([u8; 32], u64)>,
+    count: &mut usize,
+    total: &mut u64,
+) -> Result<(), Error> {
+    use rustix::fs::{Dir, Mode, openat};
+    for entry in Dir::read_from(dir).map_err(|_| changed_tree())? {
+        let entry = entry.map_err(|_| changed_tree())?;
+        let name = entry.file_name();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        *count += 1;
+        require(
+            *count <= MAX_ENTRIES * 2,
+            ErrorCode::TooLarge,
+            "too many entries",
+        )?;
+        let rel = format!("{prefix}{}", name.to_str().map_err(|_| changed_tree())?);
+        require(
+            rel.len() <= 1024,
+            ErrorCode::NotVerified,
+            "a staged entry's path is too long",
+        )?;
+        let file = File::from(
+            openat(dir, name, crate::unix_fs::READ, Mode::empty()).map_err(|_| changed_tree())?,
+        );
+        let meta = file.metadata().map_err(|_| changed_tree())?;
+        if meta.is_dir() {
+            walk_at(&file, &format!("{rel}/"), out, count, total)?;
+        } else if meta.is_file() {
+            *total = total.saturating_add(meta.len());
+            require(
+                *total <= MAX_ARCHIVE,
+                ErrorCode::TooLarge,
+                "the staged tree is too large",
+            )?;
+            let hash = HashingReader::new(file.take(meta.len() + 1)).finish()?;
+            out.insert(rel, (hash, meta.len()));
+        } else {
+            return Err(changed_tree());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
 fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, ([u8; 32], u64)>) -> Result<(), Error> {
+    if !plain_dir(&fs::symlink_metadata(dir).map_err(|_| changed_tree())?) {
+        return Err(changed_tree());
+    }
     for entry in fs::read_dir(dir).map_err(|e| io_error("reading the staged tree", e))? {
         let entry = entry.map_err(|e| io_error("reading the staged tree", e))?;
         let path = entry.path();
@@ -939,6 +1063,13 @@ fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, ([u8; 32], u64)>) ->
             ErrorCode::TooLarge,
             "too many files",
         )?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if meta.file_attributes() & 0x400 != 0 {
+                return Err(changed_tree());
+            }
+        }
         if meta.file_type().is_symlink() {
             return Err(Error::new(
                 ErrorCode::NotVerified,

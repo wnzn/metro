@@ -21,6 +21,8 @@
 //! claims stay pinned in [`crate::sigstore`] and [`crate::policy`]: nothing
 //! here can make a different signer acceptable.
 
+use std::fs::{File, Metadata};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -40,6 +42,7 @@ pub const REFRESH_INTERVAL_SECS: i64 = 7 * 24 * 3600;
 pub const CACHE_MAX_AGE_SECS: i64 = 90 * 24 * 3600;
 const TARGET: &str = "trusted_root.json";
 const MAX_TRUSTED_ROOT: u64 = 256 * 1024;
+const MAX_ROOT_ROTATIONS: u64 = 128;
 
 /// `Repository` over Metro's fetcher (pinned host list, caps, no cookies).
 struct MetroRepository {
@@ -100,9 +103,8 @@ impl TrustCache {
         }
     }
 
-    fn private_dir(&self) -> std::io::Result<()> {
-        std::fs::create_dir_all(self.dir.join("tuf"))?;
-        tighten(&self.dir)
+    fn private_dir(&self, create: bool) -> io::Result<CacheDir> {
+        CacheDir::root(&self.dir, create)
     }
 
     /// The trusted root a previous refresh verified, accepted only after the
@@ -117,7 +119,7 @@ impl TrustCache {
         match self.replay(now) {
             Ok(v) => Some(v),
             Err(why) => {
-                if self.dir.join(TARGET).exists() {
+                if why.kind() != io::ErrorKind::NotFound {
                     eprintln!("metro: the cached Sigstore trusted root was not used: {why}");
                 }
                 None
@@ -125,140 +127,89 @@ impl TrustCache {
         }
     }
 
-    fn replay(&self, now: jiff::Timestamp) -> Result<SigstoreVerifier, String> {
-        let tuf_dir = self.dir.join("tuf");
-        safe_entry(&self.dir, true, true)?;
-        safe_entry(&tuf_dir, true, false)?;
-        let read = |path: &Path, cap: u64| -> Result<Vec<u8>, String> {
-            safe_entry(path, false, false)?;
-            let raw =
-                std::fs::read(path).map_err(|e| format!("{}: {}", path.display(), e.kind()))?;
-            if raw.len() as u64 > cap {
-                return Err("a cached file is too large".into());
-            }
-            Ok(raw)
-        };
-        let at: i64 = String::from_utf8(read(&self.dir.join("verified_at"), 32)?)
-            .map_err(|_| "bad verification time")?
-            .trim()
-            .parse()
-            .map_err(|_| "bad verification time")?;
-        if at > now.as_second() + 300 || now.as_second() - at > CACHE_MAX_AGE_SECS {
-            return Err("the cached verification is from the future or too old".into());
+    fn replay(&self, now: jiff::Timestamp) -> io::Result<SigstoreVerifier> {
+        let dir = self.private_dir(false)?;
+        let at = parse_time(&dir.read("verified_at", 32)?)?;
+        if at > now.as_second() || now.as_second().saturating_sub(at) > CACHE_MAX_AGE_SECS {
+            return Err(invalid(
+                "the cached verification is from the future or too old",
+            ));
         }
-        let at = jiff::Timestamp::from_second(at).map_err(|_| "bad verification time")?;
-        let tuf = |e: sigstore_tuf::Error| e.to_string();
+        let at = jiff::Timestamp::from_second(at).map_err(io::Error::other)?;
+        let tuf = io::Error::other;
         let mut set =
             sigstore_tuf::trusted::TrustedMetadataSet::from_root(&self.tuf_root).map_err(tuf)?;
-        let history = tuf_dir.join("root_history");
-        loop {
-            let next = history.join(format!("{}.root.json", set.root().version + 1));
-            if std::fs::symlink_metadata(&next).is_err() {
-                break;
+        let tuf_dir = dir.child("tuf", false)?;
+        let history = tuf_dir.child("root_history", false)?;
+        for rotation in 0..=MAX_ROOT_ROTATIONS {
+            let next = set
+                .root()
+                .version
+                .checked_add(1)
+                .ok_or_else(|| invalid("root version overflow"))?;
+            match optional(history.read(&format!("{next}.root.json"), 512_000))? {
+                Some(raw) if rotation < MAX_ROOT_ROTATIONS => set.update_root(&raw).map_err(tuf)?,
+                Some(_) => return Err(invalid("too many cached root rotations")),
+                None => break,
             }
-            safe_entry(&history, true, false)?;
-            set.update_root(&read(&next, 512_000)?).map_err(tuf)?;
         }
         set.check_root_expired(at).map_err(tuf)?;
-        set.update_timestamp(&read(&tuf_dir.join("timestamp.json"), 16_384)?, at)
+        set.update_timestamp(&tuf_dir.read("timestamp.json", 16_384)?, at)
             .map_err(tuf)?;
-        set.update_snapshot(&read(&tuf_dir.join("snapshot.json"), 2_000_000)?, at)
+        set.update_snapshot(&tuf_dir.read("snapshot.json", 2_000_000)?, at)
             .map_err(tuf)?;
         let targets = set
-            .update_targets(&read(&tuf_dir.join("targets.json"), 5_000_000)?, at)
+            .update_targets(&tuf_dir.read("targets.json", 5_000_000)?, at)
             .map_err(tuf)?;
         let pinned = targets
             .targets
             .get(TARGET)
-            .ok_or("trusted_root.json isn't a TUF target")?;
-        let raw = read(&self.dir.join(TARGET), MAX_TRUSTED_ROOT)?;
+            .ok_or_else(|| invalid("trusted_root.json isn't a TUF target"))?;
+        let raw = dir.read(TARGET, MAX_TRUSTED_ROOT)?;
         if pinned.length != raw.len() as u64
             || pinned.hashes.get("sha256").map(String::as_str)
                 != Some(crate::hex(&crate::sha256(&raw)).as_str())
         {
-            return Err("the cached trusted root doesn't match its TUF metadata".into());
+            return Err(invalid(
+                "the cached trusted root doesn't match its TUF metadata",
+            ));
         }
-        let text = std::str::from_utf8(&raw).map_err(|_| "trusted root is not UTF-8")?;
-        SigstoreVerifier::from_trusted_root_json(text).map_err(|e| e.to_string())
+        let text = std::str::from_utf8(&raw).map_err(io::Error::other)?;
+        SigstoreVerifier::from_trusted_root_json(text).map_err(io::Error::other)
     }
 
-    fn last_attempt(&self) -> Option<i64> {
-        std::fs::read_to_string(self.dir.join("last_refresh"))
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
+    fn last_attempt(dir: &CacheDir) -> io::Result<Option<i64>> {
+        optional(dir.read("last_refresh", 32))?
+            .as_deref()
+            .map(parse_time)
+            .transpose()
     }
 
     /// Whether a network refresh would be allowed now (read-only).
     pub fn refresh_due(&self, now: jiff::Timestamp) -> bool {
-        self.last_attempt()
-            .is_none_or(|t| t <= now.as_second() && now.as_second() - t >= REFRESH_INTERVAL_SECS)
+        match optional(self.private_dir(false)) {
+            Ok(None) => true,
+            Ok(Some(dir)) => Self::last_attempt(&dir).is_ok_and(|last| refresh_due(last, now)),
+            Err(_) => false,
+        }
     }
 
     /// Reserve this week's refresh, atomically across processes (an
-    /// exclusive lock file around read-decide-write). Conservative about
-    /// clock changes: a last attempt in the future (the clock went back) is
-    /// reset to now and nothing is reserved, so at most one refresh happens
-    /// per week of the current clock.
+    /// kernel lock around read-decide-write). Never lower the recorded time
+    /// when the clock goes backwards.
     pub fn reserve(&self, now: jiff::Timestamp) -> Result<bool, Error> {
         let io =
             |e: std::io::Error| Error::new(ErrorCode::Io, format!("trust cache: {}", e.kind()));
-        self.private_dir().map_err(io)?;
-        let lock = self.dir.join("refresh.lock");
-        let held = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock)
-        {
-            Ok(_) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Another process is deciding; a lock older than an hour was
-                // left by a crash and is replaced.
-                let old = std::fs::metadata(&lock)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.elapsed().ok())
-                    .is_some_and(|age| age.as_secs() > 3600);
-                if !old {
-                    return Ok(false);
-                }
-                let _ = std::fs::remove_file(&lock);
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&lock)
-                    .is_ok()
-            }
-            Err(e) => return Err(io(e)),
+        let dir = self.private_dir(true).map_err(io)?;
+        let Some(_lock) = dir.try_lock().map_err(io)? else {
+            return Ok(false);
         };
-        if !held {
+        if !refresh_due(Self::last_attempt(&dir).map_err(io)?, now) {
             return Ok(false);
         }
-        let decision = (|| {
-            let now_s = now.as_second();
-            match self.last_attempt() {
-                Some(t) if t > now_s + 60 => {
-                    crate::write_atomic(
-                        &self.dir.join("last_refresh"),
-                        now_s.to_string().as_bytes(),
-                    )
-                    .map_err(io)?;
-                    Ok(false)
-                }
-                Some(t) if now_s - t < REFRESH_INTERVAL_SECS => Ok(false),
-                _ => {
-                    crate::write_atomic(
-                        &self.dir.join("last_refresh"),
-                        now_s.to_string().as_bytes(),
-                    )
-                    .map_err(io)?;
-                    Ok(true)
-                }
-            }
-        })();
-        let _ = std::fs::remove_file(&lock);
-        decision
+        dir.write("last_refresh", now.as_second().to_string().as_bytes())
+            .map_err(io)?;
+        Ok(true)
     }
 
     /// Run the TUF refresh and return a verifier over the new trusted root
@@ -266,84 +217,246 @@ impl TrustCache {
     pub async fn refresh(&self, now: jiff::Timestamp) -> Result<SigstoreVerifier, Error> {
         let io =
             |e: std::io::Error| Error::new(ErrorCode::Io, format!("trust cache: {}", e.kind()));
-        self.private_dir().map_err(io)?;
+        let dir = self.private_dir(true).map_err(io)?;
+        let _lock = dir.try_lock().map_err(io)?.ok_or_else(|| {
+            Error::new(ErrorCode::Io, "another trust refresh holds the cache lock")
+        })?;
+        let tuf_dir = dir.child("tuf", true).map_err(io)?;
+        let history = tuf_dir.child("root_history", true).map_err(io)?;
         let tuf = |e: sigstore_tuf::Error| {
             Error::new(ErrorCode::NotVerified, format!("trust root refresh: {e}"))
         };
         let fetcher = AsyncFetcher::new(self.source.clone(), std::time::Duration::from_secs(60))?;
+        let base = sigstore_tuf::trusted::TrustedMetadataSet::from_root(&self.tuf_root)
+            .map_err(tuf)?
+            .root()
+            .version;
+        let store = CacheStore {
+            tuf: tuf_dir,
+            history,
+            base,
+        };
         let mut updater = Updater::new(MetroRepository { fetcher }, &self.tuf_root)
             .map_err(tuf)?
-            .with_store(sigstore_tuf::cache::FileStore::new(self.dir.join("tuf")));
+            .with_store(store);
         updater.refresh(now).await.map_err(tuf)?;
         let bytes = updater.get_target(TARGET, now).await.map_err(tuf)?;
         if bytes.len() as u64 > MAX_TRUSTED_ROOT {
             return Err(Error::new(ErrorCode::TooLarge, "trusted root is too large"));
         }
-        let text = std::str::from_utf8(&bytes)
-            .map_err(|_| Error::new(ErrorCode::NotVerified, "trusted root"))?;
-        let verifier = SigstoreVerifier::from_trusted_root_json(text)?;
-        crate::write_atomic(&self.dir.join(TARGET), &bytes).map_err(io)?;
-        crate::write_atomic(
-            &self.dir.join("verified_at"),
-            now.as_second().to_string().as_bytes(),
-        )
-        .map_err(io)?;
-        // sigstore-tuf's store uses default permissions: make it private.
-        tighten(&self.dir).map_err(io)?;
-        Ok(verifier)
+        dir.write(TARGET, &bytes).map_err(io)?;
+        dir.write("verified_at", now.as_second().to_string().as_bytes())
+            .map_err(io)?;
+        self.replay(now).map_err(io)
     }
 }
 
-/// Make the cache private: folders 0700, files 0600, links left alone (and
-/// then refused by [`safe_entry`]).
-fn tighten(dir: &Path) -> std::io::Result<()> {
+fn invalid(reason: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, reason)
+}
+
+fn optional<T>(result: io::Result<T>) -> io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn parse_time(bytes: &[u8]) -> io::Result<i64> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .filter(|t| jiff::Timestamp::from_second(*t).is_ok())
+        .ok_or_else(|| invalid("bad trust cache time"))
+}
+
+fn refresh_due(last: Option<i64>, now: jiff::Timestamp) -> bool {
+    last.is_none_or(|t| now.as_second().saturating_sub(t) >= REFRESH_INTERVAL_SECS)
+}
+
+struct CacheDir {
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let m = std::fs::symlink_metadata(dir)?;
-        if m.file_type().is_symlink() {
-            return Ok(());
-        }
-        if m.is_dir() {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-            for e in std::fs::read_dir(dir)? {
-                tighten(&e?.path())?;
-            }
-        } else if m.is_file() {
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o600))?;
-        }
-    }
+    handle: File,
     #[cfg(not(unix))]
-    let _ = dir;
-    Ok(())
+    path: PathBuf,
 }
 
-/// A cache entry Metro may trust: a plain folder or file (no link), owned by
-/// this user and not writable by anyone else; `private` folders also not
-/// readable by others.
-fn safe_entry(path: &Path, dir: bool, private: bool) -> Result<(), String> {
-    let m =
-        std::fs::symlink_metadata(path).map_err(|e| format!("{}: {}", path.display(), e.kind()))?;
-    if m.file_type().is_symlink() || (dir && !m.is_dir()) || (!dir && !m.is_file()) {
-        return Err(format!(
-            "{} is not a plain {}",
-            path.display(),
-            if dir { "folder" } else { "file" }
-        ));
+impl CacheDir {
+    #[cfg(unix)]
+    fn root(path: &Path, create: bool) -> io::Result<Self> {
+        let parent = crate::unix_fs::open_dir(path.parent().unwrap_or(Path::new(".")))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| invalid("invalid trust cache path"))?;
+        Self::from_dir(crate::unix_fs::child_dir(&parent, name, create)?)
+    }
+
+    #[cfg(not(unix))]
+    fn root(path: &Path, create: bool) -> io::Result<Self> {
+        use std::path::Component;
+        let mut prefix = PathBuf::new();
+        for part in path.components() {
+            prefix.push(part);
+            if matches!(part, Component::Normal(_)) {
+                if prefix == path && create {
+                    match std::fs::create_dir(&prefix) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                validate(&std::fs::symlink_metadata(&prefix)?, true)?;
+            } else if matches!(part, Component::ParentDir) {
+                return Err(invalid("invalid trust cache path"));
+            }
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
+    }
+
+    #[cfg(unix)]
+    fn from_dir(handle: File) -> io::Result<Self> {
+        validate(&handle.metadata()?, true)?;
+        Ok(Self { handle })
+    }
+
+    fn child(&self, name: &str, create: bool) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            Self::from_dir(crate::unix_fs::child_dir(
+                &self.handle,
+                name.as_ref(),
+                create,
+            )?)
+        }
+        #[cfg(not(unix))]
+        {
+            Self::root(&self.path.join(name), create)
+        }
+    }
+
+    fn open(&self, name: &str, lock: bool) -> io::Result<File> {
+        #[cfg(unix)]
+        let file = {
+            use rustix::fs::{Mode, OFlags, openat};
+            let flags = if lock {
+                crate::unix_fs::READ.difference(OFlags::RDONLY) | OFlags::RDWR | OFlags::CREATE
+            } else {
+                crate::unix_fs::READ
+            };
+            File::from(openat(&self.handle, name, flags, Mode::RUSR | Mode::WUSR)?)
+        };
+        #[cfg(not(unix))]
+        let file = {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(lock).create(lock);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+            }
+            options.open(self.path.join(name))?
+        };
+        validate(&file.metadata()?, false)?;
+        Ok(file)
+    }
+
+    fn read(&self, name: &str, cap: u64) -> io::Result<Vec<u8>> {
+        let mut data = Vec::new();
+        self.open(name, false)?
+            .take(cap + 1)
+            .read_to_end(&mut data)?;
+        if data.len() as u64 > cap {
+            return Err(invalid("a trust cache file is too large"));
+        }
+        Ok(data)
+    }
+
+    fn write(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        // An unsafe existing file is not "repaired" or followed.
+        drop(optional(self.open(name, false))?);
+        #[cfg(unix)]
+        return crate::unix_fs::write_atomic(&self.handle, name, bytes);
+        #[cfg(not(unix))]
+        return crate::write_atomic(&self.path.join(name), bytes);
+    }
+
+    fn try_lock(&self) -> io::Result<Option<File>> {
+        let lock = self.open("refresh.lock", true)?;
+        match lock.try_lock() {
+            Ok(()) => Ok(Some(lock)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+        }
+    }
+}
+
+fn validate(m: &Metadata, dir: bool) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if m.file_attributes() & 0x400 != 0 {
+            return Err(invalid("trust cache contains a reparse point"));
+        }
+    }
+    if (dir && !m.is_dir()) || (!dir && !m.is_file()) {
+        return Err(invalid("trust cache entry has the wrong type"));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         // SAFETY: geteuid has no preconditions.
-        let me = unsafe { libc::geteuid() };
-        let forbidden = if private { 0o077 } else { 0o022 };
-        if m.uid() != me || m.mode() & forbidden != 0 {
-            return Err(format!("{} is not private to this user", path.display()));
+        if m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o077 != 0 {
+            return Err(invalid("trust cache entry is not private to this user"));
         }
     }
-    #[cfg(not(unix))]
-    let _ = private;
     Ok(())
+}
+
+struct CacheStore {
+    tuf: CacheDir,
+    history: CacheDir,
+    base: u64,
+}
+
+impl CacheStore {
+    fn entry<'a>(&self, name: &'a str) -> Option<(&CacheDir, &'a str, u64)> {
+        let max = match name {
+            "root.json" => 512_000,
+            "timestamp.json" => 16_384,
+            "snapshot.json" => 2_000_000,
+            "targets.json" => 5_000_000,
+            _ => {
+                let file = name.strip_prefix("root_history/")?;
+                let version: u64 = file.strip_suffix(".root.json")?.parse().ok()?;
+                return (version >= self.base && version - self.base <= MAX_ROOT_ROTATIONS)
+                    .then_some((&self.history, file, 512_000));
+            }
+        };
+        Some((&self.tuf, name, max))
+    }
+}
+
+impl sigstore_tuf::cache::MetadataStore for CacheStore {
+    fn load(&self, name: &str) -> sigstore_tuf::Result<Option<Vec<u8>>> {
+        let Some((dir, file, cap)) = self.entry(name) else {
+            return Ok(None);
+        };
+        optional(dir.read(file, cap)).map_err(|e| sigstore_tuf::Error::io("reading trust cache", e))
+    }
+
+    fn store(&self, name: &str, bytes: &[u8]) -> sigstore_tuf::Result<()> {
+        if let Some((dir, file, cap)) = self.entry(name) {
+            if bytes.len() as u64 > cap {
+                return Err(sigstore_tuf::Error::transport("TUF cache entry too large"));
+            }
+            dir.write(file, bytes)
+                .map_err(|e| sigstore_tuf::Error::io("writing trust cache", e))?;
+        }
+        Ok(())
+    }
 }
 
 /// The vendored root first; a refreshed root only when the vendored one is
