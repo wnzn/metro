@@ -232,7 +232,7 @@ fn addressed(resolved: &[Mention]) -> Addressed {
     Addressed {
         mentions: serde_json::to_value(resolved).unwrap_or_else(|_| json!([])),
         audience: mentions::audience(resolved).to_owned(),
-        spans: Vec::new(),
+        spans: None,
     }
 }
 
@@ -729,10 +729,13 @@ pub async fn post_message(
     // Only an unaddressed message can acquire a recipient here. Explicit
     // spans keep their canonical indices even if @agent's target is picked
     // by the classifier (that choice is run activity, not an edit to To:).
-    let addressed = plan.classified.clone().unwrap_or_else(|| Addressed {
-        spans,
-        ..addressed(&resolved)
-    });
+    let mut addressed = plan
+        .classified
+        .clone()
+        .unwrap_or_else(|| addressed(&resolved));
+    if !body.infer_text_mentions || !spans.is_empty() {
+        addressed.spans = Some(spans);
+    }
     let author = who.author();
     let event = if body.asset_ids.is_empty() {
         let (sid, rid, author, text) = (

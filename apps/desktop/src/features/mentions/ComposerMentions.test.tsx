@@ -17,8 +17,11 @@ const span = (text: string, label: string, index: number): WireMentionSpan => {
 };
 const requests = (app: App) => app.requests().filter(r => r.method === "POST" && new URL(r.url).pathname.endsWith("/messages"));
 
-async function inAcme(network: ReturnType<typeof world>["network"], width = 1200) {
-  const app = await open("../../../App.tsx", { modules: launched(), network: network as any, platform: "linux", width, height: 780 });
+async function inAcme(network: ReturnType<typeof world>["network"], width = 1200, manualClock = false, height = 780) {
+  const app = await open("../../../App.tsx", {
+    modules: launched(), network: network as any, platform: "linux", width, height,
+    ...(manualClock ? { clock: {} } : {}),
+  });
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS.alice!);
@@ -89,6 +92,8 @@ test("ambiguity offers only the same stable candidates, never sends on Return, t
   expect(app.shows("id:pick:bob")).toBe(true);
   expect(app.shows("id:pick:carol")).toBe(true);
   expect(app.shows("id:pick:agent")).toBe(false);
+  await app.keyboard.press("tab");
+  expect(app.shows("id:mention-chips")).toBe(false);
   await app.submit("id:composer");
   expect(requests(app)).toHaveLength(0);
   await app.keyboard.press("escape");
@@ -105,6 +110,65 @@ test("ambiguity offers only the same stable candidates, never sends on Return, t
     text, infer_text_mentions: false, invoke_agent: false,
     mentions: [{ kind: "user", id: "carol" }], spans: [span(text, "@Álex Rivera", 0)],
   });
+});
+
+test("narrow chooser follows the highlighted stable ID across a reorder, and never accepts a removed highlight", async () => {
+  const f = world();
+  const label = "Alex Rivera with a long display name";
+  const original = ["bob", "carol", "member-c", "member-d", "member-e", "member-f", "member-g", "member-h"];
+  let listed = original;
+  const base = f.network[get]!;
+  f.network[get] = req => {
+    const path = new URL(req.url).pathname;
+    const id = path.split("/").at(-1)!;
+    if (path === membersPath) {
+      return { status: 200, body: { members: [
+        { user_id: "alice", role: "owner" }, ...listed.map(user_id => ({ user_id, role: "member" })),
+      ] } };
+    }
+    if (path.startsWith("/v1/profiles/") && original.includes(id)) {
+      return { status: 200, body: { id, display_name: label } };
+    }
+    return base(req);
+  };
+  const app = await inAcme(f.network, 720, true, 480);
+  await waitDirectory(app);
+  const draft = `@${label}, please check.`;
+  await app.type("id:composer", draft);
+  await app.waitFor("id:mention-ambiguous");
+  await app.keyboard.press("tab");
+  await app.keyboard.press("enter");
+  expect(app.shows("id:mention-chips")).toBe(false);
+  expect(requests(app)).toHaveLength(0);
+  // Up with no prior highlight deliberately chooses the last row and reveals
+  // it inside the bounded scroller (too many two-line rows to fit at once).
+  await app.keyboard.press("up");
+  await app.waitFor("id:pick:member-h:detail");
+  expect(app.shows("id:pick:member-h >> text:@member-h")).toBe(true);
+  await app.hover("id:pick:member-h:detail");
+
+  listed = [...original].reverse();
+  await app.clock!.runFor(10_100);
+  await app.keyboard.press("tab");
+  await app.waitFor("id:mention-chip:member-h");
+  expect(app.shows("id:mention-chip:bob")).toBe(false);
+  expect(requests(app)).toHaveLength(0);
+
+  await app.clear("id:composer");
+  await app.type("id:composer", draft);
+  await app.waitFor("id:mention-ambiguous");
+  await app.keyboard.press("down"); // member-h is now the first row.
+  listed = listed.filter(id => id !== "member-h");
+  await app.clock!.runFor(10_100);
+  await app.waitFor("id:pick:member-h", { state: "gone" });
+  await app.keyboard.press("tab");
+  await app.keyboard.press("enter");
+  expect(app.shows("id:mention-chips")).toBe(false);
+  expect(app.value("id:composer")).toBe(draft);
+  expect(requests(app)).toHaveLength(0);
+  await app.keyboard.press("down");
+  await app.keyboard.press("enter");
+  await app.waitFor("id:mention-chip:member-g");
 });
 
 test("a suffix edit reopens the chooser for an automatically captured agent, and a deliberate pick survives a room switch", async () => {
@@ -302,6 +366,78 @@ test("a real-shaped message response displays current names, leaves deleted span
   await app.waitFor("id:identity-card", { state: "gone" });
   await app.press(`id:copy:${id}`);
   expect(app.clipboard()).toBe("🤖 @Alice Renamed, @Refactor Coach, @old and @agent.");
+});
+
+test("authoritative empty and malformed span fields disable fallback and copy rewriting; only stored legacy spellings qualify", async () => {
+  const w = spaceWorld();
+  const coder = w.agent("acme", { handle: "coder", name: "Current Agent Name" });
+  const modern = w.f.post("acme/lobby", {
+    kind: "message", actor: "Alice", text: "Literal @agent and @bob.", audience: "mixed",
+    mentions: [{ kind: "agent" }, { kind: "user", id: "bob" }], spans: [],
+  } as any);
+  const malformed = w.f.post("acme/lobby", {
+    kind: "message", actor: "Alice", text: "Malformed @bob.", mentions: [{ kind: "user", id: "bob" }], spans: null,
+  } as any);
+  const legacy = w.f.post("acme/lobby", {
+    kind: "message", actor: "Alice", text: "Legacy @coder.", mentions: [{ kind: "agent", agent_id: coder.id }],
+  });
+  const historical = w.f.post("acme/lobby", {
+    kind: "message", actor: "Alice", text: "Historical @old-coder, not @coder.",
+    mentions: [{ kind: "agent", agent_id: coder.id, handle: "old-coder" }],
+  });
+  const app = await inAcme(w.network);
+  await waitDirectory(app);
+  await app.waitFor(`id:mention-token:${historical.id}:0`);
+  expect(app.shows("label:Current Agent Name, mentioned. Open card.")).toBe(true);
+  expect(app.shows(`id:mention-token:${historical.id}:1`)).toBe(false);
+  for (const row of [modern, malformed, legacy]) {
+    expect(app.shows(`id:mention-token:${row.id}:0`)).toBe(false);
+    await app.press(`id:copy:${row.id}`);
+    expect(app.clipboard()).toBe(row.text);
+  }
+  await app.press(`id:copy:${historical.id}`);
+  expect(app.clipboard()).toBe("Historical @Current Agent Name, not @coder.");
+});
+
+test("a delayed re-entry never exposes a removed person's cached card but current cards work once reverified", async () => {
+  const f = world();
+  f.state.spaces.get("acme")!.members.add("carol");
+  const base = f.network[get]!;
+  f.network[get] = req => {
+    const id = new URL(req.url).pathname.split("/").at(-1);
+    return new URL(req.url).pathname.startsWith("/v1/profiles/") && (id === "bob" || id === "carol")
+      ? { status: 200, body: { id, display_name: id === "bob" ? "Robert" : "Carol", bio: `${id}'s information` } }
+      : base(req);
+  };
+  const text = "Old names @Robert and @Carol.";
+  const e = f.post("acme/lobby", {
+    kind: "message", actor: "Alice", text,
+    mentions: [{ kind: "user", id: "bob" }, { kind: "user", id: "carol" }],
+    spans: [span(text, "@Robert", 0), span(text, "@Carol", 1)],
+  } as any);
+  const app = await inAcme(f.network, 720, true);
+  await app.waitFor("label:Robert, mentioned. Open card.");
+  await app.press(`id:mention-token:${e.id}:0`);
+  await app.waitFor("id:identity-card >> text:@bob");
+  await app.keyboard.press("escape");
+  await app.press("id:nav-chat");
+  await app.waitFor("id:chat-view");
+  f.state.spaces.get("acme")!.members.delete("bob");
+  const late = f.answerLate(membersPath, TOKENS.alice!, 4_000);
+  await app.press("id:space:acme");
+  await app.waitUntil(() => late.arrived() > 0, { timeout: 1_000 });
+  expect(app.shows(`id:mention-token:${e.id}:0`)).toBe(true);
+  expect(app.shows("label:Robert, mentioned. Open card.")).toBe(false);
+  expect(app.shows("label:Carol, mentioned. Open card.")).toBe(false);
+  expect(app.shows("id:identity-card-copy-id")).toBe(false);
+  expect(app.shows("label:/Addressed to .*@bob/")).toBe(false);
+  await app.clock!.runFor(4_100);
+  await app.waitFor("label:Carol, mentioned. Open card.");
+  expect(app.shows("label:Robert, mentioned. Open card.")).toBe(false);
+  await app.press(`id:mention-token:${e.id}:1`);
+  await app.waitFor("id:identity-card >> text:@carol");
+  await app.press("id:identity-card-copy-id");
+  expect(app.clipboard()).toBe("carol");
 });
 
 test("unsupported or uncertain Space POST is never replayed and keeps the exact draft", async () => {

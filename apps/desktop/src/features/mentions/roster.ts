@@ -1,10 +1,10 @@
-import { activeSpaceId, inSpaceComposer, me, members, membersError, registerMentionDirectory, status } from "../../store";
+import { activeSpaceId, inSpaceComposer, me, members, membersError, mentionVisitVerified, registerMentionDirectory, status } from "../../store";
 import { personState, profileName } from "../profile/profileState";
 import { agentList } from "../space/agents";
 import type { MentionDirectory } from "./draft";
 
 export function verifiedMembers(sid: string) {
-  if (activeSpaceId() !== sid || !inSpaceComposer() || status().phase !== "online" || membersError()) return null;
+  if (activeSpaceId() !== sid || !inSpaceComposer() || !mentionVisitVerified(sid) || status().phase !== "online" || membersError()) return null;
   const list = members();
   return list?.some(m => m.userId === me()) ? list : null;
 }

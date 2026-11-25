@@ -105,7 +105,6 @@ import { unstage } from "./attachments/attachmentDraft";
 import { formatSize } from "./library/libraryState";
 import { mediaKindOf } from "../api/library";
 import { MentionedBody, localMentionIdentity, sentMentionLabel } from "./mentions/MentionedBody";
-import { verifiedAgents } from "./mentions/roster";
 import { copyMentionText, sentMentions } from "./mentions/sent";
 
 /** The active place's transcript, with each agent turn folded into one group. */
@@ -278,7 +277,7 @@ function recipientText(m: NonNullable<RoomEvent["mentions"]>[number], myId: stri
   }
   if (mainPlace() === "space") {
     const sid = activeSpace()?.id;
-    const fallback = lastKnown ?? (m.kind === "user" ? `@${m.id}` : m.agentId ? "Agent unavailable" : "@agent");
+    const fallback = lastKnown ?? (m.kind === "user" ? "Person unavailable" : m.agentId ? "Agent unavailable" : "@agent");
     return sid ? sentMentionLabel(sid, m, fallback) : fallback;
   }
   if (m.kind === "user" && m.id !== myId) {
@@ -289,7 +288,7 @@ function recipientText(m: NonNullable<RoomEvent["mentions"]>[number], myId: stri
 }
 
 /** What a screen reader hears for a recipient: the display name and the stable id behind it. */
-function recipientDescription(m: NonNullable<RoomEvent["mentions"]>[number], myId: string | null): string {
+function recipientDescription(m: NonNullable<RoomEvent["mentions"]>[number], myId: string | null, lastKnown?: string): string {
   if (m.kind === "agent" && m.agentId) {
     const a = agentById(activeSpace()?.id, m.agentId);
     return `Addressed to ${a ? `${a.name} (@${a.handle})` : "an agent"}${m.addressedBy ? ` (${recipientText(m, myId)})` : ""}`;
@@ -297,21 +296,21 @@ function recipientDescription(m: NonNullable<RoomEvent["mentions"]>[number], myI
   if (m.kind === "agent") return `Addressed to the agent${m.addressedBy ? ` (${mentionText(m, myId)})` : ""}`;
   if (m.id === myId) return "Addressed to you";
   const sid = activeSpace()?.id;
-  const name = mainPlace() === "space" ? sid && localMentionIdentity(sid, m)?.name : profileName(m.id);
+  if (mainPlace() === "space") {
+    const identity = sid && localMentionIdentity(sid, m);
+    if (!identity) return lastKnown ? `Addressed to ${lastKnown}, unavailable` : "Addressed to an unavailable person";
+    return identity.name !== m.id ? `Addressed to ${identity.name} (@${m.id})` : `Addressed to @${m.id}`;
+  }
+  const name = profileName(m.id);
   return name && name !== m.id ? `Addressed to ${name} (@${m.id})` : `Addressed to @${m.id}`;
 }
 
 function MessageRow(props: { row: () => Of<"event"> }) {
   const event = () => props.row().event;
   const spaceId = () => mainPlace() === "space" ? activeSpace()?.id : undefined;
-  const pieces = computed(() => {
-    const sid = spaceId();
-    if (!sid) return [];
-    const agents = verifiedAgents(sid);
-    return sentMentions(event(), id => agents?.find(a => a.id === id)?.handle);
-  });
-  const recipientLabel = (m: NonNullable<RoomEvent["mentions"]>[number]) =>
-    recipientText(m, me(), pieces().find(piece => piece.mention === m)?.literal);
+  const pieces = computed(() => spaceId() ? sentMentions(event()) : []);
+  const storedSpelling = (m: NonNullable<RoomEvent["mentions"]>[number]) =>
+    pieces().find(piece => piece.mention === m)?.literal;
   const tone = () => toneForEvent(event().kind, event().actor);
   const author = () => authorOf(event(), me());
   const forMe = () => mentionsMe(event().mentions, me());
@@ -456,8 +455,8 @@ function MessageRow(props: { row: () => Of<"event"> }) {
                 tone={m().kind === "agent" ? "agent" : "neutral"}
                 slim={continued()}
                 self={m().kind === "user" && (m() as { id: string }).id === me()}
-                label={recipientLabel(m())}
-                accessibilityLabel={recipientDescription(m(), me())}
+                label={recipientText(m(), me(), storedSpelling(m()))}
+                accessibilityLabel={recipientDescription(m(), me(), storedSpelling(m()))}
               />
             )}
           </Each>

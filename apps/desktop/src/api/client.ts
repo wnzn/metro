@@ -25,7 +25,13 @@ export type Room = { id: string; name: string; parentRoomId?: string };
  * from an unaddressed message) or `schedule` (the creator's scheduled
  * prompt). The server sets it; the app never sends it.
  */
-export type Mention = { kind: "agent"; agentId?: string; addressedBy?: "classifier" | "schedule" } | { kind: "user"; id: string };
+export type Mention = {
+  kind: "agent";
+  agentId?: string;
+  addressedBy?: "classifier" | "schedule";
+  /** If an old event stored its own spelling; never filled from the live roster. */
+  legacyHandle?: string;
+} | { kind: "user"; id: string };
 export type SpaceMessageBody = Extract<MentionSend, { ok: true }>["body"];
 /** For messages: who it was addressed to ("room" = nobody in particular). */
 export type Audience = "room" | "agent" | "users" | "mixed";
@@ -78,7 +84,7 @@ export type RoomEvent = {
   actor: string;
   text: string;
   mentions?: Mention[];
-  /** Bytes in the stored event text, indexing the event's normalized recipients. */
+  /** Bytes in the stored text; [] forbids fallback, undefined is legacy. */
   spans?: WireMentionSpan[];
   audience?: Audience;
   activity?: EventActivity;
@@ -1111,6 +1117,9 @@ function toEvent(v: RoomEvent): RoomEvent {
         if (m.agent_id != null && (typeof m.agent_id !== "string" || !m.agent_id.trim())) continue;
         mention = { kind: "agent" };
         if (typeof m.agent_id === "string") mention.agentId = m.agent_id;
+        if (mention.agentId && typeof m.handle === "string" && /^[a-z0-9_-]{1,32}$/i.test(m.handle)) {
+          mention.legacyHandle = m.handle;
+        }
         if (m.addressed_by === "classifier" || m.addressed_by === "schedule") mention.addressedBy = m.addressed_by;
       } else if (isObject(m) && m.kind === "user" && isId(m.id)) mention = { kind: "user", id: String(m.id) };
       if (mention) {

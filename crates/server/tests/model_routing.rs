@@ -2063,7 +2063,10 @@ async fn authoritative_mentions_leave_stale_text_unaddressed() {
         assert_eq!(e["text"], *text);
         assert_eq!(e["mentions"], json!([]));
         assert_eq!(e["audience"], "room");
-        assert!(e.get("spans").is_none());
+        assert_eq!(e["spans"], json!([]));
+        let stored = h.events("bob", Some(&sid)).await;
+        let polled = stored.iter().find(|row| row["id"] == e["id"]).unwrap();
+        assert_eq!(polled["spans"], json!([]));
         h.quiet_after("alice", Some(&sid), e["id"].as_i64().unwrap())
             .await;
     }
@@ -2073,6 +2076,7 @@ async fn authoritative_mentions_leave_stale_text_unaddressed() {
     for (text, recipient) in cases {
         let e = h.say("alice", Some(&sid), json!({"text": text})).await;
         assert_eq!(e["mentions"], json!([recipient]));
+        assert!(e.get("spans").is_none());
         if recipient["kind"] == "agent" {
             let id = e["id"].as_i64().unwrap();
             let started = h.started_after("alice", &sid, id).await;
@@ -2137,6 +2141,7 @@ async fn authoritative_mentions_preserve_space_classification_and_use_case_routi
         e["mentions"],
         json!([{"kind": "agent", "agent_id": coder, "addressed_by": "classifier"}])
     );
+    assert_eq!(e["spans"], json!([]));
     let id = e["id"].as_i64().unwrap();
     let started = h.started_after("alice", &sid, id).await;
     assert_eq!(started["agent"]["id"], coder.as_str());
@@ -2161,6 +2166,7 @@ async fn authoritative_mentions_preserve_space_classification_and_use_case_routi
         )
         .await;
     assert_eq!(e["mentions"], json!([{"kind": "agent", "agent_id": coder}]));
+    assert_eq!(e["spans"], json!([]));
     let id = e["id"].as_i64().unwrap();
     let started = h.started_after("alice", &sid, id).await;
     assert_eq!(started["agent"]["id"], coder.as_str());

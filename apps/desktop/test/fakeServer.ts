@@ -12,7 +12,7 @@ export const BASE = "http://127.0.0.1:8787";
 export const TOKENS: Record<string, string> = { alice: "tok-alice", bob: "tok-bob", carol: "tok-carol" };
 
 type Activity = { id: string; name: string; source: "agent" | "demo"; phase?: string };
-type Ev = { id: number; kind: string; actor: string; text: string; mentions?: unknown[]; audience?: string; activity?: Activity };
+type Ev = { id: number; kind: string; actor: string; text: string; mentions?: unknown[]; spans?: unknown; audience?: string; activity?: Activity };
 type Req = { method: string; url: string; headers: unknown; body?: string | null };
 type Space = { id: string; name: string; owner: string; members: Set<string>; runnerToken: string | null };
 type Room = { id: string; name: string; parent_room_id?: string };
@@ -46,6 +46,15 @@ export const CATALOG: { providers: { id: string; name: string; requires_key: boo
   allowed_base_urls: ["http://127.0.0.1:11434/v1"],
 };
 export const ORG_ADMINS = ["alice"];
+
+/** The Space server trims text and rebases byte spans; [] is not legacy. */
+export function spaceMessageText(body: { text: string; infer_text_mentions?: boolean; spans?: { start: number; end: number; index: number }[] }) {
+  const start = body.text.match(/^\p{White_Space}+/u)?.[0] ?? "";
+  const offset = new TextEncoder().encode(start).length;
+  const text = body.text.slice(start.length).replace(/\p{White_Space}+$/u, "");
+  if (body.infer_text_mentions !== false && !body.spans?.length) return { text };
+  return { text, spans: (body.spans ?? []).map(({ start, end, index }) => ({ start: start - offset, end: end - offset, index })) };
+}
 
 export function header(req: Req, name: string): string | undefined {
   const h = req.headers as any;
@@ -501,12 +510,12 @@ export function fakeServer() {
           const toAgent = body.invoke_agent || mentions.some((x: any) => x.kind === "agent");
           const toUsers = mentions.some((x: any) => x.kind === "user");
           const audience = toAgent && toUsers ? "mixed" : toAgent ? "agent" : toUsers ? "users" : "room";
-          const ev = post(key, { kind: "message", actor: user, text: body.text, mentions, audience });
+          const ev = post(key, { kind: "message", actor: user, ...spaceMessageText(body), mentions, audience });
           if (toAgent) {
             post(key, { kind: "agent", actor: "agent", text: `(agent) on it: ${body.text}` });
             react(key, ev.id, "👀", true, "agent", "agent");
           }
-          return ok({}, 202);
+          return ok({ ...ev, addressing_note: null, routing_note: null }, 202);
         }
         if (rr[2] === "demo") {
           if (!space.runnerToken && !state.attached.has(space.id)) return err(409, "this Space has no runner");

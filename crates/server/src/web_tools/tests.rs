@@ -107,7 +107,7 @@ fn event(kind: &str, actor_id: Option<&str>, text: &str) -> Event {
         actor_id: actor_id.map(str::to_owned),
         text: text.to_owned(),
         mentions: json!([]),
-        spans: Vec::new(),
+        spans: None,
         audience: "room".to_owned(),
         activity: None,
         created_at: None,

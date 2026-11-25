@@ -163,6 +163,8 @@ const memberFailures = signal<Record<string, string | null>>({});
 export const membersError = computed(() => memberFailures()[activeSpaceId() ?? ""] ?? null);
 const memberRequests = new Map<string, Promise<void>>();
 const memberVersions = new Map<string, number>();
+type MentionVisit = { sid: string; scope: string; navigation: number; token: object; verified: boolean };
+const mentionVisit = signal<MentionVisit | null>(null);
 
 const EMPTY_DIRECTORY: MentionDirectory = { members: [], agents: [] };
 const EMPTY_MENTION_DRAFT: MentionDraft = { text: "", anchors: [] };
@@ -1195,19 +1197,45 @@ export async function reloadMembers(): Promise<void> {
   }
 }
 
-/** Loads the active Space's members for the mention picker (any member may). */
-export function loadMembersForMentions(): Promise<void> {
+/** Start a distinct visit even on re-entry to the same cached Space. */
+export function beginMentionVisit(sid: string, scope: string) {
+  const visit: MentionVisit = { sid, scope, navigation: navigationGeneration, token: {}, verified: false };
+  mentionVisit.set(visit);
+  void loadMembersForMentions(true);
+  return () => {
+    if (mentionVisit()?.token === visit.token) mentionVisit.set(null);
+  };
+}
+
+function currentMentionVisit(visit: MentionVisit) {
+  return visit.navigation === navigationGeneration && activeScope() === visit.scope && inSpaceComposer()
+    && mentionVisit()?.token === visit.token;
+}
+
+export function mentionVisitVerified(sid: string) {
+  const visit = mentionVisit();
+  return !!visit?.verified && visit.sid === sid && currentMentionVisit(visit);
+}
+
+/** A new visit must not reuse an older visit's in-flight roster request. */
+export function loadMembersForMentions(fresh = false): Promise<void> {
   const sid = activeSpaceId();
   const c = client;
-  if (!sid || !c) return Promise.resolve();
+  const visit = mentionVisit();
+  if (!sid || !c || !visit || visit.sid !== sid || !currentMentionVisit(visit)) return Promise.resolve();
   const existing = memberRequests.get(sid);
-  if (existing) return existing;
+  if (existing && !fresh) return existing;
   const ok = guard(sid);
   const version = nextMemberVersion(sid);
   const work = c.listMembers(sid).then(list => {
-    if (ok()) adoptMembers(sid, version, list);
+    if (ok() && currentMentionVisit(visit) && version === memberVersions.get(sid)) {
+      batch(() => {
+        adoptMembers(sid, version, list);
+        if (!visit.verified) mentionVisit.set({ ...visit, verified: true });
+      });
+    }
   }, error => {
-    if (!ok() || isAborted(error)) return;
+    if (!ok() || !currentMentionVisit(visit) || isAborted(error)) return;
     markMembersUnverified(sid, version, error);
     if (error instanceof ApiError && error.kind === "auth") disconnect(error.message);
     else if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found")) void lostAccess(sid, null);
@@ -1505,6 +1533,7 @@ function endSession() {
     notice.set(null);
     membersBySpace.set({});
     memberFailures.set({});
+    mentionVisit.set(null);
     mentionDraft.set(EMPTY_MENTION_DRAFT);
     editDirectory.set(null);
     manageError.set(null);
