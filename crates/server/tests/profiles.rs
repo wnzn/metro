@@ -384,7 +384,7 @@ async fn managed_users_have_profiles_and_reset_to_the_admin_name() {
 }
 
 #[tokio::test]
-async fn profiles_are_visible_only_to_people_who_share_a_space_now() {
+async fn cards_are_listed_but_bios_follow_current_space_membership() {
     let s = Server::start().await;
     let (ana, ana_token) = s.managed("Ana").await;
     s.patch(BOB, json!({"display_name": "Bobby", "bio": "hi"}))
@@ -394,20 +394,28 @@ async fn profiles_are_visible_only_to_people_who_share_a_space_now() {
         StatusCode::OK
     );
 
-    // Strangers, unknown ids, and admins without a shared Space: 404.
-    for (who, target) in [
-        (JM, "bob"),
-        (CAROL, "bob"),
-        (ana_token.as_str(), "bob"),
-        (BOB, ana.as_str()),
-        (JM, "nobody"),
-        (JM, "mu:00000000000000000000000000000000"),
+    // Never-signed-in and unknown ids do not get public cards.
+    for target in [
+        ana.as_str(),
+        "nobody",
+        "mu:00000000000000000000000000000000",
     ] {
         let path = format!("/v1/profiles/{}", urlencode(target));
-        assert_eq!(s.get(who, &path).await.0, StatusCode::NOT_FOUND, "{target}");
+        assert_eq!(s.get(JM, &path).await.0, StatusCode::NOT_FOUND, "{target}");
         assert_eq!(
-            s.avatar(who, &format!("{path}/avatar")).await.0,
+            s.avatar(JM, &format!("{path}/avatar")).await.0,
             StatusCode::NOT_FOUND
+        );
+    }
+    // Strangers and admins can see only the card, in the legacy shape.
+    for who in [JM, CAROL, ana_token.as_str()] {
+        let (status, p) = s.get(who, "/v1/profiles/bob").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(p["display_name"], "Bobby");
+        assert!(p["bio"].is_null() && p["avatar_version"].is_string());
+        assert_eq!(
+            s.avatar(who, "/v1/profiles/bob/avatar").await.0,
+            StatusCode::OK
         );
     }
     // Yourself: always.
@@ -440,28 +448,24 @@ async fn profiles_are_visible_only_to_people_who_share_a_space_now() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(h["content-type"], "image/png");
     assert!(bytes.starts_with(b"\x89PNG"));
-    // Carol still sees nothing.
-    assert_eq!(
-        s.get(CAROL, "/v1/profiles/bob").await.0,
-        StatusCode::NOT_FOUND
-    );
+    assert!(s.get(CAROL, "/v1/profiles/bob").await.1["bio"].is_null());
 
-    // Removal: the next request fails closed.
+    // Removal: the next request no longer exposes the bio, even to an admin.
     s.remove(JM, &sid, "bob").await;
-    assert_eq!(s.get(JM, "/v1/profiles/bob").await.0, StatusCode::NOT_FOUND);
-    assert_eq!(
-        s.get(&ana_token, "/v1/profiles/bob").await.0,
-        StatusCode::NOT_FOUND
-    );
+    for who in [JM, ana_token.as_str()] {
+        let (status, p) = s.get(who, "/v1/profiles/bob").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(p["bio"].is_null());
+    }
     assert_eq!(
         s.avatar(&ana_token, "/v1/profiles/bob/avatar").await.0,
-        StatusCode::NOT_FOUND
+        StatusCode::OK
     );
     assert_eq!(
         s.get(BOB, &format!("/v1/profiles/{}", urlencode(&ana)))
             .await
             .0,
-        StatusCode::NOT_FOUND
+        StatusCode::OK
     );
     // A revoked token reads nothing at all.
     s.json(
