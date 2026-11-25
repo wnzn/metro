@@ -14,6 +14,9 @@ gets 404) -> a button on someone else's page asks for confirmation (428), runs
 as the clicker with confirm, and its answer shows on the page -> prompt to page
 with one invalid model reply that is retried with diagnostics -> apply the
 draft -> personal pages stay private.
+An organization admin changes Page limits on the running server; creation,
+recovery and draft apply respect the new count, and the next version write
+prunes history while keeping the first version.
 """
 
 import argparse
@@ -35,6 +38,7 @@ from smoke import HOST, MAX_BODY, ROOT, clean_env, content_parts, require, serve
 from schedules import Api, Server, error_text, serve_stub
 
 MODEL = "pages/stub"
+ADMIN_SETTINGS = "/v1/admin/settings"
 AGENT_ANSWER = "Release is green (page e2e)."
 SCHEDULE_PROMPT = "Produce a scheduled Daily brief (Pages e2e)."
 SCHEDULE_ANSWER = "Daily brief from the scheduled task (Pages e2e)."
@@ -132,6 +136,46 @@ def poll(deadline, what, fn, watch):
     raise RuntimeError(f"timed out waiting for {what}")
 
 
+def version_limits(api, admin, editor, pid, deadline, watch):
+    path = f"/v1/pages/{pid}"
+    versions = path + "/versions"
+
+    def history(expected):
+        _, version_list = api.ok(editor, "GET", versions)
+        require([v["version"] for v in version_list["versions"]] == expected,
+                f"unexpected Page history (expected {expected})")
+
+    for base in (2, 3):
+        api.ok(editor, "POST", versions, {"base_version": base, "source": ASK_PAGE}, (201,))
+    history([4, 3, 2, 1])
+    api.ok(admin, "PATCH", ADMIN_SETTINGS, {"versions_per_page": 2})
+    history([4, 3, 2, 1])  # A settings write is not a pruning job.
+    api.ok(editor, "POST", versions + "/1/restore", {"base_version": 4}, (201,))
+    history([5, 4, 1])
+    api.ok(editor, "PATCH", path, {"title": "Renamed", "base_version": 5})
+    history([6, 5, 1])
+
+    _, draft = api.ok(editor, "POST", "/v1/pages/drafts",
+                      {"page_id": pid, "prompt": "Show the agents instead"}, (202,))
+    draft_path = f"/v1/pages/drafts/{draft['id']}"
+
+    def finished():
+        _, d = api.ok(editor, "GET", draft_path)
+        return d if d["status"] != "generating" else None
+
+    ready = poll(deadline, "the edit draft", finished, watch)
+    require(ready["status"] == "ready", "edit draft was not ready")
+    api.ok(editor, "POST", draft_path + "/apply", {}, (201,))
+    history([7, 6, 1])
+    # Raising the limit takes effect as well, without resurrecting previously
+    # pruned versions. The next manual save retains three recent versions.
+    api.ok(admin, "PATCH", ADMIN_SETTINGS, {"versions_per_page": 3})
+    api.ok(editor, "POST", versions, {"base_version": 7, "source": ASK_PAGE}, (201,))
+    history([8, 7, 6, 1])
+    status, _ = api.raw(editor, "GET", versions + "/5")
+    require(status == 404, "a pruned version is still readable")
+
+
 def pages(binary, timeout):
     deadline = time.monotonic() + timeout
     tokens = {name: secrets.token_hex(24) for name in ("alice", "bob", "carol")}
@@ -144,6 +188,8 @@ def pages(binary, timeout):
             "METRO_BIND": f"{HOST}:{port}",
             "METRO_DB": str(state / "pages.sqlite"),
             "METRO_DEV_USERS": json.dumps(tokens),
+            "METRO_ORG_ADMINS": json.dumps(["carol"]),
+            "METRO_UPDATE_CHECK": "off",
             "METRO_MODEL": MODEL,
             "METRO_MODEL_BASE_URL": stub.base_url,
             "METRO_MODEL_API_KEY": api_key,
@@ -236,9 +282,36 @@ def pages(binary, timeout):
                 "the retry didn't carry the diagnostics")
         _, preview = api.ok(alice, "POST", f"/v1/pages/drafts/{did}/data", {}, (200,))
         require(preview["data"]["agents"]["ok"] is True, f"preview: {preview}")
+
+        # Carol can set org limits but is still an outsider to this Space.
+        _, limits = api.ok(carol, "GET", ADMIN_SETTINGS)
+        require(limits == {"pages_per_space": 50, "versions_per_page": 200}, "wrong Page defaults")
+        status, _ = api.raw(alice, "PATCH", ADMIN_SETTINGS, {"pages_per_space": 1})
+        require(status == 403, "a Space owner changed workspace-wide limits")
+        _, limits = api.ok(carol, "PATCH", ADMIN_SETTINGS, {"pages_per_space": 1})
+        require(limits == {"pages_per_space": 1, "versions_per_page": 200}, "partial patch reset retention")
+        for user, expected in ((bob, 409), (carol, 404)):
+            status, _ = api.raw(user, "POST", "/v1/pages", scope | {"source": ASK_PAGE})
+            require(status == expected, f"direct create expected {expected}, got {status}")
+        status, limited = api.raw(alice, "POST", f"/v1/pages/drafts/{did}/apply", {})
+        require(status == 409 and "live pages (1)" in error_text(limited), "full Space let a draft apply")
+        _, still_ready = api.ok(alice, "GET", f"/v1/pages/drafts/{did}")
+        require(still_ready["status"] == "ready", "refused apply consumed the draft")
+
+        api.ok(carol, "PATCH", ADMIN_SETTINGS, {"pages_per_space": 2})
         _, made = api.ok(alice, "POST", f"/v1/pages/drafts/{did}/apply", {}, (201,))
         require(made["title"] == "Generated by e2e" and made["version"]["kind"] == "create"
                 and made["version"]["model"] == f"server/{MODEL}", f"applied: {made}")
+        made_path = f"/v1/pages/{made['id']}"
+        api.ok(carol, "PATCH", ADMIN_SETTINGS, {"pages_per_space": 1})
+        api.ok(alice, "GET", made_path)  # Lowering does not delete existing pages.
+        api.ok(alice, "DELETE", made_path, expect=(204,))
+        for user, expected in ((alice, 409), (carol, 404)):
+            status, _ = api.raw(user, "POST", made_path + "/undelete", {})
+            require(status == expected, f"recovery expected {expected}, got {status}")
+        api.ok(carol, "PATCH", ADMIN_SETTINGS, {"pages_per_space": 50})
+        api.ok(alice, "POST", made_path + "/undelete", {})
+        version_limits(api, carol, bob, pid, deadline, watch)
 
         # Space Daily brief follows the room and its selected agent, not a
         # page-button origin. Exercise a real schedule dispatch on loopback.
@@ -324,7 +397,8 @@ def pages(binary, timeout):
           "409; data as a member, 404 for an outsider; a button on someone else's page asked once "
           "(428), ran as the clicker and its answer showed on the page; prompt to page retried "
           "with diagnostics and applied; scheduled reply appeared on the Space Daily brief; "
-          "personal Daily brief stayed private and followed its own button.")
+          "personal Daily brief stayed private and followed its own button; "
+          "org limits took effect without restart on create, recover, apply and version writes.")
 
 
 def terminate(signum, _frame):

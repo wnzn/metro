@@ -136,6 +136,31 @@
         </table>
       </div>
     </section>
+
+    <section class="card" aria-labelledby="page-limits-title">
+      <h2 id="page-limits-title">Page limits</h2>
+      <p class="muted">These limits apply across this workspace. Lowering them won't delete anything when you save.</p>
+      <div id="page-limits-error" class="alert alert-danger" role="alert" hidden></div>
+      <p id="page-limits-status" class="hint" role="status"></p>
+      <button type="button" id="page-limits-retry" class="btn btn-secondary" hidden>Retry loading Page limits</button>
+      <form id="page-limits-form" method="post" novalidate hidden>
+        <div class="page-limits-fields">
+          <div class="field">
+            <label for="pages-per-space" class="label">Live pages per Space</label>
+            <input id="pages-per-space" class="input" type="number" min="1" max="500" step="1" required
+                   aria-describedby="pages-per-space-hint" aria-errormessage="page-limits-error">
+            <p id="pages-per-space-hint" class="hint">1–500. The same limit applies to each person's private pages. At or above the limit, no new pages can be created or recovered from Trash.</p>
+          </div>
+          <div class="field">
+            <label for="versions-per-page" class="label">Recent versions per page</label>
+            <input id="versions-per-page" class="input" type="number" min="2" max="1000" step="1" required
+                   aria-describedby="versions-per-page-hint" aria-errormessage="page-limits-error">
+            <p id="versions-per-page-hint" class="hint">2–1,000. When a new version is saved, Metro keeps this many recent versions plus the first version.</p>
+          </div>
+        </div>
+        <button type="submit" id="page-limits-save" class="btn btn-primary">Save Page limits</button>
+      </form>
+    </section>
   </div>
 
   <p id="announce" class="visually-hidden" role="status" aria-live="polite"></p>

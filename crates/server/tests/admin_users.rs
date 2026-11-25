@@ -78,10 +78,41 @@ async fn organization_settings_are_bearer_admin_only_and_persist() {
         .await,
         (StatusCode::OK, changed.clone())
     );
+    let page_body = json!({
+        "scope": "personal",
+        "source": "export default <Page title=\"Existing page\" />"
+    });
+    let (status, existing_page) = s.post(BOB, "/v1/pages", page_body.clone()).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let changed = json!({"pages_per_space": 1, "versions_per_page": 2});
+    assert_eq!(
+        s.call(
+            Method::PATCH,
+            JM,
+            SETTINGS,
+            Some(json!({"pages_per_space": 1})),
+        )
+        .await,
+        (StatusCode::OK, changed.clone())
+    );
     // An independently reopened DB must see the same values, with no
     // on-disk defaults replacing them on initialization.
     let reopened = Server::dev(Db::open(&path).unwrap()).await;
     assert_eq!(reopened.get(JM, SETTINGS).await, (StatusCode::OK, changed));
+    let existing_path = format!("/v1/pages/{}", existing_page["id"].as_str().unwrap());
+    assert_eq!(reopened.get(BOB, &existing_path).await.0, StatusCode::OK);
+    assert_eq!(
+        reopened.get(JM, &existing_path).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        reopened.post(BOB, "/v1/pages", page_body.clone()).await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        reopened.post(JM, "/v1/pages", page_body).await.0,
+        StatusCode::CREATED
+    );
 
     // Settings are also available to an OIDC subject listed in org admins;
     // they do not depend on the managed-user (dev only) admin API.

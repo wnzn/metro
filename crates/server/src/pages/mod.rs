@@ -14,7 +14,6 @@ pub mod api;
 pub mod compile;
 pub mod data;
 pub mod generate;
-pub mod limits;
 pub mod spec;
 pub mod store;
 pub mod tsx;
