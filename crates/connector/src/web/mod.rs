@@ -25,6 +25,7 @@
 //! - **Logs** name the job, operation, provider, mode and outcome only:
 //!   never a query, URL, key or body.
 
+pub mod cli;
 pub mod keys;
 pub mod mcp;
 pub mod settings;
@@ -53,6 +54,15 @@ use crate::secret::clean_line;
 use crate::{SafeError, Secret};
 
 pub use time::rfc3339;
+
+/// Web jobs one device runs at once (separate loops, so a long fetch never
+/// blocks a search).
+pub const WORKERS_PER_DEVICE: usize = 2;
+
+/// Wall-clock seconds since the epoch.
+pub fn time_now() -> u64 {
+    time::now_secs()
+}
 
 /// The providers, in the default try order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

@@ -284,6 +284,9 @@ pub struct DesktopConfig {
     /// Opens a sign-in URL in the person's browser.
     pub open_browser: Opener,
     pub oauth_endpoints: Endpoints,
+    /// Web search vendor URLs; `None`: the compiled-in vendors (with the
+    /// loopback-only test overrides from the environment).
+    pub web_endpoints: Option<crate::web::Endpoints>,
 }
 
 impl DesktopConfig {
@@ -297,6 +300,7 @@ impl DesktopConfig {
             prepare_wait: PREPARE_WAIT,
             open_browser: Arc::new(open_system_browser),
             oauth_endpoints: Endpoints::openai(),
+            web_endpoints: None,
         }
     }
 }
@@ -320,6 +324,8 @@ pub struct Desktop {
     /// tokens): a session to one of them is only allowed while that server
     /// runs there now with that bearer.
     local_urls: Mutex<std::collections::HashSet<String>>,
+    /// This computer as the signed-in person's web search device.
+    web: super::web::WebSearch,
 }
 
 fn lock(s: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
@@ -345,8 +351,15 @@ struct Bound {
 
 impl Desktop {
     pub fn new(cfg: DesktopConfig) -> Arc<Self> {
+        let events = Events::new(&cfg.root);
+        let mut web =
+            super::web::WebSearch::new(&cfg.root, cfg.primary, cfg.poll_interval, events.clone());
+        if let Some(e) = cfg.web_endpoints.clone() {
+            web = web.with_endpoints(e);
+        }
         Arc::new(Desktop {
-            events: Events::new(&cfg.root),
+            events,
+            web,
             cfg,
             ops: tokio::sync::Mutex::new(()),
             state: Arc::new(Mutex::new(State::default())),
@@ -824,10 +837,12 @@ impl Desktop {
         self.stop_monitor();
         if !same {
             self.stop_all().await;
+            self.web.session_ended().await;
             if let Some(t) = &self.cfg.tools {
                 t.stop_all().await;
             }
         }
+        let session_token_copy = session_token.clone();
         lock(&self.state).session = Some(Session {
             server_url: server.clone(),
             account_id: account.clone(),
@@ -870,6 +885,12 @@ impl Desktop {
         if let (Some(t), Some(ctx)) = (&self.cfg.tools, self.session_ctx()) {
             t.session_bound(&ctx).await;
         }
+        if !same {
+            // Web search is on by default; failures show in its Settings.
+            self.web
+                .session_bound(&server, &account, &session_token_copy)
+                .await;
+        }
         self.start_monitor();
         drop(_g);
         Ok(self.status().await)
@@ -880,6 +901,7 @@ impl Desktop {
             let _g = self.ops.lock().await;
             self.stop_monitor();
             self.stop_all().await;
+            self.web.session_ended().await;
             if let Some(t) = &self.cfg.tools {
                 t.stop_all().await;
             }
@@ -1508,6 +1530,65 @@ impl Desktop {
     }
 
     // ---------------------------------------------------------------- local workspace
+
+    // ---------------------------------------------------------------- web search
+
+    /// `GET /v1/web-search`.
+    pub async fn web_state(&self) -> R<Value> {
+        let (server, account, _) = self.session()?;
+        self.web.state(&server, &account).await
+    }
+
+    /// `PUT /v1/web-search`.
+    pub async fn web_update(
+        &self,
+        enabled: Option<bool>,
+        notice_acknowledged: Option<bool>,
+        providers: Option<Vec<(String, bool)>>,
+    ) -> R<Value> {
+        let (server, account, token) = self.session()?;
+        if !self.cfg.primary && enabled.is_some() {
+            return Err(err(
+                409,
+                "other_instance",
+                "Another Metro window already serves this computer's web search",
+            ));
+        }
+        self.web
+            .update(
+                &server,
+                &account,
+                &token,
+                enabled,
+                notice_acknowledged,
+                providers,
+            )
+            .await
+    }
+
+    /// `PUT /v1/web-search/providers/{id}/key`.
+    pub async fn web_set_key(&self, id: &str, key: Secret) -> R<Value> {
+        let (server, account, _) = self.session()?;
+        self.web.set_key(&server, &account, id, key).await
+    }
+
+    /// `DELETE /v1/web-search/providers/{id}/key`.
+    pub async fn web_delete_key(&self, id: &str) -> R<Value> {
+        let (server, account, _) = self.session()?;
+        self.web.delete_key(&server, &account, id).await
+    }
+
+    /// `POST /v1/web-search/providers/{id}/test`.
+    pub async fn web_test(&self, id: &str) -> R<Value> {
+        let (server, account, _) = self.session()?;
+        self.web.test(&server, &account, id).await
+    }
+
+    /// `POST /v1/web-search/providers/{id}/clear-cooldown`.
+    pub async fn web_clear_cooldown(&self, id: &str) -> R<Value> {
+        let (server, account, _) = self.session()?;
+        self.web.clear_cooldown(&server, &account, id).await
+    }
 
     pub async fn open_local(&self) -> R<(String, Secret)> {
         let Some(h) = &self.cfg.local else {

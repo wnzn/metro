@@ -18,6 +18,12 @@
 //! | `PUT /v1/connections/{id}/models` | `{models}` | connection |
 //! | `PUT /v1/connections/{id}/endpoint` | `{base_url}` | connection |
 //! | `POST /v1/connections/{id}/forget` | `{revoke}` | `{forgotten, revoked}` |
+//! | `GET /v1/web-search` | | web search on this computer: switch, notice, device, providers |
+//! | `PUT /v1/web-search` | `{enabled?, notice_acknowledged?, providers?: [{id, enabled}]}` | the same |
+//! | `PUT /v1/web-search/providers/{id}/key` | `{api_key}` | provider row (`key_saved`, never the key) |
+//! | `DELETE /v1/web-search/providers/{id}/key` | | provider row (back to free mode) |
+//! | `POST /v1/web-search/providers/{id}/test` | `{}` | provider row with `test.outcome` |
+//! | `POST /v1/web-search/providers/{id}/clear-cooldown` | `{}` | provider row |
 //! | `POST /v1/local-workspace/open` | `{}` | `{server_url, token}` |
 //! | `GET/POST /v1/local-tools…` | | the desktop tools lane |
 //!
@@ -30,3 +36,4 @@ pub mod metro_api;
 pub mod monitoring;
 pub mod store;
 mod tools_glue;
+pub mod web;

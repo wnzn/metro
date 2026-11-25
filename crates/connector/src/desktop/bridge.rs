@@ -258,6 +258,16 @@ fn router(ctx: Arc<Ctx>) -> Router {
         .route("/v1/connections/{id}/models", put(models))
         .route("/v1/connections/{id}/endpoint", put(endpoint))
         .route("/v1/connections/{id}/forget", post(forget))
+        .route("/v1/web-search", get(web_state).put(web_update))
+        .route(
+            "/v1/web-search/providers/{id}/key",
+            put(web_key_set).delete(web_key_delete),
+        )
+        .route("/v1/web-search/providers/{id}/test", post(web_test))
+        .route(
+            "/v1/web-search/providers/{id}/clear-cooldown",
+            post(web_clear_cooldown),
+        )
         .route("/v1/local-workspace/open", post(local_open))
         .route("/v1/local-tools", any(tools))
         .route("/v1/local-tools/{*rest}", any(tools))
@@ -407,6 +417,85 @@ async fn login_open(State(ctx): State<Arc<Ctx>>, Path(id): Path<String>, b: Byte
 
 async fn login_cancel(State(ctx): State<Arc<Ctx>>, Path(id): Path<String>) -> Response {
     reply(ctx.desktop.cancel_sign_in(&id).await)
+}
+
+// ---------------------------------------------------------------- web search
+
+async fn web_state(State(ctx): State<Arc<Ctx>>) -> Response {
+    reply(ctx.desktop.web_state().await)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebProvider {
+    id: String,
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebUpdate {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    notice_acknowledged: Option<bool>,
+    /// The whole list, in try order.
+    #[serde(default)]
+    providers: Option<Vec<WebProvider>>,
+}
+
+async fn web_update(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
+    match body::<WebUpdate>(&b) {
+        Ok(u) => reply(
+            ctx.desktop
+                .web_update(
+                    u.enabled,
+                    u.notice_acknowledged,
+                    u.providers
+                        .map(|l| l.into_iter().map(|p| (p.id, p.enabled)).collect()),
+                )
+                .await,
+        ),
+        Err(e) => e.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebKey {
+    api_key: String,
+}
+
+async fn web_key_set(State(ctx): State<Arc<Ctx>>, Path(id): Path<String>, b: Bytes) -> Response {
+    match body::<WebKey>(&b) {
+        Ok(mut k) => {
+            let key = Secret::new(std::mem::take(&mut k.api_key));
+            reply(ctx.desktop.web_set_key(&id, key).await)
+        }
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn web_key_delete(State(ctx): State<Arc<Ctx>>, Path(id): Path<String>) -> Response {
+    reply(ctx.desktop.web_delete_key(&id).await)
+}
+
+async fn web_test(State(ctx): State<Arc<Ctx>>, Path(id): Path<String>, b: Bytes) -> Response {
+    match body::<Empty>(&b) {
+        Ok(_) => reply(ctx.desktop.web_test(&id).await),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn web_clear_cooldown(
+    State(ctx): State<Arc<Ctx>>,
+    Path(id): Path<String>,
+    b: Bytes,
+) -> Response {
+    match body::<Empty>(&b) {
+        Ok(_) => reply(ctx.desktop.web_clear_cooldown(&id).await),
+        Err(e) => e.into_response(),
+    }
 }
 
 async fn credentials_delete(State(ctx): State<Arc<Ctx>>, Path(id): Path<String>) -> Response {
