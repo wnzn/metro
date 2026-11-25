@@ -217,35 +217,32 @@ fn agent_answer(db: &Db, ctx: &Context, t: &Target, viewer: &str) -> Result<Json
         let Some(run) = store::latest_run(db, viewer, page, block, only)? else {
             return Ok(Json::Null);
         };
-        let reply = match (&run.space_id, &run.room_id) {
+        let latest = |kinds: &[&str]| match (&run.space_id, &run.room_id) {
             (Some(sid), Some(rid)) => {
                 // The run's room must still be readable by this viewer.
                 if Some(sid) != space.as_ref() && db.membership(sid, viewer)?.is_none() {
                     return Err(Fail::NoAccess);
                 }
-                store::room_events(
-                    db,
-                    viewer,
-                    sid,
-                    rid,
-                    &[kind::AGENT, kind::ERROR, kind::STATUS],
-                    Some(&run.run_id),
-                    None,
-                    1,
-                )?
-                .into_iter()
-                .next()
+                Ok(
+                    store::room_events(db, viewer, sid, rid, kinds, Some(&run.run_id), None, 1)?
+                        .into_iter()
+                        .next(),
+                )
             }
-            _ => store::last_page_event(
+            _ => Ok(store::last_page_event(
                 db,
                 page,
                 viewer,
-                &[kind::AGENT, kind::ERROR, kind::STATUS],
+                kinds,
                 Some(&run.run_id),
-            )?,
+            )?),
         };
+        // The worker publishes a reply before its terminal marker. Read the
+        // marker first so a reply committed between the reads cannot look
+        // like a completed run that ended without one.
+        let marker = latest(&[kind::ACTIVITY])?;
         let room = t.room.as_deref();
-        if let Some(e) = reply {
+        if let Some(e) = latest(&[kind::AGENT, kind::ERROR, kind::STATUS])? {
             return Ok(answer_json(db, &e, room));
         }
         // No answer: the run couldn't start, hasn't started yet, or ended
@@ -259,21 +256,6 @@ fn agent_answer(db: &Db, ctx: &Context, t: &Target, viewer: &str) -> Result<Json
                 json!({"status": "starting", "at": rfc3339_utc(run.created_at), "room": room}),
             );
         }
-        let marker = match (&run.space_id, &run.room_id) {
-            (Some(sid), Some(rid)) => store::room_events(
-                db,
-                viewer,
-                sid,
-                rid,
-                &[kind::ACTIVITY],
-                Some(&run.run_id),
-                None,
-                1,
-            )?
-            .into_iter()
-            .next(),
-            _ => store::last_page_event(db, page, viewer, &[kind::ACTIVITY], Some(&run.run_id))?,
-        };
         let phase = marker
             .as_ref()
             .and_then(|e| e.activity.as_ref())
