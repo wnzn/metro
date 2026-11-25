@@ -327,6 +327,40 @@ test("the follow-up read also detects a newer assignment made outside this app",
   expect(words(app)).toContain(other.name);
 });
 
+test("a verified Space settings attach dismisses the offer and records its folder after Runner closes", async () => {
+  const f = world();
+  const r = f.addRunner("This PC", "personal", "alice");
+  f.addSpace("manual", "Manual", "alice");
+  f.addSpace("eligible", "Still eligible", "alice");
+  const t = fixture(f, r.id);
+  t.gate.attach = 800;
+  const app = await launch(t, { manual: true });
+  await signIn(app);
+  await app.waitFor(offer);
+  await app.press("id:space:manual");
+  await app.press("id:manage-space");
+  await app.press("id:space-settings-tab:runner");
+  await app.press(`id:space-runner-attach:${r.id}`);
+  await app.waitUntil(() => f.state.attached.get("manual") === r.id);
+  await app.press("id:space-settings-close");
+  expect(app.shows(offer)).toBe(true);
+  expect(app.storage()[runnerOfferStorageKey(BASE, "alice")]).toBe(undefined);
+
+  t.status.delay = 2_000; // Don't let the Runners view's own refresh populate the folder.
+  await app.press("id:nav-settings");
+  await app.waitFor("id:runners-settings");
+  expect(app.shows("id:installed-runner-space:manual")).toBe(false);
+  await app.clock!.runFor(800);
+  await app.waitUntil(() => app.storage()[runnerOfferStorageKey(BASE, "alice")] === "dismissed");
+  await app.waitFor("id:installed-runner-space:manual");
+  expect(app.shows("id:runners-settings")).toBe(true);
+  expect(app.shows("id:space-settings-dialog")).toBe(false);
+  expect(app.shows("id:manage-notice")).toBe(false);
+  expect(app.shows("id:token-reveal")).toBe(false);
+  expect(app.shows(offer)).toBe(false);
+  expect(runnerWrites(f).map((p) => p.path)).toEqual(["/v1/spaces/manual/runner/attach-if-empty"]);
+});
+
 test("a superseded Space settings attach neither dismisses the offer nor records a folder", async () => {
   const f = world();
   const r = f.addRunner("This PC", "personal", "alice");

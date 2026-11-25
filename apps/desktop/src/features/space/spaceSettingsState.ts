@@ -502,6 +502,12 @@ export async function changeRunner(action: RunnerAction): Promise<void> {
       receipt = await api.changeDedicatedToken(sid, action);
     }
     if (!writeCurrent()) return;
+    // Older servers with empty-only attach don't include owner-only metadata
+    // on the assignment read. Verify ownership before reading that assignment.
+    const legacyOwner = installed && !before.guardedTokenChanges
+      ? await api.listSpaces().then((list) => list.some((s) => s.id === sid && s.role === "owner"), () => false)
+      : false;
+    if (!writeCurrent()) return;
     // A delayed write reply describes history, not the current assignment.
     // Use the shared exact-Space guards even when the originating page closed.
     const actual = await refreshAssignment(api, sid, writeCurrent, live);
@@ -510,7 +516,7 @@ export async function changeRunner(action: RunnerAction): Promise<void> {
       return;
     }
     const r = actual.runner;
-    if (!live() || !writeCurrent()) return;
+    if (!writeCurrent()) return;
     // Don't associate a credential or an installed-runner side effect with a
     // newer assignment that was already published by another request.
     if (spaceRunners()[sid] !== r) {
@@ -522,13 +528,18 @@ export async function changeRunner(action: RunnerAction): Promise<void> {
     if (!confirmed) return reject(tokenChange
       ? "The runner assignment changed after the token request. No token was shown. Review the current runner above."
       : "The runner assignment changed. Check the current runner above.");
-    if (action.kind === "attach" && installed?.isCurrent()) {
+    // This is session bookkeeping for the submitted attach, not feedback
+    // for whichever settings page happens to be open now.
+    const ownerVerified = (actual.guardedTokenChanges && !!r?.assignmentRevision) ||
+      (!before.guardedTokenChanges && legacyOwner);
+    if (action.kind === "attach" && ownerVerified && installed?.isCurrent()) {
       const space = spaces().find((s) => s.id === sid && s.role === "owner");
       if (space) {
         dismissRunnerOffer();
         recordAttachedFolder(space);
       }
     }
+    if (!live() || !writeCurrent()) return;
     const message = action.kind === "attach" ? `Attached “${r?.name}”. This Space now sends its runner jobs there.` :
       action.kind === "detach" ? "Runner detached from this Space. Its other Spaces are unchanged." :
         action.kind === "revoke" ? "Dedicated token revoked. The runner can no longer serve this Space." :
