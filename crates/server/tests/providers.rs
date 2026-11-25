@@ -667,19 +667,23 @@ async fn changing_endpoint_tests_before_saving_and_keeps_connection_settings() {
         .await;
     assert_eq!(status, StatusCode::OK, "{initial_share}");
 
-    assert_eq!(
-        s.patch(BOB, &path, json!({"base_url": new.base_url}))
-            .await
-            .0,
-        StatusCode::NOT_FOUND
-    );
-    for rejected in [
-        Value::Null,
-        json!(format!("{}/not-allowlisted", new.base_url)),
-        json!(format!("{}?not-allowed", new.base_url)),
+    let (status, body) = s.patch(BOB, &path, json!({"base_url": new.base_url})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "endpoint_missing");
+    for (rejected, code) in [
+        (Value::Null, "endpoint_rejected"),
+        (
+            json!(format!("{}/not-allowlisted", new.base_url)),
+            "endpoint_not_approved",
+        ),
+        (
+            json!(format!("{}?not-allowed", new.base_url)),
+            "endpoint_rejected",
+        ),
     ] {
-        let (status, _) = s.patch(ALICE, &path, json!({"base_url": rejected})).await;
+        let (status, body) = s.patch(ALICE, &path, json!({"base_url": rejected})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], code);
     }
     let device = s
         .connect(
@@ -706,6 +710,7 @@ async fn changing_endpoint_tests_before_saving_and_keeps_connection_settings() {
             "base_url": fixture.base_url, "api_key": "failed-probe-key", "name": "not saved",
         })).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{response}");
+        assert_eq!(response["code"], "endpoint_probe_failed");
         assert!(
             response["error"]
                 .as_str()
@@ -863,9 +868,16 @@ async fn endpoint_probe_cannot_overwrite_a_concurrent_edit() {
     };
     let ((status, body), ()) = tokio::join!(patch, concurrent);
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "endpoint_conflict");
     let saved = s.connection(ALICE, &c["id"]).await;
     assert_eq!(saved["name"], "Name changed");
     assert_eq!(saved["base_url"], old.base_url);
+    // Only a new, explicit PATCH can make the change after reviewing the row.
+    reply.notify_one();
+    let (status, retried) = s.patch(ALICE, &path, json!({"base_url": new})).await;
+    assert_eq!(status, StatusCode::OK, "{retried}");
+    assert_eq!(retried["base_url"], new);
+    assert_eq!(retried["name"], "Name changed");
 }
 
 #[tokio::test]

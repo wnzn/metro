@@ -33,6 +33,7 @@ use crate::tools::RunnerTool;
 pub struct ApiError {
     status: StatusCode,
     message: String,
+    code: Option<&'static str>,
 }
 
 impl ApiError {
@@ -40,7 +41,13 @@ impl ApiError {
         Self {
             status,
             message: message.into(),
+            code: None,
         }
+    }
+    /// Add a stable code without replacing a more specific one.
+    pub(crate) fn with_code(mut self, code: &'static str) -> Self {
+        self.code.get_or_insert(code);
+        self
     }
     pub fn unauthorized() -> Self {
         Self::new(StatusCode::UNAUTHORIZED, "missing or invalid bearer token")
@@ -74,7 +81,11 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let mut response = (self.status, Json(json!({"error": self.message}))).into_response();
+        let mut body = json!({"error": self.message});
+        if let Some(code) = self.code {
+            body["code"] = json!(code);
+        }
+        let mut response = (self.status, Json(body)).into_response();
         if self.status == StatusCode::UNAUTHORIZED {
             response
                 .headers_mut()
