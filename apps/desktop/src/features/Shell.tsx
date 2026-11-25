@@ -12,6 +12,7 @@ import { SpaceSettingsModal } from "./space/SpaceSettings";
 import { Sidebar } from "./Sidebar";
 import { RoomHeaderActions, RoomHeaderTitle, SpaceView } from "./SpaceView";
 import { TopSearch } from "./TopSearch";
+import { ForwardEntry } from "./forward/ForwardEntry";
 
 /**
  * The signed-in app: the sidebar (or its icon rail while collapsed; nothing
@@ -76,6 +77,7 @@ export function Shell() {
       </Column>
       <SettingsModal />
       <SpaceSettingsModal />
+      <ForwardEntry />
     </Surface>
   );
 }

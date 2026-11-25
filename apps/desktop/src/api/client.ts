@@ -18,8 +18,8 @@ import { readMentionSpans } from "../features/mentions/sent";
 import { canonicalAddressing, canonicalEventTime, canonicalStableId, readPostedNotes } from "../features/senderNotices/response";
 import type { PostedSenderNotes } from "../features/senderNotices/response";
 
-/** `parentRoomId`: set on a thread an agent delegated from that room. */
-export type Room = { id: string; name: string; parentRoomId?: string };
+/** `anchorEventId` distinguishes a reply thread from a delegated thread. */
+export type Room = { id: string; name: string; parentRoomId?: string; anchorEventId?: number };
 /**
  * Who a message addresses: the Space's agent, or a member by their stable
  * user id. An agent mention with `agentId` names one of the Space's agents
@@ -32,7 +32,7 @@ export type Room = { id: string; name: string; parentRoomId?: string };
 export type Mention = {
   kind: "agent";
   agentId?: string;
-  addressedBy?: "classifier" | "schedule";
+  addressedBy?: "classifier" | "schedule" | "reply" | "metro";
   /** If an old event stored its own spelling; never filled from the live roster. */
   legacyHandle?: string;
 } | { kind: "user"; id: string };
@@ -53,6 +53,7 @@ export type EventActivity = {
   name: string;
   source: ActivitySource;
   phase?: ActivityPhase;
+  outcome?: "reply" | "reaction" | "no_reply";
   route?: ActivityRoute;
   /** The Space agent working this turn, on every event of it (absent in personal Chat, Demo and older history). */
   agent?: EventAgent;
@@ -100,7 +101,12 @@ export type RoomEvent = {
   createdAt?: string;
   /** Library files sent with a message: metadata only, never bytes or URLs. */
   attachments?: EventAttachment[];
+  replyTo?: number;
+  via?: "metro";
+  forwarded?: { authorName: string; authorKind: "person" | "agent"; sentAt?: string; sameSpace?: { roomId: string; eventId: number } };
+  replies?: { roomId: string; count: number; lastAt?: string; participantIds: string[] };
 };
+export type ReplyAddress = { eventId: number; askAgent: boolean; agentId?: string };
 /**
  * A Library file attached to a message, or a tombstone for one deleted
  * since (no name, nothing to open). Which library holds a file is the
@@ -839,6 +845,14 @@ export function createClient(options: ClientOptions) {
       return toRoom(data);
     },
 
+    async replyThread(spaceId: string, roomId: string, eventId: number): Promise<Room> {
+      const data = await request("POST", `${room(spaceId, roomId)}/events/${eventId}/thread`);
+      if (!isRoom(data) || data.anchor_event_id !== eventId || String(data.parent_room_id) !== roomId || String(data.id) === roomId) {
+        throw new ApiError("protocol", "The server did not confirm the reply thread.");
+      }
+      return toRoom(data);
+    },
+
     async listEvents(spaceId: string, roomId: string, after: number): Promise<RoomEvent[]> {
       const path = `${room(spaceId, roomId)}/events?after=${encodeURIComponent(String(after))}`;
       const data = await request("GET", path);
@@ -854,13 +868,18 @@ export function createClient(options: ClientOptions) {
       addressing: SpaceMessageBody,
       assetIds?: readonly string[],
       choice?: TurnModelChoice,
+      reply?: ReplyAddress,
     ): Promise<PostedSenderNotes | null> {
       const body: Record<string, unknown> = { invoke_agent: false, ...addressing, infer_text_mentions: false, ...turnModelBody(choice) };
       const ids = assetIdsBody(assetIds);
       if (ids) body.asset_ids = ids;
+      if (reply) {
+        body.reply_to = reply.eventId;
+        if (!reply.askAgent) body.reply_to_agent = false;
+      }
       try {
         const data = await request("POST", `${room(spaceId, roomId)}/messages`, body);
-        return readPostedNotes(data, { ...addressing, kind: "space" });
+        return readPostedNotes(data, { ...addressing, kind: "space", reply });
       } catch (error) {
         if (error instanceof ApiError && error.status === 422) {
           throw new ApiError("http", "Update Metro Server to send Space messages with safe addressing. Your draft was kept and was not sent.", 422);
@@ -1220,12 +1239,19 @@ function toConnection(v: Record<string, unknown> & { id: string | number; name: 
   };
 }
 
-function isRoom(v: unknown): v is { id: string | number; name: string; parent_room_id?: string | number | null } {
-  return isObject(v) && isId(v.id) && typeof v.name === "string" && (v.parent_room_id == null || isId(v.parent_room_id));
+const isEventId = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v > 0;
+type WireRoom = { id: string | number; name: string; parent_room_id?: string | number | null; anchor_event_id?: number | null };
+function isRoom(v: unknown): v is WireRoom {
+  return isObject(v) && isId(v.id) && typeof v.name === "string" && (v.parent_room_id == null || isId(v.parent_room_id)) &&
+    (v.anchor_event_id == null || (isEventId(v.anchor_event_id) && v.parent_room_id != null));
 }
 
-function toRoom(v: { id: string | number; name: string; parent_room_id?: string | number | null }): Room {
-  return v.parent_room_id == null ? { id: String(v.id), name: v.name } : { id: String(v.id), name: v.name, parentRoomId: String(v.parent_room_id) };
+function toRoom(v: WireRoom): Room {
+  return {
+    id: String(v.id), name: v.name,
+    ...(v.parent_room_id != null ? { parentRoomId: String(v.parent_room_id) } : {}),
+    ...(v.anchor_event_id != null ? { anchorEventId: v.anchor_event_id } : {}),
+  };
 }
 
 function isRun(v: unknown): v is { id: string | number; space_id: string | number; room_id: string | number; status: string; actor: string; task: string } {
@@ -1245,6 +1271,9 @@ function isRun(v: unknown): v is { id: string | number; space_id: string | numbe
 const canonicalMessageRows = new WeakSet<RoomEvent>();
 export const isCanonicalMessageRow = (event: RoomEvent) => canonicalMessageRows.has(event);
 
+/** Normalize an untrusted event from another conversation endpoint (e.g. a DM). */
+export const decodeEvent = (value: unknown): RoomEvent | null => isEvent(value) ? toEvent(value) : null;
+
 function toEvent(v: RoomEvent): RoomEvent {
   const raw = v as unknown as Record<string, unknown>;
   const event: RoomEvent = { id: v.id, kind: v.kind, actor: v.actor, text: v.text };
@@ -1260,7 +1289,7 @@ function toEvent(v: RoomEvent): RoomEvent {
         if (mention.agentId && typeof m.handle === "string" && /^[a-z0-9_-]{1,32}$/i.test(m.handle)) {
           mention.legacyHandle = m.handle;
         }
-        if (m.addressed_by === "classifier" || m.addressed_by === "schedule") mention.addressedBy = m.addressed_by;
+        if (m.addressed_by === "classifier" || m.addressed_by === "schedule" || m.addressed_by === "reply" || m.addressed_by === "metro") mention.addressedBy = m.addressed_by;
       } else if (isObject(m) && m.kind === "user" && isId(m.id)) mention = { kind: "user", id: String(m.id) };
       if (mention) {
         if (mention.kind !== "agent" || !mention.addressedBy) indexes.set(index, mentions.length);
@@ -1286,6 +1315,24 @@ function toEvent(v: RoomEvent): RoomEvent {
     canonicalAddressing(raw.audience, raw.mentions)) canonicalMessageRows.add(event);
   const attachments = toAttachments(raw.attachments);
   if (attachments.length) event.attachments = attachments;
+  if (isEventId(raw.reply_to)) event.replyTo = raw.reply_to;
+  if (raw.via === "metro") event.via = raw.via;
+  const f = raw.forwarded;
+  if (isObject(f) && typeof f.author_name === "string" && (f.author_kind === "person" || f.author_kind === "agent")) {
+    const link = f.same_space;
+    event.forwarded = {
+      authorName: f.author_name, authorKind: f.author_kind, sentAt: toCreatedAt(f.sent_at),
+      sameSpace: isObject(link) && canonicalStableId(link.room_id) && isEventId(link.event_id)
+        ? { roomId: link.room_id, eventId: link.event_id } : undefined,
+    };
+  }
+  const r = raw.replies;
+  if (isObject(r) && canonicalStableId(r.room_id) && typeof r.count === "number" && Number.isSafeInteger(r.count) && r.count >= 0) {
+    event.replies = {
+      roomId: r.room_id, count: r.count, lastAt: toCreatedAt(r.last_at),
+      participantIds: Array.isArray(r.participant_ids) ? r.participant_ids.filter(canonicalStableId).slice(0, 3) : [],
+    };
+  }
   return event;
 }
 
@@ -1365,6 +1412,9 @@ export function toActivity(v: unknown): EventActivity | undefined {
   if (v.source !== "agent" && v.source !== "demo") return undefined;
   const activity: EventActivity = { id, name: typeof v.name === "string" ? v.name.trim() : "", source: v.source };
   if (typeof v.phase === "string" && ACTIVITY_PHASES.includes(v.phase)) activity.phase = v.phase as ActivityPhase;
+  if (activity.phase === "completed" && (v.outcome === "reply" || v.outcome === "reaction" || v.outcome === "no_reply")) {
+    activity.outcome = v.outcome;
+  }
   const route = toRoute(v.route);
   if (route) activity.route = route;
   const agent = toEventAgent(v.agent);

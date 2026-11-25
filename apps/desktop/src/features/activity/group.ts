@@ -30,6 +30,7 @@ export type ActivityGroup = {
   name: string;
   steps: Step[];
   outcome: GroupOutcome;
+  noReply?: boolean;
   /** Some step or a correlated error failed, whatever the lifecycle says. */
   failed: boolean;
   /** Tied to one turn by server metadata. */
@@ -154,7 +155,10 @@ export function groupTranscript(events: readonly RoomEvent[]): TranscriptItem[] 
         if (meta.source === "agent" && meta.route) g.route = meta.route; // Demo never calls a model
         if (meta.source === "agent" && meta.pick) g.pick = meta.pick;
       }
-      else if (meta.phase) g.terminal = TERMINAL[meta.phase];
+      else if (meta.phase) {
+        g.terminal = TERMINAL[meta.phase];
+        g.noReply = meta.source === "agent" && meta.phase === "completed" && meta.outcome === "no_reply" || undefined;
+      }
       if (meta.phase === "failed") g.failed = true;
       const extra = lifecycleStep(e, meta.phase);
       if (extra) g.steps.push({ eventId: e.id, activity: extra });
@@ -192,7 +196,7 @@ export function groupTranscript(events: readonly RoomEvent[]): TranscriptItem[] 
     // A turn that ended with nothing to inspect leaves no empty shell, unless
     // its route is worth saying (a use case, a chosen model, a System One or
     // scheduled start): then it stays one row, with nothing else in it.
-    if (g.steps.length === 0 && !routeBadge(g.route) && !pickBadge(g.pick) && (g.outcome === "completed" || g.outcome === "ended")) continue;
+    if (!g.noReply && g.steps.length === 0 && !routeBadge(g.route) && !pickBadge(g.pick) && (g.outcome === "completed" || g.outcome === "ended")) continue;
     placed.add(key);
     const { started: _s, ended: _e, terminal: _t, ...group } = g;
     items.push({ type: "group", key: `group:${key}`, group });
@@ -421,6 +425,7 @@ export function liveTitle(g: ActivityGroup, name = g.name): string {
 export function groupAccessibleLabel(g: ActivityGroup, name = g.name): string {
   const p = summaryParts(g);
   const outcome = groupOutcomeText(g) ?? (g.outcome === "completed" ? "completed" : g.outcome === "live" ? "in progress" : null);
-  const head = g.outcome === "live" && !g.failed ? liveTitle(g, name) : g.source === "agent" ? name : "Runner activity";
+  const head = g.noReply && g.outcome === "completed" ? `${name} chose not to reply` :
+    g.outcome === "live" && !g.failed ? liveTitle(g, name) : g.source === "agent" ? name : "Runner activity";
   return [head, p.duration, p.tools, p.route, outcome].filter(Boolean).join(", ");
 }

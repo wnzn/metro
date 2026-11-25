@@ -269,6 +269,7 @@ type TreeRow = { room: Room; depth: number };
 
 /** Rooms in server order, each thread right under the room it was delegated from. */
 export function roomTree(list: readonly Room[]): TreeRow[] {
+  list = list.filter(room => room.anchorEventId === undefined);
   const ids = new Set(list.map((r) => r.id));
   const children = new Map<string, Room[]>();
   const roots: Room[] = [];

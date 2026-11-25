@@ -14,6 +14,9 @@ pub mod auth;
 pub mod config;
 pub mod db;
 pub mod device_relay;
+mod directory;
+mod dms;
+mod forward;
 pub mod jobs;
 pub mod library;
 pub mod library_search;
@@ -34,6 +37,7 @@ pub mod runners;
 pub mod schedules;
 pub mod search;
 pub mod space_agents;
+mod space_context;
 pub mod space_prefs;
 pub mod spaces;
 pub mod tools;
@@ -82,6 +86,7 @@ pub struct AppState {
     pub managed: crate::admin_users::Managed,
     /// Avatar re-encodes running at once (see [`crate::profiles`]).
     pub avatar_encodes: Arc<Semaphore>,
+    directory_limit: directory::RateLimit,
     /// Release check, runner presence and runner update requests (memory only).
     pub updates: crate::updates::Updates,
     /// Page builder model turns at once, apart from agent runs.
@@ -132,6 +137,7 @@ impl AppState {
                 }
             },
             avatar_encodes: Arc::new(Semaphore::new(crate::profiles::MAX_AVATAR_ENCODES)),
+            directory_limit: directory::RateLimit::default(),
             page_builds: Arc::new(Semaphore::new(crate::pages::generate::MAX_PAGE_BUILDS)),
             chat_runs: Arc::default(),
             meta_waits: Arc::new(Semaphore::new((limits.max_agent_runs / 2).max(1))),
@@ -261,6 +267,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/chat/events", get(api::chat_events))
         .route("/v1/chat/messages", post(api::chat_message))
+        .route("/v1/forward", post(forward::post))
         .route(
             "/v1/chat/events/{eid}/reactions",
             put(api::put_chat_reaction).delete(api::delete_chat_reaction),
@@ -324,6 +331,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::admin_settings::router())
         // Personal profiles and avatars; the avatar upload sets its own limit.
         .merge(crate::profiles::router())
+        .merge(directory::router().merge(dms::router()))
         // `GET /v1/monitoring/events`: Space owners and org admins.
         .merge(crate::monitoring::router())
         // Space edit/delete/leave, Space agents and per-Space preferences.

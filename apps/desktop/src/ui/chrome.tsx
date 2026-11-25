@@ -544,7 +544,7 @@ export const modalOpen = () => openModals() > 0;
  * callers close it. Sized to the window, never past it: a compact window
  * gets a narrower margin. With reduced motion it appears without a fade.
  */
-export function Modal(props: Testable & { open: boolean; title: string; onClose: () => void; children?: JSX.Element; size?: "large" | "compact" }) {
+export function Modal(props: Testable & { open: boolean; title: string; onClose: () => void; children?: JSX.Element; size?: "large" | "compact" | "full-height" }) {
   effect(() => {
     if (!props.open) return;
     openModals.set(untracked(openModals) + 1);
@@ -555,6 +555,7 @@ export function Modal(props: Testable & { open: boolean; title: string; onClose:
     const margin = compactWidth() ? 16 : 48;
     // A compact modal (a short form, a question) is as tall as its content.
     if (props.size === "compact") return { width: Math.max(300, Math.min(460, w.width - margin)), maxHeight: w.height - margin };
+    if (props.size === "full-height") return { width: Math.max(320, w.width - 16), height: w.height - 16 };
     return { width: Math.max(320, Math.min(1080, w.width - margin)), height: Math.max(360, Math.min(800, w.height - margin)) };
   };
   return (
