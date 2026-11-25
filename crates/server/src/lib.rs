@@ -4,6 +4,7 @@
 //! personal or organization runner attached to it), and Rig agents whose
 //! tools run on that runner.
 
+pub mod admin_settings;
 pub mod admin_users;
 pub mod agent;
 pub mod agent_dispatch;
@@ -261,6 +262,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::library_search::router())
         // Managed user accounts, for org admins (dev namespace only).
         .merge(crate::admin_users::api_router())
+        .merge(crate::admin_settings::router())
         // Personal profiles and avatars; the avatar upload sets its own limit.
         .merge(crate::profiles::router())
         // `GET /v1/monitoring/events`: Space owners and org admins.

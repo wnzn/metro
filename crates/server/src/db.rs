@@ -456,6 +456,7 @@ impl Db {
         reactions::init(&conn)?;
         crate::runners::init(&conn)?;
         crate::admin_users::init(&conn)?;
+        crate::admin_settings::init(&conn)?;
         crate::profiles::init(&conn)?;
         crate::providers::init(&conn)?;
         crate::device_relay::init(&conn)?;
