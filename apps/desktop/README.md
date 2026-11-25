@@ -8,7 +8,8 @@ and Win32 on Windows. No npm or Node is needed to build or run it.
 
 Download the build for your system from
 [Releases](https://github.com/wnzn/metro/releases). **No release has been
-published yet.** The 0.2.0 files have been built and verified locally
+published yet.** The files built and verified locally so far were the
+0.2.0 candidate
 ([evidence](../../docs/acceptance.md#final-metro-020-local-release-prepublication-2026-11-23-project-manager-local)), but there are no files to download yet. You never need NSH, a
 checkout or a terminal to use the app; the build commands further down are
 for contributors.
@@ -26,15 +27,17 @@ for contributors.
 - **Windows x64:** `Metro-<version>-windows-x64.zip`, a portable ZIP. See
   [Windows portable package](#windows-portable-package).
 
-Check each download against the `.sha256` file published beside it. The
-0.2.0 names are verified targets but aren't published yet.
+Check each download against the `.sha256` file published beside it. No
+version has been published yet.
 
-Per-user installer scripts for Linux, Windows and macOS (preview), which
-check the download, add a menu entry and optionally install Linux
-libraries, are described in [docs/install.md](../../docs/install.md). The
-Linux installer passed in a local test cut on Debian 13 and CachyOS
+Per-user installer scripts for Linux and Windows, which check the
+download, add a menu entry and optionally install Linux libraries, are
+described in [docs/install.md](../../docs/install.md). The Linux installer
+passed in a local test cut on Debian 13 and CachyOS
 ([acceptance](../../docs/acceptance.md#staged-installers-and-setup-at-57409bb-2026-11-23-project-manager-local)). None is published or
-signed, and the Windows and macOS ones haven't been run in a recorded test.
+signed, and the Windows one hasn't been run in a recorded test. There's no
+Mac build or download for now: CI doesn't build macOS. The macOS installer
+script stays in the repository, untested, for when Mac builds return.
 
 In 0.2.0, the first screen, **Connect to Metro**, offers two choices:
 
@@ -43,7 +46,7 @@ In 0.2.0, the first screen, **Connect to Metro**, offers two choices:
   token, and its data stays on this computer, separate from any server you
   connect to.
 - **Or connect to a server:** the URL and token your admin gave you
-  ([README](../../README.md#install-and-use-prebuilt-only)).
+  ([README](../../README.md#get-started)).
 
 In the current source after 0.2.0 (checked natively in a Linux test
 archive, [acceptance](../../docs/acceptance.md#staged-startup-server-attachments-and-device-sign-in-at-ba07516-2026-11-23-project-manager-local);
@@ -617,11 +620,11 @@ contributors only, in
 
 The release file will be `Metro-<version>-windows-x64.zip`, a portable build
 with no installer. The package recorded so far was built locally as
-`Metro-windows-x64.zip`. It isn't signed or published yet, and it hasn't been started on native Windows. The 0.2.0 candidate has only been started under Wine. Its
+`Metro-windows-x64.zip`. It isn't published yet, and release ZIPs ship without an Authenticode signature for now ([install.md](../../docs/install.md#desktop-on-windows)). It hasn't been started on native Windows. The 0.2.0 candidate has only been started under Wine. Its
 checks are in [acceptance](../../docs/acceptance.md#verified-windows-x64-portable-package-built-on-linux-2026-11-22-packaging-local).
 
 1. Check the ZIP against its `.sha256` file, for example with
-   `Get-FileHash Metro-0.2.0-windows-x64.zip -Algorithm SHA256` in PowerShell.
+   `Get-FileHash Metro-<version>-windows-x64.zip -Algorithm SHA256` in PowerShell.
 2. Extract the **whole** ZIP. Don't run the app from inside the archive.
 3. Run `Metro\Metro.exe`. Keep the `nsh` folder next to it, because it holds
    the app bundle.

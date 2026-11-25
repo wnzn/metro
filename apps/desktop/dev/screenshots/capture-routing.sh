@@ -130,6 +130,7 @@ api alice PUT "/v1/spaces/$sid/prefs" '{"classify_unaddressed":true}' >/dev/null
 # --- the app, natively, in the container, from the disposable copy -------------
 TOKEN_FILE="$sec/alice" URL="$url" SPACE="$sid" SHARED="$local_qwen" SHOTS=/shots node "$here/routing-steps.mjs" alice |
   docker run --rm -i --init --network host --user "$(id -u):$(id -g)" -e HOME=/tmp -e SCREEN=1280x1080x24 \
+    -e DISPLAY_NUM=$((200 + RANDOM % 600)) \
     -v "$NSH_DIST":/opt/nsh:ro -v "$copy":/app -v "$out":/shots -w /app "$image" \
     sh /app/dev/screenshots/with-display.sh /opt/nsh/bin/nsh test App.tsx --target linux
 

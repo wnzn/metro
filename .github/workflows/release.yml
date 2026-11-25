@@ -1,15 +1,24 @@
 name: Release artifacts
 
-# Reusable, read-only platform build and smoke gates. Main and PRs get preview
-# artifacts only. Eligible protected master pushes instead hand off the verified
-# Windows ZIP seed, the ad hoc macOS archives and Linux archives. No job in
-# this tree can sign with credentials or publish.
+# Reusable, read-only platform build and smoke gates. PRs and main pushes that
+# do not release get preview artifacts only. An eligible protected main push (a
+# version bump) instead hands off the Linux archives and, per
+# packaging/windows-release-signing.txt, either the verified Windows ZIP seed
+# for signing (signed) or the natively tested unsigned Windows build
+# (unsigned). No job in this tree can sign with credentials or publish.
+#
+# macOS builds are off for now, for every event: GitHub's macOS runners queued
+# for 15+ minutes and the jobs were cancelled. The macOS packaging code stays
+# (packaging/package.py, macos_release.py, install-metro-macos.sh,
+# smoke-macos-launch.sh). To restore the builds, take the `desktop-macos` job
+# and meta's macOS matrix step from this file at commit 106e5da, and the
+# `macos-sign` job from release-publish.yml there.
 
 on:
   workflow_call:
     inputs:
       release:
-        description: 'Stage native signing inputs for an official master release; false yields a preview.'
+        description: 'Stage native signing inputs for an official main release; false yields a preview.'
         type: boolean
         default: false
       version:
@@ -47,7 +56,7 @@ jobs:
         run: |
           set -eu
           if [ "$RELEASE" = true ]; then
-            # Official builds only for the protected master push (release_policy.py), and only
+            # Official builds only for the protected main push (release_policy.py), and only
             # for the checked-in version that the caller's release decision chose.
             python3 -I packaging/release_policy.py provenance > "$RUNNER_TEMP/policy.txt"
             version="$(sed -n 's/^version=//p' "$RUNNER_TEMP/policy.txt")"
@@ -69,6 +78,7 @@ jobs:
   runner-linux:
     needs: meta
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -247,6 +257,7 @@ jobs:
   desktop-windows:
     needs: [meta, ui]
     runs-on: windows-2025
+    timeout-minutes: 40
     defaults:
       run:
         shell: pwsh
@@ -258,9 +269,17 @@ jobs:
         with:
           name: ui-windows-x64
           path: ${{ runner.temp }}/stage
-      - name: Toolchain, locked fetch and native tests of the launcher
+      - name: Rust toolchain
+        run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
+      # Previews only: official builds always compile from a clean target. Only
+      # main pushes write the cache.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ !inputs.release }}
+        with:
+          key: x86_64-pc-windows-msvc
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Locked fetch and native tests of the launcher
         run: |
-          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
           cargo fetch --locked --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python --version
@@ -606,11 +625,15 @@ jobs:
 
   # Windows distribution (owned by the Windows lane): turns the seed into the
   # ZIP, the MSI and the two PowerShell scripts, the ZIP and MSI each with a
-  # .sha256. Pull requests and main: uploaded as dist-desktop-windows-x64
-  # (unsigned preview). Official master: uploaded as unsigned-desktop-windows-x64 for
-  # windows-sign.yml in release-publish.yml, the only place that may hold
-  # id-token: write. This call grants contents: read only, so nothing in its
-  # tree may request more (GitHub checks nested permissions before any `if:`).
+  # .sha256. Pull requests and main pushes without a release: uploaded as
+  # dist-desktop-windows-x64 (unsigned preview). Official main release, signed
+  # (packaging/windows-release-signing.txt): the seed is uploaded as
+  # unsigned-desktop-windows-x64 for windows-sign.yml in release-publish.yml,
+  # the only place that may hold id-token: write. Official main release,
+  # unsigned: the same unsigned build as a preview, tested natively, uploaded
+  # as dist-desktop-windows-x64 for release-publish.yml. This call grants
+  # contents: read only, so nothing in its tree may request more (GitHub
+  # checks nested permissions before any `if:`).
   windows-distribution:
     needs: [meta, desktop-windows]
     uses: ./.github/workflows/windows-distribution.yml
@@ -620,12 +643,12 @@ jobs:
     permissions:
       contents: read
 
-  # Linux x64 desktop. The GUI launch is best-effort on a headless runner
-  # (Xvfb + WebKitGTK); native tests, layout, checksum, capability and server
-  # checks are blocking.
+  # Linux x64 desktop: build, package, layout, checksum, capability, server
+  # and installer checks, all blocking. There is no GUI launch here.
   desktop-linux:
     needs: [meta, ui]
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -634,14 +657,22 @@ jobs:
         with:
           name: ui-linux-x64
           path: ${{ runner.temp }}/stage
-      - name: Toolchain, locked fetch and native tests of the launcher
+      - name: Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      # Previews only: official builds always compile from a clean target. Only
+      # main pushes write the cache.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ !inputs.release }}
+        with:
+          key: x86_64-unknown-linux-gnu
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # metro-desktop's tests run on Linux in ci.yml's rust job.
+      - name: Locked fetch and build tools
         run: |
           set -eu
-          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
           cargo fetch --locked --target x86_64-unknown-linux-gnu
           python3 -I -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
           readelf --version | head -1
-          cargo test --locked --release -p metro-desktop
       - name: Build metro-desktop, metro-server and metro-tui (locked)
         run: |
           set -eu
@@ -721,7 +752,10 @@ jobs:
             sleep 1
           done
           echo "metro-server did not answer /healthz" >&2; exit 1
-      - name: Per-user desktop installer (explains missing libraries, --install-deps, update, uninstall keeps data)
+      # No network: --install-deps (a ~60 MB download from a slow mirror) and
+      # install, update and uninstall without the libraries are covered by
+      # packaging/test_installers.py with fake tools.
+      - name: Per-user desktop installer (explains missing libraries; install, update, uninstall when present)
         env:
           VERSION: ${{ needs.meta.outputs.version }}
         run: |
@@ -731,67 +765,31 @@ jobs:
           unset XDG_CONFIG_HOME XDG_DATA_HOME
           i="$GITHUB_WORKSPACE/packaging/install-metro-linux.sh"
           a="$GITHUB_WORKSPACE/dist/Metro-$VERSION-linux-x64.tar.gz"
+          app="$home/.local/share/metro-desktop-app"
+          entry="$home/.local/share/applications/dev.metro.desktop.desktop"
           mkdir -p "$home/.config/metro-desktop" && echo keep > "$home/.config/metro-desktop/marker"
-          if ldd "$METRO_ROOT/ui/Metro" | grep -q 'not found'; then
-            # Without --install-deps nothing on the system changes and the exact command is shown.
-            if sh "$i" install --archive "$a" 2>"$RUNNER_TEMP/deps.err"; then
+          if ldd "$METRO_ROOT/Metro" "$METRO_ROOT/metro-server" "$METRO_ROOT/ui/Metro" | grep -q 'not found'; then
+            # Without --install-deps it refuses, shows the exact command and changes nothing.
+            if sh "$i" install --archive "$a" </dev/null 2>"$RUNNER_TEMP/deps.err"; then
               echo "installed without its runtime libraries" >&2; exit 1
             fi
             grep -F 'sudo apt-get install --no-install-recommends libgtk-4-1 libwebkitgtk-6.0-4 gstreamer1.0-plugins-base' "$RUNNER_TEMP/deps.err"
-            test ! -e "$home/.local/share/metro-desktop-app"
+            grep -F -- '--install-deps' "$RUNNER_TEMP/deps.err"
+            test ! -e "$app" && test ! -e "$entry"
+          else
+            # The libraries are already here, so the real lifecycle needs no download.
+            sh "$i" install --archive "$a" </dev/null
+            test -f "$app/current/enable-local-runner"
+            grep -F "Exec=/usr/bin/env \"$app/versions/$VERSION/Metro\"" "$entry"
+            sh "$i" check-deps
+            sh "$i" update --archive "$a" --no-local-runner
+            test ! -e "$app/current/enable-local-runner"
+            sh "$i" update --archive "$a"
+            test ! -e "$app/current/enable-local-runner"
+            sh "$i" uninstall
+            test ! -e "$app" && test ! -e "$entry"
           fi
-          # apt-get asks before installing; the CI answers for the person.
-          yes | DEBIAN_FRONTEND=noninteractive sh "$i" install --archive "$a" --install-deps
-          test -f "$home/.local/share/metro-desktop-app/current/enable-local-runner"
-          grep -F "Exec=/usr/bin/env \"$home/.local/share/metro-desktop-app/versions/$VERSION/Metro\"" \
-            "$home/.local/share/applications/dev.metro.desktop.desktop"
-          sh "$i" check-deps
-          sh "$i" update --archive "$a" --no-local-runner
-          test ! -e "$home/.local/share/metro-desktop-app/current/enable-local-runner"
-          sh "$i" update --archive "$a"
-          test ! -e "$home/.local/share/metro-desktop-app/current/enable-local-runner"
-          sh "$i" uninstall
-          test ! -e "$home/.local/share/metro-desktop-app" && test ! -e "$home/.local/share/applications/dev.metro.desktop.desktop"
           test "$(cat "$home/.config/metro-desktop/marker")" = keep
-      - name: Launch under Xvfb (best effort)
-        continue-on-error: true
-        run: |
-          set -eu
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends xvfb xdotool x11-utils imagemagick libwebkitgtk-6.0-4 libgtk-4-1
-          work="$(mktemp -d "$RUNNER_TEMP/desktop-run.XXXXXX")"
-          mkdir -p "$RUNNER_TEMP/shot"
-          # shellcheck disable=SC2016 # the inner script expands its own variables
-          for attempt in 1 2 3; do
-            if GDK_BACKEND=x11 METRO_DESKTOP_HOME="$work/home" xvfb-run -a --server-args='-screen 0 1280x800x24' bash -c '
-              set -eu
-              mkdir -p "$METRO_DESKTOP_HOME"
-              cd "$1"
-              HOME="$1" "$METRO_ROOT/Metro" &
-              pid=$!
-              for _ in $(seq 1 45); do
-                kill -0 "$pid" 2>/dev/null || { echo "launcher exited early" >&2; exit 1; }
-                xdotool search --name "^Metro$" >/dev/null 2>&1 && break
-                sleep 1
-              done
-              wid="$(xdotool search --name "^Metro$" | head -n 1)"
-              xprop -id "$wid" WM_CLASS | grep -F dev.metro.desktop
-              sleep 8
-              kill -0 "$pid"
-              import -window root "$2/desktop-linux.png" || true
-              kill "$pid"
-            ' _ "$work" "$RUNNER_TEMP/shot"; then exit 0; fi
-            echo "attempt $attempt failed" >&2
-          done
-          exit 1
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always()
-        with:
-          name: smoke-linux-screenshot
-          path: ${{ runner.temp }}/shot
-          if-no-files-found: ignore
-          overwrite: true
-          retention-days: 7
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-desktop-linux-x64
@@ -800,219 +798,12 @@ jobs:
           overwrite: true
           retention-days: 14
 
-  # macOS build and preview. Native jobs per architecture (macos-15 = Apple
-  # silicon, macos-15-intel = Intel; GitHub offers Intel macOS runners until
-  # August 2027). They build and test the launcher and server natively, package
-  # the stock NSH macOS runtime (pinned asset and runtime digests) as the inner
-  # MetroUI.app, assemble and ad hoc sign the outer Metro.app, install it with
-  # install-metro-macos.sh into a path with spaces and check a clean start and
-  # shutdown. This job never sees signing credentials (it runs third-party build
-  # code). Its ad hoc output is uploaded as preview-not-verified-adhoc-*, never
-  # matched by the release collection; release-publish.yml signs and notarizes
-  # it on eligible master pushes.
-  desktop-macos:
-    needs: meta
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15
-            target: macos-arm64
-            rust: aarch64-apple-darwin
-            arch: arm64
-            nsh_asset: nsh-macos-arm64.tar.gz
-            nsh_sha256: ee1aed2a4d111fe90e6cceca4b9d5f834c9e11cfda525f8be984261a329c06de
-          - runner: macos-15-intel
-            target: macos-x64
-            rust: x86_64-apple-darwin
-            arch: x86_64
-            nsh_asset: nsh-macos-x86_64.tar.gz
-            nsh_sha256: 23ccbfa71f50eb312e57862b7b843a15b23c1b9a9464cfc30735b1c07a18e324
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
-    env:
-      TARGET: ${{ matrix.target }}
-      RUST_TARGET: ${{ matrix.rust }}
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-      - name: Runner architecture matches the target
-        env:
-          ARCH: ${{ matrix.arch }}
-        run: |
-          set -eu
-          test "$(uname -m)" = "$ARCH"
-          sw_vers
-      - name: Install pinned NSH for macOS (asset digest, then runtime digest in package.py)
-        env:
-          NSH_ASSET: ${{ matrix.nsh_asset }}
-          NSH_ASSET_SHA256: ${{ matrix.nsh_sha256 }}
-        run: |
-          set -eu
-          archive="$RUNNER_TEMP/$NSH_ASSET"
-          curl --fail --silent --show-error --location --retry 3 --output "$archive" \
-            "https://github.com/longbridge/nsh/releases/download/$NSH_VERSION/$NSH_ASSET"
-          printf '%s  %s\n' "$NSH_ASSET_SHA256" "$archive" | shasum -a 256 -c -
-          mkdir -p "$RUNNER_TEMP/nsh-macos"
-          tar -xzf "$archive" -C "$RUNNER_TEMP/nsh-macos"
-          printf '%s\n' "$RUNNER_TEMP/nsh-macos/nsh/bin" >> "$GITHUB_PATH"
-      - name: nsh package --target macos (inner MetroUI bundle, its own identifier)
-        working-directory: apps/desktop
-        env:
-          VERSION: ${{ needs.meta.outputs.version }}
-          # Package the pinned prebuilt runner. Without NSH_RUNTIME, nsh on a Mac
-          # with cargo builds an app-specific runner from source instead.
-          NSH_RUNTIME: ${{ runner.temp }}/nsh-macos/nsh/runtime
-        run: |
-          set -eu
-          python3 -I - "$GITHUB_WORKSPACE/packaging" "$TARGET" "$NSH_RUNTIME/macos/nsh-macos-app" <<'PY'
-          import hashlib, runpy, sys
-          pinned = runpy.run_path(sys.argv[1] + "/package.py")["NSH_MACOS_APPS"][sys.argv[2]][0]
-          got = hashlib.sha256(open(sys.argv[3], "rb").read()).hexdigest()
-          assert got == pinned, f"NSH_RUNTIME runner is not the pinned stock runtime: {got}"
-          PY
-          nsh package App.tsx --target macos --id dev.metro.desktop.ui --app-version "${VERSION#v}" \
-            --icon assets/metro-256.png --out "$RUNNER_TEMP/out-macos"
-          find "$RUNNER_TEMP/out-macos" | head -40
-          plutil -p "$RUNNER_TEMP/out-macos/Metro.app/Contents/Info.plist"
-          codesign --verify --strict --verbose=2 "$RUNNER_TEMP/out-macos/Metro.app"
-          codesign --display --verbose=2 "$RUNNER_TEMP/out-macos/Metro.app" 2>&1 | grep -E '^(Identifier|Format|CodeDirectory|Signature|TeamIdentifier)='
-          # Early, explicit: the inner executable is the stock runtime re-signed ad hoc
-          # (package.py repeats this check before it assembles the outer app).
-          python3 -I - "$GITHUB_WORKSPACE/packaging" "$NSH_RUNTIME/macos/nsh-macos-app" \
-            "$RUNNER_TEMP/out-macos/Metro.app/Contents" "$TARGET" <<'PY'
-          import sys
-          from pathlib import Path
-          sys.path.insert(0, sys.argv[1])
-          import package
-          contents = Path(sys.argv[3])
-          package.stock_renderer(contents / "MacOS/Metro", Path(sys.argv[2]), contents, sys.argv[4])
-          print("inner executable: stock NSH runtime, re-signed ad hoc for", package.MACOS_UI_ID)
-          PY
-      - name: Toolchain, locked fetch and native tests of the launcher
-        run: |
-          set -eu
-          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target "$RUST_TARGET"
-          cargo fetch --locked --target "$RUST_TARGET"
-          python3 -I -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
-          cargo test --locked --release --target "$RUST_TARGET" -p metro-desktop
-      - name: Build metro-desktop, metro-server and metro-tui (native, locked)
-        run: |
-          set -eu
-          cargo build --locked --release --target "$RUST_TARGET" --bin metro-desktop --bin metro-server --bin metro-tui
-      - name: Third-party notices
-        run: |
-          set -eu
-          python3 -I packaging/cargo-notices.py --target "$RUST_TARGET" \
-            --package metro-desktop --package metro-server --package metro-tui --out "$RUNNER_TEMP/notices-desktop.txt"
-      - name: Package (outer Metro.app, ad hoc signed preview)
-        env:
-          VERSION: ${{ needs.meta.outputs.version }}
-        run: |
-          set -eu
-          rel="target/$RUST_TARGET/release"
-          python3 -I packaging/package.py desktop --target "$TARGET" --version "$VERSION" \
-            --launcher "$rel/metro-desktop" --server "$rel/metro-server" --tui "$rel/metro-tui" \
-            --ui-dir "$RUNNER_TEMP/out-macos/Metro.app" --nsh-root "$RUNNER_TEMP/nsh-macos/nsh" \
-            --notices "$RUNNER_TEMP/notices-desktop.txt" --out-dir dist-macos
-          ls -l dist-macos
-      - name: Install into a path with spaces, then a clean start and shutdown
-        timeout-minutes: 8
-        shell: bash
-        env:
-          VERSION: ${{ needs.meta.outputs.version }}
-        run: |
-          set -Eeuo pipefail
-          # Every check runs under a named gate; a failure reports that gate and the
-          # script line. Nothing prints process arguments, the environment or tokens.
-          gate=setup
-          trap 'echo "::error title=macOS install smoke::gate \"$gate\" failed (step script line $LINENO)" >&2' ERR
-          # Exact folder inventory: names, kinds and the marker's mode, no extras.
-          # (Not `find | sort`: sort order follows the runner's en_US.UTF-8 collation.)
-          inventory() { # DIR NAME=KIND...  (KIND: dir, or empty-file-644)
-            python3 -I - "$@" <<'PY'
-          import stat, sys
-          from pathlib import Path
-          folder, want = Path(sys.argv[1]), dict(a.split("=", 1) for a in sys.argv[2:])
-          def kind(p):
-              st = p.lstat()
-              if stat.S_ISLNK(st.st_mode):
-                  return "symlink"
-              if stat.S_ISDIR(st.st_mode):
-                  return "dir"
-              if stat.S_ISREG(st.st_mode):
-                  return f"{'empty-' if st.st_size == 0 else ''}file-{stat.S_IMODE(st.st_mode):03o}"
-              return "other"
-          got = {p.name: kind(p) for p in folder.iterdir()}
-          if got != want:
-              print(f"{folder.name}: expected {sorted(want.items())}, found {sorted(got.items())}", file=sys.stderr)
-              sys.exit(1)
-          PY
-          }
-          home="$(mktemp -d "$RUNNER_TEMP/mac home.XXXXXX")"
-          home="$(cd "$home" && pwd -P)"
-          a="$GITHUB_WORKSPACE/dist-macos/Metro-$VERSION-$TARGET.tar.gz"
-          i="$GITHUB_WORKSPACE/packaging/install-metro-macos.sh"
-          dir="$home/Applications/Metro Desktop"
-          app="$dir/Metro.app"
-
-          gate="install (path with spaces)"
-          HOME="$home" sh "$i" install --archive "$a"
-          gate="install folder holds exactly Metro.app and the local-runner marker"
-          inventory "$dir" Metro.app=dir enable-local-runner=empty-file-644
-          gate="codesign --verify --deep --strict Metro.app"
-          codesign --verify --deep --strict "$app"
-          gate="codesign --verify --strict MetroUI.app"
-          codesign --verify --strict "$app/Contents/Helpers/MetroUI.app"
-          gate="codesign --verify --strict metro-tui"
-          codesign --verify --strict "$app/Contents/MacOS/metro-tui"
-          gate="metro-tui --help (exit 0, about text on stdout)"
-          "$app/Contents/MacOS/metro-tui" --help > "$RUNNER_TEMP/tui-help.txt"
-          grep -q "Metro conversations" "$RUNNER_TEMP/tui-help.txt"
-          gate="outer bundle identifier dev.metro.desktop"
-          test "$(plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist")" = dev.metro.desktop
-          gate="inner bundle identifier dev.metro.desktop.ui"
-          test "$(plutil -extract CFBundleIdentifier raw "$app/Contents/Helpers/MetroUI.app/Contents/Info.plist")" = dev.metro.desktop.ui
-
-          gate="launch smoke (smoke-macos-launch.sh names its own failing check)"
-          export METRO_DESKTOP_HOME="$home/desktop data"
-          sh packaging/smoke-macos-launch.sh "$app" "$home/Library/Application Support/Metro/Installer/RELEASE.json" \
-            "$RUNNER_TEMP/shot" "desktop-$TARGET"
-
-          gate="update --no-local-runner removes only the marker"
-          HOME="$home" sh "$i" update --archive "$a" --no-local-runner
-          inventory "$dir" Metro.app=dir
-          gate="uninstall removes the app folder and keeps Metro data"
-          HOME="$home" sh "$i" uninstall
-          test ! -e "$dir"
-          test -d "$METRO_DESKTOP_HOME"
-          gate="all checks passed"
-          echo "macOS install smoke passed"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always()
-        with:
-          name: smoke-${{ matrix.target }}-screenshot
-          path: ${{ runner.temp }}/shot/*.png
-          if-no-files-found: ignore
-          overwrite: true
-          retention-days: 7
-      # Named so it cannot be mistaken for a release asset.
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: preview-not-verified-adhoc-${{ matrix.target }}
-          path: dist-macos/
-          if-no-files-found: error
-          overwrite: true
-          retention-days: 7
-
   # The preview aggregate: the Linux and Windows
   # desktop archives, the Windows MSI, the Linux runner, their .sha256
   # sidecars and the installer scripts in one SHA256SUMS, checked by the same
-  # release_assets.py as the release but without macOS (its ad hoc previews
-  # are separate artifacts) and without signature requirements.
+  # release_assets.py as the release but without signature requirements.
   assets:
-    needs: [meta, runner-linux, windows-distribution, desktop-linux, desktop-macos]
+    needs: [meta, runner-linux, windows-distribution, desktop-linux]
     if: ${{ !inputs.release }}
     runs-on: ubuntu-24.04
     permissions:

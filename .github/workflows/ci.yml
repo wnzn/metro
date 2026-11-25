@@ -1,24 +1,40 @@
 name: CI
 
-# Public releases come only from a protected push to refs/heads/master (see
-# packaging/release_policy.py). Pull requests (including into master) and
-# main run read-only previews; tag pushes start nothing here.
+# Public releases come only from a protected push to refs/heads/main that
+# changes the checked-in version (see packaging/release_policy.py). Other
+# main pushes and pull requests run CI and read-only previews only; tag
+# pushes start nothing here.
 on:
   pull_request:
   push:
-    branches: [main, master]
+    branches: [main]
 
 permissions:
   contents: read
 
-# Official master runs are serialized. A new run may replace a pending one,
-# but cannot interrupt the run already signing or publishing.
+# A new push to a pull request cancels that PR's older run. Every other run,
+# including every push to main, has its own group and is never cancelled or
+# replaced. Only actual releases are serialized, by the `publish` job's own
+# concurrency group below.
 concurrency:
-  group: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && github.ref_protected && !github.event.deleted && !github.event.forced && 'metro-official-master' || format('ci-{0}', github.run_id) }}
-  cancel-in-progress: false
+  group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# `workflows` always runs. It classifies the diff of a pull request into main
+# (from the merge base) or of a push to main (from github.event.before) into
+# segments (packaging/ci_changes.py), and each job below runs only when its
+# segment is not 'false'. An empty answer (classifier skipped, failed or not
+# reached) runs the job. A skipped job counts as passed for branch protection.
+# When release-policy decides to release, every gate the `release` job needs
+# runs whatever the classifier said, and `release` requires each to succeed.
+# If `workflows` fails, `rust`, `containers` and `packaging` still run
+# (`desktop` and `package-smoke`, as before, do not).
 jobs:
   rust:
+    needs: [workflows, release-policy]
+    if: >-
+      ${{ !cancelled() && (needs.workflows.outputs.rust != 'false'
+      || needs.release-policy.outputs.release == 'true') }}
     runs-on: ubuntu-24.04
     env:
       RUSTUP_TOOLCHAIN: 1.98.1
@@ -27,20 +43,17 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+      # Only main pushes write the cache; pull requests and other pushes only read it.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      # Some tests start the real target/debug/metro-server; build it first on a fresh runner.
-      - run: cargo build --locked --bin metro-server
+      # Some tests start the real target/debug/metro-server, so build first.
+      - name: Locked debug build of every binary the tests and end-to-end tests run
+        run: cargo build --locked --bin metro-server --bin metro-runner --bin metro-connector --bin metro-tui
       - run: cargo test --locked --workspace
       - run: ./examples/workspace/check.sh
-      - name: Locked debug build of every binary the end-to-end tests run
-        run: cargo build --locked --bin metro-server --bin metro-runner --bin metro-connector --bin metro-tui
-      - name: Release build of the Linux connector companion
-        run: |
-          set -eu
-          cargo build --locked --release --bin metro-connector
-          test -x target/release/metro-connector
-          sha256sum target/release/metro-connector
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
@@ -71,9 +84,16 @@ jobs:
         run: timeout --kill-after=15s 240s python3 -B crates/tui/tests/pty_qa.py --bin-dir target/debug
 
   desktop:
-    needs: workflows
+    # Release runs stay on GitHub-hosted runners: the self-hosted queue is used
+    # only when the selector chose it and release-policy did not choose a
+    # release (it is skipped for pull requests, and CI only for main pushes
+    # without a version bump). Still runs when release-policy is skipped.
+    needs: [workflows, release-policy]
+    if: >-
+      ${{ !cancelled() && needs.workflows.result == 'success' && needs.release-policy.result != 'failure'
+      && (needs.workflows.outputs.desktop != 'false' || needs.release-policy.outputs.release == 'true') }}
     # Choose a queue, not a fallback if the selected runner is offline.
-    runs-on: ${{ needs.workflows.outputs.desktop_runner == 'metro-ci-linux-x64' && 'metro-ci-linux-x64' || 'ubuntu-24.04' }}
+    runs-on: ${{ needs.workflows.outputs.desktop_runner == 'metro-ci-linux-x64' && needs.release-policy.outputs.release != 'true' && 'metro-ci-linux-x64' || 'ubuntu-24.04' }}
     env:
       NSH_VERSION: v0.6.1
       NSH_ARCHIVE_SHA256: 9a7ac692f1c229df476be8ff83a3c5912d271453b644e313f02cb19d18696070
@@ -119,12 +139,15 @@ jobs:
           printf '%s\n' "$install_dir/nsh/bin" >> "$GITHUB_PATH"
       - run: nsh check
         working-directory: apps/desktop
+      # The release build is package-smoke's `ui` job (when the `previews` segment runs).
       - run: nsh test
-        working-directory: apps/desktop
-      - run: nsh build --release
         working-directory: apps/desktop
 
   containers:
+    needs: [workflows, release-policy]
+    if: >-
+      ${{ !cancelled() && (needs.workflows.outputs.containers != 'false'
+      || needs.release-policy.outputs.release == 'true') }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -309,7 +332,11 @@ jobs:
   workflows:
     runs-on: ubuntu-24.04
     outputs:
-      docs_only: ${{ steps.preview-policy.outputs.docs_only }}
+      rust: ${{ steps.changes.outputs.rust }}
+      desktop: ${{ steps.changes.outputs.desktop }}
+      containers: ${{ steps.changes.outputs.containers }}
+      packaging: ${{ steps.changes.outputs.packaging }}
+      previews: ${{ steps.changes.outputs.previews }}
       desktop_runner: ${{ steps.desktop-route.outputs.desktop_runner }}
     env:
       ACTIONLINT_VERSION: 1.7.12
@@ -413,6 +440,32 @@ jobs:
           set -eu
           bad="$(grep -hE '^\s*(-\s+)?uses:' .github/workflows/*.yml | grep -vE 'uses:\s+\./' | grep -vE 'uses:[[:space:]]+[^@[:space:]]+@[0-9a-f]{40}([[:space:]]|$)' || true)"
           [ -z "$bad" ] || { printf 'unpinned actions:\n%s\n' "$bad" >&2; exit 1; }
+      # One diff, one answer per segment (rust, desktop, containers, packaging,
+      # previews). Pull requests into main and pushes to main are classified;
+      # anything else, and any doubt, answers 'true' everywhere.
+      - name: Classify the changes into CI segments
+        id: changes
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          EVENT_BEFORE: ${{ github.event.before }}
+          EVENT_AFTER: ${{ github.event.after }}
+          EVENT_FORCED: ${{ github.event.forced }}
+          EVENT_DELETED: ${{ github.event.deleted }}
+        run: python3 -I packaging/ci_changes.py >> "$GITHUB_OUTPUT"
+
+  # Separate from `workflows`, so the desktop job and package previews do not
+  # wait for these tests. Official releases still need them.
+  packaging:
+    needs: [workflows, release-policy]
+    if: >-
+      ${{ !cancelled() && (needs.workflows.outputs.packaging != 'false'
+      || needs.release-policy.outputs.release == 'true') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
       - name: Packaging and installer tests (PE resources, app-menu integration, isolated installers)
         run: |
           sudo apt-get update -qq
@@ -421,29 +474,22 @@ jobs:
           # pwsh ships with the ubuntu-24.04 image; the PowerShell tests skip without it.
           command -v pwsh
           python3 -B -m unittest discover -s packaging -v
-      - name: Check whether this PR needs the optional package previews
-        id: preview-policy
-        if: github.event_name == 'pull_request' && github.base_ref == 'main'
-        env:
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
-          PR_HEAD: ${{ github.event.pull_request.head.sha }}
-        run: |
-          if python3 -I packaging/package_smoke_policy.py; then
-            echo 'docs_only=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'docs_only=false' >> "$GITHUB_OUTPUT"
-          fi
+          # Their own folders: discover -s packaging does not descend into them.
+          # The public-Sigstore fixture test skips without METRO_TEST_COSIGN.
+          python3 -B -m unittest discover -s packaging/release-signatures -v
+          python3 -B -m unittest discover -s packaging/windows-signing -v
 
-  # The release decision for the official master push: provenance first (no
-  # secrets, read-only token), then the checked-in version and its eligibility
-  # (new / resume -> release; unchanged / done -> CI only). Skipped for every
-  # other event, so nothing else can release.
+  # The release decision for an official main push: provenance first (no
+  # secrets, read-only token), then whether this push changed the checked-in
+  # version, then its eligibility (new / resume -> release; unchanged,
+  # no-previous-version, done -> CI only). Only a version bump looks at tags
+  # and releases. Skipped for every other event, so nothing else can release.
   release-policy:
     if: >-
-      github.event_name == 'push' && github.repository == 'wnzn/metro' && github.ref == 'refs/heads/master'
+      github.event_name == 'push' && github.repository == 'wnzn/metro' && github.ref == 'refs/heads/main'
       && github.repository_id == '1467654868' && github.ref_protected
       && github.event.deleted == false && github.event.forced == false && github.event.after == github.sha
-      && github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master'
+      && github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/main'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -468,14 +514,15 @@ jobs:
         run: python3 -I packaging/release_policy.py decide
 
   # Build and package everything a release would ship, but publish nothing:
-  # PRs except proven docs-only changes to main, main pushes, and already
-  # released master versions. Unknown PR diffs still build.
+  # pull requests and main pushes that change a build input (the `previews`
+  # segment), and every PR to another branch, but never a release run.
+  # Unknown or unreadable diffs still build. No macOS builds for now (see release.yml).
   # No secrets and contents: read only (release.yml's whole tree stays read-only).
   package-smoke:
     needs: [workflows, release-policy]
     if: >-
       ${{ !cancelled() && needs.workflows.result == 'success'
-      && needs.workflows.outputs.docs_only != 'true'
+      && needs.workflows.outputs.previews != 'false'
       && (needs.release-policy.result == 'skipped'
           || (needs.release-policy.result == 'success' && needs.release-policy.outputs.release != 'true')) }}
     uses: ./.github/workflows/release.yml
@@ -485,10 +532,15 @@ jobs:
       contents: read
 
   # Build and exercise every platform on the exact protected push revision.
-  # This tree cannot write or see signing credentials.
+  # This tree cannot write or see signing credentials. Every gate must have
+  # run and passed: a skipped gate stops the release, never waives it.
   release:
-    needs: [rust, desktop, containers, workflows, release-policy]
-    if: needs.release-policy.outputs.release == 'true'
+    needs: [rust, desktop, containers, workflows, packaging, release-policy]
+    if: >-
+      needs.release-policy.outputs.release == 'true'
+      && needs.rust.result == 'success' && needs.desktop.result == 'success'
+      && needs.containers.result == 'success' && needs.workflows.result == 'success'
+      && needs.packaging.result == 'success'
     uses: ./.github/workflows/release.yml
     with:
       release: true
@@ -496,17 +548,25 @@ jobs:
     permissions:
       contents: read
 
-  # Then: Windows signing and verification, exact-commit tag, macOS signing,
+  # Then: Windows signing and verification (skipped when
+  # packaging/windows-release-signing.txt says unsigned), exact-commit tag,
   # GHCR images, Sigstore, and automatic public release of the verified set.
   # No tag event is used.
   publish:
     needs: [release-policy, release]
     if: >-
       needs.release-policy.outputs.release == 'true'
-      && github.event_name == 'push' && github.repository == 'wnzn/metro' && github.ref == 'refs/heads/master'
+      && github.event_name == 'push' && github.repository == 'wnzn/metro' && github.ref == 'refs/heads/main'
       && github.repository_id == '1467654868' && github.ref_protected
       && github.event.deleted == false && github.event.forced == false && github.event.after == github.sha
-      && github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master'
+      && github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/main'
+    # Only actual releases are serialized: a second release run's `publish`
+    # waits until the first one finishes and never interrupts it. Everything
+    # before it (tests, read-only builds) runs per run. The `release` job only
+    # builds read-only artifacts, so it needs no group.
+    concurrency:
+      group: metro-official-release
+      cancel-in-progress: false
     uses: ./.github/workflows/release-publish.yml
     with:
       version: ${{ needs.release-policy.outputs.version }}
@@ -514,9 +574,3 @@ jobs:
       contents: write
       packages: write
       id-token: write
-    secrets:
-      MACOS_SIGNING_P12_BASE64: ${{ secrets.MACOS_SIGNING_P12_BASE64 }}
-      MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
-      APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-      APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-      APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}

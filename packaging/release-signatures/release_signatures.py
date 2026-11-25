@@ -17,15 +17,16 @@ import tarfile
 REPOSITORY = "https://github.com/wnzn/metro"
 REPOSITORY_ID = "1467654868"
 ISSUER = "https://token.actions.githubusercontent.com"
-SOURCE_REF = "refs/heads/master"
+SOURCE_REF = "refs/heads/main"
 MANIFEST = "SHA256SUMS"
 BUNDLE = ".sigstore.json"
 SIGNER_WORKFLOW = "sign-release-assets.yml"
 CALLER_WORKFLOW = "ci.yml"
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?")
 COMMIT = re.compile(r"[0-9a-f]{40}")
+# install-metro-macos.sh ships only next to macOS archives (none for now; see MACOS_TARGETS).
 INSTALLERS = {
-    "install-metro-linux.sh", "install-metro-macos.sh", "install-metro-runner-linux.sh",
+    "install-metro-linux.sh", "install-metro-runner-linux.sh",
     "install-metro-windows.ps1", "metro-runner-container.sh", "metro-runner-container.ps1",
 }
 IMAGES = {
@@ -83,11 +84,48 @@ def direct_archives(version):
     return (f"Metro-{version}-linux-x64.tar.gz", f"Metro-runner-{version}-linux-x64.tar.gz")
 
 
-def binaries(version):
+# The Macs a release ships (release_assets.MACOS): none for now. macOS builds
+# are off in CI (GitHub's macOS runners queued for 15+ minutes and jobs were
+# cancelled; see release.yml). When they return, list the targets here and add
+# install-metro-macos.sh to INSTALLERS again.
+MACOS_TARGETS = ()
+
+# The checked-in switch for how official releases ship Windows. There is no
+# default and no environment override: only this file decides, so changing it
+# is a reviewed one-line pull request.
+WINDOWS_SIGNING_FILE = Path(__file__).resolve().parents[1] / "windows-release-signing.txt"
+WINDOWS_SIGNING_MODES = ("signed", "unsigned")
+
+
+def parse_windows_signing(text):
+    values = [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    require(len(values) == 1 and values[0] in WINDOWS_SIGNING_MODES,
+            "windows-release-signing.txt must hold exactly one value line: signed or unsigned")
+    return values[0]
+
+
+def windows_signing(path=None):
+    """`signed` (Authenticode via windows-sign.yml) or `unsigned`, from the checked-in file."""
+    path = WINDOWS_SIGNING_FILE if path is None else path
+    try:
+        text = read_small(path).decode("utf-8")
+    except UnicodeDecodeError:
+        raise ReleaseError("windows-release-signing.txt is not UTF-8") from None
+    return parse_windows_signing(text)
+
+
+def windows_msi(version, signing=None):
+    """The release MSI's name. An unsigned release keeps windows-distribution.yml's unsigned name."""
+    signing = windows_signing() if signing is None else signing
+    require(signing in WINDOWS_SIGNING_MODES, f"unknown Windows signing mode {signing!r}")
+    return f"Metro-{version}-windows-x64" + (".msi" if signing == "signed" else ".unsigned-preview.msi")
+
+
+def binaries(version, windows=None):
+    """The release archives and the MSI; `windows` is the signing mode (default: the checked-in one)."""
     return set(direct_archives(version)) | {
-        f"Metro-{version}-windows-x64.zip", f"Metro-{version}-windows-x64.msi",
-        f"Metro-{version}-macos-arm64.tar.gz", f"Metro-{version}-macos-x64.tar.gz",
-    }
+        f"Metro-{version}-windows-x64.zip", windows_msi(version, windows),
+    } | {f"Metro-{version}-{target}.tar.gz" for target in MACOS_TARGETS}
 
 
 def regular_file(path):

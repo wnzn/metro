@@ -98,7 +98,7 @@ function Get-PackageIdentityProblems($Package, [string] $FileName, [string] $Ver
     if ($Package.MetroSemver -ne $Version) { $p.Add("MetroSemver $($Package.MetroSemver) is not $Version") }
     $wantFlag = if ($preview) { '1' } else { '0' }
     if ($Package.MetroPreview -ne $wantFlag) { $p.Add("MetroPreview $($Package.MetroPreview) does not match the file name (want $wantFlag)") }
-    $wantName = if ($preview) { 'Metro (unsigned preview)' } else { 'Metro' }
+    $wantName = if ($preview) { 'Metro (unsigned)' } else { 'Metro' }
     if ($Package.ProductName -ne $wantName) { $p.Add("ProductName '$($Package.ProductName)' is not '$wantName'") }
     if ($Package.ProductCode -notmatch '^\{[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}\}$') { $p.Add('ProductCode is not a GUID') }
     $sc = @($Package.Shortcuts)

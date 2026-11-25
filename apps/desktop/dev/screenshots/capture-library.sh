@@ -24,8 +24,9 @@
 #
 # Env: NSH_DIST (default: from `nsh` on PATH), METRO_BIN (default: target/debug).
 # Writes library-assets.png, library-search.png, library-open-page.png,
-# library-open-time.png, library-open-image.png, library-revocation-before.png
-# and library-revocation-after.png into OUT_DIR.
+# library-open-image.png, library-revocation-before.png and
+# library-revocation-after.png into OUT_DIR. (A recording's player isn't
+# captured: in the container its preview folder isn't private, so it won't play.)
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -155,12 +156,16 @@ bob_ids="$(python3 -c 'import sys,json; print(json.dumps({"harbor-notes.txt": sy
 
 run_app() { # run_app <user> <steps> <ids json>
   TOKEN_FILE="$sec/$1" URL="$url" IDS="$3" MEDIA="$conn" SHOTS=/shots node "$here/library-steps.mjs" "$2" |
+    # A private, uncommon X display per run: --network host shares abstract X sockets.
     docker run --rm -i --init --network host --user "$(id -u):$(id -g)" -e HOME=/tmp -e SCREEN=1280x1080x24 \
+      -e DISPLAY_NUM=$((200 + RANDOM % 600)) \
       -v "$NSH_DIST":/opt/nsh:ro -v "$copy":/app -v "$out":/shots -w /app "$image" \
       sh /app/dev/screenshots/with-display.sh /opt/nsh/bin/nsh test App.tsx --target linux
 }
 
-# --- Alice: choose the model, index, search, open a page, a time, an image -----
+# --- Alice: choose the model, index, search, open a page and an image ---------
+run_app alice alice-model "$alice_ids" # Settings › Model providers (each session gets 30 s)
+run_app alice alice-index "$alice_ids"
 run_app alice alice "$alice_ids"
 run_app alice alice-open "$alice_ids"
 

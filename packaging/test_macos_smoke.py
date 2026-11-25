@@ -22,13 +22,20 @@ LAUNCH = ROOT / "packaging/smoke-macos-launch.sh"
 STEP = "Install into a path with spaces, then a clean start and shutdown"
 
 
+def macos_job():
+    """release.yml's desktop-macos job, or None while macOS builds are off."""
+    if yaml is None:
+        return None
+    return yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())["jobs"].get("desktop-macos")
+
+
 def install_step():
-    data = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
-    steps = data["jobs"]["desktop-macos"]["steps"]
-    return next(s for s in steps if s.get("name") == STEP)["run"]
+    return next(s for s in macos_job()["steps"] if s.get("name") == STEP)["run"]
 
 
 @unittest.skipUnless(yaml, "PyYAML is not installed")
+@unittest.skipIf(yaml and macos_job() is None,
+                 "macOS builds are off for now (release.yml); these tests return with the desktop-macos job")
 class InstallStepTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

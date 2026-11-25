@@ -1,8 +1,9 @@
 # Installers: desktop and runners
 
 > **Status: no public release yet.** <https://github.com/wnzn/metro/releases>
-> is where public downloads will appear, published automatically from the
-> protected `master` branch ([how](#official-releases)). Nothing has been
+> is where public downloads will appear, published automatically when a
+> version bump is merged into the protected `main` branch
+> ([how](#official-releases)). Nothing has been
 > released or signed for real so far. Until there's a release, the only
 > builds are temporary, unsigned **test builds** from GitHub Actions
 > ([below](#test-builds-from-github-actions)).
@@ -75,6 +76,16 @@ sh install-metro-linux.sh check-deps [--install-deps]
 There are two Windows downloads with the same app inside: the per-user
 **MSI** and the **portable ZIP**.
 
+**Releases ship Windows unsigned for now.** Metro doesn't have a Windows
+code-signing certificate yet, so the release's ZIP, MSI and `.ps1` scripts
+carry no Authenticode signature. Windows SmartScreen warnings and an
+"Unknown publisher" prompt are expected. Check every Windows download
+against the Sigstore-verified `SHA256SUMS` before you run it
+([check a download](#check-a-download)). The checked-in switch
+`packaging/windows-release-signing.txt` says `unsigned`; signed releases
+come back once a certificate is set up and it says `signed`
+([deploy.md](deploy.md#windows-releases-signed-or-unsigned)).
+
 **Not verified on native Windows.** The MSI's native Windows Installer
 checks are written for a Windows CI runner but haven't passed there yet,
 and its wizard hasn't been seen on screen. Its install, upgrade and removal
@@ -82,7 +93,7 @@ were checked only under Wine on Linux, which has its own Windows Installer
 ([MSI notes](../packaging/windows-msi/README.md)). Every other Windows check
 so far also ran under Wine ([acceptance.md](acceptance.md)).
 
-### The MSI (`Metro-<version>-windows-x64.msi`)
+### The MSI
 
 - **Per user.** No administrator rights are needed when the folder you pick
   is writable by you. The setup window uses Windows' own Segoe UI font.
@@ -96,11 +107,13 @@ so far also ran under Wine ([acceptance.md](acceptance.md)).
   **Settings → Apps → Installed apps**. Removal deletes only what it
   installed, so files you added stay, and your data in
   `%LOCALAPPDATA%\Metro\Desktop` is never touched.
-- **Test or public.** A test build's MSI is named
-  `Metro-<version>-windows-x64.unsigned-preview.msi`. It installs as
-  "Metro (unsigned preview)" and warns on its first page. It isn't signed,
-  so Windows SmartScreen may warn about it. Only a public release has
-  `Metro-<version>-windows-x64.msi`, signed with Authenticode ([check
+- **Its name says whether it's signed.** An unsigned MSI is named
+  `Metro-<version>-windows-x64.unsigned-preview.msi`, in test builds and,
+  for now, in releases too. It installs as "Metro (unsigned)", and its
+  first page says the build isn't code-signed, that Windows may warn about
+  an unknown publisher, and to check the file against its SHA-256 checksum
+  (`SHA256SUMS`) before installing. Windows SmartScreen may warn about it. Only a signed release
+  has `Metro-<version>-windows-x64.msi`, signed with Authenticode ([check
   it](#check-a-download)). No public MSI exists yet.
 
 ### The portable ZIP and `install-metro-windows.ps1`
@@ -119,22 +132,24 @@ The ZIP runs from any folder you extract it to
   for you, the script refuses `Install` and `Update` and tells you to update
   or remove Metro with the MSI instead. It never installs a second copy or
   changes the MSI's.
-- In a test build the script is the unsigned source copy, so Windows
-  PowerShell's execution policy may refuse to run it. A public release's
-  copy is Authenticode signed. Don't weaken or bypass your execution policy
-  for Metro.
+- In a test build, and in a release while Windows ships unsigned, the
+  script is the unsigned source copy, so Windows PowerShell's execution
+  policy may refuse to run it. A signed release's copy is Authenticode
+  signed. Don't weaken or bypass your execution policy for Metro.
 
-## Desktop on macOS (`install-metro-macos.sh`)
+## Desktop on macOS
 
-**Not verified, no release yet.** Test builds are ad hoc signed previews
-that are never part of a release, and macOS may refuse to open them. A
-public release build is set up to sign `Metro.app` with a Developer ID
-certificate, have Apple notarize it and staple the ticket. That has never
-run, because the signing credentials aren't configured. For an archive
-marked as a release, the installer requires the stapled ticket and
-Gatekeeper's acceptance before it installs anything. Metro never asks you
-to change Gatekeeper. It installs to `~/Applications/Metro Desktop/Metro.app`
-and never touches `~/Library/Application Support/Metro/Desktop`.
+**There's no Mac download for now.** CI doesn't build Metro for macOS at
+the moment, for Apple silicon or Intel: GitHub's macOS build machines were
+too busy, and the builds kept getting cancelled. Releases ship Windows and
+Linux only, and test builds don't include a Mac either. There's no date for
+when Mac builds come back.
+
+The macOS installer, `install-metro-macos.sh`, stays in the source so Mac
+builds can return. It isn't published with releases for now, and it has
+never been verified. A Mac release was designed to be signed
+with a Developer ID certificate, notarized by Apple and stapled, but that
+has never run.
 
 ## The desktop's own runner
 
@@ -269,8 +284,9 @@ native runner with `METRO_SANDBOX=docker` ([runner.md](runner.md)).
 
 ## Test builds from GitHub Actions
 
-**For testing only.** Every pull request, every push to `main`, and every
-push to `master` that doesn't release builds installable test files. A test build is **not a release**,
+**For testing only.** Every push to `main` that doesn't release, and pull
+requests that change a build input, build installable test files. Pull requests that change only docs or tests don't
+([deploy.md](deploy.md#ci-and-publishing)). A test build is **not a release**,
 **not signed**, and kept only for a short time. Use one only if you accept
 that.
 
@@ -279,13 +295,12 @@ that.
 - `preview-assets`: the Linux and Windows desktop archives, the Windows
   `….unsigned-preview.msi`, the Linux runner archive, their `.sha256` files,
   the installer scripts and a `SHA256SUMS`.
-- `preview-not-verified-adhoc-macos-arm64` and `…-macos-x64`: one
-  download per Mac, ad hoc signed, not notarized.
 - The checksums only show that a file wasn't damaged in transit. They don't
   show who built it. Nothing in a test build is signed by Metro's
   publishers.
-- A test build's `RELEASE.json` says so: `unsigned-preview` on Windows and
-  `adhoc` on macOS. The installers say so too.
+- A test build's `RELEASE.json` says so (`unsigned-preview` on Windows). The
+  installers say so too.
+- There's no Mac test build for now ([macOS](#desktop-on-macos)).
 - A run's tests aren't all guaranteed to pass. Check the run's status before
   you rely on one of its files.
 
@@ -293,45 +308,49 @@ that.
 
 > **No public release exists yet.** The process below is in the source
 > (policy `1b3edab`, Windows and images `1cb6094`, Sigstore `2cfdc24`, MSI
-> `f642616` and `6171c75`). It hasn't run on GitHub with real credentials,
-> and the protected `master` branch and signing setup it needs aren't
-> configured yet ([deploy.md](deploy.md#ci-and-publishing)).
+> `f642616` and `6171c75`). It hasn't run on GitHub with real credentials.
+> There's no Windows code-signing setup, so releases ship Windows unsigned
+> for now ([deploy.md](deploy.md#windows-releases-signed-or-unsigned)).
 
 Releases are made by CI, not by hand. A release starts only from a
-**protected, non-deleted, non-forced push to the `master` branch** of
-`wnzn/metro`, run by its own `ci.yml`, for exactly the pushed commit. The
-version is the checked-in one. The Cargo workspace and the desktop app's
-`nsh.json` must name the same version.
+**protected, non-deleted, non-forced push to the `main` branch** of
+`wnzn/metro` **that changes the version**, run by its own `ci.yml`, for
+exactly the pushed commit. The version is the checked-in one. The Cargo
+workspace and the desktop app's `nsh.json` must name the same version.
 
-- **A new version is released once.** The first push with a version that
-  has no `v<version>` tag and no release starts the release. A later push
-  with the same version runs the tests and test builds but releases nothing.
-  A push that switches to a version that's already in use, or finds a
-  conflicting tag, fails instead.
+- **Only a version bump releases.** A maintainer bumps the version in both
+  files in a pull request and merges it. That push to `main` starts the
+  release. Every other push to `main` runs the tests and test builds but
+  releases nothing.
+- **A new version is released once.** A bump to a version that's already
+  in use, or that finds a conflicting tag, fails instead.
 - **The tag is immutable.** CI creates `v<version>` on exactly that commit
-  after the tests, the platform checks, and Windows signing and verification.
-  It's never moved.
-- **Then:** macOS is signed and notarized, every file is checked, the GHCR
+  after the tests, the platform checks, and the Windows gate: Windows
+  signing and verification, or, while Windows ships unsigned, the native
+  install and self-test of the unsigned Windows build in the same run. It's
+  never moved.
+- **Then:** every file is checked, the GHCR
   images are pushed and signed, and `SHA256SUMS` is signed with Sigstore.
 - **Publishing is automatic.** CI uploads the files and checks every digest
-  GitHub reports, then makes the release public. A rerun after a failure
-  picks up where it stopped. A rerun after success changes nothing. An
+  GitHub reports, then makes the release public. Re-running the bump's run
+  after a failure picks up where it stopped. A rerun after success changes nothing. An
   existing public release is never overwritten.
-- **Never from anything else.** Pushing a tag, pushing to `main`, a pull
-  request (also one into `master`) or a manual run never signs, creates a
-  tag, pushes an image or publishes anything.
+- **Never from anything else.** Pushing a tag, a push to `main` without a
+  version bump, a push to any other branch, a pull request or a manual run
+  never signs, creates a tag, pushes an image or publishes anything.
 - A prerelease version (for example `0.3.0-rc.1`) is published as a GitHub
   prerelease and never marked latest. Images have no `latest` tag.
 
 **Files** (for version `X.Y.Z`):
 
-- The desktop archives `Metro-X.Y.Z-linux-x64.tar.gz`,
-  `Metro-X.Y.Z-windows-x64.zip`, `Metro-X.Y.Z-macos-arm64.tar.gz` and
-  `Metro-X.Y.Z-macos-x64.tar.gz`, each with `metro-tui` inside.
-- `Metro-X.Y.Z-windows-x64.msi`.
+- The desktop archives `Metro-X.Y.Z-linux-x64.tar.gz` and
+  `Metro-X.Y.Z-windows-x64.zip`, each with `metro-tui` inside. There's no
+  macOS archive for now ([macOS](#desktop-on-macos)).
+- The MSI: `Metro-X.Y.Z-windows-x64.unsigned-preview.msi` while Windows
+  ships unsigned (now), `Metro-X.Y.Z-windows-x64.msi` once it's signed.
 - The runner archive `Metro-runner-X.Y.Z-linux-x64.tar.gz`.
 - A `.sha256` beside each archive and the MSI.
-- The six installer scripts.
+- The five installer scripts (all except `install-metro-macos.sh`).
 - `SHA256SUMS`, which lists them all, with its Sigstore bundle
   `SHA256SUMS.sigstore.json`. The two Linux archives have their own
   `.sigstore.json` too.
@@ -340,7 +359,7 @@ version is the checked-in one. The Cargo workspace and the desktop app's
 ### Check a download
 
 1. **The checksum list is signed** by the release workflow, for the release's
-   commit on `master`. Find that commit with
+   commit on `main`. Find that commit with
    `git ls-remote https://github.com/wnzn/metro refs/tags/vX.Y.Z`. Then
    check it with
    [cosign](https://docs.sigstore.dev/cosign/system_config/installation/):
@@ -348,9 +367,9 @@ version is the checked-in one. The Cargo workspace and the desktop app's
    ```sh
    commit=<the 40-character commit from git ls-remote>
    cosign verify-blob --bundle SHA256SUMS.sigstore.json \
-     --certificate-identity 'https://github.com/wnzn/metro/.github/workflows/sign-release-assets.yml@refs/heads/master' \
+     --certificate-identity 'https://github.com/wnzn/metro/.github/workflows/sign-release-assets.yml@refs/heads/main' \
      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-     --certificate-github-workflow-ref refs/heads/master \
+     --certificate-github-workflow-ref refs/heads/main \
      --certificate-github-workflow-sha "$commit" SHA256SUMS
    sha256sum -c --ignore-missing SHA256SUMS
    ```
@@ -359,20 +378,27 @@ version is the checked-in one. The Cargo workspace and the desktop app's
    --version X.Y.Z --revision "$commit" SHA256SUMS` runs the same check. It
    also checks the certificate's repository, branch, trigger and workflow
    fields.
-2. **Windows.** Right-click the MSI or `Metro.exe` → **Properties → Digital
-   Signatures**. The signer must be the publisher named in the release
-   notes, with a timestamp. Or, in PowerShell,
-   `Get-AuthenticodeSignature .\Metro-X.Y.Z-windows-x64.msi` should say
-   `Valid` with that publisher. The publisher isn't known yet; it's the
-   validated name on the certificate the maintainers obtain. The release
-   copies of the two PowerShell scripts are signed too, so a policy that
-   requires signed scripts (`RemoteSigned` or `AllSigned`) can run them.
-   SmartScreen may still warn about a new publisher until it builds
-   reputation, which signing alone doesn't guarantee.
-3. **macOS.** Release builds are Developer ID signed, notarized and
-   stapled. `install-metro-macos.sh` refuses a release archive without the
-   stapled ticket and Gatekeeper's acceptance.
-4. **Images.** `IMAGES.txt` lists each image by digest:
+2. **Windows.**
+   - **Unsigned release (now).** There's no Authenticode signature to check,
+     so step 1 is the check: after `SHA256SUMS` verifies with cosign, compare
+     each Windows file with it. In PowerShell,
+     `(Get-FileHash .\Metro-X.Y.Z-windows-x64.zip -Algorithm SHA256).Hash`
+     prints the hash in capitals; ignoring case, it must equal the hash on
+     that file's line in `SHA256SUMS`. The ZIP's `RELEASE.json` says `"mode": "unsigned-preview"` and
+     names the release commit under `signing.commit`. Expect SmartScreen
+     and an "Unknown publisher" prompt; `Get-AuthenticodeSignature` reports
+     `NotSigned`.
+   - **Signed release (later).** Right-click the MSI or `Metro.exe` →
+     **Properties → Digital Signatures**. The signer must be the publisher
+     named in the release notes, with a timestamp. Or, in PowerShell,
+     `Get-AuthenticodeSignature .\Metro-X.Y.Z-windows-x64.msi` should say
+     `Valid` with that publisher. The publisher isn't known yet; it's the
+     validated name on the certificate the maintainers obtain. The release
+     copies of the two PowerShell scripts are signed too, so a policy that
+     requires signed scripts (`RemoteSigned` or `AllSigned`) can run them.
+     SmartScreen may still warn about a new publisher until it builds
+     reputation, which signing alone doesn't guarantee.
+3. **Images.** `IMAGES.txt` lists each image by digest:
    `ghcr.io/wnzn/metro-server` and `ghcr.io/wnzn/metro-runner` for
    `linux/amd64` and `linux/arm64`, and the optional media image
    `ghcr.io/wnzn/metro-embeddinggemma2` for `linux/amd64` only. There are no
@@ -380,9 +406,9 @@ version is the checked-in one. The Cargo workspace and the desktop app's
 
    ```sh
    cosign verify \
-     --certificate-identity 'https://github.com/wnzn/metro/.github/workflows/release-images.yml@refs/heads/master' \
+     --certificate-identity 'https://github.com/wnzn/metro/.github/workflows/release-images.yml@refs/heads/main' \
      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-     --certificate-github-workflow-ref refs/heads/master \
+     --certificate-github-workflow-ref refs/heads/main \
      --certificate-github-workflow-sha "$commit" \
      'ghcr.io/wnzn/metro-server:vX.Y.Z@sha256:…'
    ```

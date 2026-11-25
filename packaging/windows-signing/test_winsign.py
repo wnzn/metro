@@ -539,20 +539,20 @@ class ReleaseContext(unittest.TestCase):
     VERSION = json.loads((HERE.parents[1] / "apps/desktop/nsh.json").read_text())["version"]
 
     def context(self, tmp, event=None, **env):
-        payload = {"ref": "refs/heads/master", "after": self.SHA, "deleted": False,
+        payload = {"ref": "refs/heads/main", "after": self.SHA, "deleted": False,
                    "repository": {"full_name": "wnzn/metro", "id": 1467654868}}
         payload.update(event or {})
         path = Path(tmp) / "event.json"
         path.write_text(json.dumps(payload))
-        base = {"GITHUB_EVENT_NAME": "push", "GITHUB_REPOSITORY": "wnzn/metro", "GITHUB_REF": "refs/heads/master",
+        base = {"GITHUB_EVENT_NAME": "push", "GITHUB_REPOSITORY": "wnzn/metro", "GITHUB_REF": "refs/heads/main",
                  "GITHUB_REPOSITORY_ID": "1467654868",
                 "GITHUB_REF_TYPE": "branch", "GITHUB_REF_PROTECTED": "true", "GITHUB_SHA": self.SHA,
-                "GITHUB_WORKFLOW_REF": "wnzn/metro/.github/workflows/ci.yml@refs/heads/master",
+                "GITHUB_WORKFLOW_REF": "wnzn/metro/.github/workflows/ci.yml@refs/heads/main",
                 "GITHUB_EVENT_PATH": str(path)}
         base.update(env)
         return base
 
-    def test_official_master_push(self):
+    def test_official_main_push(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(winsign.release_context(self.context(tmp), self.SHA, self.VERSION), self.SHA)
 
@@ -578,13 +578,15 @@ class ReleaseContext(unittest.TestCase):
             "pull request": dict(GITHUB_EVENT_NAME="pull_request", GITHUB_REF="refs/pull/1/merge"),
             "pull_request_target": dict(GITHUB_EVENT_NAME="pull_request_target"),
             "workflow_dispatch": dict(GITHUB_EVENT_NAME="workflow_dispatch"),
-            "main branch": dict(GITHUB_REF="refs/heads/main",
-                                GITHUB_WORKFLOW_REF="wnzn/metro/.github/workflows/ci.yml@refs/heads/main"),
-            "master-like branch": dict(GITHUB_REF="refs/heads/master2"),
-            "unprotected master": dict(GITHUB_REF_PROTECTED="false"),
+            "master branch (no longer the release branch)": dict(
+                GITHUB_REF="refs/heads/master", GITHUB_WORKFLOW_REF="wnzn/metro/.github/workflows/ci.yml@refs/heads/master"),
+            "ci.yml from master": dict(GITHUB_WORKFLOW_REF="wnzn/metro/.github/workflows/ci.yml@refs/heads/master"),
+            "main-like branch": dict(GITHUB_REF="refs/heads/main2"),
+            "nonliteral main": dict(GITHUB_REF="refs/heads/Main"),
+            "unprotected main": dict(GITHUB_REF_PROTECTED="false"),
             "fork": dict(GITHUB_REPOSITORY="someone/metro"),
             "reused repository name": dict(GITHUB_REPOSITORY_ID="123"),
-            "other workflow": dict(GITHUB_WORKFLOW_REF="wnzn/metro/.github/workflows/release.yml@refs/heads/master"),
+            "other workflow": dict(GITHUB_WORKFLOW_REF="wnzn/metro/.github/workflows/release.yml@refs/heads/main"),
             "workflow from a tag": dict(GITHUB_WORKFLOW_REF="wnzn/metro/.github/workflows/ci.yml@refs/tags/v0.3.0"),
             "no sha": dict(GITHUB_SHA=""),
         }
@@ -594,20 +596,20 @@ class ReleaseContext(unittest.TestCase):
                     winsign.release_context(self.context(tmp, **env), self.SHA, "0.3.0")
             for name, event in {"deleted branch": {"deleted": True}, "missing deleted": {"deleted": None},
                                 "event for another commit": {"after": other},
-                                "event for another ref": {"ref": "refs/tags/v0.3.0"},
+                                "event for another ref": {"ref": "refs/tags/v0.3.0"}, "event for master": {"ref": "refs/heads/master"},
                                  "event from another repository": {"repository": {"full_name": "x/metro", "id": 1467654868}},
                                  "event with another repo ID": {"repository": {"full_name": "wnzn/metro", "id": 123}}}.items():
                 with self.subTest(name), self.assertRaisesRegex(winsign.Failure, "refused"):
                     winsign.release_context(self.context(tmp, event), self.SHA, "0.3.0")
             with self.assertRaisesRegex(winsign.Failure, "checked-out commit"):
                 winsign.release_context(self.context(tmp), other, "0.3.0")
-            for version in ("", "v0.3.0", "master", "0.3"):
+            for version in ("", "v0.3.0", "main", "0.3"):
                 with self.subTest(version), self.assertRaisesRegex(winsign.Failure, "invalid version"):
                     winsign.release_context(self.context(tmp), self.SHA, version)
             with self.assertRaisesRegex(winsign.Failure, "unreadable event"):
                 winsign.release_context(self.context(tmp, GITHUB_EVENT_PATH=str(Path(tmp) / "missing.json")), self.SHA, "0.3.0")
 
-    def test_official_finalize_refuses_outside_master(self):
+    def test_official_finalize_refuses_outside_main(self):
         import os
         from unittest import mock
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, self.context(tmp, GITHUB_REF="refs/tags/v0.3.0")), \
@@ -619,11 +621,11 @@ class ReleaseContext(unittest.TestCase):
 
 
 class SigningEnvironment(unittest.TestCase):
-    def test_only_one_literal_master_branch_rule(self):
+    def test_only_one_literal_main_branch_rule(self):
         with tempfile.TemporaryDirectory() as tmp:
             args = winsign.argparse.Namespace(environment=Path(tmp) / "environment", policies=Path(tmp) / "policies")
             custom = {"protected_branches": False, "custom_branch_policies": True}
-            master = {"name": "master", "type": "branch"}
+            main = {"name": "main", "type": "branch"}
 
             def check(policy, *rules, total=None):
                 args.environment.write_text(json.dumps({"name": "windows-release-signing", "deployment_branch_policy": policy}))
@@ -631,12 +633,13 @@ class SigningEnvironment(unittest.TestCase):
                                                     "branch_policies": rules}))
                 winsign.check_signing_environment(args)
 
-            check(custom, master)
+            check(custom, main)
             for policy, rules, total in (
-                (None, [], 0), ({"protected_branches": True, "custom_branch_policies": False}, [master], 1),
-                (custom, [{"name": "master", "type": "tag"}], 1),
-                (custom, [{"name": "master*", "type": "branch"}], 1),
-                (custom, [master, {"name": "v*", "type": "tag"}], 2), (custom, [master], 2),
+                (None, [], 0), ({"protected_branches": True, "custom_branch_policies": False}, [main], 1),
+                (custom, [{"name": "main", "type": "tag"}], 1),
+                (custom, [{"name": "main*", "type": "branch"}], 1),
+                (custom, [{"name": "master", "type": "branch"}], 1),
+                (custom, [main, {"name": "v*", "type": "tag"}], 2), (custom, [main], 2),
             ):
                 with self.subTest(policy=policy, rules=rules, total=total), self.assertRaisesRegex(winsign.Failure, "no tags"):
                     check(policy, *rules, total=total)
@@ -769,8 +772,39 @@ class Workflows(unittest.TestCase):
                           "vars."):
             self.assertNotIn(forbidden, text)
         self.assertEqual(set(jobs(text)), {"seed", "preview"})
-        self.assertIn("if: ${{ !inputs.release }}", jobs(text)["preview"])
+        self.assertIn("if: needs.seed.outputs.mode == 'preview' || needs.seed.outputs.mode == 'unsigned-release'",
+                      jobs(text)["preview"])
         self.assertIn("name: unsigned-desktop-windows-x64", jobs(text)["seed"])
+
+    def test_distribution_release_mode_comes_from_the_checked_in_switch(self):
+        """A release run is `official` (signed hand-off) or `unsigned-release`, only as
+        packaging/windows-release-signing.txt says, after the release-context check."""
+        import re
+        seed = jobs(self.read("windows-distribution.yml"))["seed"]
+        mode = seed[seed.index("- id: mode"):seed.index("- name: Signing helper tests")]
+        self.assertLess(mode.index("winsign.py release-context"), mode.index("release_policy.py windows-signing"))
+        self.assertIn("signed) echo mode=official >> \"$GITHUB_OUTPUT\" ;;", mode)
+        self.assertIn("unsigned) echo mode=unsigned-release >> \"$GITHUB_OUTPUT\" ;;", mode)
+        self.assertIn('*) echo "unknown Windows release signing mode" >&2; exit 1 ;;', mode)
+        self.assertEqual(re.findall(r"echo mode=([a-z-]+)", mode), ["official", "unsigned-release", "preview"])
+        # Every release, signed or not, passes the official seed checks (metro-tui.exe required);
+        # the unsigned build is the same seed, matched by hash.
+        verify = seed[seed.index("- id: verify"):]
+        self.assertIn("official|unsigned-release)", verify)
+        self.assertIn('--mode official --work "$RUNNER_TEMP/official-check"', verify)
+        self.assertIn('${sha:+--expect-sha256 "$sha"}', verify)
+        # The signed hand-off is uploaded only in official mode; everything unsigned in the others.
+        self.assertIn("- if: steps.mode.outputs.mode == 'official'\n        uses: actions/upload-artifact", seed)
+        self.assertEqual(seed.count("if: steps.mode.outputs.mode != 'official'"), 4)
+        self.assertNotIn("inputs.release }}\n", seed.replace("RELEASE: ${{ inputs.release }}\n", ""))
+        build = seed[seed.index("- id: preview"):]
+        self.assertIn('if [ "$MODE" = unsigned-release ] || [ -e "$RUNNER_TEMP/tree/metro-tui.exe" ]; then', build)
+        self.assertIn('finalize --work "$RUNNER_TEMP/work" --mode preview', build)
+        # The unsigned release dist is the preview job's, verified natively against this commit.
+        preview = jobs(self.read("windows-distribution.yml"))["preview"]
+        self.assertIn("--expect-commit $env:COMMIT", preview)
+        self.assertIn("COMMIT: ${{ github.sha }}", preview)
+        self.assertIn("name: dist-desktop-windows-x64", preview)
 
     def test_no_tag_or_ref_name_release_logic(self):
         for name in ("windows-distribution.yml", "windows-sign.yml"):
@@ -779,7 +813,7 @@ class Workflows(unittest.TestCase):
                 self.assertNotIn(forbidden, text, name)
         self.assertIn("winsign.py release-context", jobs(self.read("windows-distribution.yml"))["seed"])
 
-    def test_signing_is_master_only_and_isolated(self):
+    def test_signing_is_main_only_and_isolated(self):
         text = self.read("windows-sign.yml")
         self.check_common(text)
         head = text.split("\njobs:", 1)[0]
@@ -800,10 +834,18 @@ class Workflows(unittest.TestCase):
                 self.assertIn("runs-on: ubuntu-24.04" if job in ("guard", "msi") else "runs-on: windows-2025", body)
         self.assertIn("winsign.py release-context", all_jobs["guard"])
         self.assertIn("winsign.py signing-environment", all_jobs["guard"])
+        # Signed mode still fails closed without a configured backend, and only runs when
+        # packaging/windows-release-signing.txt says signed.
+        guard = all_jobs["guard"]
+        backend = 'case "$BACKEND" in azure|kms) ;; *) echo "METRO_WINDOWS_SIGNING_BACKEND must be azure or kms" >&2; exit 1 ;; esac'
+        self.assertIn(backend, guard)
+        self.assertIn("grep -qx 'windows_signing=signed'", guard)
+        self.assertLess(guard.index("release_policy.py windows-signing"), guard.index(backend))
+        self.assertLess(guard.index(backend), guard.index("winsign.py signing-environment"))
         guard_if = ("if: >- github.event_name == 'push' && github.repository == 'wnzn/metro' && "
-                    "github.repository_id == '1467654868' && github.ref == 'refs/heads/master' && "
+                    "github.repository_id == '1467654868' && github.ref == 'refs/heads/main' && "
                     "github.ref_type == 'branch' && github.ref_protected && toJSON(github.event.deleted) == 'false' && "
-                    "github.event.after == github.sha && github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master'")
+                    "github.event.after == github.sha && github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/main'")
         for job in ("sign", "sign-msi"):
             # Job-level, so no runner (self-hosted included) is assigned outside the official context.
             self.assertIn(guard_if, " ".join(all_jobs[job].split()))
@@ -812,12 +854,88 @@ class Workflows(unittest.TestCase):
         self.assertIn("--expect-commit $env:GITHUB_SHA", all_jobs["verify"])
         self.assertIn("name: dist-desktop-windows-x64", all_jobs["verify"])
 
+    def test_release_publication_calls_windows_signing_only_in_signed_mode(self):
+        import re
+        text = self.read("release-publish.yml")
+        all_jobs = jobs(text)
+        sign = all_jobs["windows-sign"]
+        self.assertIn("if: needs.authorize.outputs.proceed == 'true' && needs.authorize.outputs.windows_signing == 'signed'",
+                      sign)
+        self.assertIn("uses: ./.github/workflows/windows-sign.yml", sign)
+        self.assertIn("windows_signing: ${{ steps.check.outputs.windows_signing }}", all_jobs["authorize"])
+        # Only windows-sign (the Windows signer), images and sign (Sigstore/GHCR) may hold id-token.
+        self.assertEqual({name for name, body in all_jobs.items() if "id-token: write" in body},
+                         {"windows-sign", "images", "sign"})
+        self.assertEqual(len(re.findall(r"windows-sign\.yml", text)), 1)
+        self.assertNotIn("vars.", text)
+        self.assertNotIn("environment:", text)
+        # The tag needs a successful signed Windows gate, or windows-sign skipped in unsigned mode.
+        tag = " ".join(all_jobs["tag"].split())
+        self.assertIn("needs: [authorize, windows-sign]", tag)
+        self.assertIn("(needs.authorize.outputs.windows_signing == 'signed' && needs.windows-sign.result == 'success')", tag)
+        self.assertIn("(needs.authorize.outputs.windows_signing == 'unsigned' && needs.windows-sign.result == 'skipped')",
+                      tag)
+
     def test_module_allowlist_matches_winsign(self):
         module = (HERE / "MetroWindowsSigning.psm1").read_text(encoding="utf-8")
         for exe in winsign.SIGNED_EXES:
             self.assertIn(exe.replace("/", "\\\\").replace(".", "\\."), module)
         for script in winsign.SCRIPTS:
             self.assertIn(script.removesuffix(".ps1"), module)
+
+
+class VerifierSelfTestGuard(unittest.TestCase):
+    """The throwaway-certificate self-test runs only when the preview job says so, never for tags."""
+    MODULE = HERE / "MetroWindowsSigning.psm1"
+
+    def test_only_the_preview_job_opts_in_and_no_branch_decides(self):
+        module = self.MODULE.read_text(encoding="utf-8")
+        body = module[module.index("function Invoke-MetroVerifierSelfTest"):module.index("$tool = Get-MetroSignTool",
+                                                                                     module.index("function Invoke-MetroVerifierSelfTest"))]
+        self.assertNotIn("refs/heads/", body)  # main pushes without a version bump run previews too
+        self.assertIn("$env:METRO_WINDOWS_SELF_TEST -cne 'preview'", body)
+        text = (HERE.parents[1] / ".github/workflows/windows-distribution.yml").read_text(encoding="utf-8")
+        preview = jobs(text)["preview"]
+        self.assertIn("if: needs.seed.outputs.mode == 'preview' || needs.seed.outputs.mode == 'unsigned-release'", preview)
+        step = preview[preview.index("Invoke-MetroVerifierSelfTest") - 800:preview.index("Invoke-MetroVerifierSelfTest")]
+        self.assertIn("METRO_WINDOWS_SELF_TEST: ${{ (needs.seed.outputs.mode == 'preview' || "
+                      "needs.seed.outputs.mode == 'unsigned-release') && 'preview' || 'release' }}", step)
+        self.assertNotIn("permissions:\n      contents: read\n      id-token", preview)
+        self.assertEqual(text.count("METRO_WINDOWS_SELF_TEST"), 1)
+        self.assertNotIn("Invoke-MetroVerifierSelfTest", jobs(text)["seed"])
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 (pwsh) is not installed")
+    def test_guard_refuses_unless_preview_and_fails_closed(self):
+        import os
+        import subprocess
+        command = ("Import-Module $env:METRO_MODULE; try { Invoke-MetroVerifierSelfTest -Tree 'missing-tree' "
+                   "-Msi 'missing.msi' -SourceScripts 'missing-scripts'; 'NO ERROR' } catch { $_.Exception.Message }")
+        preview = {"METRO_WINDOWS_SELF_TEST": "preview", "GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/main",
+                   "GITHUB_REF_TYPE": "branch"}
+        guard = re.compile(r"self-test (never runs|runs only)")
+        cases = {
+            "preview on a main push": ({}, None),
+            "preview on a pull request": ({"GITHUB_EVENT_NAME": "pull_request", "GITHUB_REF": "refs/pull/1/merge"}, None),
+            "tag type": ({"GITHUB_REF_TYPE": "tag"}, "never runs for tags"),
+            "tag ref": ({"GITHUB_REF": "refs/tags/v0.3.0", "GITHUB_REF_TYPE": ""}, "never runs for tags"),
+            "no opt-in": ({"METRO_WINDOWS_SELF_TEST": None}, "runs only in the preview job"),
+            "release value": ({"METRO_WINDOWS_SELF_TEST": "release"}, "runs only in the preview job"),
+            "nonliteral value": ({"METRO_WINDOWS_SELF_TEST": "Preview"}, "runs only in the preview job"),
+            "OIDC-capable job": ({"ACTIONS_ID_TOKEN_REQUEST_URL": "https://token.invalid/x"}, "OIDC"),
+            "OIDC token only": ({"ACTIONS_ID_TOKEN_REQUEST_TOKEN": "synthetic"}, "OIDC"),
+        }
+        for name, (change, refusal) in cases.items():
+            env = {"PATH": os.environ["PATH"], "HOME": os.environ.get("HOME", "/"), "METRO_MODULE": str(self.MODULE),
+                   **{k: v for k, v in (preview | change).items() if v is not None}}
+            with self.subTest(name):
+                r = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command", command], env=env,
+                                   capture_output=True, text=True, timeout=120, check=False)
+                out = r.stdout + r.stderr
+                self.assertNotIn("NO ERROR", out)
+                if refusal:
+                    self.assertIn(refusal, out)
+                else:  # past the guard: it stops at the Windows-only SignTool lookup on this host
+                    self.assertIsNone(guard.search(out), out)
 
 
 if __name__ == "__main__":

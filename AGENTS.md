@@ -261,7 +261,10 @@ runtime.
     agents per Space, per-connection model lists, the desktop redesign) is
     staged, not a release: 686 Rust tests, eight e2e scripts (not
     `library_reference.py`) and desktop `nsh test` 400/400, with no
-    packaging tests, real vendor run or native Windows check.
+    packaging tests, real vendor run or native Windows check. The 0.3.0,
+    0.3.1 and 0.3.2 version bumps on `main` are recorded in
+    `docs/acceptance.md` as source-only packaging changes, and none of
+    them contains that staged source.
   - Don't claim a real commercial provider, production auth, a published
     release, pretrained `google/embeddinggemma-2` ranking quality, or
     native audio and video playback, seeking or the native file picker for

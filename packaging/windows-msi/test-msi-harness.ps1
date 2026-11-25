@@ -149,7 +149,7 @@ if ($env:METRO_MSI_FACTS_JSON) {
             Property = @(@('ProductName', 'Metro'), @('UpgradeCode', '{29BBE899-7D6A-49A7-B60E-F9644544D683}'), @('ProductCode', '{3D6B2A2E-6F0B-5E52-9C1B-2F6C8E3A1B11}'), @('MetroSemver', '1.0.0'), @('MetroPreview', '0'))
             Shortcut = @(, @('Metro.lnk', 'ProgramMenuFolder')) }
         preview = [pscustomobject] @{ file = 'Metro-1.0.0-windows-x64.unsigned-preview.msi'
-            Property = @(@('ProductName', 'Metro (unsigned preview)'), @('UpgradeCode', '{29BBE899-7D6A-49A7-B60E-F9644544D683}'), @('ProductCode', '{3D6B2A2E-6F0B-5E52-9C1B-2F6C8E3A1B11}'), @('MetroSemver', '1.0.0'), @('MetroPreview', '1'))
+            Property = @(@('ProductName', 'Metro (unsigned)'), @('UpgradeCode', '{29BBE899-7D6A-49A7-B60E-F9644544D683}'), @('ProductCode', '{3D6B2A2E-6F0B-5E52-9C1B-2F6C8E3A1B11}'), @('MetroSemver', '1.0.0'), @('MetroPreview', '1'))
             Shortcut = @(, @('Metro.lnk', 'ProgramMenuFolder')) }
     }
     "identity rows: written in this test (set METRO_MSI_FACTS_JSON for rows from build_msi.py)"

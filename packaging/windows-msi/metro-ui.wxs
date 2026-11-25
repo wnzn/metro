@@ -38,7 +38,7 @@
         <Control Id="Description" Type="Text" X="20" Y="67" Width="330" Height="40" NoPrefix="yes" Text="Setup installs Metro [MetroSemver] for you only. No administrator rights are needed. Next, you choose the folder and what Setup sets up." HideCondition="OLDERFOUND OR SAMEVERSIONFOUND" ShowCondition="NOT (OLDERFOUND OR SAMEVERSIONFOUND)" />
         <Control Id="UpgradeDescription" Type="Text" X="20" Y="67" Width="330" Height="40" NoPrefix="yes" Text="Setup updates Metro [PREVSEMVER] to Metro [MetroSemver]. Close Metro before you continue." ShowCondition="OLDERFOUND OR SAMEVERSIONFOUND" HideCondition="NOT (OLDERFOUND OR SAMEVERSIONFOUND)" />
         <Control Id="DataNote" Type="Text" X="20" Y="113" Width="330" Height="40" NoPrefix="yes" Text="Your Metro data in [MetroDataDir] is never changed or removed by Setup, including when you update or uninstall Metro." />
-        <Control Id="PreviewNote" Type="Text" X="20" Y="160" Width="330" Height="40" NoPrefix="yes" Text="{\MetroWarning}This is an unsigned local preview build for testing. It is not a Metro release and is not Authenticode signed." Hidden="yes" ShowCondition="MetroPreview = &quot;1&quot;" />
+        <Control Id="PreviewNote" Type="Text" X="20" Y="160" Width="330" Height="48" NoPrefix="yes" Text="{\MetroWarning}This Metro build isn't code-signed, so Windows may warn about an unknown publisher. Before you install it, check the file against its SHA-256 checksum (SHA256SUMS)." Hidden="yes" ShowCondition="MetroPreview = &quot;1&quot;" />
         <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
       </Dialog>
 

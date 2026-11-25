@@ -8,8 +8,9 @@ hasn't been demonstrated.
 A **gate on unreleased source**, run on Linux and reported by the project
 manager. It isn't a release, and nothing was built for distribution or
 published. The [Metro 0.2.0 local release](#final-metro-020-local-release-prepublication-2026-11-23-project-manager-local)
-is still the current final local *release* result. Packaging tests weren't
-rerun.
+is still the current final local *release* gate. The 0.3.0, 0.3.1 and 0.3.2
+entries below record source-only packaging changes on `main`; this gate's
+source isn't in any of those versions. Packaging tests weren't rerun.
 
 **Source.** Commits `4d72b28` through `4175475`:
 
@@ -51,6 +52,465 @@ server, and they aren't stored in the repository.
 - Real agent picture images.
 - Resetting a panel's width with a double-click.
 - Packaging tests, release archives, and the Docker sandbox suite.
+
+## Source only: image load on Docker's classic image store, version 0.3.2 (2026-11-24, packaging lane, local)
+
+The 0.3.1 release run failed in `release-images.yml`, job `build`, step
+"Load exactly those archives": `docker load -i <name>-<arch>.oci.tar` exited
+1. The orchestrator reproduced it against `docker:28.0.4-dind` (the Docker
+version of GitHub's ubuntu-24.04 runners, classic overlay2 image store):
+`open /var/lib/docker/tmp/docker-import-…/blobs/json: no such file or
+directory`. The archives are pure OCI layouts from buildx, without a Docker
+`manifest.json`, which the classic store needs and the containerd store
+(Docker 29) doesn't.
+
+Fix, in `packaging/image_release.py` `load` only: it writes a temporary
+copy of the archive (in a private temporary directory that's removed
+afterwards) with an added Docker `manifest.json` whose `Config` and
+`Layers` (in manifest order) are the blobs of the same manifest `describe`
+resolves through `index.json`, and loads that copy. `index.json` stays in
+the copy, so the containerd store still loads by manifest digest. The
+built archive, its digests and what `push` publishes don't change. An
+archive that already has a `manifest.json` is accepted only if it names
+exactly that image. The checks after loading are unchanged (exactly one
+image id, equal to the config or manifest digest, then tag and platform),
+and a failed `docker load` now reports Docker's error output. The version
+moves to `0.3.2` (Cargo workspace, `apps/desktop/nsh.json`, `Cargo.lock`,
+the file names in `docs/deploy.md` and `docs/runner.md`), because `v0.3.1`
+is already tagged.
+
+Ran locally on Debian 13 (Python 3.13, PyYAML in a throwaway uv
+environment; no PowerShell, so its tests skipped). No Docker daemon was
+used; `docker` is mocked in the new tests:
+
+| Check | Result |
+| --- | --- |
+| `python3 -I packaging/release_policy.py version` | `version=0.3.2` |
+| `cargo metadata --locked --format-version 1` | passed |
+| `python3 -B -m unittest discover -s packaging -v` | 226 tests, 15 skipped, passed in a throwaway clone with the change committed; in the uncommitted worktree, one test fails only because `HEAD` is still 0.3.1 |
+| New `LoadTests` (5): `manifest.json` paths and layer order, plain and index-wrapped layouts, source archive unchanged and temporary copy removed, classic and containerd ids, Docker's error shown, wrong id or platform refused, a disagreeing `manifest.json` refused before `docker` runs | passed |
+
+**Not yet shown here:** a real `docker load` of a buildx archive on Docker
+28.0.4 (classic store) or Docker 29 (containerd store) with this change,
+and the release run on GitHub.
+
+## Source only: releases ship Windows unsigned, version 0.3.1 (2026-11-24, packaging lane, local)
+
+The maintainer reported that the 0.3.0 bump's run on `main` (GitHub Actions
+run 45372491546) passed its build and test gates and then stopped in
+`publish / windows-sign / guard` with `METRO_WINDOWS_SIGNING_BACKEND must be
+azure or kms`: the repository has no Windows code-signing certificate, no
+`windows-release-signing` environment and no signing variables. Nothing was
+tagged or published. That run wasn't repeated here.
+
+Decision: release with Windows unsigned, labelled so, until a certificate
+exists. The new checked-in switch `packaging/windows-release-signing.txt`
+says `unsigned`. In that mode `windows-distribution.yml` checks the seed in
+official mode, then builds and natively tests the unsigned build as for a
+test build, and `release-publish.yml` skips `windows-sign.yml`. The release
+ships `Metro-0.3.1-windows-x64.zip`
+(`RELEASE.json` `unsigned-preview`, with its commit),
+`Metro-0.3.1-windows-x64.unsigned-preview.msi`, their `.sha256` files and
+the unsigned `.ps1` scripts. Its release notes say the Windows files aren't
+code-signed and how to check them. The version moves to `0.3.1` (Cargo
+workspace, `apps/desktop/nsh.json`, `Cargo.lock`), because 0.3.0's bump
+push has already happened.
+
+Ran locally on Debian 13 (Python 3.13, PyYAML 6.0.4 and ShellCheck 0.11.0 in
+a throwaway virtualenv; no PowerShell, so its tests skipped):
+
+| Check | Result |
+| --- | --- |
+| `python3 -I packaging/release_policy.py version` | `version=0.3.1` |
+| `python3 -I packaging/release_policy.py windows-signing` | `windows_signing=unsigned` |
+| `cargo metadata --locked --format-version 1` | passed |
+| `shellcheck -s sh packaging/*.sh` | passed |
+| actionlint 1.7.12 (checksum as in `ci.yml`), with ShellCheck | passed |
+| Every action pinned to a full SHA (the `ci.yml` check) | passed |
+| `python3 -B -m unittest discover -s packaging -v` | 220 tests, 15 skipped, passed in a throwaway clone with the change committed; in the uncommitted worktree, one test fails only because `HEAD` is still 0.3.0 |
+| `python3 -B -m unittest discover -s packaging/release-signatures -v` | 18 tests, 1 skipped, passed |
+| `python3 -B -m unittest discover -s packaging/windows-signing -v` | 41 tests, 6 skipped, passed |
+
+The unsigned (`--preview`) MSI's wording now fits both its uses, test
+builds and unsigned releases. Its product name is "Metro (unsigned)", not
+"Metro (unsigned preview)". Its first page says: "This Metro build isn't
+code-signed, so Windows may warn about an unknown publisher. Before you
+install it, check the file against its SHA-256 checksum (SHA256SUMS)." It
+no longer says it "is not a Metro release". With the pinned MSI toolchain
+(`build_msi.py fetch-tools`, hashes from `wixl-lock.json`),
+`METRO_MSI_TOOLS=… python3 -B -m unittest test_windows_msi` ran 26 tests,
+with 2 skipped for lack of PowerShell, and passed. That includes the real
+`--preview` builds and their inspection. A `--preview` MSI built from the
+lane's fake payload showed, through `msiinfo`, `ProductName` "Metro
+(unsigned)", the new `PreviewNote` text, the new Comments, and no
+"not a Metro release" or "local preview" anywhere in its `Control` table.
+`MsiHarness.ps1` and `test-msi-harness.ps1` expect the new name, but
+without `pwsh` they weren't run here.
+
+**Not yet shown:** nothing ran on GitHub. The unsigned release path, the
+native Windows checks in it (including the PowerShell harness's product-name
+check), the wizard on screen, and the publication of 0.3.1 run only when the
+bump reaches `main`.
+
+## Source only: the release version moves to 0.3.0 (2026-11-24, packaging lane, local)
+
+A protected `main` push releases only when it changes the checked-in version,
+and the version has been `0.2.0` since `89eedf7` (2026-11-22). Every `main`
+push since releases were retargeted to `main` therefore decided
+`unchanged (before: 0.2.0, now: 0.2.0); CI only, no release` — as run 45361682056
+logged — so `release` and `publish` skipped and nothing was ever published.
+
+This bumps the version that the next release will carry: Cargo
+`[workspace.package] version`, `apps/desktop/nsh.json` (which must match) and
+`Cargo.lock` move to `0.3.0` together, and the three named release-file targets
+in [deploy.md](deploy.md#release-files-and-images),
+[runner.md](runner.md#separate-remote-runner) and the desktop README's download
+names move with them. `0.3.0` rather than another `0.2.x`: `0.2.0` was never
+published, and the source is well past it. Provenance prose — the 0.2.0
+candidate, the current source after 0.2.0 — is left as written, because those
+records still describe exactly what was verified.
+
+**Not yet shown:** no release, file or image exists, and no official run has
+been attempted. Merging a version bump into `main` starts the first attempt,
+and it publishes nothing until the `windows-release-signing` environment exists
+with its one `main` branch rule and `METRO_WINDOWS_SIGNING_BACKEND` and
+`METRO_WINDOWS_PUBLISHER_CN` are set, because `windows-sign` runs before
+`release_policy.py tag`. A bump to a prerelease such as `0.3.0-rc.1` would
+publish as a prerelease instead of `latest`.
+
+Checked locally, `python3 -m unittest discover -s packaging` with PyYAML
+installed: 209 tests pass (15 skipped: no PowerShell 7, `METRO_MSI_TOOLS`
+unset). `cargo metadata --locked` confirms `Cargo.lock` matches the manifests.
+
+## Source only: CI runs only the segments a change needs (2026-11-24, CI lane, local)
+
+Uncommitted changes on `ci/path-segmentation`, on top of `17b6e3c`, to
+`ci.yml` and `packaging/package_smoke_policy.py`, renamed to
+`packaging/ci_changes.py` ([deploy.md](deploy.md#ci-and-publishing)):
+
+- The `workflows` job classifies pull requests into `main` (from the merge
+  base) and now also pushes to `main` (from `github.event.before`) into five
+  segments: `rust`, `desktop`, `containers`, `packaging` and `previews`
+  (`package-smoke`). Each of those jobs runs only when its segment isn't
+  `false`; an empty answer runs it.
+- Documentation, `apps/desktop/dev`, `ops/`, `.gitignore` and
+  `.env.example` need no segment. `ci.yml`, `.gitattributes`, `Cargo.toml`,
+  `apps/desktop/nsh.json` and unknown paths need all of them. So does a
+  push that is forced, deletes the branch, creates it, or whose `before`
+  isn't an ancestor, and any empty or unreadable diff.
+- `rust`, `containers`, `packaging` and `desktop` also run whenever
+  `release-policy` decides to release, so they now also wait for it. The
+  `release` job requires each of its gates' result to be `success`.
+
+**Not yet shown:** any GitHub run of these changes. That a skipped job
+satisfies the required checks was seen on PR #6 only for pull requests.
+
+Checked locally, with `TMPDIR` off `/tmp`:
+
+```sh
+~/.cache/actionlint-1.7.12/actionlint -color   # clean, also with shellcheck enabled
+# ci.yml's "Every action is pinned" grep       # no unpinned actions
+shellcheck -s sh packaging/*.sh                # clean (koalaman/shellcheck:stable)
+python -B -m unittest discover -s packaging    # 209 tests, OK (15 skipped: no pwsh, MSI tools or macOS runtimes, macOS jobs off)
+python -B -m unittest discover -s packaging/release-signatures  # 17 tests, OK (1 skipped)
+python -B -m unittest discover -s packaging/windows-signing     # 39 tests, OK (6 skipped)
+python -B -m unittest discover -s ops/github-runner             # 33 tests, OK
+```
+
+The classifier was also run by hand as a push to `main` (`before` = first
+parent) on this repository's history:
+
+| Commit | Changes | rust | desktop | containers | packaging | previews |
+| --- | --- | --- | --- | --- | --- | --- |
+| `17b6e3c` | README, screenshots, docs, `apps/desktop/dev` | skip | skip | skip | skip | skip |
+| `eea7221` | `ci.yml`, `release.yml`, desktop tests | run | run | run | run | run |
+| `0a84b10` | `crates/connector` tests | run | skip | run | skip | run |
+| `7194081` | `AGENTS.md`, `docs/acceptance.md` | skip | skip | skip | skip | skip |
+| `c838263` | `packaging`, `release.yml` | skip | skip | skip | run | run |
+| `7452f6f` | `ops/github-runner` | skip | skip | skip | skip | skip |
+
+`17b6e3c` with an all-zero `before`, or marked forced, ran everything. The
+`17b6e3c` push was also classified in a fresh depth-1 clone of
+`github.com/wnzn/metro`, as CI checks it out; the classifier fetched
+`before` and gave the same answer.
+
+## Screenshots refreshed from main `eea7221` (2026-11-24, docs lane, local)
+
+Uncommitted changes on `docs/readme-refresh`, on top of `eea7221` (then
+`origin/main`). The desktop screenshots in `docs/screenshots/` were retaken
+from that source, natively on NSH 0.6.1's Linux (GTK 4) host under Xvfb in
+the `metro-desktop-shots:trixie` and `:trixie-media` images, against
+debug `metro-server` and `metro-runner` built with `cargo build --locked`
+at `eea7221`, on loopback, in the default dark theme. Every model was a
+local double: `scripted_model.py` for chat, and keyless loopback fixtures
+for System One, embeddings and media embeddings. No real vendor was called.
+
+| Script | Files written to `docs/screenshots/` | Result |
+| --- | --- | --- |
+| `apps/desktop/dev/screenshots/capture.sh` (all scenarios) | `connection`, `connection-error`, `room-runner`, `space-members`, `agent-thinking`, `agent-activity-expanded`, `chat-runs`, `thread`, `settings-runners`, `settings-providers`, `settings-device-onboarding`, `settings-appearance`, `settings-space-runner` | pass; the compact profile save was checked on the server |
+| `capture-routing.sh` | `model-routing`, `model-routing-dataflow`, `model-sharing`, `route-attribution` | pass, after the fixes below |
+| `capture-library.sh` | `library-assets`, `library-search`, `library-open-page`, `library-open-image`, `library-revocation-before`, `library-revocation-after` | pass, after the fixes below |
+| `capture-discovery.sh` (new) | `semantic-search`, `scheduled-tasks` | pass; System One was called, and the one-time task dispatched |
+
+That's 25 regenerated files, with the same names. Each script's own check
+found none of its tokens or keys in the output, the checkout or the staged
+app. Every new image was also reviewed by eye against the old one: no token
+on screen (the device token is masked), no error banner except the intended
+`401` in `connection-error`, and a fully drawn window. They were then
+optimized with `optipng -o5 -strip all`. ImageMagick `compare` found them
+pixel-identical before and after.
+
+Two referenced files were **kept unchanged**: `local-workspace-relaunch.png`
+and `settings-profile.png`. They're the 0.2.0 Linux-candidate QA shots of a
+packaged archive across a relaunch, with the native file picker
+([below](#staged-020-linux-candidate-local-workspace-and-desktop-qa-2026-11-22-project-manager-local)).
+The screenshot scripts can't reproduce that flow, and these shots show the
+older UI.
+
+Script fixes, all dev tooling under `apps/desktop/dev/screenshots/`:
+
+- `capture-routing.sh` and `capture-library.sh` use a random private X
+  display per run, like `capture.sh`. With the default `:99` and
+  `--network host`, two captures at once collided.
+- `routing-steps.mjs`:
+  - opens a connection's **Manage** before its sharing control;
+  - waits for the route badge *Routed: Incident review*;
+  - scrolls the Settings window to the use cases, and to the whole sharing
+    warning.
+- `library-steps.mjs` and `capture-library.sh` follow the current layout:
+  - the Library in the sidebar;
+  - the media model saved in Settings › Model providers (session
+    `alice-model`);
+  - Index from each row's **More** menu (session `alice-index`, which also
+    takes `library-assets.png`, because index status lives only in that
+    session);
+  - search from the box at the top, in Search › Documents & media.
+- The unpublished `library-open-time.png` was dropped. In the container,
+  the player refuses to play because its preview folder isn't private
+  (mode 755). That's the app's own check, not a script fault.
+- New: `capture-discovery.sh`, `discovery-steps.mjs` and
+  `search_fixture.py`, a keyless word-overlap embeddings and System One
+  double. It isn't a semantic model. It follows the same rules as
+  `capture.sh`: a staged read-only app copy, tokens only in mode-600 files,
+  and redacted output.
+
+Older entries in this file that link these file names, such as the routing,
+Documents & media, search, scheduled-tasks and settings captures, now show
+the current UI rather than what those runs saw. Their text still describes
+those runs. In particular, `model-routing.png` now shows the use cases
+rather than the classifier and the routing switch, `library-search.png` is
+in similarity order (not reranked), and `semantic-search.png` no longer has
+per-result score labels.
+
+Not checked here: the desktop `nsh test` suite and the Rust gate (no
+application source changed), the light theme, Windows and macOS, and real
+vendors.
+
+## Source only: leaner pull request CI (2026-11-24, CI lane, local)
+
+Uncommitted changes on `ci/trim-steps`, on top of `3933776`, to `ci.yml`,
+`release.yml` and `packaging/package_smoke_policy.py`
+([deploy.md](deploy.md#ci-and-publishing)):
+
+- The `workflows` job's policy step reads one diff of a pull request into
+  `main` and gives three answers: `skip_previews` (as before),
+  `docs_only` and `containers`. Pushes, other bases, empty or unreadable
+  diffs, symlinks and unknown paths answer `skip_previews=false`,
+  `docs_only=false`, `containers=true`.
+- `docs_only=true` skips `rust`, `containers` and `desktop`. Documentation
+  means Markdown and images under `docs/`, top-level Markdown and Markdown
+  under `ops/`, and nothing else.
+- `containers=false` skips `containers`. Its inputs are the Dockerfile,
+  `.dockerignore`, `.gitattributes`, the Cargo files, `crates/`, the
+  Compose files, `services/`, the two container runner scripts,
+  `tests/e2e/`, `rust-toolchain*` and `ci.yml`. Only paths under `docs/`,
+  `apps/`, `examples/`, `ops/`, other `packaging/` and `tests/` files,
+  other `.github/` files, `.cargo/`, top-level Markdown, `.env.example`
+  and `.gitignore` can skip it.
+- `rust` and `containers` now wait for `workflows`, and always run on
+  pushes, including when `workflows` fails.
+- The `desktop` job no longer runs `nsh build --release`; it keeps
+  `nsh check` and `nsh test`.
+- `release.yml`'s `desktop-linux` no longer has the best-effort Xvfb
+  launch (`continue-on-error`) or its screenshot upload.
+
+**Not yet shown:** any GitHub run of these changes. That a job skipped by
+`if:` satisfies the required `rust` and `containers` checks, and the job
+conditions themselves, were checked only by the contract tests below, not
+on GitHub.
+
+Checked locally, with `TMPDIR` off `/tmp`:
+
+```sh
+~/.cache/actionlint-1.7.12/actionlint -color   # clean
+# ci.yml's "Every action is pinned" grep       # no unpinned actions
+python -B -m unittest discover -s packaging    # 200 tests, OK (15 skipped: no pwsh, MSI tools or macOS runtimes, macOS jobs off)
+python -B -m unittest discover -s packaging/release-signatures  # 17 tests, OK (1 skipped)
+python -B -m unittest discover -s packaging/windows-signing     # 39 tests, OK (6 skipped)
+python3 -B -m unittest discover -s ops/github-runner            # 33 tests, OK
+```
+
+The policy was also run by hand on this repository's history, as a pull
+request into `main` from each commit's parent:
+
+| Commit | Changes | skip_previews | docs_only | containers |
+| --- | --- | --- | --- | --- |
+| `ff787b7` | `docs/acceptance.md` | true | true | false |
+| `1719366` | `tests/e2e/schedules.py` | true | false | true |
+| `0a84b10` | `crates/connector` tests | false | false | true |
+| `057284a` | `apps/desktop` and docs | false | false | false |
+| `82ff919` | `compose.prebuilt.yaml`, a packaging test | false | false | true |
+
+`ff787b7` as a push or as a pull request into `master`, and an invalid SHA,
+answer `false`, `false`, `true`. In a throwaway clone, one-file commits on
+`3933776` gave: `Dockerfile` false, false, true; `.github/workflows/release.yml`
+false, false, false; `docs/screenshots/new.png` true, true, false.
+
+**Desktop tests and the wall clock (`ad8f994`).** Three schedule-card
+tests compared fixed November 2026 firings with the app's `Date.now()`
+and broke as the real date moved on. They now run on NSH's manual clock
+from Mon, Nov 23, 2026 12:00 UTC. Desktop `nsh test`: 353/353, and
+`nsh check` passed (NSH 0.6.1).
+
+**`desktop-linux` installer check without a download.** The installer
+step's real `--install-deps` run downloaded about 58.5 MB from GitHub's
+Ubuntu mirror. That took 10–16 minutes, and in run 45320397101 more than
+57 minutes before the run was cancelled. A cache of the `.deb` files was
+tried (`2decebd`) and removed again: only a `main` run that suffered the
+same download could fill it, and it added five steps. The step now needs no
+network:
+
+- Where `ldd` finds libraries missing, it checks that the installer
+  without `--install-deps` refuses, prints the exact
+  `sudo apt-get install --no-install-recommends libgtk-4-1 libwebkitgtk-6.0-4 gstreamer1.0-plugins-base`
+  line and installs nothing.
+- Where the libraries are already present, it runs the real install,
+  `check-deps`, both updates and the uninstall.
+
+`--install-deps` itself, and install, update and uninstall without the
+libraries, are covered by `packaging/test_installers.py` with fake tools.
+`desktop-linux`, `desktop-windows` and `runner-linux` now have job
+timeouts of 30, 40 and 20 minutes. Recent runs took about 5–7, 7–15 and
+4 minutes. Checked locally:
+
+```sh
+~/.cache/actionlint-1.7.12/actionlint -color   # clean, also with shellcheck (koalaman/shellcheck:stable)
+# ci.yml's "Every action is pinned" grep       # no unpinned actions
+python -B -m unittest discover -s packaging    # 202 tests, OK (15 skipped, as above)
+python -B -m unittest discover -s packaging/release-signatures  # OK (1 skipped)
+python -B -m unittest discover -s packaging/windows-signing     # OK (6 skipped)
+python3 -B -m unittest discover -s ops/github-runner            # 33 tests, OK
+```
+
+**Not yet shown:** this step on GitHub.
+
+## Source only: releases from `main` on a version bump (2026-11-24, CI lane, local)
+
+Uncommitted changes on `fix/ci-cleanup`, on top of `106e5da`
+([deploy.md](deploy.md#releases-from-main-on-a-version-bump-in-the-source-never-run-with-real-credentials)).
+`main` is the only long-lived branch. Earlier entries that name `master`
+describe the source as it was then.
+
+- Every release guard, signer identity and provenance check now names
+  `refs/heads/main` and `ci.yml@refs/heads/main`: `release_policy.py`,
+  `winsign.py`, `release_signatures.py`, `ci.yml`, `release.yml`,
+  `release-publish.yml`, `windows-sign.yml`, `windows-distribution.yml`,
+  `sign-release-assets.yml` and `release-images.yml`. `ci.yml` no longer
+  runs on `master` pushes.
+- Only a version bump releases. `release_policy.py decide` compares the
+  checked-in version with the one at `github.event.before`. Without a
+  change, or without a readable previous version, it answers
+  `release=false` before any GitHub call. `authorize` and `tag` recheck the
+  bump and fail without one.
+- A version bump uses the earlier eligibility table. A re-run of the bump's
+  run resumes after a failure.
+- Release runs keep the `desktop` job on GitHub-hosted runners. The
+  self-hosted queue is used only when release-policy didn't choose a
+  release.
+- Every push to `main` has its own workflow-level concurrency group and is
+  never cancelled or replaced; pull requests keep `ci-pr-<n>` with cancel.
+  Only the `publish` job is serialized (`metro-official-release`, never
+  cancelled), so only a second release run can wait behind a first.
+- The Windows verifier self-test no longer decides by branch. It runs only
+  when the preview job sets `METRO_WINDOWS_SELF_TEST=preview` (from
+  `!inputs.release`), and refuses tags and jobs that can request an OIDC
+  token.
+- The `packaging` CI job also runs the `packaging/release-signatures` and
+  `packaging/windows-signing` suites.
+- No macOS builds for now, for Apple silicon or Intel, in previews or
+  releases: GitHub's macOS runners queued for 15+ minutes and jobs were
+  cancelled. `desktop-macos`, meta's macOS matrix and `macos-sign` are
+  removed, along with the five Apple secrets passed to `release-publish.yml`.
+  `release-publish.yml`'s `assets` job now checks the tag step's `proceed`
+  itself; before, `macos-sign` did. The official set is Windows and Linux
+  only (no macOS archive, no `install-metro-macos.sh`). The macOS packaging
+  code and its unit tests stay. The install-step tests skip while
+  `desktop-macos` is absent, and the release-assets macOS gate is still
+  tested with the targets patched back in.
+
+With version 0.2.0 checked in and nothing published, merging this releases
+nothing until a later pull request changes the version.
+
+**Not yet shown:** any GitHub run. The `windows-release-signing`
+environment's deployment rule must name `main` before Windows signing can
+pass. The runner routing, the `publish` concurrency group and the release
+DAG without macOS were checked only by actionlint and the contract tests
+below. The self-test guard ran under Linux pwsh 7.7.0 only, not on Windows.
+
+Checked locally, with `TMPDIR` off `/tmp`:
+
+```sh
+~/.cache/actionlint-1.7.12/actionlint -color   # clean
+# ci.yml's "Every action is pinned" grep       # no unpinned actions
+python -B -m unittest discover -s packaging -v # 190 tests, OK (15 skipped: no pwsh, MSI tools, macOS runtimes; 3 desktop-macos step tests)
+python3 -B -m unittest discover -s packaging/release-signatures  # 17 tests, OK (1 skipped: no METRO_TEST_COSIGN)
+python3 -B -m unittest discover -s packaging/windows-signing     # 39 tests, OK (6 skipped: no pwsh)
+python3 -B -m unittest discover -s ops/github-runner             # 33 tests, OK
+# Again with pwsh 7.7.0 on PATH, as on ubuntu-24.04:
+#   packaging 190 OK (10 skipped: MSI tools, macOS runtimes, desktop-macos step); windows-signing 39 OK (0 skipped)
+# shellcheck -s sh packaging/*.sh (koalaman/shellcheck:stable)  # clean
+```
+
+The policy tests run `release_policy.py` itself with synthetic GitHub
+environments and no network: no-bump pushes (same version, all-zero,
+unknown, malformed or missing `before`) answer `release=false`, and a bump
+in a throwaway repository reaches the GitHub client. `master` refs are
+refused everywhere.
+
+## Source only: faster pull request CI (2026-11-24, CI lane, local)
+
+Uncommitted changes on `fix/ci-cleanup`, on top of `1719366`, to `ci.yml`,
+`release.yml` and `packaging/package_smoke_policy.py`
+([deploy.md](deploy.md#ci-and-publishing)):
+
+- a new push to a pull request cancels its older run; pushes and the
+  official `master` group never cancel;
+- the packaging tests run in their own `packaging` job, which releases need;
+- a pull request into `main` skips the test builds unless it changes a
+  build input; pull requests build only the Apple-silicon Mac;
+- a Rust cache, written only by `main` pushes and skipped by release builds;
+- the `rust` job builds its debug binaries once and no longer builds a
+  release connector, and `desktop-linux` no longer runs a second release
+  compile for tests.
+
+**Not yet shown:** any GitHub run of these changes. GitHub's matrix from
+`fromJSON`, cancellation and cache scoping were checked only by the
+contract tests below, not on GitHub.
+
+Checked locally, with `TMPDIR` off `/tmp`:
+
+```sh
+~/.cache/actionlint-1.7.12/actionlint -color   # clean
+# ci.yml's "Every action is pinned" grep       # no unpinned actions
+python -B -m unittest discover -s packaging -v # 182 tests, OK (12 skipped: no pwsh, MSI tools or macOS runtimes)
+python3 -B -m unittest discover -s ops/github-runner  # 33 tests, OK
+```
+
+The `Swatinem/rust-cache` pin `d1527c8` is the commit of tag `v2.9.3`
+(`git ls-remote`). The preview policy was also run by hand on this
+repository's history: the `tests/e2e`-only commit `1719366` skips as a pull
+request into `main` and builds as a pull request into `master` or a push; a
+`crates` commit and an invalid SHA build.
 
 ## Partial: macOS installer previews on hosted Macs at b7f693b (2026-11-24, docs lane, GitHub)
 

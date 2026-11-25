@@ -27,19 +27,23 @@ const steps = [
   `await app.press("id:nav-settings:routing")`,
   `await app.waitFor("id:case-label:1", { timeout: 15000 })`,
   `await app.waitFor("text:/Bob's GPU box · fixture\\/shared-local/", { timeout: 15000 })`,
+  `await app.scroll("id:routing-settings", 600)`, // down to the use cases (Settings is a dialog)
   `await app.wait(300)`,
   shot("model-routing.png"),
   // Where text goes, from what is chosen.
-  `await app.scroll("id:routing-settings", 1400)`,
+  `await app.scroll("id:routing-settings", 800)`, // scroll distances add up: 1400 in all
   `await app.waitFor("id:routing-dataflow")`,
   `await app.wait(300)`,
   shot("model-routing-dataflow.png"),
 
   // Sharing: a local model shared with one Space, and what that means.
   `await app.press("id:nav-settings:providers")`,
+  `await app.waitFor(${q(`id:connection-manage:${SHARED}`)}, { timeout: 15000 })`,
+  `await app.press(${q(`id:connection-manage:${SHARED}`)})`, // a connection's controls sit behind Manage
   `await app.waitFor(${q(`id:connection-sharing:${SHARED}`)}, { timeout: 15000 })`,
   `await app.press(${q(`id:connection-sharing:${SHARED}`)})`,
   `await app.waitFor(${q(`id:sharing-warning:${SHARED}`)}, { timeout: 15000 })`,
+  `await app.scroll("id:providers-settings", 260)`, // the whole warning in view
   `await app.wait(300)`,
   shot("model-sharing.png"),
   `await app.press("id:settings-close")`,
@@ -52,7 +56,7 @@ const steps = [
   `await app.press("id:send")`,
   `await app.waitFor("text:/reply from shared-local/", { timeout: 30000 })`,
   `await app.waitFor("text:/detected by System One/", { timeout: 15000 })`,
-  `await app.waitFor("text:Incident review", { timeout: 15000 })`,
+  `await app.waitFor("text:/^Routed: Incident review/", { timeout: 15000 })`, // the compact route badge
   `await app.press("text:/’s activity$/")`,
   `await app.waitFor("text:/answered: System One matched the use case/", { timeout: 15000 })`,
   `await app.wait(300)`,

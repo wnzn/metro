@@ -13,6 +13,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 
 import package
@@ -91,38 +92,51 @@ def windows_fields(files, mode):
     fields = {"nsh": package.NSH_VERSION, "connector": "linked", "local_runner": package.LOCAL_RUNNER,
               "dependencies": {n: {"imports": ["kernel32.dll"]} for n in exes}}
     if mode:
-        fields["signing"] = {"mode": mode, "seed_sha256": "0" * 64, "stock_renderer_unsigned_sha256": "1" * 64,
-                             "files": {}}
+        fields["signing"] = {"mode": mode, "seed_sha256": "0" * 64, "commit": REV,
+                             "stock_renderer_unsigned_sha256": "1" * 64, "files": {}}
     return fields
 
 
-def collected(folder, mode="release", windows_signed=True, mac=None, msi_signed=True, ps1_signed=True, tui=True,
-              win_mode=None):
-    """What the dist-* artifacts of one run hold, named and shaped as the real producers write them."""
+def collected(folder, mode="release", windows_signed=None, mac=None, msi_signed=None, ps1_signed=None, tui=True,
+              win_mode=None, windows=None):
+    """What the dist-* artifacts of one run hold, named and shaped as the real producers write them.
+
+    `windows` is the release's Windows signing mode (default: the checked-in one, or a test's patch);
+    the signing flags default to what that mode's producer writes."""
     folder.mkdir(parents=True, exist_ok=True)
+    if mode == "release" and windows is None:
+        windows = release_signatures.windows_signing()
+    signed = mode == "release" and windows == "signed"
+    windows_signed = signed if windows_signed is None else windows_signed
+    msi_signed = signed if msi_signed is None else msi_signed
+    ps1_signed = signed if ps1_signed is None else ps1_signed
     linux = {"Metro": b"\x7fELF launcher", "START.txt": b"s", **({"metro-tui": b"\x7fELF tui"} if tui else {})}
     write_archive(folder, f"Metro-{V}-linux-x64", linux, "desktop", "linux-x64")
     write_archive(folder, f"Metro-runner-{V}-linux-x64", {"metro-runner": b"\x7fELF runner"}, "runner", "linux-x64")
     win = {"Metro.exe": pe(windows_signed), "metro-server.exe": pe(windows_signed),
            "ui/Metro.exe": pe(windows_signed), "START.txt": b"s",
            **({"metro-tui.exe": pe(windows_signed)} if tui else {})}
-    signing_mode = win_mode or ("authenticode" if mode == "release" else "unsigned-preview")
+    signing_mode = win_mode or ("authenticode" if signed else "unsigned-preview")
     write_archive(folder, f"Metro-{V}-windows-x64", win, "desktop", "windows-x64", windows_fields(win, signing_mode))
-    msi = folder / ra.Layout(V, mode).msi
+    msi = folder / ra.Layout(V, mode, windows if mode == "release" else None).msi
     msi.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\0" * 64
                     + (ra.MSI_SIGNATURE if msi_signed else b"") + b"\0" * 32)
     sidecar(msi)
     for script in ra.PS1_SCRIPTS:
-        source = (HERE / script).read_bytes()  # preview: unchanged source; tag: source + one signature block
-        (folder / script).write_bytes(source + (PS1_SIG if ps1_signed and mode == "release" else b""))
+        source = (HERE / script).read_bytes()  # unsigned: unchanged source; signed: source + one signature block
+        (folder / script).write_bytes(source + (PS1_SIG if ps1_signed else b""))
     if mode == "release":
-        for target in ("macos-arm64", "macos-x64"):
-            write_archive(folder, f"Metro-{V}-{target}",
-                          {"Metro.app/Contents/MacOS/Metro": b"\xcf\xfa\xed\xfe",
-                           "Metro.app/Contents/MacOS/metro-tui": b"\xcf\xfa\xed\xfe tui",
-                           "Metro.app/Contents/CodeResources": b"ticket"},
-                          "desktop", target, mac or mac_fields())
+        for target in ra.MACOS:  # none while macOS builds are off; tests patch ra.MACOS
+            write_mac(folder, target, mac or mac_fields())
     return folder
+
+
+def write_mac(folder, target, fields):
+    write_archive(folder, f"Metro-{V}-{target}",
+                  {"Metro.app/Contents/MacOS/Metro": b"\xcf\xfa\xed\xfe",
+                   "Metro.app/Contents/MacOS/metro-tui": b"\xcf\xfa\xed\xfe tui",
+                   "Metro.app/Contents/CodeResources": b"ticket"},
+                  "desktop", target, fields)
 
 
 def image_evidence(folder, version=V, revision=REV):
@@ -151,10 +165,15 @@ def image_evidence(folder, version=V, revision=REV):
 
 
 class AssembleTests(unittest.TestCase):
+    """A signed Windows release (packaging/windows-release-signing.txt `signed`) and previews."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.out = self.root / "release"
+        mode = patch.object(release_signatures, "windows_signing", return_value="signed")
+        mode.start()
+        self.addCleanup(mode.stop)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -165,9 +184,10 @@ class AssembleTests(unittest.TestCase):
     def test_release_holds_exactly_the_published_set(self):
         self.assemble()
         names = sorted(p.name for p in self.out.iterdir())
-        archives = [f"Metro-{V}-linux-x64.tar.gz", f"Metro-{V}-macos-arm64.tar.gz", f"Metro-{V}-macos-x64.tar.gz",
+        self.assertEqual(ra.MACOS, ())  # macOS builds are off for now: Windows and Linux only
+        archives = [f"Metro-{V}-linux-x64.tar.gz",
                     f"Metro-{V}-windows-x64.msi", f"Metro-{V}-windows-x64.zip", f"Metro-runner-{V}-linux-x64.tar.gz"]
-        scripts = ["install-metro-linux.sh", "install-metro-macos.sh", "install-metro-runner-linux.sh",
+        scripts = ["install-metro-linux.sh", "install-metro-runner-linux.sh",
                    "install-metro-windows.ps1", "metro-runner-container.ps1", "metro-runner-container.sh"]
         self.assertEqual(names, sorted(archives + [a + ".sha256" for a in archives] + scripts + ["SHA256SUMS"]))
         sums = (self.out / "SHA256SUMS").read_text().splitlines()
@@ -182,8 +202,8 @@ class AssembleTests(unittest.TestCase):
             self.assertNotEqual(signed, source)
             info = winsign.script_unsigned_info(source, script)
             self.assertEqual(winsign.script_split(signed, info, script)[0], source)
-        for script in ("install-metro-linux.sh", "install-metro-macos.sh"):
-            self.assertEqual((self.out / script).read_bytes(), (HERE / script).read_bytes())
+        self.assertEqual((self.out / "install-metro-linux.sh").read_bytes(),
+                         (HERE / "install-metro-linux.sh").read_bytes())
 
     def test_smoke_has_no_macos_and_allows_unsigned_previews(self):
         self.assemble("smoke", windows_signed=False, msi_signed=False, ps1_signed=False, tui=False)
@@ -203,8 +223,9 @@ class AssembleTests(unittest.TestCase):
         self.assertIn("name: dist-desktop-windows-x64", sign)
         self.assertEqual(set(ra.PS1_SCRIPTS), set(winsign.SCRIPTS))
         self.assertEqual(ra.TUI["windows-x64"], winsign.TUI_EXE)
-        for mode, official in (("release", True), ("smoke", False)):
-            src = collected(self.root / f"real-{mode}", mode)
+        for mode, official, windows in (("release", True, "signed"), ("release", False, "unsigned"),
+                                        ("smoke", False, None)):
+            src = collected(self.root / f"real-{mode}-{windows}", mode, windows=windows)
             name = f"Metro-{V}-windows-x64.zip"
             with zipfile.ZipFile(src / name) as z:
                 manifest = json.loads(z.read(f"Metro-{V}-windows-x64/RELEASE.json"))
@@ -230,11 +251,7 @@ class AssembleTests(unittest.TestCase):
             ra.assemble(V, "release", src, self.out)
 
     def test_release_refuses_what_must_never_ship(self):
-        cases = {
-            "ad hoc macOS": dict(mac=mac_fields(signing="adhoc", status="preview-not-verified")),
-            "not stapled": dict(mac=mac_fields(notarization={**mac_fields()["notarization"], "stapled": False})),
-            "ticket missing": dict(mac=mac_fields(notarization={**mac_fields()["notarization"],
-                                                                "ticket_files": ["Metro.app/Contents/Nope"]})),
+        cases = {  # the macOS cases are in test_macos_release_checks_still_hold_when_macs_return
             "unsigned Windows seed": dict(windows_signed=False),
             "unsigned MSI": dict(msi_signed=False),
             "unsigned ps1": dict(ps1_signed=False),
@@ -251,8 +268,8 @@ class AssembleTests(unittest.TestCase):
 
     def test_missing_and_extra_inputs_are_refused(self):
         src = collected(self.root / "collected")
-        (src / f"Metro-{V}-macos-x64.tar.gz").unlink()
-        with self.assertRaisesRegex(ra.AssetError, "missing release files: Metro-0.3.0-macos-x64.tar.gz"):
+        (src / f"Metro-{V}-linux-x64.tar.gz").unlink()
+        with self.assertRaisesRegex(ra.AssetError, "missing release files: Metro-0.3.0-linux-x64.tar.gz"):
             ra.assemble(V, "release", src, self.out)
         shutil.rmtree(src)
         src = collected(self.root / "collected")
@@ -262,7 +279,37 @@ class AssembleTests(unittest.TestCase):
         shutil.rmtree(src)
         src = collected(self.root / "collected", "smoke")
         with self.assertRaisesRegex(ra.AssetError, "missing release files"):
-            ra.assemble(V, "release", src, self.out)  # a tag never ships without macOS
+            ra.assemble(V, "release", src, self.out)  # a preview set is never a release
+        shutil.rmtree(src)
+        # macOS builds are off: even a notarized-looking Mac archive is never part of a release.
+        for target in ("macos-arm64", "macos-x64"):
+            src = collected(self.root / "collected")
+            write_mac(src, target, mac_fields())
+            with self.subTest(target), self.assertRaisesRegex(ra.AssetError, f"unexpected files.*{target}"):
+                ra.assemble(V, "release", src, self.out)
+            shutil.rmtree(src)
+
+    def test_macos_release_checks_still_hold_when_macs_return(self):
+        """The macOS gate is kept for later; exercise it with the targets it would have."""
+        with patch.object(ra, "MACOS", ("macos-arm64", "macos-x64")):
+            self.assemble()
+            names = {p.name for p in self.out.iterdir()}
+            self.assertTrue({f"Metro-{V}-macos-arm64.tar.gz", f"Metro-{V}-macos-x64.tar.gz",
+                             "install-metro-macos.sh"} <= names)
+            src = collected(self.root / "smoke-collected", "smoke")
+            with self.assertRaisesRegex(ra.AssetError, "missing release files"):
+                ra.assemble(V, "release", src, self.root / "out2")  # a tag never ships without macOS
+            for label, mac in {
+                "ad hoc macOS": mac_fields(signing="adhoc", status="preview-not-verified"),
+                "not stapled": mac_fields(notarization={**mac_fields()["notarization"], "stapled": False}),
+                "ticket missing": mac_fields(notarization={**mac_fields()["notarization"],
+                                                           "ticket_files": ["Metro.app/Contents/Nope"]}),
+            }.items():
+                with self.subTest(label):
+                    out = self.root / f"out-{label}"
+                    with self.assertRaises(ra.AssetError):
+                        ra.assemble(V, "release", collected(self.root / f"c-{label}", mac=mac), out)
+                    self.assertFalse(out.exists())
 
     def test_tampering_is_refused(self):
         src = collected(self.root / "collected")
@@ -306,8 +353,87 @@ class AssembleTests(unittest.TestCase):
         self.assertTrue(winsign.SIG_BLOCK.match(PS1_SIG))
 
 
+class UnsignedReleaseTests(unittest.TestCase):
+    """An unsigned Windows release (packaging/windows-release-signing.txt `unsigned`): the natively
+    tested unsigned build from windows-distribution.yml, labelled unsigned, nothing else."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.out = self.root / "release"
+        mode = patch.object(release_signatures, "windows_signing", return_value="unsigned")
+        mode.start()
+        self.addCleanup(mode.stop)
+
+    def assemble(self, **kw):
+        shutil.rmtree(self.root / "collected", ignore_errors=True)
+        shutil.rmtree(self.out, ignore_errors=True)
+        return ra.assemble(V, "release", collected(self.root / "collected", "release", **kw), self.out)
+
+    def test_release_holds_the_unsigned_windows_build_under_its_unsigned_names(self):
+        self.assemble()
+        names = sorted(p.name for p in self.out.iterdir())
+        archives = [f"Metro-{V}-linux-x64.tar.gz", f"Metro-{V}-windows-x64.unsigned-preview.msi",
+                    f"Metro-{V}-windows-x64.zip", f"Metro-runner-{V}-linux-x64.tar.gz"]
+        scripts = ["install-metro-linux.sh", "install-metro-runner-linux.sh",
+                   "install-metro-windows.ps1", "metro-runner-container.ps1", "metro-runner-container.sh"]
+        self.assertEqual(names, sorted(archives + [a + ".sha256" for a in archives] + scripts + ["SHA256SUMS"]))
+        self.assertNotIn(f"Metro-{V}-windows-x64.msi", names)
+        for script in ra.PS1_SCRIPTS:  # this checkout's unsigned scripts, unchanged
+            self.assertEqual((self.out / script).read_bytes(), (HERE / script).read_bytes())
+        self.assertEqual(ra.Layout(V, "release").msi, release_signatures.windows_msi(V))
+
+    def test_unsigned_release_keeps_the_official_checks_and_its_label(self):
+        cases = {
+            "no terminal client": dict(tui=False),
+            "an Authenticode ZIP under the unsigned mode": dict(win_mode="authenticode"),
+            "a signature in the MSI named unsigned": dict(msi_signed=True),
+            "signed scripts": dict(ps1_signed=True),
+        }
+        for label, kw in cases.items():
+            with self.subTest(label), self.assertRaises(ra.AssetError):
+                self.assemble(**kw)
+            self.assertFalse(self.out.exists())
+
+    def test_unsigned_release_needs_the_commit_it_was_built_from(self):
+        src = collected(self.root / "collected", "release")
+        top = f"Metro-{V}-windows-x64"
+        win = {"Metro.exe": pe(False), "metro-server.exe": pe(False), "ui/Metro.exe": pe(False),
+               "START.txt": b"s", "metro-tui.exe": pe(False)}
+        fields = windows_fields(win, "unsigned-preview")
+        del fields["signing"]["commit"]
+        write_archive(src, top, win, "desktop", "windows-x64", fields)
+        with self.assertRaisesRegex(ra.AssetError, "unsigned-preview with its commit"):
+            ra.assemble(V, "release", src, self.out)
+        # An old seed without any signing record is not a labelled unsigned release either.
+        write_archive(src, top, win, "desktop", "windows-x64", windows_fields(win, None))
+        with self.assertRaisesRegex(ra.AssetError, "signing mode None"):
+            ra.assemble(V, "release", src, self.out)
+        self.assertFalse(self.out.exists())
+
+    def test_signed_set_is_refused_while_the_switch_says_unsigned(self):
+        src = collected(self.root / "collected", "release", windows="signed")
+        with self.assertRaisesRegex(ra.AssetError, "missing release files: .*unsigned-preview.msi"):
+            ra.assemble(V, "release", src, self.out)
+        # An unsigned release has a preview's shape by design (the same windows-distribution.yml
+        # path); what keeps a preview out is its -ci version, which release mode refuses.
+        with self.assertRaisesRegex(ra.AssetError, "tag version"):
+            ra.Layout(f"{V}-ci", "release")
+
+    def test_previews_never_follow_the_switch(self):
+        with patch.object(release_signatures, "windows_signing", return_value="signed"):
+            self.assertEqual(ra.Layout(V, "smoke").msi, f"Metro-{V}-windows-x64.unsigned-preview.msi")
+            self.assertFalse(ra.Layout(V, "smoke").windows_signed)
+        with self.assertRaisesRegex(ra.AssetError, "never signed"):
+            ra.Layout(V, "smoke", "signed")
+        with self.assertRaisesRegex(ra.AssetError, "bad Windows signing mode"):
+            ra.Layout(V, "release", "maybe")
+
+
 class SignerContractTests(unittest.TestCase):
-    """The assembled folder is exactly what sign-release-assets.yml (release_signatures.py) stages."""
+    """The assembled folder is exactly what sign-release-assets.yml (release_signatures.py) stages,
+    for the checked-in Windows signing mode (the CLI below reads the same file)."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
