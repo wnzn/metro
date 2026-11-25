@@ -1207,11 +1207,27 @@ async fn resumed_apply_requires_signed_evidence_and_every_staged_file() {
     let req = rx.borrow().clone().unwrap();
     let lock = install::Lock::take(&i.root).unwrap();
     u.verify_apply(&req, &lock).unwrap();
+    let journal_path = i.root.join(install::JOURNAL);
+    let original_journal = fs::read(&journal_path).unwrap();
+    fs::write(&journal_path, b"{").unwrap();
+    let ambiguous = u.verify_apply(&req, &lock).err().unwrap();
+    assert!(
+        ambiguous
+            .get_ref()
+            .is_some_and(|e| e.is::<install::JournalUncertain>())
+    );
+    assert_eq!(fs::read(&journal_path).unwrap(), b"{");
+    fs::write(&journal_path, original_journal).unwrap();
     let stage = i.root.join("versions").join(NEW);
     let app_file = stage.join("ui/Metro");
     let original = fs::read(&app_file).unwrap();
     fs::write(&app_file, b"changed after staging").unwrap();
-    assert!(u.verify_apply(&req, &lock).is_err());
+    let bad_stage = u.verify_apply(&req, &lock).err().unwrap();
+    assert!(
+        !bad_stage
+            .get_ref()
+            .is_some_and(|e| e.is::<install::JournalUncertain>())
+    );
     fs::write(&app_file, original).unwrap();
     let assets = i
         .desktop_root
@@ -1413,24 +1429,55 @@ fn unknown_or_foreign_journal_is_never_consumed() {
     let p = paths(&i);
     let path = p.root.join(install::JOURNAL);
     let old = Version::parse(OLD).unwrap();
+    let snap = p.update_dir.join(format!("db-snapshot-{}", j.id));
+    fs::create_dir_all(&snap).unwrap();
+    let backup = snap.join("metro.sqlite3");
+    fs::write(&backup, b"preserve old database").unwrap();
     for raw in [
+        b"{".as_slice(),
         br#"{"version":99,"id":"01","phase":"trial"}"#.as_slice(),
         br#"{"version":1,"id":"../../outside","from":"0.9.0","to":"0.9.1","phase":"trial","started_at":0}"#,
         br#"{"version":1,"id":"0123456789abcdef","from":"0.9.1","to":"0.9.0","phase":"trial","started_at":0}"#,
     ] {
         fs::write(&path, raw).unwrap();
-        assert_eq!(install::recover(&p.root, &p.desktop_root, &p.update_dir, &old), install::Recovery::Blocked);
+        assert_eq!(
+            install::recover(&p.root, &p.desktop_root, &p.update_dir, &old),
+            install::Recovery::JournalUncertain
+        );
         assert_eq!(fs::read(&path).unwrap(), raw);
+        assert_eq!(install::read_pointer(&p.root).as_deref(), Some(OLD));
+        assert_eq!(fs::read(&backup).unwrap(), b"preserve old database");
     }
     j.phase = JournalPhase::Trial;
     install::write_journal(&path, &j).unwrap();
     install::set_pointer(&p.root, "0.9.2").unwrap();
     assert_eq!(
         install::recover(&p.root, &p.desktop_root, &p.update_dir, &old),
-        install::Recovery::Blocked
+        install::Recovery::JournalUncertain
     );
     assert_eq!(install::read_journal(&path), Some(j));
     assert_eq!(install::read_pointer(&p.root).as_deref(), Some("0.9.2"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_journal_that_becomes_unreadable_during_use_blocks_future_staging() {
+    let i = install();
+    let f = serve(release(desktop_archive(NEW, "desktop")).files, vec![]);
+    let u = updater(&i, &f, Channel::Release);
+    u.check(true).await.unwrap();
+    let journal = i.root.join(install::JOURNAL);
+    fs::write(&journal, b"{").unwrap();
+    u.start_download(NEW).unwrap();
+    let state = until_settled(&u).await;
+    assert_eq!(state["phase"], "failed");
+    assert_eq!(state["failure"]["code"], install::JOURNAL_UNCERTAIN);
+    u.check(true).await.unwrap();
+    assert_eq!(
+        u.start_download(NEW).unwrap_err().code,
+        install::JOURNAL_UNCERTAIN
+    );
+    assert_eq!(fs::read(&journal).unwrap(), b"{");
+    assert_eq!(install::read_pointer(&i.root).as_deref(), Some(OLD));
 }
 
 #[test]

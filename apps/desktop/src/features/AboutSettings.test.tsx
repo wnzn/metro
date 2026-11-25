@@ -450,6 +450,27 @@ test("a verified check cannot re-offer a stage with a recorded verification fail
   expect(f.count("download")).toBe(0);
 });
 
+test("an uncertain install journal gives read-only support guidance instead of the manual installer", async () => {
+  const f = scenario({ ...available(), phase: "failed", failure: { code: "update_journal_unknown" },
+    last_update: { from: CURRENT, to: NEXT, at: lastAt, outcome: "install_failed", failure_code: "stage_verification_failed" } });
+  const app = await harness(f);
+  await app.waitFor("id:update-recovery-support");
+  expect(text(app)).toContain("read-only diagnosis");
+  expect(text(app)).not.toContain("Use the official installer to update manually");
+  expect(app.shows("id:update-recovery-release")).toBe(false);
+  expect(app.shows("id:update-start")).toBe(false);
+  expect(app.shows("id:update-restart")).toBe(false);
+  f.check = () => {
+    f.update({ phase: "idle", latest: latest(AFTER), last_checked_at: lastAt + 1 });
+    return undefined;
+  };
+  await app.press("id:update-check");
+  await app.waitUntil(() => f.count("check") === 1);
+  await app.waitFor("id:update-recovery-support");
+  expect(app.shows("id:h-update-available")).toBe(false);
+  expect(app.shows("id:update-start")).toBe(false);
+});
+
 test("a dismissed outcome stays dismissed on relaunch, but a new attempt with the same version and result appears", async () => {
   const last = { from: CURRENT, to: NEXT, at: lastAt, outcome: "rolled_back", detail: "private path" };
   const f = scenario({ ...available(), last_update: last });

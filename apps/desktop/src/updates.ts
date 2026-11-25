@@ -35,6 +35,7 @@ const installs = ["linux-installer", "windows-script", "windows-msi", "portable"
 const results = ["never", "up_to_date", "available", "error"] as const;
 const outcomes = ["updated", "rolled_back", "install_failed", "not_confirmed"] as const;
 const installFailures = ["installer_busy", "stage_verification_failed", "backup_failed"] as const;
+export const JOURNAL_UNCERTAIN = "update_journal_unknown";
 const DISMISSED_OUTCOME = "metro.update.dismissedOutcome";
 
 type Release = { version: string; commit?: string; signedAt: number | null; url?: string; notes?: string; notesTruncated: boolean };
@@ -159,7 +160,7 @@ export function needsManualRecovery(last: LastUpdate | undefined) {
 
 export function verifiedOffer(s: UpdateState | null): UpdateOffer | undefined {
   if (!s?.canCheck || s.result !== "available" || s.error || s.anomaly || s.persistenceError
-      || !s.latest || !newerVersion(s.latest.version, s.current.version)) return;
+      || s.failure === JOURNAL_UNCERTAIN || !s.latest || !newerVersion(s.latest.version, s.current.version)) return;
   // A failed restart should not immediately re-offer that same version on
   // the strength of the old check. Checking again never downloads anything.
   const last = s.lastUpdate;
@@ -316,7 +317,7 @@ export function createDesktopUpdates(endpoint: BridgeEndpoint | null, storage: P
       if (command === "cancel") cancelling.set(false);
       // Capture the action's identity, not whichever offer a concurrent
       // read happened to publish before the refusal arrived.
-      const refusedIdentity = ["not_latest", "not_ready", "not_verified", "not_in_app", "stage_verification_failed"].includes(refusal)
+      const refusedIdentity = ["not_latest", "not_ready", "not_verified", "not_in_app", "stage_verification_failed", JOURNAL_UNCERTAIN].includes(refusal)
         ? actedOn?.identity : undefined;
       if (refusedIdentity) refusedOffers.set(new Set([...refusedOffers(), refusedIdentity]));
       if (refusal !== "would_interrupt") problem.set({ command, code: refusal, refusedIdentity });

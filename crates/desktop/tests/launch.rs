@@ -179,6 +179,68 @@ fn a_portable_launcher_cannot_open_a_shared_workspace_with_an_unfinished_trial()
     check(); // The data-root gate survives the source watchdog.
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn malformed_journal_stops_packaged_launch_with_read_only_recovery_guidance() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let dir = scratch("malformed-update-journal");
+    layout(&dir, true);
+    let root = dir.join("install");
+    let version = env!("CARGO_PKG_VERSION");
+    let target = Path::new("versions").join(version);
+    fs::create_dir_all(root.join("versions")).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::rename(dir.join("app"), root.join(&target)).unwrap();
+    let launcher = root.join(&target).join("Metro");
+    fs::write(
+        root.join(".metro-desktop-install"),
+        b"metro-update-lock-v2\n",
+    )
+    .unwrap();
+    symlink(&target, root.join("current")).unwrap();
+    let journal = root.join(".update.json");
+    fs::write(&journal, b"{").unwrap();
+
+    let home = dir.join("home");
+    metro_connector::desktop::store::prepare_private_dir(&home).unwrap();
+    let live_db = home.join("local/db/metro.sqlite3");
+    let backup = home.join("update/db-snapshot-0123456789abcdef/metro.sqlite3");
+    for (file, contents) in [(&live_db, b"live database"), (&backup, b"saved backup!")] {
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, contents).unwrap();
+    }
+    let out = dir.join("ui.json");
+    let gate_path = home.join("desktop-update.json");
+    let gate = serde_json::json!({"root": root, "id":"0123456789abcdef"}).to_string();
+    for with_gate in [false, true] {
+        if with_gate {
+            fs::write(&gate_path, &gate).unwrap();
+        }
+        let result = retry(|| command(&dir, &launcher, &out, "home").output());
+        assert_eq!(result.status.code(), Some(1));
+        let text = String::from_utf8_lossy(&result.stderr);
+        for required in [
+            "[update_journal_unknown]",
+            "sh install-metro-linux.sh status",
+            "Do not run install, update or uninstall",
+            "https://github.com/wnzn/metro/issues",
+        ] {
+            assert!(text.contains(required), "{text}");
+        }
+        assert!(!out.exists(), "the launcher opened the UI");
+        assert_eq!(fs::read_link(root.join("current")).unwrap(), target);
+        assert_eq!(fs::read(&journal).unwrap(), b"{");
+        assert_eq!(fs::read(&live_db).unwrap(), b"live database");
+        assert_eq!(fs::read(&backup).unwrap(), b"saved backup!");
+        if with_gate {
+            assert_eq!(fs::read_to_string(&gate_path).unwrap(), gate);
+        }
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn launches_the_packaged_ui_with_a_private_bridge_and_cleans_up() {
     let dir = scratch("ok");

@@ -31,6 +31,41 @@ pub enum After {
     Relaunch,
 }
 
+fn recovery_message(code: &str, reason: &str) -> String {
+    let mut message = format!(
+        "[{code}] {reason}\n\
+         Stop Metro, its bundled server and any Metro installer. Keep the installation and workspace data, \
+         including the update records, live database and backup. Do not remove locks or records, \
+         change the current version pointer, or overwrite either database copy."
+    );
+    if cfg!(target_os = "linux") {
+        message.push_str(
+            "\nFor read-only diagnosis, run `sh install-metro-linux.sh status` using the verified official \
+             installer and the same install location. Do not run install, update or uninstall to recover.",
+        );
+    }
+    message.push_str(
+        "\nContact the Metro maintainers at https://github.com/wnzn/metro/issues. Share this diagnostic, \
+         not private databases or credentials. Resume only after the installation and workspace \
+         have been verified together.",
+    );
+    message
+}
+
+fn uncertain_journal() -> String {
+    recovery_message(
+        install::JOURNAL_UNCERTAIN,
+        "Metro could not verify the update journal against this installation.",
+    )
+}
+
+fn blocked_recovery() -> String {
+    recovery_message(
+        "update_recovery_required",
+        "The shared workspace has an unfinished update. Metro cannot verify safe recovery yet.",
+    )
+}
+
 pub async fn apply(
     updater: &Arc<Updater>,
     req: ApplyRequest,
@@ -55,6 +90,13 @@ pub async fn apply(
     };
     let (mut j, verified) = match updater.verify_apply_with_refresh(&req, &install_lock).await {
         Ok(stage) => stage,
+        Err(e)
+            if e.get_ref()
+                .is_some_and(|cause| cause.is::<install::JournalUncertain>()) =>
+        {
+            crate::fatal(&uncertain_journal());
+            return After::Exit(1);
+        }
         Err(e) => {
             eprintln!("metro-desktop: the staged update wasn't used: {e}");
             if !record_failure(InstallFailure::StageVerificationFailed) {
@@ -121,9 +163,7 @@ pub async fn apply(
         }
         TrialOutcome::NotConfirmed => After::Exit(0),
         TrialOutcome::NeedsRecovery => {
-            crate::fatal(
-                "Metro did not finish the update. The backup and update records were kept. Resolve the interrupted update manually before restarting.",
-            );
+            crate::fatal(&blocked_recovery());
             After::Exit(1)
         }
         TrialOutcome::RolledBack(detail) => {
@@ -135,7 +175,10 @@ pub async fn apply(
 
 pub fn gate_msi_at_start(desktop_root: &Path) -> Result<(), String> {
     install::gate_legacy_msi(&desktop_root.join("update")).map_err(|_| {
-        "Metro can't confirm that the previous Windows Installer transaction finished. The update record and workspace backup were kept. Resolve the installer and backup manually before starting Metro.".into()
+        recovery_message(
+            "update_recovery_required",
+            "Metro can't confirm that the previous Windows Installer transaction finished.",
+        )
     })
 }
 
@@ -144,13 +187,10 @@ pub fn recover_at_start(
     desktop_root: &Path,
     lock: Option<&InstanceLock>,
 ) -> Result<(), String> {
-    let blocked = || {
-        "The shared workspace has an unfinished update. Close other Metro instances. If the interrupted update still blocks startup, preserve both copies and resolve it manually before restarting.".to_string()
-    };
-    let gate = RootGate::read(desktop_root).map_err(|_| blocked())?;
+    let gate = RootGate::read(desktop_root).map_err(|_| uncertain_journal())?;
     let Some(lock) = lock else {
         return if gate.is_some() {
-            Err(blocked())
+            Err(blocked_recovery())
         } else {
             Ok(())
         };
@@ -161,39 +201,38 @@ pub fn recover_at_start(
         .filter(|root| root.join(install::MARKER).is_file());
     let Some(root) = root else {
         return if gate.is_some() {
-            Err(blocked())
+            Err(blocked_recovery())
         } else {
             Ok(())
         };
     };
     let Some(own) = metro_release::Version::parse(env!("CARGO_PKG_VERSION")) else {
-        return Err(blocked());
+        return Err(blocked_recovery());
+    };
+    let recover = || match install::recover(root, desktop_root, &desktop_root.join("update"), &own)
+    {
+        install::Recovery::Nothing => Ok(()),
+        install::Recovery::Blocked => Err(blocked_recovery()),
+        install::Recovery::JournalUncertain => Err(uncertain_journal()),
     };
     if let Some(gate) = &gate {
         let j = install::load_journal(&root.join(install::JOURNAL))
-            .map_err(|_| blocked())?
+            .map_err(|_| uncertain_journal())?
             .filter(|j| gate.matches(root, &j.id))
-            .ok_or_else(blocked)?;
+            .ok_or_else(uncertain_journal)?;
+        if !install::script_state(root, &own.to_string()) {
+            return Err(uncertain_journal());
+        }
         if !matches!(
             j.phase.as_str(),
             "staged" | "backing_up" | "committed" | "failed"
-        ) || !install::script_state(root, &own.to_string())
-        {
-            return Err(blocked());
+        ) {
+            return Err(blocked_recovery());
         }
-        if install::recover(root, desktop_root, &desktop_root.join("update"), &own)
-            == install::Recovery::Blocked
-        {
-            return Err(blocked());
-        }
-        return RootGate::retire(desktop_root, root, &j.id, lock).map_err(|_| blocked());
+        recover()?;
+        return RootGate::retire(desktop_root, root, &j.id, lock).map_err(|_| blocked_recovery());
     }
-    if install::recover(root, desktop_root, &desktop_root.join("update"), &own)
-        == install::Recovery::Blocked
-    {
-        return Err(blocked());
-    }
-    Ok(())
+    recover()
 }
 
 pub fn trial_lock(id: &str, install_dir: &Path, desktop_root: &Path) -> Option<InstanceLock> {

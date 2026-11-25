@@ -231,6 +231,9 @@ pub fn message_for(code: &str) -> &'static str {
         "installer_busy" => {
             "Another Metro install or update is running. Try again when it has finished."
         }
+        install::JOURNAL_UNCERTAIN => {
+            "Metro couldn't verify the update journal. Keep the installation and workspace data unchanged and contact the Metro maintainers."
+        }
         "missing_libraries" => "This version needs system libraries that aren't installed.",
         "not_latest" => "That version isn't the latest verified release anymore. Check again.",
         _ => "The update couldn't be completed. Nothing was changed.",
@@ -557,6 +560,10 @@ impl Updater {
     fn authorizes(&self, inner: &Inner, version: Version) -> bool {
         !inner.floor_unreadable
             && !inner.status_error
+            && !inner
+                .failure
+                .as_ref()
+                .is_some_and(|f| f.code == install::JOURNAL_UNCERTAIN)
             && offered(&inner.status, self.cfg.own, version)
             && inner.status.evidence.as_ref().is_some_and(|e| {
                 e.verify(self.cfg.verifier.as_ref())
@@ -877,6 +884,17 @@ impl Updater {
         let Some(target) = Version::parse(version) else {
             return Err(refuse(400, "bad_request", "version must be X.Y.Z"));
         };
+        if inner
+            .failure
+            .as_ref()
+            .is_some_and(|f| f.code == install::JOURNAL_UNCERTAIN)
+        {
+            return Err(refuse(
+                409,
+                install::JOURNAL_UNCERTAIN,
+                message_for(install::JOURNAL_UNCERTAIN),
+            ));
+        }
         if blocked_stage(&inner.status, self.cfg.own, target) {
             return Err(refuse(
                 409,
@@ -1166,6 +1184,17 @@ impl Updater {
         if !self.can_update_in_app() {
             return Err(invalid());
         }
+        lock.check(install::lock_root(&self.cfg.kind, &self.cfg.dir))?;
+        let path = install::journal_path(&self.cfg.kind, &self.cfg.dir).ok_or_else(invalid)?;
+        let j = install::load_journal(&path)
+            .map_err(|_| install::journal_uncertain())?
+            .filter(|j| {
+                j.phase == "staged"
+                    && j.id == req.journal_id
+                    && j.from == self.cfg.own.to_string()
+                    && j.to == req.version.to_string()
+            })
+            .ok_or_else(install::journal_uncertain)?;
         let manifest = {
             let inner = self.lock();
             if inner.phase != Phase::Applying
@@ -1183,15 +1212,6 @@ impl Updater {
                 .manifest
                 .clone()
         };
-        let path = install::journal_path(&self.cfg.kind, &self.cfg.dir).ok_or_else(invalid)?;
-        let j = install::load_journal(&path)?
-            .filter(|j| {
-                j.phase == "staged"
-                    && j.id == req.journal_id
-                    && j.from == self.cfg.own.to_string()
-                    && j.to == req.version.to_string()
-            })
-            .ok_or_else(invalid)?;
         let file = install::verify_staged(
             &self.cfg.kind,
             &self.cfg.dir,

@@ -2,7 +2,7 @@ import { appInfo, cleanup, Clipboard, effect, openUrl, platform, signal } from "
 import type { ViewRef } from "nsh";
 import type { ServerUpdate } from "../api/serverUpdate";
 import { apiClient, connectedTo, me, orgAdmin, sessionGuard, status } from "../store";
-import { desktopUpdates, METRO_LICENSES, METRO_RELEASES, METRO_SOURCE, needsManualRecovery, newerVersion, officialReleaseUrl, outcomeKey, stableVersion } from "../updates";
+import { desktopUpdates, JOURNAL_UNCERTAIN, METRO_LICENSES, METRO_RELEASES, METRO_SOURCE, needsManualRecovery, newerVersion, officialReleaseUrl, outcomeKey, stableVersion } from "../updates";
 import type { DesktopUpdates, UpdateOffer, UpdateState } from "../updates";
 import { Action, ActionBar, Badge, Banner, Column, compactWidth, ConfirmInline, Disclosure, Label, PageHeader,
   PageLayout, ProgressLine, SettingRow, SettingsGroup, Toggle } from "../ui";
@@ -45,6 +45,7 @@ function failureMessage(code: string | undefined) {
     case "not_offered": return "Metro couldn't confirm a complete, published release.";
     case "installer_busy": return "Another installation or update is using this Metro install. No update was installed. Try again when it finishes.";
     case "stage_verification_failed": return "Metro couldn't verify the staged update. Use the official installer to update manually.";
+    case JOURNAL_UNCERTAIN: return "Metro couldn't verify the update journal. Stop here and contact the Metro maintainers.";
     case "backup_failed": return "Metro couldn't back up the local workspace. The update wasn't started.";
     case "missing_libraries": return "This version needs system libraries that aren't installed. Install the required GTK, WebKitGTK and GStreamer packages before trying again.";
     case "not_latest": return "That version is no longer the current verified offer. Check again.";
@@ -142,6 +143,10 @@ function Privacy() {
   </SettingsGroup>;
 }
 
+function journalNeedsSupport(updates: DesktopUpdates) {
+  return updates.state()?.failure === JOURNAL_UNCERTAIN || updates.problem()?.code === JOURNAL_UNCERTAIN;
+}
+
 function UpdateOutcome(props: { updates: DesktopUpdates }) {
   const updates = props.updates;
   return <Each of={updates.outcome() ? [updates.outcome()!] : []} key={outcomeKey}>{last => {
@@ -154,8 +159,8 @@ function UpdateOutcome(props: { updates: DesktopUpdates }) {
         case "updated": return `Metro updated from ${from} to ${to}.`;
         case "rolled_back": return `Metro ${to} didn't start successfully. Metro went back to ${from}.`;
         case "not_confirmed": return `Metro ${to} didn't finish starting. Metro kept ${from}.`;
-        case "install_failed": return `Metro didn't install ${to}. ${failureCode ? failureMessage(failureCode)
-          : "Metro couldn't confirm the stage was safe to use. Use the official installer to update manually."}`;
+        case "install_failed": return `Metro didn't install ${to}. ${journalNeedsSupport(updates) ? failureMessage(JOURNAL_UNCERTAIN)
+          : failureCode ? failureMessage(failureCode) : "Metro couldn't confirm the stage was safe to use. Use the official installer to update manually."}`;
       }
     };
     const copyDetails = async () => {
@@ -238,6 +243,7 @@ function PublishedUpdates(props: { updates: DesktopUpdates }) {
   const checking = () => phase() === "checking" || updates.pending() === "check";
   const transfer = () => phase() === "downloading" || phase() === "verifying" || phase() === "staging";
   const ready = () => s().canUpdateInApp && phase() === "ready" ? offer() : undefined;
+  const journalBlocked = () => journalNeedsSupport(updates);
   const blocked = () => {
     const last = s().lastUpdate;
     return s().canUpdateInApp && last?.from === s().current.version && needsManualRecovery(last) ? last.to : undefined;
@@ -248,6 +254,7 @@ function PublishedUpdates(props: { updates: DesktopUpdates }) {
     if (v.anomaly) return "Release files changed after Metro verified them. Metro won't use them. Check again later.";
     if (v.persistenceError === "status_io") return "Metro can't read or save its update record. It won't install an update without that record.";
     if (v.persistenceError === "settings_io") return "Metro can't read or save this computer's update settings.";
+    if (journalBlocked()) return failureMessage(JOURNAL_UNCERTAIN);
     if (v.phase === "failed") return failureMessage(v.failure);
     if (v.error || v.result === "error") return failureMessage(v.error);
     if (blocked() && v.latest?.version === blocked()) return `Metro won't retry the staged update to ${blocked()} in the app.`;
@@ -300,7 +307,13 @@ function PublishedUpdates(props: { updates: DesktopUpdates }) {
         <OfficialLink label="Open Metro releases" url={offer()?.url ?? METRO_RELEASES} testID="update-download-page" />
       </SettingRow>
     </If>
-    <If when={blocked()}>
+    <If when={journalBlocked()}>
+      <SettingRow label="Update recovery" testID="update-journal-recovery" stacked
+        description="Stop Metro, its bundled server and any installer. Keep the installation, update records and both database copies. Do not remove locks or records, change the current version, or run install, update or uninstall. Use the verified Linux installer's status command for read-only diagnosis. Share the diagnostic, not private files.">
+        <OfficialLink label="Contact Metro maintainers" url={`${METRO_SOURCE}/issues`} testID="update-recovery-support" />
+      </SettingRow>
+    </If>
+    <If when={!journalBlocked() && blocked()}>
       {version => <SettingRow label="Manual recovery" testID="update-manual-recovery" stacked
         description={`The staged update to ${version()} wasn't used. To update manually, get the Linux installer from Metro's official releases.`}>
         <OfficialLink label="Open Metro releases" url={METRO_RELEASES} testID="update-recovery-release" />

@@ -22,6 +22,24 @@ use super::{LastUpdate, now_ms};
 
 pub const MARKER: &str = ".metro-desktop-install";
 pub const JOURNAL: &str = ".update.json";
+pub const JOURNAL_UNCERTAIN: &str = "update_journal_unknown";
+
+/// The update record could not be matched to this install. Unlike a bad
+/// payload, it is not safe to recommend that the installer replace it.
+#[derive(Debug)]
+pub struct JournalUncertain;
+
+impl std::fmt::Display for JournalUncertain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("update journal could not be verified against this installation")
+    }
+}
+
+impl std::error::Error for JournalUncertain {}
+
+pub(super) fn journal_uncertain() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, JournalUncertain)
+}
 pub const MSI_JOURNAL: &str = "journal.json";
 pub const LOCK: &str = ".lock";
 pub const LOCAL_RUNNER_MARKER: &str = "enable-local-runner";
@@ -550,8 +568,12 @@ pub fn verify_staged(
     };
     lock.check(lock_root(kind, update_dir))?;
     let path = journal_path(kind, update_dir).ok_or_else(no)?;
-    if load_journal(&path)?.as_ref() != Some(j) {
-        return Err(no());
+    if load_journal(&path)
+        .map_err(|_| journal_uncertain())?
+        .as_ref()
+        != Some(j)
+    {
+        return Err(journal_uncertain());
     }
     let version = Version::parse(&j.to).ok_or_else(no)?;
     let assets = stage_assets(update_dir, &j.id);
@@ -594,6 +616,9 @@ pub fn verify_staged(
             _parents: package_parents,
         });
     };
+    if !script_state(root, &j.from) {
+        return Err(journal_uncertain());
+    }
     ensure_script_transition(root, j, &["staged"])?;
     let top = metro_release::manifest::archive_top(&name).ok_or_else(no)?;
     let expect = expect(kind, &version);
@@ -847,12 +872,17 @@ pub fn stage(
         return Err(stage_err("not_in_app"));
     }
     let from = own.to_string();
+    let existing = load_journal(&path).map_err(|_| stage_err(JOURNAL_UNCERTAIN))?;
     if kind.root().is_some_and(|root| {
         !script_state(root, &from) || install_dir != root.join("versions").join(&from)
     }) {
-        return Err(stage_err("installer_busy"));
+        return Err(stage_err(if existing.is_some() {
+            JOURNAL_UNCERTAIN
+        } else {
+            "installer_busy"
+        }));
     }
-    if let Some(j) = load_journal(&path).map_err(|_| stage_err("installer_busy"))? {
+    if let Some(j) = existing {
         if !finished_for(&j, &from) {
             return Err(stage_err("installer_busy"));
         }
@@ -1353,6 +1383,8 @@ pub enum Recovery {
     Nothing,
     /// Cannot safely open the database or install until recovery succeeds.
     Blocked,
+    /// The journal is unreadable or disagrees with the current installation.
+    JournalUncertain,
 }
 
 pub fn recover(root: &Path, _desktop_root: &Path, update_dir: &Path, own: &Version) -> Recovery {
@@ -1366,8 +1398,18 @@ pub fn recover(root: &Path, _desktop_root: &Path, update_dir: &Path, own: &Versi
     let mut j = match load_journal(&path) {
         Ok(Some(j)) => j,
         Ok(None) => return Recovery::Nothing,
-        Err(_) => return Recovery::Blocked,
+        Err(_) => return Recovery::JournalUncertain,
     };
+    let current_matches = match j.phase {
+        JournalPhase::Committed => script_state(root, &j.to),
+        JournalPhase::Committing | JournalPhase::RollingBack => {
+            script_state(root, &j.from) || script_state(root, &j.to)
+        }
+        _ => script_state(root, &j.from),
+    };
+    if !current_matches {
+        return Recovery::JournalUncertain;
+    }
     let own = own.to_string();
     match j.phase.as_str() {
         "backing_up" if own == j.from => {
