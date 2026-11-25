@@ -132,7 +132,11 @@ fn install() -> Install {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
     }
     fs::write(install_dir.join(install::LOCAL_RUNNER_MARKER), b"").unwrap();
-    fs::write(root.join(install::MARKER), b"managed").unwrap();
+    fs::write(
+        root.join(install::MARKER),
+        metro_release::installer_lock::MIGRATION,
+    )
+    .unwrap();
     install::set_pointer(&root, OLD).unwrap();
     let desktop_root = dir.path().join("desktop");
     fs::create_dir_all(desktop_root.join("local/db")).unwrap();
@@ -229,6 +233,7 @@ fn detection() {
         outcome: None,
         detail: None,
         local_db_snapshot: false,
+        backup_manifest: None,
         watchdog_pid: None,
         source_pid: None,
         reported: false,
@@ -463,6 +468,7 @@ fn staged_journal(i: &Install) -> Journal {
         outcome: None,
         detail: None,
         local_db_snapshot: false,
+        backup_manifest: None,
         watchdog_pid: None,
         source_pid: None,
         reported: false,
@@ -547,7 +553,7 @@ async fn trial_confirmed_commits() {
         i.root.join("versions").join(OLD).exists(),
         "the last known-good copy is kept"
     );
-    assert!(!p.update_dir.join("db-snapshot").exists());
+    assert!(!p.update_dir.join(format!("db-snapshot-{}", j.id)).exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -623,61 +629,37 @@ async fn trial_closed_at_once_is_not_committed() {
     );
 }
 
-/// MSI: "installed but didn't start" keeps the pre-update data until the
-/// previous version runs again, then restores it.
 #[test]
-fn msi_install_failed_keeps_and_restores_the_snapshot() {
+fn legacy_msi_failure_does_not_prove_the_installer_stopped() {
     let i = install();
     let update_dir = i.desktop_root.join("update");
-    fs::create_dir_all(update_dir.join("helper-0123456789abcdef")).unwrap();
+    let backup = update_dir.join("db-snapshot");
+    fs::create_dir_all(&backup).unwrap();
+    fs::write(backup.join("metro.sqlite3"), b"kept").unwrap();
     let before = db(&i);
-    assert!(install::snapshot_db(&i.desktop_root, &update_dir).unwrap());
-    fs::write(
-        i.desktop_root.join("local/db/metro.sqlite3"),
-        b"migrated by the new version",
-    )
-    .unwrap();
     let mut j = staged_journal(&i);
-    let _ = fs::remove_file(i.root.join(install::JOURNAL));
     j.phase = JournalPhase::Failed;
     j.outcome = Some("install_failed".into());
     j.local_db_snapshot = true;
-    install::write_journal(&update_dir.join(install::MSI_JOURNAL), &j).unwrap();
-    let kind = InstallKind::Portable;
-    // The new (installed, broken) version or any other start: reported once, data kept.
-    let new = Version::parse(NEW).unwrap();
-    let first = install::take_finished(&kind, &update_dir, &new).unwrap();
-    assert_eq!(first.outcome, "install_failed");
+    let path = update_dir.join(install::MSI_JOURNAL);
+    install::write_journal(&path, &j).unwrap();
+    assert!(install::gate_legacy_msi(&update_dir).is_err());
     assert!(
-        install::take_finished(&kind, &update_dir, &new).is_none(),
-        "reported once"
+        install::take_finished(
+            &InstallKind::Portable,
+            &update_dir,
+            &Version::parse(OLD).unwrap()
+        )
+        .is_none()
     );
-    assert!(
-        update_dir.join("db-snapshot/metro.sqlite3").is_file(),
-        "the snapshot is kept"
-    );
-    assert_ne!(db(&i), before);
-    // The previous version is reinstalled and starts: the data comes back.
-    let old = Version::parse(OLD).unwrap();
-    let back = install::take_finished(&kind, &update_dir, &old).unwrap();
-    assert_eq!(db(&i), before, "restored byte for byte");
-    assert!(back.detail.unwrap().contains("restored"));
-    assert!(!update_dir.join("db-snapshot").exists());
-    assert!(!update_dir.join(install::MSI_JOURNAL).exists());
-    assert!(!update_dir.join("helper-0123456789abcdef").exists());
-    // A successful MSI update drops the snapshot at once.
-    install::snapshot_db(&i.desktop_root, &update_dir).unwrap();
+    assert_eq!(install::read_journal(&path), Some(j.clone()));
+    assert_eq!(db(&i), before);
+    assert_eq!(fs::read(backup.join("metro.sqlite3")).unwrap(), b"kept");
     j.phase = JournalPhase::Committed;
     j.outcome = Some("updated".into());
-    j.reported = false;
-    install::write_journal(&update_dir.join(install::MSI_JOURNAL), &j).unwrap();
-    assert_eq!(
-        install::take_finished(&kind, &update_dir, &new)
-            .unwrap()
-            .outcome,
-        "updated"
-    );
-    assert!(!update_dir.join("db-snapshot").exists());
+    install::write_journal(&path, &j).unwrap();
+    install::gate_legacy_msi(&update_dir).unwrap();
+    assert!(backup.is_dir());
 }
 
 #[test]
@@ -711,41 +693,194 @@ fn msi_is_hashed_again_before_it_runs() {
 }
 
 #[test]
-fn interrupted_msi_recovery_keeps_failed_restore_retryable() {
+fn dead_msi_helper_never_unblocks_startup_or_consumes_a_backup() {
     let i = install();
     let original = db(&i);
     let dir = i.desktop_root.join("update");
     let path = dir.join(install::MSI_JOURNAL);
-    let old = Version::parse(OLD).unwrap();
-    let new = Version::parse(NEW).unwrap();
     let mut j = staged_journal(&i);
-    j.phase = JournalPhase::Installing;
-    j.local_db_snapshot = install::snapshot_db(&i.desktop_root, &dir).unwrap();
-    j.source_pid = Some(100);
-    j.watchdog_pid = Some(101);
-    install::write_journal(&path, &j).unwrap();
-    fs::write(
-        i.desktop_root.join("local/db/metro.sqlite3"),
-        b"trial output",
+    j.local_db_snapshot = true;
+    j.source_pid = Some(i32::MAX as u32 - 2);
+    j.watchdog_pid = Some(i32::MAX as u32 - 1);
+    let backup = dir.join("db-snapshot");
+    fs::create_dir(&backup).unwrap();
+    fs::write(backup.join("metro.sqlite3"), b"backup").unwrap();
+    for phase in [JournalPhase::Installing, JournalPhase::Trial] {
+        j.phase = phase;
+        install::write_journal(&path, &j).unwrap();
+        install::mark_trial_ok(&dir, &j.id).unwrap();
+        assert!(install::gate_legacy_msi(&dir).is_err());
+        assert_eq!(install::read_journal(&path), Some(j.clone()));
+        assert_eq!(fs::read(backup.join("metro.sqlite3")).unwrap(), b"backup");
+        assert_eq!(db(&i), original);
+    }
+}
+
+#[test]
+fn backup_intent_recovers_on_both_sides_of_publication() {
+    for published in [false, true] {
+        let i = install();
+        let p = paths(&i);
+        let before = db(&i);
+        let mut j = staged_journal(&i);
+        let lock = install::Lock::take(&p.root).unwrap();
+        install::begin_backup(&p.root, &mut j, &lock).unwrap();
+        let old_orphan = p.update_dir.join("db-snapshot");
+        fs::create_dir(&old_orphan).unwrap();
+        fs::write(
+            old_orphan.join("metro.sqlite3"),
+            b"an unowned previous backup",
+        )
+        .unwrap();
+        let pending = p.update_dir.join(format!(".snapshot-{}.tmp", j.id));
+        let backup = p.update_dir.join(format!("db-snapshot-{}", j.id));
+        if published {
+            assert!(
+                install::snapshot_db(&p.desktop_root, &p.update_dir, &j)
+                    .unwrap()
+                    .0
+            );
+            assert!(backup.join("snapshot.json").is_file());
+        } else {
+            fs::create_dir(&pending).unwrap();
+            fs::write(pending.join("metro.sqlite3"), b"partial copy").unwrap();
+        }
+        drop(lock);
+        let old = Version::parse(OLD).unwrap();
+        assert_eq!(
+            install::recover(&p.root, &p.desktop_root, &p.update_dir, &old),
+            install::Recovery::Nothing
+        );
+        assert_eq!(db(&i), before);
+        assert!(!pending.exists() && !backup.exists());
+        assert!(old_orphan.join("metro.sqlite3").is_file());
+        let mut j = install::read_journal(&p.root.join(install::JOURNAL)).unwrap();
+        assert_eq!(j.phase, JournalPhase::Staged);
+        let lock = install::Lock::take(&p.root).unwrap();
+        apply::begin_trial(&p, &mut j, &lock).unwrap();
+        assert_eq!(j.phase, JournalPhase::Trial);
+        assert!(backup.join("snapshot.json").is_file());
+    }
+}
+
+#[test]
+fn terminal_journal_survives_failed_cleanup_and_retries_without_restore() {
+    let i = install();
+    let p = paths(&i);
+    let mut j = staged_journal(&i);
+    let lock = install::Lock::take(&p.root).unwrap();
+    apply::begin_trial(&p, &mut j, &lock).unwrap();
+    install::rollback(
+        &p.root,
+        &p.desktop_root,
+        &p.update_dir,
+        &mut j,
+        &lock,
+        "rolled_back",
+        None,
     )
     .unwrap();
-    let snapshot = dir.join("db-snapshot/metro.sqlite3-wal");
-    let saved = fs::read(&snapshot).unwrap();
-    fs::remove_file(&snapshot).unwrap();
-    assert!(install::recover_msi(&i.desktop_root, &dir, &old).is_err());
-    let failed = install::read_journal(&path).unwrap();
-    assert_eq!(failed.phase, JournalPhase::Failed);
-    assert!(failed.local_db_snapshot);
-    assert_eq!(db(&i).0, b"trial output");
-    install::recover_msi(&i.desktop_root, &dir, &new).unwrap();
-    assert!(
-        dir.join("db-snapshot").is_dir(),
-        "the new version cannot consume the old backup"
+    drop(lock);
+    let path = p.root.join(install::JOURNAL);
+    let backup = p.update_dir.join(format!("db-snapshot-{}", j.id));
+    let other = p.update_dir.join("unrelated");
+    fs::create_dir(&other).unwrap();
+    let partial = p.update_dir.join(format!(".snapshot-{}.tmp", j.id));
+    std::os::unix::fs::symlink(&other, &partial).unwrap();
+    let old = Version::parse(OLD).unwrap();
+    let kind = InstallKind::LinuxInstaller {
+        root: p.root.clone(),
+    };
+    assert!(install::take_finished(&kind, &p.update_dir, &old).is_none());
+    assert_eq!(install::read_journal(&path), Some(j.clone()));
+    assert!(backup.join("metro.sqlite3").is_file());
+    fs::remove_file(partial).unwrap();
+    // Simulate a crash partway through removing the backup and a subsequent
+    // valid DB write. Terminal cleanup must not attempt another restore.
+    fs::remove_file(backup.join("snapshot.json")).unwrap();
+    fs::write(
+        i.desktop_root.join("local/db/metro.sqlite3"),
+        b"after rollback",
+    )
+    .unwrap();
+    assert_eq!(
+        install::take_finished(&kind, &p.update_dir, &old)
+            .unwrap()
+            .outcome,
+        "rolled_back"
     );
-    fs::write(snapshot, saved).unwrap();
-    install::recover_msi(&i.desktop_root, &dir, &old).unwrap();
-    assert_eq!(db(&i), original);
-    assert!(!install::read_journal(&path).unwrap().local_db_snapshot);
+    assert!(!path.exists() && !backup.exists());
+    assert!(other.is_dir());
+    assert_eq!(db(&i).0, b"after rollback");
+}
+
+#[test]
+fn committing_and_recovering_retarget_the_menu_without_running_the_staged_script() {
+    const CHILD: &str = "METRO_TEST_MENU_ISOLATED";
+    if std::env::var_os(CHILD).is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "committing_and_recovering_retarget_the_menu_without_running_the_staged_script",
+            ])
+            .env(CHILD, "1")
+            .env("XDG_DATA_HOME", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stdout)
+        );
+        return;
+    }
+    let apps = PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap()).join("applications");
+    fs::create_dir_all(&apps).unwrap();
+    let entry = apps.join("dev.metro.desktop.desktop");
+    for interrupted in [false, true] {
+        let i = install();
+        let mut j = staged_journal(&i);
+        let hit = i.root.join("script-was-run");
+        exec_file(
+            &i.root.join("versions").join(NEW).join("install-desktop"),
+            format!("#!/bin/sh\n: > '{}'\n", hit.display()).as_bytes(),
+        );
+        fs::write(
+            &entry,
+            format!(
+                "[Desktop Entry]\nExec=/usr/bin/env \"{}/Metro\"\nIcon=dev.metro.desktop\n",
+                i.install_dir.display()
+            ),
+        )
+        .unwrap();
+        j.phase = if interrupted {
+            JournalPhase::Committing
+        } else {
+            JournalPhase::Trial
+        };
+        install::write_journal(&i.root.join(install::JOURNAL), &j).unwrap();
+        if interrupted {
+            assert_eq!(
+                install::recover(
+                    &i.root,
+                    &i.desktop_root,
+                    &paths(&i).update_dir,
+                    &Version::parse(NEW).unwrap()
+                ),
+                install::Recovery::Committed
+            );
+        } else {
+            let lock = install::Lock::take(&i.root).unwrap();
+            install::commit(&i.root, &mut j, &lock).unwrap();
+        }
+        assert!(!hit.exists());
+        assert!(
+            fs::read_to_string(&entry)
+                .unwrap()
+                .contains("/current/Metro\"")
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -875,9 +1010,11 @@ fn failed_restore_keeps_the_snapshot_and_blocks_the_old_version_until_retry() {
     let lock = install::Lock::take(&p.root).unwrap();
     apply::begin_trial(&p, &mut j, &lock).unwrap();
     drop(lock);
-    let snap = p.update_dir.join("db-snapshot/metro.sqlite3-wal");
+    let snap = p
+        .update_dir
+        .join(format!("db-snapshot-{}/metro.sqlite3-wal", j.id));
     let saved = fs::read(&snap).unwrap();
-    fs::remove_file(&snap).unwrap();
+    fs::write(&snap, b"corrupt WAL with matching name").unwrap();
     fs::write(
         i.desktop_root.join("local/db/metro.sqlite3"),
         b"trial output",

@@ -273,14 +273,16 @@ async fn launch(
         .map_err(|e| start_failed(format!("cannot find a place for Metro's data: {e}")))?;
     store::prepare_private_dir(&root)
         .map_err(|e| start_failed(format!("cannot prepare Metro's data folder: {e}")))?;
+    update::gate_msi_at_start(&root).map_err(start_failed)?;
     let lock = if trial.is_some() {
         update::lock_for_trial(&root).await
     } else {
-        update::wait_for_trial(&dir, &root).await;
+        update::wait_for_trial(&dir).await;
         store::try_lock_instance(&root)
             .map_err(|e| start_failed(format!("cannot prepare Metro's data folder: {e}")))?
     };
     let primary = lock.is_some();
+    update::gate_msi_at_start(&root).map_err(start_failed)?;
     if let Some(id) = &trial
         && (!primary || !update::is_expected_trial(id, &dir, &root))
     {
@@ -484,9 +486,12 @@ fn main() -> ExitCode {
         fatal("Metro can't start: this copy of Metro is damaged. Download Metro again.");
         return ExitCode::from(2);
     }
-    let mode = update::mode().unwrap_or(update::Mode::Normal);
-    if let update::Mode::Helper(id) = &mode {
-        return ExitCode::from(update::run_helper(id));
+    let mode = update::mode();
+    if mode == update::Mode::LegacyHelper {
+        fatal(
+            "In-app MSI updates are no longer supported. Use a verified manual installer; any existing backup was kept.",
+        );
+        return ExitCode::from(2);
     }
     #[cfg(unix)]
     // SAFETY: umask has no preconditions.

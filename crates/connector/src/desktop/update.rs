@@ -12,15 +12,14 @@
 //! - **Download** happens only after the person clicks Update: the release is
 //!   fetched and verified again for exactly that version, then the file's
 //!   signed row (and for Linux the archive's own bundle) and `RELEASE.json`.
-//! - **Stage**: script installs extract into `<root>/versions/<V>` under the
-//!   installers' `.lock`; nothing visible changes. The MSI is only verified.
+//! - **Stage**: migrated Linux installs extract into `<root>/versions/<V>`
+//!   under the installer locks; nothing visible changes.
 //! - **Apply** is the launcher's job (`crates/desktop/src/update.rs`): trial
 //!   start under a watchdog, then the pointer switch, or a rollback. The
 //!   primitives it uses live in [`install`].
 //!
-//! Portable copies (not installed by a Metro script or the MSI) get a notice
-//! and the release page only: Metro never rewrites a folder it didn't
-//! install.
+//! Portable copies, unmigrated Linux installs and Windows installs get a
+//! notice and the release page only.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -316,6 +315,10 @@ fn offered(status: &Status, own: Version, target: Version) -> bool {
         && status.evidence.is_some()
 }
 
+fn supports_managed_update(kind: &InstallKind) -> bool {
+    matches!(kind, InstallKind::LinuxInstaller { root } if metro_release::installer_lock::migrated(root, install::MARKER))
+}
+
 fn latest_info(
     release: &VerifiedRelease,
     notes: Option<String>,
@@ -412,7 +415,10 @@ impl Updater {
         }
         // A staged version is offered again while it is still the latest.
         // Otherwise (an older or superseded version) it is deleted.
-        let found = install::staged(&cfg.kind, &cfg.dir);
+        let found =
+            (private && cfg.channel == Channel::Release && supports_managed_update(&cfg.kind))
+                .then(|| install::staged(&cfg.kind, &cfg.dir))
+                .flatten();
         let staged = found.clone().filter(|(v, _)| offered(&status, cfg.own, *v));
         if found.is_some() && staged.is_none() {
             install::discard_staged(&cfg.kind, &cfg.dir);
@@ -469,13 +475,7 @@ impl Updater {
     }
 
     pub fn can_update_in_app(&self) -> bool {
-        self.can_check()
-            && matches!(
-                self.cfg.kind,
-                InstallKind::LinuxInstaller { .. }
-                    | InstallKind::WindowsScript { .. }
-                    | InstallKind::WindowsMsi { .. }
-            )
+        self.can_check() && supports_managed_update(&self.cfg.kind)
     }
 
     fn save_status(&self, inner: &mut Inner) {
@@ -500,6 +500,12 @@ impl Updater {
             (Channel::Preview, _) => Some("preview_build"),
             (_, InstallKind::Unsupported(_)) => Some("unsupported_platform"),
             (_, InstallKind::Portable) => Some("portable"),
+            (_, InstallKind::LinuxInstaller { .. }) if !self.can_update_in_app() => {
+                Some("manual_migration_required")
+            }
+            (_, InstallKind::WindowsMsi { .. } | InstallKind::WindowsScript { .. }) => {
+                Some("manual_update_required")
+            }
             _ => None,
         };
         let mut v = json!({
@@ -546,7 +552,7 @@ impl Updater {
             v["last_update"] = serde_json::to_value(u).unwrap_or(Value::Null);
         }
         if matches!(self.cfg.kind, InstallKind::WindowsMsi { .. }) {
-            v["msi_note"] = "no_automatic_rollback".into();
+            v["msi_note"] = "manual_update_required".into();
         }
         v
     }
@@ -603,9 +609,7 @@ impl Updater {
         }
         let mut result = self.check_inner().await;
         if let Err(e) = &result
-            && e.code == metro_release::ErrorCode::TrustRootStale
-            && let Some(trust) = &self.cfg.trust
-            && trust.refresh_if_due().await
+            && self.refresh_stale_trust(e).await
         {
             result = self.check_inner().await;
         }
@@ -823,10 +827,14 @@ impl Updater {
             Duration::from_secs(6 * 3600),
         )
         .map_err(|e| release_error(&e))?;
-        let release = fetcher
-            .fetch_release(self.cfg.verifier.as_ref(), &target)
-            .await
-            .map_err(|e| release_error(&e))?;
+        let fetch_release = || fetcher.fetch_release(self.cfg.verifier.as_ref(), &target);
+        let mut release = fetch_release().await;
+        if let Err(e) = &release
+            && self.refresh_stale_trust(e).await
+        {
+            release = fetch_release().await;
+        }
+        let release = release.map_err(|e| release_error(&e))?;
         let current_offer = |inner: &Inner| {
             offered(&inner.status, self.cfg.own, target)
                 && !inner.status_error
@@ -895,9 +903,16 @@ impl Updater {
                 )
                 .await
                 .map_err(|e| release_error(&e))?;
-            release
-                .check_archive_signature(self.cfg.verifier.as_ref(), &name, &digest, &bundle)
-                .map_err(|e| release_error(&e))?;
+            let verify = || {
+                release.check_archive_signature(self.cfg.verifier.as_ref(), &name, &digest, &bundle)
+            };
+            let mut result = verify();
+            if let Err(e) = &result
+                && self.refresh_stale_trust(e).await
+            {
+                result = verify();
+            }
+            result.map_err(|e| release_error(&e))?;
         }
         // Serialize publication with checks, so a newly checked version can
         // never be superseded by an older download finishing late.
@@ -956,6 +971,13 @@ impl Updater {
         confirm_interrupt: bool,
         busy: Busy,
     ) -> Result<(), Refusal> {
+        if !self.can_update_in_app() {
+            return Err(refuse(
+                409,
+                "not_in_app",
+                "Use the supported manual installer for this copy of Metro.",
+            ));
+        }
         let Ok(_check) = self.checking.try_lock() else {
             return Err(refuse(409, "busy", "A check is already running."));
         };
@@ -1013,6 +1035,9 @@ impl Updater {
                 "the update is no longer staged and offered",
             )
         };
+        if !self.can_update_in_app() {
+            return Err(invalid());
+        }
         let manifest = {
             let inner = self.lock();
             if inner.phase != Phase::Applying
@@ -1048,6 +1073,33 @@ impl Updater {
             lock,
         )?;
         Ok((j, file))
+    }
+
+    pub async fn verify_apply_with_refresh(
+        &self,
+        req: &ApplyRequest,
+        lock: &install::Lock,
+    ) -> std::io::Result<(Journal, install::CheckedFile)> {
+        let result = self.verify_apply(req, lock);
+        if let Err(e) = &result
+            && let Some(e) = e
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<metro_release::Error>())
+            && self.refresh_stale_trust(e).await
+        {
+            return self.verify_apply(req, lock);
+        }
+        result
+    }
+
+    async fn refresh_stale_trust(&self, e: &metro_release::Error) -> bool {
+        if e.code != metro_release::ErrorCode::TrustRootStale {
+            return false;
+        }
+        match &self.cfg.trust {
+            Some(trust) => trust.refresh_if_due().await,
+            None => false,
+        }
     }
 
     /// `POST /v1/update/started`: the UI rendered (trial health signal).

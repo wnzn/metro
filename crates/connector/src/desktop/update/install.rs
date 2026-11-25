@@ -197,6 +197,7 @@ pub fn open_input(path: &Path) -> io::Result<fs::File> {
 #[serde(rename_all = "snake_case")]
 pub enum JournalPhase {
     Staged,
+    BackingUp,
     Trial,
     Installing,
     Committing,
@@ -209,6 +210,7 @@ impl JournalPhase {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Staged => "staged",
+            Self::BackingUp => "backing_up",
             Self::Trial => "trial",
             Self::Installing => "installing",
             Self::Committing => "committing",
@@ -239,6 +241,9 @@ pub struct Journal {
     pub detail: Option<String>,
     #[serde(default)]
     pub local_db_snapshot: bool,
+    /// Digest of this attempt's published snapshot manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_manifest: Option<String>,
     /// The watchdog (old launcher) during a trial.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watchdog_pid: Option<u32>,
@@ -268,12 +273,27 @@ impl Journal {
                 Some("rolled_back" | "not_confirmed" | "install_failed")
             ),
             "committed" => self.outcome.as_deref() == Some("updated"),
-            "staged" | "trial" | "committing" | "rolling_back" | "installing" => {
+            "staged" | "backing_up" | "trial" | "committing" | "rolling_back" | "installing" => {
                 self.outcome.is_none()
             }
             _ => false,
         };
-        self.version == 1
+        (self.version == 1 || (!msi && self.version == 2))
+            && (if self.version == 1
+                || matches!(self.phase, JournalPhase::Staged | JournalPhase::BackingUp)
+            {
+                self.backup_manifest.is_none()
+            } else {
+                self.backup_manifest
+                    .as_deref()
+                    .and_then(metro_release::parse_hex32)
+                    .is_some()
+            })
+            && (phase != "backing_up"
+                || (!msi
+                    && self.version == 2
+                    && !self.local_db_snapshot
+                    && self.watchdog_pid.is_none()))
             && valid_id(&self.id)
             && matches!((Version::parse(&self.from), Version::parse(&self.to)), (Some(a), Some(b)) if a < b)
             && outcome
@@ -339,7 +359,6 @@ fn getrandom_fill(b: &mut [u8]) -> Result<(), ()> {
 /// A journal that ended (committed/failed) since the last start, as
 /// `last_update`; it is removed. Cleans leftovers of finished updates.
 pub fn take_finished(kind: &InstallKind, update_dir: &Path, own: &Version) -> Option<LastUpdate> {
-    let desktop_root = update_dir.parent()?;
     let own_s = own.to_string();
     let last = |j: &Journal, detail: Option<String>| LastUpdate {
         from: j.from.clone(),
@@ -354,76 +373,37 @@ pub fn take_finished(kind: &InstallKind, update_dir: &Path, own: &Version) -> Op
         at: now_ms(),
         detail: detail.or_else(|| j.detail.clone()),
     };
-    let mut result = None;
-    // The MSI journal, whichever way this version was installed (the person
-    // may reinstall the previous version from the ZIP).
-    let msi_path = update_dir.join(MSI_JOURNAL);
-    if let Ok(_lock) = Lock::take(update_dir)
-        && let Some(mut j) =
-            read_journal(&msi_path).filter(|j| matches!(j.phase.as_str(), "committed" | "failed"))
-        && (own_s == j.from || own_s == j.to)
-    {
-        let keep = j.outcome.as_deref() == Some("install_failed") && j.local_db_snapshot;
-        if keep && own_s == j.from {
-            // The previous version is back: so is the data from before the update.
-            if restore_db(desktop_root, update_dir).is_ok() {
-                discard_msi(update_dir, &j);
-                result = Some(last(
-                    &j,
-                    Some("Your data from before the update was restored.".to_string()),
-                ));
-            }
-        } else if keep {
-            // Keep the snapshot until the previous version starts again.
-            if !j.reported {
-                j.reported = true;
-                let _ = write_journal(&msi_path, &j);
-                result = Some(last(&j, None));
-            }
-        } else {
-            discard_msi(update_dir, &j);
-            result = Some(last(&j, None));
-        }
-    }
+    // Legacy MSI records and their unowned backup are never consumed here.
+    // A failed record from the old helper could mean its wait call failed,
+    // not that the machine-wide Windows Installer transaction ended.
     if let Some(root) = kind.root()
         && let Ok(_lock) = Lock::take(root)
         && script_state(root, &own_s)
     {
         let path = root.join(JOURNAL);
-        if let Some(j) =
-            read_journal(&path).filter(|j| matches!(j.phase.as_str(), "committed" | "failed"))
-            && ((j.phase == "committed" && own_s == j.to)
-                || (j.phase == "failed" && own_s == j.from))
-        {
-            if fs::remove_file(&path).is_ok() {
-                let _ = metro_release::sync_parent(&path);
-                if j.local_db_snapshot {
-                    let _ = fs::remove_dir_all(update_dir.join("db-snapshot"));
-                }
-                let _ = fs::remove_dir_all(stage_assets(update_dir, &j.id));
-            }
-            result = result.or(Some(last(&j, None)));
+        if let Some(j) = read_journal(&path).filter(|j| finished_for(j, &own_s)) {
+            retire_finished(&path, update_dir, &j).ok()?;
+            return Some(last(&j, None));
         }
     }
-    result
+    None
 }
 
-/// Remove an MSI update's journal, snapshot, download and helper copies.
-fn discard_msi(update_dir: &Path, j: &Journal) {
-    let journal = update_dir.join(MSI_JOURNAL);
-    if fs::remove_file(&journal).is_ok() {
-        let _ = metro_release::sync_parent(&journal);
-        if j.local_db_snapshot {
-            let _ = fs::remove_dir_all(update_dir.join("db-snapshot"));
-        }
-        let _ = fs::remove_dir_all(stage_assets(update_dir, &j.id));
-        let _ = fs::remove_dir_all(update_dir.join(format!("helper-{}", j.id))); // legacy layout
-    }
+fn retire_finished(path: &Path, update_dir: &Path, j: &Journal) -> io::Result<()> {
+    // Keep the terminal journal until all owned cleanup succeeds. A restart
+    // can finish this without restoring an already restored DB.
+    clean_backup(update_dir, j)?;
+    remove_owned_dir(&stage_assets(update_dir, &j.id))?;
+    fs::remove_file(path)?;
+    metro_release::sync_parent(path)
+}
+
+fn finished_for(j: &Journal, own: &str) -> bool {
+    (j.phase == "committed" && own == j.to) || (j.phase == "failed" && own == j.from)
 }
 
 /// Drop a staged update that is no longer offered (design 3.5: "otherwise
-/// it is deleted"): its version folder (never the current one) or MSI
-/// download, and its journal.
+/// it is deleted"): its version folder (never the current one) and journal.
 pub fn discard_staged(kind: &InstallKind, update_dir: &Path) {
     let Some(path) = journal_path(kind, update_dir) else {
         return;
@@ -445,7 +425,6 @@ pub fn discard_staged(kind: &InstallKind, update_dir: &Path) {
                 let _ = fs::remove_file(&path);
             }
         }
-        InstallKind::WindowsMsi { .. } => discard_msi(update_dir, &j),
         _ => {}
     }
 }
@@ -456,49 +435,17 @@ pub fn trial_in_progress(root: &Path) -> bool {
         .is_some_and(|j| j.phase == "trial" && j.watchdog_pid.is_some_and(pid_alive))
 }
 
-pub fn msi_in_progress(update_dir: &Path) -> bool {
-    read_journal(&update_dir.join(MSI_JOURNAL)).is_some_and(|j| {
-        matches!(j.phase.as_str(), "installing" | "trial") && j.watchdog_pid.is_some_and(pid_alive)
-    })
-}
-
-#[cfg(windows)]
-pub fn msi_registered_dir(own: &Version) -> Option<PathBuf> {
-    msi::registered_dir(own)
-}
-
-/// Recover a helper that stopped in the middle of an MSI update. Never
-/// automatically downgrade; restore data only when the old version is back.
-pub fn recover_msi(desktop_root: &Path, update_dir: &Path, own: &Version) -> io::Result<()> {
+/// No new in-app MSI transactions are supported. A legacy helper's PID,
+/// installed version, or `failed` record does not prove the installer has
+/// stopped. Block startup for ambiguous records, preserving both copies.
+pub fn gate_legacy_msi(update_dir: &Path) -> io::Result<()> {
     let path = update_dir.join(MSI_JOURNAL);
-    if load_journal(&path)?.is_none() {
-        return Ok(());
-    }
-    let _lock = Lock::take(update_dir).map_err(|e| io::Error::other(e.message))?;
-    let Some(mut j) = load_journal(&path)? else {
-        return Ok(());
-    };
-    let version = own.to_string();
-    if version != j.from && version != j.to {
-        return Ok(()); // unrelated version; never consume its snapshot
-    }
-    if matches!(j.phase.as_str(), "installing" | "trial") {
-        if j.phase == "trial" && version == j.to && trial_ok(update_dir, &j.id) {
-            j.phase = JournalPhase::Committed;
-            j.outcome = Some("updated".into());
-        } else {
-            j.phase = JournalPhase::Failed;
-            j.outcome = Some("install_failed".into());
-            j.detail = Some("The installer was interrupted.".into());
-        }
-        write_journal(&path, &j)?;
-    }
-    if j.phase == "failed" && j.local_db_snapshot && j.from == version {
-        restore_db(desktop_root, update_dir)?;
-        j.local_db_snapshot = false;
-        j.detail = Some("Your data from before the update was restored.".into());
-        write_journal(&path, &j)?;
-        let _ = fs::remove_dir_all(update_dir.join("db-snapshot"));
+    if load_journal(&path)?
+        .is_some_and(|j| !matches!(j.phase, JournalPhase::Staged | JournalPhase::Committed))
+    {
+        return Err(io::Error::other(
+            "Windows Installer completion could not be established",
+        ));
     }
     Ok(())
 }
@@ -692,60 +639,12 @@ pub fn verify_staged(
     })
 }
 
-/// Make and verify a fresh private helper from this installation's own
-/// launcher. It is not taken from unauthenticated journal fields.
-pub fn prepare_msi_helper(
-    update_dir: &Path,
-    j: &Journal,
-    source: &Path,
-    lock: &Lock,
-) -> io::Result<CheckedFile> {
-    lock.check(update_dir)?;
-    if j.phase != "staged" || load_journal(&update_dir.join(MSI_JOURNAL))?.as_ref() != Some(j) {
-        return Err(io::ErrorKind::InvalidData.into());
-    }
-    let assets = stage_assets(update_dir, &j.id);
-    if !plain_dir(&assets) {
-        return Err(io::ErrorKind::InvalidData.into());
-    }
-    let input = open_input(source)?;
-    let mut read = HashingReader::new(input);
-    let dir = assets.join(format!("helper-{}", new_id()));
-    private_mkdir(&dir)?;
-    #[cfg(windows)]
-    let parents = archive::pin_windows_dirs(&dir)?;
-    let path = dir.join("metro-update-helper.exe");
-    let mut output = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&path)?;
-    io::copy(
-        &mut (&mut read).take(metro_release::MAX_ARCHIVE + 1),
-        &mut output,
-    )?;
-    output.sync_all()?;
-    drop(output);
-    let file = open_input(&path)?;
-    if HashingReader::new(&file)
-        .finish()
-        .map_err(io::Error::other)?
-        != read.finish().map_err(io::Error::other)?
-    {
-        return Err(io::ErrorKind::InvalidData.into());
-    }
-    Ok(CheckedFile {
-        path,
-        file,
-        #[cfg(windows)]
-        _parents: parents,
-    })
-}
-
 // ---- the installers' lock ----
 
 pub struct Lock {
     root: PathBuf,
     handle: fs::File,
+    legacy: Option<metro_release::installer_lock::LegacyLock>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -807,20 +706,27 @@ impl Lock {
             Err(fs::TryLockError::WouldBlock) => return Err(stage_err("installer_busy")),
             Err(fs::TryLockError::Error(_)) => return Err(stage_err("io")),
         }
-        if !matches!(fs::symlink_metadata(root.join(LOCK)), Err(e) if e.kind() == io::ErrorKind::NotFound)
-        {
-            return Err(stage_err("installer_busy"));
-        }
-        let lock = Self {
+        let mut lock = Self {
             root: root.to_path_buf(),
             handle,
+            legacy: None,
         };
         lock.check(root).map_err(|_| stage_err("installer_busy"))?;
+        lock.legacy = Some(
+            metro_release::installer_lock::LegacyLock::take(root).map_err(|e| {
+                stage_err(if e.kind() == io::ErrorKind::WouldBlock {
+                    "installer_busy"
+                } else {
+                    "io"
+                })
+            })?,
+        );
         Ok(lock)
     }
 
     pub fn check(&self, root: &Path) -> io::Result<()> {
-        if self.root != root || !plain_dir(root) {
+        if self.root != root || !plain_dir(root) || self.legacy.as_ref().is_some_and(|l| !l.owned())
+        {
             return Err(io::ErrorKind::InvalidData.into());
         }
         #[cfg(unix)]
@@ -847,6 +753,7 @@ impl Drop for Lock {
         // Unlock this open file description only. A concurrently starting
         // process can briefly inherit the descriptor before its exec closes
         // it, and must not accidentally extend the watchdog's lock lifetime.
+        drop(self.legacy.take());
         let _ = self.handle.unlock();
     }
 }
@@ -933,17 +840,24 @@ pub fn stage(
     let path = journal_path(kind, update_dir).ok_or_else(|| stage_err("not_in_app"))?;
     let locked_root = lock_root(kind, update_dir);
     let lock = Lock::take(locked_root)?;
+    if !matches!(kind, InstallKind::LinuxInstaller { root }
+        if metro_release::installer_lock::migrated(root, MARKER))
+    {
+        return Err(stage_err("not_in_app"));
+    }
     let from = own.to_string();
     if kind.root().is_some_and(|root| {
         !script_state(root, &from) || install_dir != root.join("versions").join(&from)
     }) {
         return Err(stage_err("installer_busy"));
     }
-    if load_journal(&path)
-        .map_err(|_| stage_err("installer_busy"))?
-        .is_some()
-    {
-        return Err(stage_err("installer_busy"));
+    if let Some(j) = load_journal(&path).map_err(|_| stage_err("installer_busy"))? {
+        if !finished_for(&j, &from) {
+            return Err(stage_err("installer_busy"));
+        }
+        // Cleanup may not have run if the trial was still launching when
+        // this instance started. Don't require another restart to stage.
+        retire_finished(&path, update_dir, &j).map_err(|_| stage_err("io"))?;
     }
     let id = new_id();
     let journal = Journal {
@@ -955,6 +869,7 @@ pub fn stage(
         outcome: None,
         detail: None,
         local_db_snapshot: false,
+        backup_manifest: None,
         watchdog_pid: None,
         source_pid: None,
         reported: false,
@@ -1104,9 +1019,44 @@ fn db_files(desktop_root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Copy the local database aside (the server must be stopped).
-pub fn snapshot_db(desktop_root: &Path, update_dir: &Path) -> io::Result<bool> {
-    let snap = update_dir.join("db-snapshot");
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Snapshot {
+    id: String,
+    from: String,
+    to: String,
+    sha256: [Option<[u8; 32]>; 3],
+}
+
+fn backup_paths(update_dir: &Path, j: &Journal) -> io::Result<(PathBuf, PathBuf)> {
+    if j.version != 2 || !valid_id(&j.id) {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    Ok((
+        update_dir.join(format!(".snapshot-{}.tmp", j.id)),
+        update_dir.join(format!("db-snapshot-{}", j.id)),
+    ))
+}
+
+pub fn begin_backup(root: &Path, j: &mut Journal, lock: &Lock) -> io::Result<()> {
+    lock.check(root)?;
+    ensure_script_transition(root, j, &["staged"])?;
+    j.version = 2;
+    j.phase = JournalPhase::BackingUp;
+    write_journal(&root.join(JOURNAL), j)
+}
+
+/// Copy the stopped database into this journal's private attempt directory.
+/// Even an absent database has a published record; absence is not an error.
+pub fn snapshot_db(
+    desktop_root: &Path,
+    update_dir: &Path,
+    j: &Journal,
+) -> io::Result<(bool, String)> {
+    if j.phase != JournalPhase::BackingUp {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    let (tmp, snap) = backup_paths(update_dir, j)?;
     if !matches!(fs::symlink_metadata(&snap), Err(e) if e.kind() == io::ErrorKind::NotFound) {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -1122,36 +1072,95 @@ pub fn snapshot_db(desktop_root: &Path, update_dir: &Path) -> io::Result<bool> {
             Err(e) => return Err(e),
         });
     }
-    if inputs[0].is_none() {
-        if inputs.iter().any(Option::is_some) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "database sidecar without its main file",
-            ));
-        }
-        return Ok(false);
+    if inputs[0].is_none() && inputs.iter().any(Option::is_some) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "database sidecar without its main file",
+        ));
     }
-    let tmp = update_dir.join(format!(".snapshot-{}", new_id()));
     private_mkdir(&tmp)?;
-    let result = (|| {
-        let mut present = [false; 3];
-        for (index, (path, input)) in files.iter().zip(inputs).enumerate() {
-            if let Some(input) = input {
-                copy_synced(input, &tmp.join(path.file_name().unwrap_or_default()))?;
-                present[index] = true;
+    let mut sha256 = [None; 3];
+    for (index, (path, input)) in files.iter().zip(inputs).enumerate() {
+        if let Some(input) = input {
+            sha256[index] = Some(copy_synced(
+                input,
+                &tmp.join(path.file_name().unwrap_or_default()),
+            )?);
+        }
+    }
+    let manifest = Snapshot {
+        id: j.id.clone(),
+        from: j.from.clone(),
+        to: j.to.clone(),
+        sha256,
+    };
+    let encoded = serde_json::to_vec(&manifest).map_err(io::Error::other)?;
+    let manifest_hash = metro_release::hex(&metro_release::sha256(&encoded));
+    write_atomic(&tmp.join("snapshot.json"), &encoded)?;
+    metro_release::rename_durable(&tmp, &snap)?;
+    let published = read_snapshot(&snap, j, &manifest_hash)?;
+    for (file, want) in files.iter().zip(published.sha256) {
+        let path = snap.join(file.file_name().unwrap_or_default());
+        match (open_input(&path), want) {
+            (Ok(input), Some(digest)) => {
+                if hash_copy(input, io::sink())? != digest {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "published backup does not verify",
+                    ));
+                }
+            }
+            (Err(e), None) if e.kind() == io::ErrorKind::NotFound => {}
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "published backup does not verify",
+                ));
             }
         }
-        write_atomic(
-            &tmp.join("snapshot.json"),
-            &serde_json::to_vec(&present).map_err(io::Error::other)?,
-        )?;
-        metro_release::rename_durable(&tmp, &snap)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_dir_all(&tmp);
     }
-    result?;
-    Ok(true)
+    Ok((published.sha256[0].is_some(), manifest_hash))
+}
+
+fn read_snapshot(snap: &Path, j: &Journal, expected: &str) -> io::Result<Snapshot> {
+    if !plain_dir(snap) {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    let raw = read_evidence_file(&snap.join("snapshot.json"), 4096)?;
+    if metro_release::hex(&metro_release::sha256(&raw)) != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the snapshot manifest changed",
+        ));
+    }
+    let record: Snapshot = serde_json::from_slice(&raw).map_err(io::Error::other)?;
+    if record.id != j.id
+        || record.from != j.from
+        || record.to != j.to
+        || (record.sha256[0].is_none() && record.sha256.iter().any(Option::is_some))
+    {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    Ok(record)
+}
+
+fn remove_owned_dir(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) if plain_dir(path) => fs::remove_dir_all(path)?,
+        Ok(_) => return Err(io::ErrorKind::InvalidData.into()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    metro_release::sync_parent(path)
+}
+
+fn clean_backup(update_dir: &Path, j: &Journal) -> io::Result<()> {
+    if j.version == 2 {
+        let (tmp, published) = backup_paths(update_dir, j)?;
+        remove_owned_dir(&tmp)?;
+        remove_owned_dir(&published)?;
+    }
+    Ok(())
 }
 
 pub fn private_mkdir(path: &Path) -> io::Result<()> {
@@ -1171,7 +1180,7 @@ pub fn private_mkdir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn copy_synced(mut input: fs::File, dest: &Path) -> io::Result<()> {
+fn copy_synced(input: fs::File, dest: &Path) -> io::Result<[u8; 32]> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -1180,43 +1189,67 @@ fn copy_synced(mut input: fs::File, dest: &Path) -> io::Result<()> {
         options.mode(0o600);
     }
     let mut output = options.open(dest)?;
-    io::copy(&mut input, &mut output)?;
-    output.sync_all()
+    let digest = hash_copy(input, &mut output)?;
+    output.sync_all()?;
+    Ok(digest)
+}
+
+fn hash_copy(mut input: impl Read, mut output: impl io::Write) -> io::Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = input.read(&mut buf)?;
+        if n == 0 {
+            return Ok(hash.finalize().into());
+        }
+        hash.update(&buf[..n]);
+        output.write_all(&buf[..n])?;
+    }
 }
 
 /// Put the snapshot back byte for byte (removing a newer WAL/SHM).
-pub fn restore_db(desktop_root: &Path, update_dir: &Path) -> io::Result<()> {
-    let snap = update_dir.join("db-snapshot");
-    if !plain_dir(&snap) {
+fn restore_db(desktop_root: &Path, update_dir: &Path, j: &Journal) -> io::Result<()> {
+    let (_, snap) = backup_paths(update_dir, j)?;
+    let record = read_snapshot(
+        &snap,
+        j,
+        j.backup_manifest
+            .as_deref()
+            .ok_or(io::ErrorKind::InvalidData)?,
+    )?;
+    if record.sha256[0].is_some() != j.local_db_snapshot {
         return Err(io::ErrorKind::InvalidData.into());
     }
-    let mut raw = Vec::new();
-    open_input(&snap.join("snapshot.json"))?
-        .take(128)
-        .read_to_end(&mut raw)?;
-    let present: [bool; 3] = serde_json::from_slice(&raw).map_err(io::Error::other)?;
-    if !present[0] {
-        return Err(io::ErrorKind::InvalidData.into());
+    // Never delete the only database if the old install had no DB.
+    if !j.local_db_snapshot {
+        return Ok(());
     }
     let files = db_files(desktop_root);
     let dir = files[0].parent().ok_or(io::ErrorKind::InvalidData)?;
     if !plain_dir(dir) {
         return Err(io::ErrorKind::InvalidData.into());
     }
-    let tmp = dir.join(format!(".restore-{}", new_id()));
+    let tmp = dir.join(format!(".restore-{}.tmp", j.id));
+    remove_owned_dir(&tmp)?;
     private_mkdir(&tmp)?;
     let result = (|| {
         // Finish every copy before changing any live filename. The caller
         // must keep recovery pending and must not open the DB until all
         // renames/removals and the directory sync succeed.
-        for (path, present) in files.iter().zip(present) {
-            if present {
+        for (path, expected) in files.iter().zip(record.sha256) {
+            if let Some(expected) = expected {
                 let name = path.file_name().ok_or(io::ErrorKind::InvalidData)?;
-                copy_synced(open_input(&snap.join(name))?, &tmp.join(name))?;
+                if copy_synced(open_input(&snap.join(name))?, &tmp.join(name))? != expected {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "the backup changed",
+                    ));
+                }
             }
         }
-        for (path, present) in files.iter().zip(present).rev() {
-            if present {
+        for (path, expected) in files.iter().zip(record.sha256).rev() {
+            if expected.is_some() {
                 metro_release::rename_durable(
                     &tmp.join(path.file_name().ok_or(io::ErrorKind::InvalidData)?),
                     path,
@@ -1231,8 +1264,8 @@ pub fn restore_db(desktop_root: &Path, update_dir: &Path) -> io::Result<()> {
         }
         metro_release::sync_parent(&files[0])
     })();
-    let _ = fs::remove_dir_all(&tmp);
-    result
+    result?;
+    remove_owned_dir(&tmp)
 }
 
 // ---- commit and rollback (script installs) ----
@@ -1245,7 +1278,7 @@ pub fn commit(root: &Path, j: &mut Journal, lock: &Lock) -> io::Result<()> {
     j.phase = JournalPhase::Committing;
     write_journal(&path, j)?;
     set_pointer(root, &j.to)?;
-    move_launch_entry(root, &j.from, &j.to);
+    move_launch_entry(root, &j.from);
     j.phase = JournalPhase::Committed;
     j.outcome = Some("updated".into());
     write_journal(&path, j)
@@ -1268,8 +1301,10 @@ pub fn rollback(
     j.phase = JournalPhase::RollingBack;
     j.detail = detail;
     write_journal(&path, j)?;
-    if j.local_db_snapshot {
-        restore_db(desktop_root, update_dir)?;
+    if j.version == 2 {
+        restore_db(desktop_root, update_dir, j)?;
+    } else if j.local_db_snapshot {
+        return Err(io::Error::other("legacy backup needs manual recovery"));
     }
     // Move the pointer only after the DB is safe. Keep the old executable
     // and the snapshot until the terminal state is durable.
@@ -1329,6 +1364,23 @@ pub fn recover(root: &Path, desktop_root: &Path, update_dir: &Path, own: &Versio
     };
     let own = own.to_string();
     match j.phase.as_str() {
+        "backing_up" if own == j.from => {
+            // No trial can be launched before Trial is published. A crash
+            // on either side of snapshot publication leaves the live DB
+            // authoritative, so retire only this attempt and retry staging.
+            let reset = (|| {
+                ensure_script_transition(root, &j, &["backing_up"])?;
+                clean_backup(update_dir, &j)?;
+                j.phase = JournalPhase::Staged;
+                write_journal(&path, &j)
+            })();
+            if reset.is_ok() {
+                Recovery::Nothing
+            } else {
+                Recovery::Blocked
+            }
+        }
+        "backing_up" => Recovery::Blocked,
         "committing" if own == j.to => {
             if commit(root, &mut j, &lock).is_ok() {
                 Recovery::Committed
@@ -1360,7 +1412,7 @@ pub fn recover(root: &Path, desktop_root: &Path, update_dir: &Path, own: &Versio
 
 /// Linux: rewrite the menu entry when it names the old version's launcher.
 /// Windows: rewrite our own Start-menu shortcut and the uninstall entry.
-fn move_launch_entry(root: &Path, from: &str, to: &str) {
+fn move_launch_entry(root: &Path, from: &str) {
     #[cfg(not(windows))]
     {
         let data = std::env::var_os("XDG_DATA_HOME")
@@ -1370,73 +1422,67 @@ fn move_launch_entry(root: &Path, from: &str, to: &str) {
         let Some(entry) = data.map(|d| d.join("applications/dev.metro.desktop.desktop")) else {
             return;
         };
-        let Ok(text) = fs::read_to_string(&entry) else {
-            return;
-        };
-        let old = root.join("versions").join(from).join(LAUNCHER);
-        if !text.contains(&*old.to_string_lossy()) {
-            return;
-        }
-        let script = root.join("versions").join(to).join("install-desktop");
-        if script.is_file() {
-            let _ = std::process::Command::new(&script)
-                .arg("--install")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .status();
+        if let Err(e) = retarget_linux_entry(&entry, root, from)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            eprintln!("metro-desktop: the applications menu entry was not changed: {e}");
         }
     }
     #[cfg(windows)]
     {
-        let _ = from;
-        windows_entry::update(root, to);
+        // Windows updates are manual. A legacy recovery only moves the
+        // pointer, never runs code from either version to rewrite shortcuts.
+        let _ = (root, from);
     }
 }
 
-#[cfg(windows)]
-mod windows_entry {
-    use std::path::Path;
-
-    /// Rewrite `Metro.lnk` (only when it points into this install) and the
-    /// HKCU uninstall entry's version, through PowerShell with every value
-    /// passed in the environment (never on a command line).
-    pub fn update(root: &Path, to: &str) {
-        let target = root.join("versions").join(to).join("Metro.exe");
-        let script = r#"
-$ErrorActionPreference = 'Stop'
-$lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Metro.lnk'
-if (Test-Path -LiteralPath $lnk) {
-  $sh = New-Object -ComObject WScript.Shell
-  $s = $sh.CreateShortcut($lnk)
-  if ($s.TargetPath.StartsWith($env:METRO_UPDATE_ROOT + '\versions\', [StringComparison]::OrdinalIgnoreCase)) {
-    $s.TargetPath = $env:METRO_UPDATE_TARGET
-    $s.WorkingDirectory = Split-Path -Parent $env:METRO_UPDATE_TARGET
-    $s.IconLocation = $env:METRO_UPDATE_TARGET + ',0'
-    $s.Save()
-  }
-}
-$key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\dev.metro.desktop'
-if (Test-Path -LiteralPath $key) {
-  Set-ItemProperty -LiteralPath $key -Name DisplayVersion -Value $env:METRO_UPDATE_VERSION
-  Set-ItemProperty -LiteralPath $key -Name DisplayIcon -Value $env:METRO_UPDATE_TARGET
-}
-"#;
-        let system = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
-        let ps = Path::new(&system).join("System32\\WindowsPowerShell\\v1.0\\powershell.exe");
-        let _ = std::process::Command::new(ps)
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                script,
-            ])
-            .env("METRO_UPDATE_ROOT", root)
-            .env("METRO_UPDATE_TARGET", &target)
-            .env("METRO_UPDATE_VERSION", to)
-            .status();
+/// Match only the exact Exec form generated by the released menu script.
+/// Point it at `current` so later commits need not touch the menu at all.
+#[cfg(not(windows))]
+pub fn retarget_linux_entry(entry: &Path, root: &Path, from: &str) -> io::Result<()> {
+    let exec = |path: &Path| -> io::Result<String> {
+        let path = path
+            .to_str()
+            .filter(|path| !path.chars().any(char::is_control))
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        let mut line = String::from("Exec=/usr/bin/env \"");
+        for ch in path.chars() {
+            match ch {
+                '%' => line.push_str("%%"),
+                '"' | '$' | '`' => {
+                    line.push_str("\\\\");
+                    line.push(ch);
+                }
+                '\\' => line.push_str("\\\\\\\\"),
+                _ => line.push(ch),
+            }
+        }
+        line.push('"');
+        Ok(line)
+    };
+    let bytes = read_evidence_file(entry, 64 * 1024)?;
+    let text = std::str::from_utf8(&bytes).map_err(io::Error::other)?;
+    let old = exec(&root.join("versions").join(from).join(LAUNCHER))?;
+    let current = exec(&root.join("current").join(LAUNCHER))?;
+    if text.starts_with("[Desktop Entry]\n")
+        && text
+            .lines()
+            .filter(|line| line.starts_with("Exec="))
+            .eq([old.as_str()])
+    {
+        let replacement: String = text
+            .split_inclusive('\n')
+            .map(|line| {
+                if line.strip_suffix('\n').unwrap_or(line) == old {
+                    format!("{current}\n")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect();
+        write_atomic(entry, replacement.as_bytes())?;
     }
+    Ok(())
 }
 
 #[cfg(windows)]

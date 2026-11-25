@@ -37,9 +37,10 @@ pub struct TrialPaths {
 
 /// Snapshot the DB and journal `trial` (before the trial starts).
 pub fn begin_trial(p: &TrialPaths, j: &mut Journal, lock: &install::Lock) -> std::io::Result<()> {
-    lock.check(&p.root)?;
-    install::ensure_script_transition(&p.root, j, &["staged"])?;
-    j.local_db_snapshot = install::snapshot_db(&p.desktop_root, &p.update_dir)?;
+    install::begin_backup(&p.root, j, lock)?;
+    let (has_db, manifest) = install::snapshot_db(&p.desktop_root, &p.update_dir, j)?;
+    j.local_db_snapshot = has_db;
+    j.backup_manifest = Some(manifest);
     j.phase = install::JournalPhase::Trial;
     j.watchdog_pid = Some(std::process::id());
     install::write_journal(&p.root.join(install::JOURNAL), j)
