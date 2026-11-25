@@ -947,9 +947,9 @@ impl ProviderError {
             ProviderError::Use(UseError::NotFound) => S::NOT_FOUND,
             ProviderError::Use(UseError::Revoked) => S::FORBIDDEN,
             ProviderError::Use(UseError::Busy) | ProviderError::Busy => S::SERVICE_UNAVAILABLE,
-            ProviderError::Use(UseError::Internal) | ProviderError::Internal => {
-                S::INTERNAL_SERVER_ERROR
-            }
+            ProviderError::Use(UseError::Internal)
+            | ProviderError::Device(DeviceError::Internal)
+            | ProviderError::Internal => S::INTERNAL_SERVER_ERROR,
             ProviderError::Use(
                 UseError::Unsupported
                 | UseError::WrongCapability { .. }
@@ -982,6 +982,7 @@ struct TypedUse {
     caller: String,
     space: Option<String>,
     chosen: String,
+    device_generation: Option<u64>,
     _global: tokio::sync::OwnedSemaphorePermit,
     _borrowed: Option<tokio::sync::OwnedSemaphorePermit>,
 }
@@ -993,7 +994,27 @@ async fn typed_use(
     id: &str,
     capability: Capability,
 ) -> Result<TypedUse, ProviderError> {
-    let authorized = resolve(state, caller, space, id).await?;
+    let (user, sid, id) = (caller.to_owned(), space.map(str::to_owned), id.to_owned());
+    let (authorized, device_generation) = state
+        .db
+        .call(move |db| {
+            let conn = db.lock();
+            let authorized = match sharing::authorize(&conn, &user, sid.as_deref(), &id) {
+                Ok(a) => a,
+                Err(e) => return Ok(Err(e)),
+            };
+            let row = &authorized.row;
+            let generation = if catalog::is_device(&row.provider_id) {
+                crate::device_relay::credential_of(&conn, &row.id)?
+                    .filter(|(owner, _)| owner == &row.user_id)
+                    .map(|(_, generation)| generation)
+            } else {
+                None
+            };
+            Ok(Ok((authorized, generation)))
+        })
+        .await
+        .map_err(read_error)??;
     if authorized.row.capability != capability {
         return Err(UseError::WrongCapability {
             expected: capability,
@@ -1037,6 +1058,7 @@ async fn typed_use(
         caller: caller.to_owned(),
         space: space.map(str::to_owned),
         chosen,
+        device_generation,
         _global: global,
         _borrowed: borrowed,
     })
@@ -1105,7 +1127,7 @@ async fn recheck_typed_answer(state: &AppState, u: &TypedUse) -> Result<(), Prov
 /// Where a typed call runs: a server endpoint with its key, or a device.
 enum TypedTarget {
     Server { base: String, key: Option<String> },
-    Device,
+    Device(crate::device_relay::DispatchBinding),
 }
 
 fn typed_target(state: &AppState, u: &TypedUse) -> Result<TypedTarget, ProviderError> {
@@ -1114,7 +1136,11 @@ fn typed_target(state: &AppState, u: &TypedUse) -> Result<TypedTarget, ProviderE
             let (base, key) = state.providers.typed_endpoint(u.entry, &u.row)?;
             Ok(TypedTarget::Server { base, key })
         }
-        Adapter::Device => Ok(TypedTarget::Device),
+        Adapter::Device => Ok(TypedTarget::Device(crate::device_relay::DispatchBinding {
+            generation: u.device_generation.ok_or(DeviceError::NotPaired)?,
+            grant: guard::DeviceClaimGrant::typed(&u.caller, u.space.as_deref(), &u.chosen, &u.row),
+            advertised: None,
+        })),
         Adapter::Registered(_) | Adapter::Custom => Err(UseError::Unsupported.into()),
     }
 }
@@ -1161,9 +1187,15 @@ async fn decide_with(
     still_current(state, &u).await?;
     let answer = match typed_target(state, &u)? {
         TypedTarget::Server { base, key } => typed::decide(&base, key.as_deref(), request).await,
-        TypedTarget::Device => state
+        TypedTarget::Device(binding) => state
             .device
-            .decide(&state.db, &caller_of(caller, space), &u.row.id, request)
+            .decide_bound(
+                &state.db,
+                &caller_of(caller, space),
+                &u.row.id,
+                request,
+                Some(binding),
+            )
             .await
             .map_err(ProviderError::from),
     }
@@ -1186,9 +1218,15 @@ pub async fn embed(
     still_current(state, &u).await?;
     let vectors = match typed_target(state, &u)? {
         TypedTarget::Server { base, key } => typed::embed(&base, key.as_deref(), request).await,
-        TypedTarget::Device => state
+        TypedTarget::Device(binding) => state
             .device
-            .embed(&state.db, &caller_of(caller, space), &u.row.id, request)
+            .embed_bound(
+                &state.db,
+                &caller_of(caller, space),
+                &u.row.id,
+                request,
+                Some(binding),
+            )
             .await
             .map_err(ProviderError::from)
             .and_then(|answer| typed::vectors(&answer)),
@@ -1246,9 +1284,15 @@ pub async fn media_embed(
         TypedTarget::Server { base, key } => {
             typed::media_embed(&base, key.as_deref(), request).await
         }
-        TypedTarget::Device => state
+        TypedTarget::Device(binding) => state
             .device
-            .media_embed_request(&state.db, &caller_of(caller, space), &u.row.id, request)
+            .media_embed_request_bound(
+                &state.db,
+                &caller_of(caller, space),
+                &u.row.id,
+                request,
+                Some(binding),
+            )
             .await
             .map_err(ProviderError::from),
     }
@@ -1494,6 +1538,75 @@ async fn ask_typed_fixture(
         serde_json::json!({"check": {"type": "noul", "instructions": "Is value true?"}}),
     )
     .await
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn a_prepared_typed_call_cannot_use_a_replacement_pairing() {
+    use crate::device_relay::Device;
+
+    let state = api::probe_state(vec![]).await;
+    let row = api::probe_row(&state, catalog::DEVICE_SYSTEMONE, "unused");
+    state
+        .device
+        .issue_token(&state.db, "user", &row.id)
+        .await
+        .unwrap();
+    let prepared = typed_use(&state, "user", None, &row.id, Capability::SystemOne)
+        .await
+        .unwrap();
+    state
+        .device
+        .issue_token(&state.db, "user", &row.id)
+        .await
+        .unwrap();
+    let (owner, generation) = crate::device_relay::credential_of(&state.db.lock(), &row.id)
+        .unwrap()
+        .unwrap();
+    let replacement = Device {
+        connection: row.id,
+        owner,
+        generation,
+    };
+    assert!(
+        state
+            .device
+            .claim_checked(&state.db, &replacement)
+            .await
+            .is_none()
+    );
+    let watch_for_payload = async {
+        loop {
+            assert!(
+                state
+                    .device
+                    .claim_checked(&state.db, &replacement)
+                    .await
+                    .is_none(),
+                "the replacement pairing received the prepared payload"
+            );
+            tokio::task::yield_now().await;
+        }
+    };
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::select! {
+            result = ask_typed_fixture(&state, prepared) => result,
+            () = watch_for_payload => unreachable!(),
+        }
+    })
+    .await
+    .expect("the prepared call should be refused without waiting on a device");
+    assert_eq!(
+        result,
+        Err(ProviderError::Device(DeviceError::CredentialChanged))
+    );
+    assert!(
+        state
+            .device
+            .claim_checked(&state.db, &replacement)
+            .await
+            .is_none()
+    );
 }
 
 #[cfg(test)]

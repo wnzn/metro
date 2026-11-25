@@ -2046,6 +2046,45 @@ async fn online_device(s: &Server, token: &str) -> (String, String) {
 }
 
 #[tokio::test]
+async fn device_claims_never_deliver_a_retired_typed_model() {
+    let captured = captured_logs();
+    let s = Arc::new(Server::start().await);
+    let sid = s.space(ALICE, "Pinned device jobs", &["bob"]).await;
+    for owner in [BOB, ALICE] {
+        let (id, device) = online_device(&s, owner).await;
+        if owner == ALICE {
+            let (status, body) = s
+                .share(ALICE, &id, json!({"visibility": "organization"}))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let pending = {
+            let (s, sid, id) = (s.clone(), sid.clone(), id.clone());
+            tokio::spawn(async move { s.decide("bob", Some(&sid), &id).await })
+        };
+        captured.wait_for_enqueue(&id).await;
+        let (status, body) = s
+            .patch(
+                owner,
+                &format!("/v1/providers/{id}"),
+                json!({"model": "jev-replacement"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            claim(&s, &device).await.is_none(),
+            "claim released a stale payload"
+        );
+        let err = pending.await.unwrap().unwrap_err();
+        assert_eq!(
+            err,
+            ProviderError::Device(metro_server::device_relay::DeviceError::AccessRevoked)
+        );
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+}
+
+#[tokio::test]
 async fn space_work_queued_for_a_device_is_withheld_after_the_caller_leaves() {
     let captured = captured_logs();
     let s = Arc::new(Server::start().await);

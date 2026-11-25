@@ -77,24 +77,42 @@ pub(crate) struct DeviceClaimGrant {
     target: String,
     model: String,
     config_rev: i64,
+    /// Typed calls always use the saved model, even for their owner.
+    require_saved_model: bool,
 }
 
 impl DeviceClaimGrant {
+    pub(super) fn typed(
+        caller: &str,
+        space: Option<&str>,
+        chosen: &str,
+        row: &super::store::Row,
+    ) -> Self {
+        Self {
+            caller: caller.to_owned(),
+            space: space.map(str::to_owned),
+            chosen: chosen.to_owned(),
+            target: row.id.clone(),
+            model: row.model.clone(),
+            config_rev: row.config_rev,
+            require_saved_model: true,
+        }
+    }
+
     pub(crate) fn allowed(&self, conn: &rusqlite::Connection) -> anyhow::Result<bool> {
         if let Some(space) = &self.space
             && !super::store::is_member(conn, space, &self.caller)?
         {
             return Ok(false);
         }
-        Ok(
-            sharing::authorize(conn, &self.caller, self.space.as_deref(), &self.chosen).is_ok_and(
-                |a| {
-                    a.row.id == self.target
-                        && a.row.config_rev == self.config_rev
-                        && (a.access == sharing::Access::Own || a.row.model == self.model)
-                },
-            ),
-        )
+        match sharing::authorize(conn, &self.caller, self.space.as_deref(), &self.chosen) {
+            Ok(a) => Ok(a.row.id == self.target
+                && a.row.config_rev == self.config_rev
+                && ((!self.require_saved_model && a.access == sharing::Access::Own)
+                    || a.row.model == self.model)),
+            Err(UseError::Internal) => Err(super::ProviderError::Use(UseError::Internal).into()),
+            Err(_) => Ok(false),
+        }
     }
 }
 
@@ -387,6 +405,7 @@ impl Transport<Chat> for GuardedDeviceTransport {
                                 target: this.grant.target.clone(),
                                 model: check.selection.model_id.clone(),
                                 config_rev: check.selection.config_rev,
+                                require_saved_model: false,
                             },
                         )
                         .await
