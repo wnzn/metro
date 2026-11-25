@@ -32,9 +32,9 @@ CONTAINER_PS1 = HERE / "metro-runner-container.ps1"
 TRUE = shutil.which("true")
 # Validation only: none of these is ever connected to.
 BAD_LOOPBACK = (
-    "http://127.0.0.1.evil.example:80", "http://127.0.0.2:8787", "http://127.1:8787", "http://localhost",
+    "http://127.0.0.2:8787", "http://127.1:8787", "http://localhost",
     "http://localhost:", "http://localhost:0", "http://localhost:65536", "http://localhost:99999",
-    "http://localhost:80x", "http://localhost:+80", "http://localhost:8787:1", "http://localhostx:80",
+    "http://localhost:80x", "http://localhost:+80", "http://localhost:8787:1",
     "http://LOCALHOST:80", "http://[::1]", "http://[::1]80", "http://[::1:80", "http://[::1]]:80",
     "http://[0:0:0:0:0:0:0:1]:80", "http://u@localhost:80", "http://localhost@evil.example:80",
     "http://0.0.0.0:80", "http://127.0.0.1 :80",
@@ -43,11 +43,18 @@ GOOD_LOOPBACK = ("http://127.0.0.1:41234", "http://localhost:1", "http://[::1]:6
                  "http://localhost:41234/base")
 # Plain http beyond loopback is allowed: Tailscale silently, anything else with a warning.
 TAILSCALE_HTTP = ("http://100.64.0.1", "http://100.127.255.255:8787", "http://[fd7a:115c:a1e0::1]:8787",
-                  "http://metro.tail1234.ts.net", "http://Metro.Tail1234.TS.NET:8787/base")
+                  "http://metro.tail1234.ts.net", "http://Metro.Tail1234.TS.NET:8787/base",
+                  "http://office.metro.ts.net.:8787")
 OTHER_HTTP = ("http://metro.example", "http://10.0.0.5:8787", "http://192.168.1.10:8787/base",
-              "http://100.128.0.1", "http://100.63.255.255:80", "http://[fe80::1]:8787", "http://ts.net")
+              "http://100.128.0.1", "http://100.63.255.255:80", "http://[fe80::1]:8787", "http://ts.net",
+              # Real DNS labels, not prefix tests: these are ordinary names.
+              "http://localhost-office.example:8787", "http://localhostx:80", "http://127.0.0.1.evil.example:80")
 BAD_HTTP = ("http://1.2.3.999", "http://.metro.example", "http://a..b", "http://-x:80", "http://[::]:80",
-            "http://[fd7a::1", "http://metro.example:0", "http://metro.example:65536", "http://metro.example:")
+            "http://[fd7a::1", "http://metro.example:0", "http://metro.example:65536", "http://metro.example:",
+            "http://[fd7a:115c:a1e0:::]:8787", "http://[fd7a:115c:a1e0::1::2]",
+            # Numeric spellings resolvers read differently (octal, hex, shorthand).
+            "http://100.077.0.1", "http://100.00077.0.1:8787", "http://0x64.64.0.1", "http://100.64.1",
+            "http://1681915905:8787")
 VECTORS = HERE.parent / "crates/url-policy/testdata/host_vectors.json"
 HOST_MUTATORS = {"docker", "podman", "sudo", "doas", "pkexec", "su", "systemctl", "apt", "apt-get", "dpkg",
                  "pacman", "dnf", "yum", "rpm", "zypper", "flatpak", "snap"}
@@ -323,6 +330,7 @@ FAKE_RUNNER = """#!/bin/sh
 printf 'url=%s ws=%s token_sha=%s insecure=%s file=%s\\n' "$METRO_SERVER_URL" "$METRO_WORKSPACE" \
   "$(printf %s "$METRO_RUNNER_TOKEN" | sha256sum | cut -c1-16)" "${METRO_ALLOW_INSECURE_HTTP:-unset}" \
   "${METRO_RUNNER_TOKEN_FILE:-unset}"
+printf 'NO_PROXY=%s no_proxy=%s HTTP_PROXY=%s\\n' "${NO_PROXY:-unset}" "${no_proxy:-unset}" "${HTTP_PROXY:-unset}"
 """
 
 
@@ -370,9 +378,24 @@ class RunnerInstallerTests(unittest.TestCase):
         self.assertEqual(r.stderr.count("isn't encrypted"), 1, r.stderr)
         self.assertIn("192.168.1.10", r.stderr)
         self.assertNotIn("secret-value", r.stdout + r.stderr)
-        r = self.box.run(RUNNER, "run", check=True, env={"METRO_RUNNER_TOKEN": "x"})
+        proxy_env = {"METRO_RUNNER_TOKEN": "x", "HTTP_PROXY": "http://proxy.invalid:3128", "NO_PROXY": "corp.example"}
+        r = self.box.run(RUNNER, "run", check=True, env=proxy_env)
         self.assertIn("url=http://192.168.1.10:8787 ", r.stdout)
         self.assertIn("insecure=1 ", r.stdout)
+        # An ordinary host keeps the person's proxy settings untouched.
+        self.assertIn("NO_PROXY=corp.example no_proxy=unset HTTP_PROXY=http://proxy.invalid:3128", r.stdout)
+        # A Tailscale or loopback server is always reached without the proxy,
+        # also by runners up to 0.4.0: NO_PROXY gains exactly its host.
+        for url, entries in (("http://100.101.102.103:8787", "100.101.102.103"),
+                             ("http://[fd7a:115c:a1e0::1]:8787", "[fd7a:115c:a1e0::1],fd7a:115c:a1e0::1"),
+                             ("http://office.metro.ts.net.:8787", "office.metro.ts.net."),
+                             ("http://127.0.0.1:41234", "127.0.0.1")):
+            self.assertEqual(self.configure(url).returncode, 0, url)
+            r = self.box.run(RUNNER, "run", check=True, env=proxy_env)
+            self.assertIn(f"NO_PROXY=corp.example,{entries} no_proxy=corp.example,{entries} "
+                          "HTTP_PROXY=http://proxy.invalid:3128", r.stdout, url)
+        r = self.box.run(RUNNER, "run", check=True, env={"METRO_RUNNER_TOKEN": "x"})
+        self.assertIn("NO_PROXY=127.0.0.1 no_proxy=127.0.0.1 ", r.stdout)
         self.assertEqual(self.configure("https://metro.example").returncode, 0)
 
         out = self.box.run(RUNNER, "install-service", check=True).stdout
@@ -543,6 +566,7 @@ class ContainerScriptTests(unittest.TestCase):
         self.assertNotIn("--network=host", run)
         self.assertIn("METRO_SERVER_URL=http://192.168.1.10:8787", run)
         self.assertIn("--env METRO_ALLOW_INSECURE_HTTP=1", run)  # for runner images up to 0.4.0
+        self.assertNotIn("NO_PROXY", run)  # an ordinary host keeps the engine's proxy settings
         self.assertFalse(any("/dev/tcp/" in c for c in self.docker_calls()))
         self.box.run(CONTAINER, "remove", check=True)
 
@@ -551,6 +575,14 @@ class ContainerScriptTests(unittest.TestCase):
                              check=True)
             self.assertNotIn("isn't encrypted", r.stderr, url)
             self.assertIn("NETWORK=default", self.config.read_text())
+        # A Tailscale server is reached without any proxy the engine injects.
+        self.box.run(CONTAINER, "setup", "--server-url", "http://[fd7a:115c:a1e0::1]:8787", "--token-file", self.token,
+                     "--image", "m:ci", check=True)
+        self.box.run(CONTAINER, "start", check=True)
+        run = [c for c in self.docker_calls() if c.startswith("docker run -d")][-1]
+        entries = "[fd7a:115c:a1e0::1],fd7a:115c:a1e0::1"
+        self.assertIn(f"--env NO_PROXY={entries} --env no_proxy={entries}", run)
+        self.box.run(CONTAINER, "remove", check=True)
         for url in BAD_HTTP:
             r = self.box.run(CONTAINER, "setup", "--server-url", url, "--token-file", self.token, "--image", "m:ci")
             self.assertNotEqual(r.returncode, 0, url)
@@ -563,6 +595,7 @@ class ContainerScriptTests(unittest.TestCase):
         run = next(c for c in self.docker_calls() if c.startswith("docker run -d"))
         self.assertIn("--network=host", run)
         self.assertNotIn("METRO_ALLOW_INSECURE_HTTP", run)
+        self.assertIn("--env NO_PROXY=127.0.0.1 --env no_proxy=127.0.0.1", run)
 
     def test_loopback_urls_are_exact_literals_with_a_port(self):
         for url in BAD_LOOPBACK:
@@ -641,6 +674,24 @@ class UrlRuleVectorTests(unittest.TestCase):
             r = subprocess.run(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", harness,
                                 *[u for u, _ in cases]], text=True, capture_output=True, timeout=120, check=True)
             self.check(r.stdout.splitlines(), cases)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 (pwsh) is not installed")
+    def test_powershell_direct_args(self):
+        with tempfile.TemporaryDirectory() as d:
+            harness = Path(d) / "direct.ps1"
+            harness.write_text("$Prog = 't'\nfunction Fail([string] $Message) { throw $Message }\n" +
+                               url_rule_block(CONTAINER_PS1, "#") +
+                               "foreach ($u in $args) { (Get-DirectArgs ([pscustomobject]@{ ServerUrl = $u })) -join ' ' }\n")
+            urls = ["http://100.101.102.103:8787", "http://[fd7a:115c:a1e0::1]:8787", "http://127.0.0.1:41234",
+                    "http://192.168.1.10:8787", "https://metro.example"]
+            r = subprocess.run(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", harness, *urls],
+                               text=True, capture_output=True, timeout=120, check=True)
+            self.assertEqual(r.stdout.splitlines(), [
+                "--env NO_PROXY=100.101.102.103 --env no_proxy=100.101.102.103",
+                "--env NO_PROXY=[fd7a:115c:a1e0::1],fd7a:115c:a1e0::1 --env no_proxy=[fd7a:115c:a1e0::1],fd7a:115c:a1e0::1",
+                "--env NO_PROXY=127.0.0.1 --env no_proxy=127.0.0.1",
+                "", "",
+            ])
 
 
 class MacosInstallerTests(unittest.TestCase):

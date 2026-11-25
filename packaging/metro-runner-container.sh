@@ -73,20 +73,61 @@ done
 # ---------------------------------------------------------------- checks
 # url-rule:begin (test_installers.py runs this block against
 # crates/url-policy/testdata/host_vectors.json)
-# Plain http works to any host. The runner token is sent
-# as given, so the host decides how it's said:
+# Plain http works to any host. The host is parsed for real: an IPv6 address
+# in brackets, a canonical dotted-quad IPv4 address, or a DNS name (labels of
+# letters, digits and inner hyphens; one trailing dot allowed). Then:
 # - loopback: only the exact literals localhost, 127.0.0.1 or [::1] with an
-#   explicit port 1-65535 (anything else that names this machine, such as
-#   127.1, LOCALHOST, [::ffff:7f00:1] or a trailing dot, is refused as
-#   ambiguous: a trailing dot sends even an address through the resolver);
+#   explicit port 1-65535; any other spelling of this machine (127.1,
+#   LOCALHOST, 127.0.0.2, [0:0:0:0:0:0:0:1], ::ffff: forms, 0.0.0.0, [::]) is
+#   refused as ambiguous;
 # - Tailscale (100.64.0.0/10, fd7a:115c:a1e0::/48, names ending in .ts.net):
-#   encrypted by Tailscale itself, used silently;
-# - any other host: allowed, with one warning that the token crosses the
-#   network unencrypted.
-# http_class URL sets url_class (loopback, tailscale or other) and url_host;
-# it fails on a malformed or ambiguous authority.
+#   encrypted by Tailscale itself, used silently, and always reached without a
+#   proxy (see direct_no_proxy);
+# - any other host: allowed, with one warning that the runner token crosses
+#   the network unencrypted.
+# Numbers must be a canonical dotted quad: resolvers read 100.077.0.1 as
+# octal, 0x64 as hex and 100.64.1 as shorthand, so those are refused.
+# http_class URL sets url_class (loopback, tailscale or other) and url_host
+# (as written, IPv6 in brackets); it fails on a malformed or ambiguous host.
+is_label() {
+    case "$1" in ''|-*|*-|*[!A-Za-z0-9-]*) return 1 ;; esac
+    [ ${#1} -le 63 ]
+}
+
+v6_part() { # colon-separated groups of 1-4 hex digits (or nothing): prints them padded
+    [ -n "$1" ] || return 0
+    case "$1" in :*|*:) return 1 ;; esac
+    (
+        IFS=:
+        # shellcheck disable=SC2086 # split on colons on purpose
+        set -- $1
+        for g in "$@"; do
+            case "$g" in ''|?????*) exit 1 ;; esac
+            printf '%04x ' "0x$g"
+        done
+    )
+}
+
+ipv6_groups() { # prints the 8 groups, lowercase and padded, or fails
+    t=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    case "$t" in ''|*[!0-9a-f:]*|*::*::*) return 1 ;; esac
+    case "$t" in
+        *::*) head=${t%%::*}; tail=${t#*::}; compress=1 ;;
+        *) head=$t; tail=''; compress=0 ;;
+    esac
+    hg=$(v6_part "$head") || return 1
+    tg=$(v6_part "$tail") || return 1
+    # shellcheck disable=SC2086
+    n=$(( $(set -- $hg; echo $#) + $(set -- $tg; echo $#) ))
+    if [ "$compress" = 1 ]; then [ "$n" -le 7 ] || return 1; else [ "$n" -eq 8 ] || return 1; fi
+    zeros=''; i=$n
+    while [ "$i" -lt 8 ]; do zeros="$zeros 0000"; i=$((i + 1)); done
+    # shellcheck disable=SC2086
+    echo $hg $zeros $tg
+}
+
 http_class() {
-    rest=${1#http://}; auth=${rest%%/*}; port='' has_port=0 url_class='' url_host=
+    rest=${1#http://}; auth=${rest%%/*}; port='' has_port=0 url_class='' url_host=''
     case "$auth" in
         \[*\]:*) url_host=${auth%%\]:*}']'; port=${auth##*\]:}; has_port=1 ;;
         \[*\]) url_host=$auth ;;
@@ -99,38 +140,72 @@ http_class() {
         [ ${#port} -le 5 ] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
     fi
     case "$url_host" in
-        \[*\]) inner=${url_host#\[}; inner=${inner%\]}
-               case "$inner" in ''|*[!0-9A-Fa-f:]*|::[fF][fF][fF][fF]:*) return 1 ;; esac ;;
-        # Labels of letters, digits and inner hyphens; no trailing dot.
-        ''|.*|-*|*.|*-|*..*|*-.*|*.-*|*[!A-Za-z0-9.-]*) return 1 ;;
+        \[*\])
+            inner=${url_host#\[}; inner=${inner%\]}
+            groups=$(ipv6_groups "$inner") || return 1
+            # shellcheck disable=SC2086
+            set -- $groups
+            case "$*" in
+                "0000 0000 0000 0000 0000 0000 0000 0000") return 1 ;;
+                "0000 0000 0000 0000 0000 0000 0000 0001")
+                    [ "$url_host" = '[::1]' ] && [ "$has_port" = 1 ] || return 1
+                    url_class=loopback; return 0 ;;
+                "0000 0000 0000 0000 0000 ffff "*) return 1 ;;
+                "fd7a 115c a1e0 "*) url_class=tailscale; return 0 ;;
+            esac
+            url_class=other; return 0 ;;
     esac
-    if [ "$has_port" = 1 ]; then
-        case "$url_host" in localhost|127.0.0.1|\[::1\]) url_class=loopback; return 0 ;; esac
+    name=$url_host; dotted=0
+    case "$name" in *.) name=${name%.}; dotted=1 ;; esac
+    [ -n "$name" ] && [ ${#name} -le 253 ] || return 1
+    case "$name" in .*|*..*) return 1 ;; esac
+    labels=$(printf '%s' "$name" | tr '.' ' ')
+    count=0 last=''
+    for l in $labels; do is_label "$l" || return 1; count=$((count + 1)); last=$l; done
+    case "$last" in
+        *[!0-9]*) case "$last" in 0[xX]*) numeric=1 ;; *) numeric=0 ;; esac ;;
+        *) numeric=1 ;;
+    esac
+    if [ "$numeric" = 1 ]; then
+        [ "$dotted" = 0 ] && [ "$count" = 4 ] || return 1
+        for o in $labels; do
+            case "$o" in 0|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;; *) return 1 ;; esac
+            [ "$o" -le 255 ] || return 1
+        done
+        # shellcheck disable=SC2086 # four validated numeric labels
+        set -- $labels
+        if [ "$1" = 127 ]; then
+            [ "$name" = 127.0.0.1 ] && [ "$has_port" = 1 ] || return 1
+            url_class=loopback; return 0
+        fi
+        [ "$name" != 0.0.0.0 ] || return 1
+        if [ "$1" = 100 ] && [ "$2" -ge 64 ] && [ "$2" -le 127 ]; then url_class=tailscale; return 0; fi
+        url_class=other; return 0
     fi
-    lower=$(printf '%s' "$url_host" | tr '[:upper:]' '[:lower:]')
+    lower=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
+    if [ "$lower" = localhost ] && [ "$dotted" = 0 ]; then
+        [ "$url_host" = localhost ] && [ "$has_port" = 1 ] || return 1
+        url_class=loopback; return 0
+    fi
     case "$lower" in
-        localhost*|127.*|0.0.0.0|0) return 1 ;;
-        \[*\]) bits=$(printf '%s' "$lower" | tr -d '[]0:')
-               [ -n "$bits" ] && [ "$bits" != 1 ] || return 1 ;;
-    esac
-    case "$lower" in
-        *.ts.net) url_class=tailscale; return 0 ;;
-        \[fd7a:115c:a1e0:*\]) url_class=tailscale; return 0 ;;
-    esac
-    case "$lower" in
-        *[!0-9.]*) ;;
-        *.*.*.*)
-            o1=${lower%%.*}; r=${lower#*.}; o2=${r%%.*}; r=${r#*.}; o3=${r%%.*}; o4=${r#*.}
-            for o in "$o1" "$o2" "$o3" "$o4"; do
-                case "$o" in ''|*[!0-9]*) return 1 ;; esac
-                [ ${#o} -le 3 ] && [ "$o" -le 255 ] || return 1
-            done
-            if [ "$o1" = 100 ] && [ "$o2" -ge 64 ] && [ "$o2" -le 127 ]; then url_class=tailscale; return 0; fi ;;
+        *.ts.net) [ "$count" -ge 3 ] && url_class=tailscale && return 0 ;;
     esac
     url_class=other
 }
-
 # url-rule:end
+
+# NO_PROXY for a loopback or Tailscale server: the runner must reach it
+# directly, or the "encrypted"/"local" assumption behind skipping the warning
+# is false. Runners up to 0.4.0 (ureq 3.5.2) read HTTP_PROXY and friends and
+# skip them only for NO_PROXY matches, compared against the URI host as
+# written (IPv6 in brackets). Prints the person's NO_PROXY (or no_proxy) with
+# this server's host added; other destinations keep their proxy settings.
+direct_no_proxy() { # $1 = url_host
+    base=${NO_PROXY-${no_proxy-}}
+    extra=$1
+    case "$1" in \[*\]) extra="$1,${1#\[}"; extra=${extra%\]} ;; esac
+    printf '%s' "${base:+$base,}$extra"
+}
 
 plain_http_warning() { # $1 = host; never mentions the token's value
     printf '%s: warning: plain HTTP to %s isn'"'"'t encrypted: anyone on the network between this machine and %s could read the runner token. Use it only on networks you trust, such as Tailscale or a VPN, or use https://.\n' "$PROG" "$1" "$1" >&2
@@ -235,6 +310,17 @@ insecure_flag() {
     esac
 }
 
+# A loopback or Tailscale server is always reached directly: proxies the
+# engine injects (Docker's "proxies" client setting) are skipped for exactly
+# that host. Other destinations keep the engine's settings.
+direct_flag() {
+    case "$url_class" in
+        loopback|tailscale)
+            direct=$(unset NO_PROXY no_proxy; direct_no_proxy "$url_host")
+            printf -- '--env NO_PROXY=%s --env no_proxy=%s' "$direct" "$direct" ;;
+    esac
+}
+
 network_flag() {
     if [ "$network" = host ]; then
         printf '%s' '--network=host' || true
@@ -288,6 +374,7 @@ start() {
         "$engine" start "$name" >/dev/null; say "Started $name."; return 0
     fi
     ensure_image
+    set -f # the unquoted flags hold IPv6 brackets: never glob them
     # shellcheck disable=SC2016 # expanded by the container shell
     # The token is read from the read-only mount at start, never put in the
     # container's configuration, the command line or the image.
@@ -297,11 +384,12 @@ start() {
         --cap-drop ALL --security-opt no-new-privileges:true --pids-limit 256 \
         --mount "type=volume,source=$volume,target=/workspace" \
         --mount "type=bind,source=$token_file,target=$SECRET,readonly" \
-        --env "METRO_SERVER_URL=$server_url" $(insecure_flag) \
+        --env "METRO_SERVER_URL=$server_url" $(insecure_flag) $(direct_flag) \
         --label dev.metro.managed-by=$PROG \
         --entrypoint /bin/sh "$image" \
         -c 'IFS= read -r METRO_RUNNER_TOKEN < '"$SECRET"' || [ -n "$METRO_RUNNER_TOKEN" ]; export METRO_RUNNER_TOKEN; exec /usr/local/bin/metro-runner' \
-        >/dev/null || die "could not start the runner container"
+        >/dev/null || { set +f; die "could not start the runner container"; }
+    set +f
     say "Started $name ($image). See its log with: $0 logs"
 }
 

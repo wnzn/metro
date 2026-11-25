@@ -56,41 +56,108 @@ function Fail([string] $Message) { throw "${Prog}: $Message" }
 
 # url-rule:begin (test_installers.py runs this block against
 # crates/url-policy/testdata/host_vectors.json)
-# Plain http only to an exact loopback literal (localhost, 127.0.0.1 or [::1])
-# with an explicit numeric port 1-65535, then an optional path.
-function Test-LoopbackHttp([string] $Url) {
-    if (-not ($Url -cmatch '^http://(localhost|127\.0\.0\.1|\[::1\]):([0-9]{1,5})(/[^?#@]*)?$')) { return $false }
-    $port = [int] $Matches[2]
-    return $port -ge 1 -and $port -le 65535
+# Plain http works to any host. The host is parsed for real: an IPv6 address
+# in brackets, a canonical dotted-quad IPv4 address, or a DNS name (labels of
+# letters, digits and inner hyphens; one trailing dot allowed). Then:
+# - loopback: only the exact literals localhost, 127.0.0.1 or [::1] with an
+#   explicit port 1-65535; any other spelling of this computer (127.1,
+#   LOCALHOST, 127.0.0.2, [0:0:0:0:0:0:0:1], ::ffff: forms, 0.0.0.0, [::]) is
+#   refused as ambiguous;
+# - Tailscale (100.64.0.0/10, fd7a:115c:a1e0::/48, names ending in .ts.net):
+#   used silently, and always reached without a proxy (Get-DirectArgs);
+# - any other host: allowed, with one warning, because the runner token
+#   crosses the network unencrypted.
+# Numbers must be a canonical dotted quad: resolvers read 100.077.0.1 as
+# octal, 0x64 as hex and 100.64.1 as shorthand, so those are refused.
+# Same algorithm as the http_class function of the shell installers.
+
+function Test-Label([string] $Label) {
+    return $Label.Length -ge 1 -and $Label.Length -le 63 -and $Label -cmatch '^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$'
 }
 
-# Plain http works to any host. Loopback (the exact literals above) and
-# Tailscale hosts are used silently; any other host gets one warning, because
-# the runner token crosses the network unencrypted. Other names for this
-# computer (127.1, LOCALHOST, [0:0:0:0:0:0:0:1], [::ffff:7f00:1], 0.0.0.0,
-# a trailing dot, ...) are refused as ambiguous: a trailing dot sends even an
-# address through the resolver. Returns loopback, tailscale or other; $null when malformed.
+# The groups of one side of '::' (or of a whole address), padded; $null when malformed.
+function Get-V6Part([string] $Part) {
+    if ($Part -eq '') { return , @() }
+    if ($Part.StartsWith(':') -or $Part.EndsWith(':')) { return $null }
+    $out = @()
+    foreach ($g in $Part.Split(':')) {
+        if ($g.Length -lt 1 -or $g.Length -gt 4) { return $null }
+        $out += $g.PadLeft(4, '0')
+    }
+    return , $out
+}
+
+# The 8 groups of an IPv6 address, lowercase and padded; $null when malformed.
+function Get-Ipv6Groups([string] $Text) {
+    $t = $Text.ToLowerInvariant()
+    if ($t -eq '' -or $t -notmatch '^[0-9a-f:]+$') { return $null }
+    $idx = $t.IndexOf('::')
+    if ($idx -ge 0) {
+        if ($t.IndexOf('::', $idx + 2) -ge 0) { return $null }
+        $head = Get-V6Part $t.Substring(0, $idx)
+        $tail = Get-V6Part $t.Substring($idx + 2)
+        if ($null -eq $head -or $null -eq $tail) { return $null }
+        $n = $head.Count + $tail.Count
+        if ($n -gt 7) { return $null }
+        return , @($head + @('0000') * (8 - $n) + $tail)
+    }
+    $all = Get-V6Part $t
+    if ($null -eq $all -or $all.Count -ne 8) { return $null }
+    return , $all
+}
+
+# Returns loopback, tailscale or other, and sets $script:UrlHost (as written,
+# IPv6 in brackets); $null when malformed or ambiguous.
 function Get-HttpClass([string] $Url) {
-    if (Test-LoopbackHttp $Url) { return 'loopback' }
-    $label = '[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?'
-    if (-not ($Url -cmatch "^http://(\[[0-9A-Fa-f:]+\]|$label(?:\.$label)*)(?::([0-9]{1,5}))?(/[^?#@]*)?$")) { return $null }
-    $hostPart = $Matches[1].ToLowerInvariant()
-    $portText = $Matches[2]
-    if ($portText) { $port = [int] $portText; if ($port -lt 1 -or $port -gt 65535) { return $null } }
-    if ($hostPart -like 'localhost*' -or $hostPart -like '127.*' -or $hostPart -eq '0.0.0.0' -or $hostPart -eq '0') { return $null }
-    if ($hostPart.StartsWith('[')) {
-        if ($hostPart.StartsWith('[::ffff:')) { return $null }
-        $bits = $hostPart -replace '[\[\]0:]', ''
-        if ($bits -eq '' -or $bits -eq '1') { return $null }
-        if ($hostPart.StartsWith('[fd7a:115c:a1e0:')) { return 'tailscale' }
+    if (-not ($Url -cmatch '^http://(\[[^\]/]*\]|[^/:\[\]]*)(?::([0-9]*))?(/[^?#@]*)?$')) { return $null }
+    $h = $Matches[1]
+    $hasPort = $Url -cmatch '^http://(\[[^\]/]*\]|[^/:\[\]]*):'
+    $portText = if ($hasPort) { ($Url -replace '^http://(\[[^\]/]*\]|[^/:\[\]]*):([0-9]*).*$', '$2') } else { '' }
+    if ($hasPort) {
+        if ($portText -notmatch '^[0-9]{1,5}$') { return $null }
+        $port = [int] $portText
+        if ($port -lt 1 -or $port -gt 65535) { return $null }
+    }
+    $script:UrlHost = $h
+    if ($h.StartsWith('[')) {
+        $g = Get-Ipv6Groups $h.Substring(1, $h.Length - 2)
+        if ($null -eq $g) { return $null }
+        $joined = $g -join ' '
+        if ($joined -eq '0000 0000 0000 0000 0000 0000 0000 0000') { return $null }
+        if ($joined -eq '0000 0000 0000 0000 0000 0000 0000 0001') {
+            if ($h -ceq '[::1]' -and $hasPort) { return 'loopback' }
+            return $null
+        }
+        if ($joined.StartsWith('0000 0000 0000 0000 0000 ffff ')) { return $null }
+        if ($joined.StartsWith('fd7a 115c a1e0 ')) { return 'tailscale' }
         return 'other'
     }
-    if ($hostPart.EndsWith('.ts.net')) { return 'tailscale' }
-    if ($hostPart -match '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$') {
-        $o = @($hostPart.Split('.') | ForEach-Object { [int] $_ })
-        if (@($o | Where-Object { $_ -gt 255 }).Count -gt 0) { return $null }
-        if ($o[0] -eq 100 -and $o[1] -ge 64 -and $o[1] -le 127) { return 'tailscale' }
+    $name = $h; $dotted = $false
+    if ($name.EndsWith('.')) { $name = $name.Substring(0, $name.Length - 1); $dotted = $true }
+    if ($name -eq '' -or $name.Length -gt 253) { return $null }
+    $labels = $name.Split('.')
+    foreach ($l in $labels) { if (-not (Test-Label $l)) { return $null } }
+    $last = $labels[-1]
+    $numeric = ($last -cmatch '^[0-9]+$') -or ($last -match '^0x')
+    if ($numeric) {
+        if ($dotted -or $labels.Count -ne 4) { return $null }
+        foreach ($o in $labels) {
+            if ($o -cnotmatch '^(0|[1-9][0-9]{0,2})$' -or [int] $o -gt 255) { return $null }
+        }
+        if ($labels[0] -eq '127') {
+            if ($name -ceq '127.0.0.1' -and $hasPort) { return 'loopback' }
+            return $null
+        }
+        if ($name -eq '0.0.0.0') { return $null }
+        if ([int] $labels[0] -eq 100 -and [int] $labels[1] -ge 64 -and [int] $labels[1] -le 127) { return 'tailscale' }
+        return 'other'
     }
+    $lower = $name.ToLowerInvariant()
+    if ($lower -eq 'localhost' -and -not $dotted) {
+        if ($h -ceq 'localhost' -and $hasPort) { return 'loopback' }
+        return $null
+    }
+    if ($lower.EndsWith('.ts.net') -and $labels.Count -ge 3) { return 'tailscale' }
     return 'other'
 }
 
@@ -105,9 +172,20 @@ function Test-Url([string] $Url) {
     if ($Url -cmatch '^http://') {
         $class = Get-HttpClass $Url
         if ($class) { return $class }
-        Fail "invalid -ServerUrl ${Url}: for this computer use exactly http://127.0.0.1:PORT, http://localhost:PORT or http://[::1]:PORT; otherwise host[:port] with a port of 1-65535"
+        Fail "invalid -ServerUrl ${Url}: for this computer use exactly http://127.0.0.1:PORT, http://localhost:PORT or http://[::1]:PORT; otherwise host[:port] with a port of 1-65535 and a canonical IPv4 address or DNS name"
     }
     Fail '-ServerUrl must start with https:// or http://'
+}
+
+# NO_PROXY for a loopback or Tailscale server: it is always reached directly
+# (runner images up to 0.4.0 use proxies from the environment unless
+# NO_PROXY matches the URI host as written, IPv6 in brackets). Proxies Docker
+# injects are skipped for exactly that host; other destinations keep them.
+function Get-DirectArgs($c) {
+    if ((Test-Url $c.ServerUrl) -notin 'loopback', 'tailscale') { return @() }
+    $h = $script:UrlHost
+    $entries = if ($h.StartsWith('[')) { "$h,$($h.Substring(1, $h.Length - 2))" } else { $h }
+    return @('--env', "NO_PROXY=$entries", '--env', "no_proxy=$entries")
 }
 
 # url-rule:end
@@ -227,7 +305,7 @@ function Start-Runner($c) {
         '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--pids-limit', '256',
         '--mount', "type=volume,source=$($c.Volume),target=/workspace",
         '--mount', (Get-TokenMount $c),
-        '--env', "METRO_SERVER_URL=$($c.ServerUrl)") + (Get-InsecureArgs $c) + @(
+        '--env', "METRO_SERVER_URL=$($c.ServerUrl)") + (Get-InsecureArgs $c) + (Get-DirectArgs $c) + @(
         '--label', "dev.metro.managed-by=$Prog",
         '--entrypoint', '/bin/sh', $c.Image, '-c', $script)
     Invoke-Engine @a | Out-Null
