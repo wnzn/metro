@@ -9,6 +9,7 @@
 
 pub mod access;
 pub mod actions;
+pub(crate) mod agent_tools;
 pub mod api;
 pub mod compile;
 pub mod data;

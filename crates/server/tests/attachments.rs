@@ -104,6 +104,7 @@ impl RoutingBackend for Backend {
                 }),
                 max_tokens: None,
                 built_from: None,
+                effective_device: None,
             })
         })
     }

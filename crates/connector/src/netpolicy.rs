@@ -21,7 +21,7 @@ use url::{Host, Url};
 /// Validate and normalize a provider base URL (no trailing slash): https, or
 /// http to loopback only.
 pub fn validate_base_url(raw: &str, what: &str) -> Result<String> {
-    let (url, host) = parse_url(raw, what)?;
+    let (url, host) = parse_url(raw_input(raw, what)?, what)?;
     match url.scheme() {
         "https" => {}
         "http" if is_loopback(&host) => {}
@@ -37,7 +37,20 @@ pub fn validate_base_url(raw: &str, what: &str) -> Result<String> {
 /// plain http to any host. Callers that start talking to it report
 /// `server_plain_http_warning` once.
 pub fn validate_server_url(raw: &str, what: &str) -> Result<String> {
-    let (url, _) = parse_url(raw, what)?;
+    normalize_server_url(raw_input(raw, what)?, what)
+}
+
+/// Check a saved Metro server URL without reapplying the raw-input limit:
+/// percent encoding can expand a valid URL. The record reader bounds its size.
+pub(crate) fn validate_canonical_server_url(server: &str, what: &str) -> Result<()> {
+    if normalize_server_url(server, what)? != server {
+        bail!("{what} is not normalized");
+    }
+    Ok(())
+}
+
+fn normalize_server_url(input: &str, what: &str) -> Result<String> {
+    let (url, _) = parse_url(input, what)?;
     match url.scheme() {
         "https" | "http" => {}
         other => bail!("{what}: scheme {other:?} is not supported; use https:// or http://"),
@@ -62,14 +75,22 @@ pub fn url_host_class(url: &Url) -> metro_url_policy::HostClass {
     )
 }
 
-fn parse_url(raw: &str, what: &str) -> Result<(Url, Host<String>)> {
+fn raw_input<'a>(raw: &'a str, what: &str) -> Result<&'a str> {
     let raw = raw.trim();
-    if raw.is_empty() || raw.len() > 2048 || raw.chars().any(|c| c.is_control()) {
+    if raw.len() > 2048 {
         bail!("{what}: enter a URL like https://metro.example.com");
     }
-    let url = match Url::parse(raw) {
+    Ok(raw)
+}
+
+fn parse_url(input: &str, what: &str) -> Result<(Url, Host<String>)> {
+    if input.is_empty() || input.chars().any(|c| c.is_control()) {
+        bail!("{what}: enter a URL like https://metro.example.com");
+    }
+    let url = match Url::parse(input) {
         Ok(u) => u,
-        Err(_) => bail!("{what}: {raw:?} is not a valid URL"),
+        // The input may contain credentials, including when parsing fails.
+        Err(e) => bail!("{what}: invalid URL ({e})"),
     };
     if !url.username().is_empty() || url.password().is_some() {
         bail!("{what}: the URL must not contain a user name or password");

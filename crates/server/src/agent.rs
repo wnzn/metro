@@ -165,6 +165,7 @@ struct RunModel {
     /// The connection that runs and its `config_rev` when the model was
     /// built (see [`crate::providers::SelectedModel::built_from`]).
     built_from: Option<(String, i64)>,
+    effective_device: Option<crate::providers::EffectiveDevice>,
 }
 
 impl RunModel {
@@ -223,7 +224,8 @@ async fn route_model(
                         model: selected.model,
                         max_tokens: selected.max_tokens,
                         params: selection.and_then(|s| s.params(&selected.provider_id)),
-                        built_from: selected.built_from.clone(),
+                        built_from: selected.built_from,
+                        effective_device: selected.effective_device,
                     })
                 }
                 Err(e) => Err(route.refused(space, &e)),
@@ -238,7 +240,8 @@ async fn route_model(
                     model: selected.model,
                     max_tokens: selected.max_tokens,
                     params: None,
-                    built_from: selected.built_from.clone(),
+                    built_from: selected.built_from,
+                    effective_device: selected.effective_device,
                 })
             }
             Ok(None) => match &state.config.model {
@@ -256,6 +259,7 @@ async fn route_model(
                         max_tokens: None,
                         params: None,
                         built_from: None,
+                        effective_device: None,
                     })
                 }
                 None => Err(Refusal::shown(NO_MODEL)),
@@ -363,7 +367,10 @@ enum Outcome {
     /// the text, and the allowlisted monitoring code.
     Failed(String, Code),
     /// The model or the connection serving it failed.
-    ModelFailed(ModelFailure),
+    ModelFailed {
+        failure: ModelFailure,
+        redact_diagnostics: bool,
+    },
     Cancelled,
 }
 
@@ -451,6 +458,7 @@ async fn refusal_after(
 /// ([`crate::orchestration::RunFailure`]).
 pub const MODEL_STOPPED_IN_ROOM: &str =
     "The agent stopped: the sender's model failed or is no longer available to this run.";
+const PAGE_MODEL_FAILED: &str = "The agent could not complete the model turn.";
 
 /// The monitoring code of a failed run, from the error's type and
 /// classification only; its text is never recorded.
@@ -515,6 +523,7 @@ async fn drive(
     history: Vec<Message>,
     cancel: Option<watch::Receiver<bool>>,
     connection: Option<&str>,
+    redact_diagnostics: bool,
 ) -> Outcome {
     let limits = &state.config.limits;
     let run = agent
@@ -530,21 +539,27 @@ async fn drive(
     tokio::select! {
         result = tokio::time::timeout(limits.agent_timeout, run) => match result {
             Ok(Ok(response)) => Outcome::Completed(response.output()),
-            // Logged as allowlisted fields only, never the error's text.
-            Ok(Err(e)) => match ModelFailure::of(&e) {
-                Some(failure) => {
+            Ok(Err(e)) => {
+                let model_failure = ModelFailure::of(&e);
+                let code = model_failure.map_or_else(|| failure_code(&e), |failure| failure.code);
+                // Shared Pages errors publish only fixed wording. Keep the
+                // allowlisted model failure separately for the initiator.
+                if redact_diagnostics {
+                    tracing::warn!(code = code.code(), "Pages model turn failed");
+                } else if let Some(failure) = model_failure {
                     tracing::warn!(
                         code = failure.code.code(),
                         status = ?failure.status,
                         connection = ?connection,
                         "agent run failed: model"
                     );
-                    Outcome::ModelFailed(failure)
-                }
-                None => {
-                    let code = failure_code(&e);
+                } else {
                     tracing::warn!(code = code.code(), connection = ?connection, "agent run failed");
-                    Outcome::Failed(truncate(&format!("The agent failed: {e}"), 2_000), code)
+                }
+                match model_failure {
+                    Some(failure) => Outcome::ModelFailed { failure, redact_diagnostics },
+                    None if redact_diagnostics => Outcome::Failed(PAGE_MODEL_FAILED.to_owned(), code),
+                    None => Outcome::Failed(truncate(&format!("The agent failed: {e}"), 2_000), code),
                 }
             },
             Err(_) => Outcome::Failed(
@@ -558,6 +573,36 @@ async fn drive(
 
 // ---- Page builder ----
 
+/// The room run's actual route, including its private resolved binding.
+/// Never use this binding for activity, draft provenance or diagnostics.
+#[derive(Clone)]
+pub(crate) struct RoomBuilderModel {
+    pub(crate) route: Route,
+    effective_device: Option<crate::providers::EffectiveDevice>,
+}
+
+impl RoomBuilderModel {
+    pub(crate) fn pinned(
+        route: &Route,
+        effective_device: Option<crate::providers::EffectiveDevice>,
+    ) -> Self {
+        let mut route = route.clone();
+        // A default route may not have named a connection before the room
+        // selected its model. Use the actual public choice, not a new default.
+        route.connection_id = route.note.connection_id.clone();
+        Self {
+            route,
+            effective_device,
+        }
+    }
+
+    fn matches(&self, route: &Route, model: &RunModel) -> bool {
+        self.route.note.connection_id == route.note.connection_id
+            && self.route.note.model_id == route.note.model_id
+            && self.effective_device == model.effective_device
+    }
+}
+
 /// One tool-less model turn for the page builder ([`crate::pages`]), as
 /// `user_id` on `route`: the same model choice and checks as their agent
 /// turns, and a failure (including a connection that can't be used) is
@@ -565,7 +610,7 @@ async fn drive(
 /// of the same generation, `(from_user, text)`. Returns the reply and the
 /// route note of the model that answered.
 #[allow(clippy::too_many_arguments)]
-pub async fn page_builder_turn<F, Fut>(
+pub(crate) async fn page_builder_turn<F, Fut>(
     state: &AppState,
     user_id: &str,
     space: Option<&str>,
@@ -573,6 +618,7 @@ pub async fn page_builder_turn<F, Fut>(
     preamble: &str,
     history: Vec<(bool, String)>,
     prompt: String,
+    pin: Option<&RoomBuilderModel>,
     recheck: F,
 ) -> Result<(String, crate::model_routing::RouteNote), PageTurnError>
 where
@@ -581,7 +627,14 @@ where
 {
     let model = route_model(state, user_id, space, &mut route)
         .await
-        .map_err(|refusal| PageTurnError::Failed(refusal.private().to_owned()))?;
+        .map_err(|refusal| {
+            let text = if pin.is_some() {
+                refusal.shown
+            } else {
+                refusal.private().to_owned()
+            };
+            PageTurnError::Failed(text)
+        })?;
     // Its own small pool: page building never takes agent-run slots.
     let Ok(_permit) = state.page_builds.clone().try_acquire_owned() else {
         return Err(PageTurnError::Failed(
@@ -593,6 +646,14 @@ where
     // called.
     if !recheck().await {
         return Err(PageTurnError::Revoked);
+    }
+    // The model is bound to the resolved device id. For presets its
+    // transport also reauthorizes that same target at dispatch, so a
+    // later change cannot redirect the request to a replacement device.
+    if pin.is_some_and(|expected| !expected.matches(&route, &model)) {
+        return Err(PageTurnError::Failed(
+            "The model connection used by the room run changed; start a new run.".to_owned(),
+        ));
     }
     let agent = model.builder().preamble(preamble).build();
     let history = history
@@ -612,12 +673,20 @@ where
         history,
         None,
         route.note.connection_id.as_deref(),
+        pin.is_some(),
     )
     .await
     {
         Outcome::Completed(text) => Ok((text, route.note)),
         Outcome::Failed(text, _) => Err(PageTurnError::Failed(text)),
-        Outcome::ModelFailed(failure) => Err(PageTurnError::Failed(failure.text())),
+        Outcome::ModelFailed {
+            failure,
+            redact_diagnostics,
+        } => Err(PageTurnError::Failed(if redact_diagnostics {
+            PAGE_MODEL_FAILED.to_owned()
+        } else {
+            failure.text()
+        })),
         Outcome::Cancelled => Err(PageTurnError::Failed(
             "The page builder was stopped.".to_owned(),
         )),
@@ -966,9 +1035,23 @@ async fn execute_room_run(
                 .copied()
                 .filter(|t| agent.allows(t.runner_name()))
                 .collect();
-            let mut builder = model
-                .builder()
-                .preamble(PREAMBLE)
+            let page_tools = crate::pages::agent_tools::tools(
+                state,
+                space_id,
+                room,
+                initiator,
+                turn,
+                &RoomBuilderModel::pinned(route, model.effective_device.clone()),
+                agent,
+            );
+            let offers_pages = !page_tools.is_empty();
+            let mut builder = model.builder().preamble(PREAMBLE);
+            if offers_pages {
+                builder = builder
+                    .append_preamble(crate::pages::agent_tools::PREAMBLE)
+                    .dynamic_tools(page_tools);
+            }
+            builder = builder
                 .append_preamble(&agent_preamble(agent))
                 .append_preamble(match (paired, allowed.is_empty()) {
                     (false, _) => NO_RUNNER_PREAMBLE,
@@ -1046,9 +1129,11 @@ async fn execute_room_run(
                 reacted = flag;
             }
             let key = TurnKey::new();
-            builder = builder
-                .append_preamble(&turn_preamble(crate::db::now_ms(), &key))
-                .add_hook(ReasoningSummaries {
+            builder = builder.append_preamble(&turn_preamble(crate::db::now_ms(), &key));
+            // Don't publish provider reasoning on shared Pages runs. It
+            // is not a room-projected value and can carry provider details.
+            if !offers_pages {
+                builder = builder.add_hook(ReasoningSummaries {
                     state: state.clone(),
                     scope: Scope::Room {
                         space_id: space_id.to_owned(),
@@ -1056,6 +1141,7 @@ async fn execute_room_run(
                     },
                     turn: turn.clone(),
                 });
+            }
             let prompt = user_turn(trigger, &key);
             drive(
                 state,
@@ -1064,6 +1150,7 @@ async fn execute_room_run(
                 history(&earlier, &key),
                 Some(cancel),
                 route.note.connection_id.as_deref(),
+                offers_pages,
             )
             .await
         }
@@ -1092,14 +1179,25 @@ async fn execute_room_run(
         // One public category for every model failure, in the room and in
         // the Space owner's monitoring: neither can tell a revoked share
         // from an upstream failure. The initiator gets the reason.
-        Outcome::ModelFailed(model) => {
+        Outcome::ModelFailed {
+            failure: model,
+            redact_diagnostics,
+        } => {
             state.monitor_space(space_id, Code::ProviderFailed).await;
             failure = Some(
                 private_failure(state, space_id, initiator, route, built_from.clone(), model).await,
             );
             (
                 RunStatus::Failed,
-                Some((kind::ERROR, MODEL_STOPPED_IN_ROOM.to_owned())),
+                Some((
+                    kind::ERROR,
+                    if redact_diagnostics {
+                        PAGE_MODEL_FAILED
+                    } else {
+                        MODEL_STOPPED_IN_ROOM
+                    }
+                    .to_owned(),
+                )),
             )
         }
         Outcome::Cancelled => (RunStatus::Cancelled, None),
@@ -1799,6 +1897,7 @@ async fn execute_personal_run(
         history(&earlier, &key),
         None,
         route.note.connection_id.as_deref(),
+        false,
     )
     .await
     {
@@ -1814,7 +1913,7 @@ async fn execute_personal_run(
             tagged(kind::ERROR, text).await;
             activity::FAILED
         }
-        Outcome::ModelFailed(failure) => {
+        Outcome::ModelFailed { failure, .. } => {
             state.monitor_personal(&user_id, failure.code).await;
             let text = match refusal_after(&state, &user_id, None, &route, built_from).await {
                 Some((_, message)) => message,

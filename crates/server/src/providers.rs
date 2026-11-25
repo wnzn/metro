@@ -555,7 +555,15 @@ pub struct SelectedModel {
     /// the preset) and its `config_rev` (endpoint, credential and model)
     /// when this model was built, when Metro tracks one.
     pub built_from: Option<(String, i64)>,
+    /// Internal binding of a device model. Unlike `connection_id`, this
+    /// may be the caller's private connection behind a shared preset.
+    pub effective_device: Option<EffectiveDevice>,
 }
+
+/// Compare the resolved device connections without printing or serializing
+/// the private identity, or using it as a public route.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EffectiveDevice(String);
 
 impl std::fmt::Debug for SelectedModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -873,6 +881,7 @@ fn build_model_for_turn(
         model,
         max_tokens,
         built_from,
+        effective_device: matches!(entry.adapter, Adapter::Device).then(|| EffectiveDevice(row.id)),
     })
 }
 

@@ -859,8 +859,11 @@ async fn subscription_sign_ins_are_shared_only_as_bring_your_own_presets() {
     let selected = providers::connection_model_for(&s.state, "bob", None, &id)
         .await
         .unwrap();
+    assert_eq!(selected.connection_id, id);
     assert_eq!(selected.provider_id, "device-openai-oauth");
     assert_eq!(selected.model_id, "gpt-5.5");
+    assert!(selected.effective_device.is_some());
+    assert!(!format!("{selected:?}").contains(&own));
     assert_ne!(own, id);
     // Bob's device relay never serves Alice's sign-in: her connection is not
     // usable through the relay by anyone else.

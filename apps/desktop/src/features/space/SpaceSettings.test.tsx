@@ -30,6 +30,30 @@ async function openSettingsFor(app: App, space = "acme") {
 
 const calls = (w: W, method: string, path: string) => w.s.log.filter((r) => r.method === method && r.path === path);
 
+for (const legacy of [false, true]) {
+  test(`new agent tool defaults stay opt-in (${legacy ? "legacy catalogue" : "explicit defaults"})`, async () => {
+    const w = spaceWorld();
+    w.s.toolCatalog = ["workspace.list", "workspace.read", "threads", "pages_list", "page_read", "page_propose", "web_search", "web_fetch"];
+    w.s.defaultTools = legacy ? undefined : []; // An explicit empty list is not a legacy response.
+    const app = await signIn(w);
+    await openSettingsFor(app);
+    await app.press("id:space-settings-tab:agents");
+    await app.waitFor("id:agent:ag-1");
+    await app.press("id:add-agent");
+    await app.type("id:agent-name", "Fixture assistant");
+    await app.type("id:agent-description", "Checks tool defaults.");
+    if (!legacy) {
+      await app.press("id:agent-tool:page_read");
+      await app.press("id:agent-tool:web_search");
+    }
+    await app.press("id:agent-save");
+    await app.waitUntil(() => !app.shows("id:agent-editor"));
+    expect(calls(w, "POST", "/v1/spaces/acme/agents")[0]!.body.tools).toEqual(
+      legacy ? ["workspace.list", "workspace.read", "threads"] : ["page_read", "web_search"],
+    );
+  });
+}
+
 test("the owner edits the Space's name and description; the new name shows everywhere", async () => {
   const w = spaceWorld();
   const app = await signIn(w);

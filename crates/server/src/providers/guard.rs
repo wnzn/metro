@@ -120,7 +120,6 @@ impl std::fmt::Debug for Grant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Grant")
             .field("chosen", &self.chosen)
-            .field("target", &self.target)
             .finish_non_exhaustive()
     }
 }
@@ -351,7 +350,6 @@ pub struct GuardedDeviceTransport {
 impl std::fmt::Debug for GuardedDeviceTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GuardedDeviceTransport")
-            .field("connection", &self.connection)
             .finish_non_exhaustive()
     }
 }

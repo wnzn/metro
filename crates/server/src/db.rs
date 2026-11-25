@@ -162,6 +162,9 @@ pub struct Activity {
     /// e.g. `Picked by classifier: Coder` or `Addressed: @coder`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pick: Option<String>,
+    /// On a `page_draft` event only: public card metadata, never the draft body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_draft: Option<crate::pages::store::DraftCard>,
     /// Only on a web tool's `tool_call` / `tool_result` / `error` events:
     /// which tool, the provider that answered and every attempt
     /// ([`crate::web_tools`]). Never a query result or page text.
@@ -196,6 +199,7 @@ impl Activity {
             route: None,
             agent: None,
             pick: None,
+            page_draft: None,
             tool: None,
         }
     }
@@ -223,6 +227,7 @@ impl Activity {
             route: None,
             agent: None,
             pick: None,
+            page_draft: None,
             tool: None,
         }
     }
@@ -303,6 +308,8 @@ pub mod kind {
     pub const TOOL_CALL: &str = "tool_call";
     /// The runner's answer to a tool call.
     pub const TOOL_RESULT: &str = "tool_result";
+    /// A Space agent left a page draft for the person who started the run.
+    pub const PAGE_DRAFT: &str = "page_draft";
     /// A person started Demo.
     pub const DEMO: &str = "demo";
     /// A failure or notice from the server.
@@ -993,6 +1000,23 @@ impl Db {
         activity: Option<&Activity>,
     ) -> anyhow::Result<Event> {
         let conn = self.lock();
+        Self::append_event_in(
+            &conn, space_id, room_id, kind, author, text, addressed, activity,
+        )
+    }
+
+    /// Append an event inside the caller's transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_event_in(
+        conn: &Connection,
+        space_id: &str,
+        room_id: &str,
+        kind: &str,
+        author: &Author,
+        text: &str,
+        addressed: &Addressed,
+        activity: Option<&Activity>,
+    ) -> anyhow::Result<Event> {
         let at = now_ms();
         conn.execute(
             "INSERT INTO space_events (space_id, room_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
@@ -1097,7 +1121,8 @@ impl Db {
         let conn = self.lock();
         let mut stmt = conn.prepare_cached(
             "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at FROM space_events
-             WHERE space_id = ?1 AND room_id = ?2 AND id < ?3 AND kind NOT IN ('activity', 'reasoning_summary')
+             WHERE space_id = ?1 AND room_id = ?2 AND id < ?3
+               AND kind NOT IN ('activity', 'reasoning_summary', 'page_draft')
              ORDER BY id DESC LIMIT ?4",
         )?;
         let rows = stmt.query_map(params![space_id, room_id, before, limit as i64], row_event)?;

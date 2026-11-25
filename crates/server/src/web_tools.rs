@@ -991,8 +991,10 @@ fn device_error_text(tool: &str, whose: &str, e: &DeviceError) -> (String, &'sta
             ),
             "revoked",
         ),
-        DeviceError::Device(msg) => (
-            format!("{what} couldn't run: {whose} computer refused it: {msg}"),
+        // Device text is untrusted and may contain credentials or private
+        // diagnostics. This wording is used for both the event and model.
+        DeviceError::Device(_) => (
+            format!("{what} couldn't run: {whose} computer refused the web request."),
             "refused",
         ),
         DeviceError::BadResponse(_) | DeviceError::TooLarge => (
