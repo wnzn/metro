@@ -10,7 +10,8 @@
 //! 2. The `invoke_agent` flag, which adds [`Mention::Agent`].
 //! 3. `@agent` / `@<member-id>` written in the text, recognised only for
 //!    *current members* and only as standalone handles (see [`resolve`]).
-//!    Text in a validated explicit mention span is not scanned.
+//!    Text in a validated explicit mention span is not scanned. Clients may
+//!    also opt out of text scanning entirely.
 //!
 //! This module never reads membership itself: the caller passes the member
 //! ids of the room's Space it has already authorised for this sender.
@@ -243,7 +244,7 @@ pub fn resolve_with_agents(
     agents: &[(String, String)],
 ) -> Result<Vec<Mention>, String> {
     let (resolved, _) = resolve_with_spans(
-        text,
+        Some(text),
         explicit,
         invoke_agent,
         invoke_agent_id,
@@ -259,11 +260,12 @@ pub fn resolve_with_agents(
 /// `invoke_agent` with `invoke_agent_id` adds that agent instead of the
 /// generic one. In text, `@handle` of an agent (any ASCII case) wins over a
 /// member id of the same length; the handle `agent` always stays the
-/// generic `@agent` outside explicit spans. `text` is the trimmed text
-/// against which the `spans` were validated. Returned spans refer to the
-/// canonical (deduplicated) list.
+/// generic `@agent` outside explicit spans. Pass `None` for `infer_from` to
+/// skip text scanning, or `Some` with the trimmed text against which the
+/// `spans` were validated. Returned spans refer to the canonical
+/// (deduplicated) list in either case.
 pub(crate) fn resolve_with_spans(
-    text: &str,
+    infer_from: Option<&str>,
     explicit: &[Mention],
     invoke_agent: bool,
     invoke_agent_id: Option<&str>,
@@ -315,18 +317,20 @@ pub(crate) fn resolve_with_spans(
         (false, None) => {}
     }
 
-    let handles: Vec<&str> = member_ids
-        .iter()
-        .map(String::as_str)
-        .filter(|id| is_handle(id) && !id.eq_ignore_ascii_case(AGENT_HANDLE))
-        .collect();
-    let agent_handles: Vec<(&str, &str)> = agents
-        .iter()
-        .filter(|(_, h)| is_handle(h) && !h.eq_ignore_ascii_case(AGENT_HANDLE))
-        .map(|(id, h)| (id.as_str(), h.as_str()))
-        .collect();
-    for m in scan_text(text, &handles, &agent_handles, &spans) {
-        push(m, &mut out)?;
+    if let Some(text) = infer_from {
+        let handles: Vec<&str> = member_ids
+            .iter()
+            .map(String::as_str)
+            .filter(|id| is_handle(id) && !id.eq_ignore_ascii_case(AGENT_HANDLE))
+            .collect();
+        let agent_handles: Vec<(&str, &str)> = agents
+            .iter()
+            .filter(|(_, h)| is_handle(h) && !h.eq_ignore_ascii_case(AGENT_HANDLE))
+            .map(|(id, h)| (id.as_str(), h.as_str()))
+            .collect();
+        for m in scan_text(text, &handles, &agent_handles, &spans) {
+            push(m, &mut out)?;
+        }
     }
     for span in &mut spans {
         // Explicit recipients are validated and inserted first; the
@@ -699,9 +703,16 @@ mod tests {
                 index: 0,
             };
             let spans = ValidatedSpans::new(&text, 1, vec![span]).unwrap();
-            let (recipients, spans) =
-                resolve_with_spans(&text, &[user("bob")], false, None, &ids(TEAM), &[], spans)
-                    .unwrap();
+            let (recipients, spans) = resolve_with_spans(
+                Some(&text),
+                &[user("bob")],
+                false,
+                None,
+                &ids(TEAM),
+                &[],
+                spans,
+            )
+            .unwrap();
             assert_eq!(
                 recipients,
                 [user("bob"), Mention::Agent, user("carol-ops")],
@@ -721,8 +732,16 @@ mod tests {
             index: 0,
         };
         let spans = ValidatedSpans::new(&text, 1, vec![span]).unwrap();
-        let (recipients, _) =
-            resolve_with_spans(&text, &[user("bob")], false, None, &ids(TEAM), &[], spans).unwrap();
+        let (recipients, _) = resolve_with_spans(
+            Some(&text),
+            &[user("bob")],
+            false,
+            None,
+            &ids(TEAM),
+            &[],
+            spans,
+        )
+        .unwrap();
         assert_eq!(recipients, [user("bob"), Mention::Agent]);
 
         // The same backticks still have their legacy meaning when not
@@ -934,6 +953,46 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn authoritative_recipients_still_count_ask_agent_toward_the_cap() {
+        let members: Vec<String> = (0..MAX_RECIPIENTS).map(|i| format!("u{i}")).collect();
+        let explicit: Vec<Mention> = members.iter().map(|id| user(id)).collect();
+        let agents = [("ag-1".to_owned(), "coder".to_owned())];
+        let resolve = |mentions: &[Mention], invoke, agent_id| {
+            resolve_with_spans(
+                None,
+                mentions,
+                invoke,
+                agent_id,
+                &members,
+                &agents,
+                ValidatedSpans::default(),
+            )
+            .map(|(recipients, _)| recipients)
+        };
+        assert_eq!(resolve(&explicit, false, None).unwrap(), explicit);
+        for (agent_id, ask) in [
+            (None, Mention::Agent),
+            (
+                Some("ag-1"),
+                Mention::AgentId {
+                    agent_id: "ag-1".to_owned(),
+                },
+            ),
+        ] {
+            assert_eq!(resolve(&explicit, true, agent_id), Err(ERR_TOO_MANY.into()));
+            let mut at_cap = explicit[..MAX_RECIPIENTS - 1].to_vec();
+            at_cap.push(ask.clone());
+            assert_eq!(
+                resolve(&at_cap[..MAX_RECIPIENTS - 1], true, agent_id).unwrap(),
+                at_cap
+            );
+            assert_eq!(resolve(&at_cap, true, agent_id).unwrap(), at_cap);
+            at_cap.push(ask);
+            assert_eq!(resolve(&at_cap, false, None), Err(ERR_TOO_MANY.into()));
+        }
     }
 
     #[test]

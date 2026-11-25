@@ -400,17 +400,20 @@ async fn mention_spans_round_trip_in_rooms_threads_and_attachment_events() {
         let mut body = body.clone();
         if let Some(file) = file {
             body["asset_ids"] = json!([file]);
+            body["infer_text_mentions"] = json!(false);
         }
         let (status, event) = h.room("alice", &sid, room, body).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{event}");
         assert_eq!(event["text"], text);
         assert_eq!(event["spans"], json!(expected));
         // No second recipient from the span's first word, the colliding
-        // agent handle, or code. The legacy @carol outside it still works.
-        assert_eq!(
-            event["mentions"],
+        // agent handle, or code. The unspanned @carol only works in legacy mode.
+        let recipients = if file.is_some() {
+            json!([bob])
+        } else {
             json!([bob, {"kind": "user", "id": "carol"}])
-        );
+        };
+        assert_eq!(event["mentions"], recipients);
         assert_eq!(event["audience"], "users");
         assert!(event.get("activity").is_none());
         if let Some(file) = file {
@@ -466,7 +469,10 @@ async fn invalid_mention_spans_and_recipients_never_post_or_dispatch() {
                 "alice",
                 &sid,
                 "lobby",
-                json!({"text": "@bob @agent", "mentions": [recipient], "spans": [range]}),
+                json!({
+                    "text": "@bob @agent", "infer_text_mentions": false,
+                    "mentions": [recipient], "spans": [range]
+                }),
             )
             .await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
@@ -483,10 +489,42 @@ async fn invalid_mention_spans_and_recipients_never_post_or_dispatch() {
                 "alice",
                 &sid,
                 "lobby",
-                json!({"text": "@bob @agent", "mentions": [bob], "spans": spans}),
+                json!({
+                    "text": "@bob @agent", "infer_text_mentions": false, "invoke_agent": true,
+                    "mentions": [bob], "spans": spans
+                }),
             )
             .await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    }
+    for (key, value) in [
+        ("infer_text_mentions", Value::Null),
+        ("infer_text_mentions", json!("false")),
+        ("infer_text_mentions", json!(0)),
+        ("unknown_field", json!(false)),
+    ] {
+        let mut body = json!({"text": "@agent", "invoke_agent": true});
+        body[key] = value;
+        let (s, v) = h.room("alice", &sid, "lobby", body).await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    }
+    for (invoke, agent_id, error) in [
+        (false, other_agent.as_str(), "agent_id needs invoke_agent"),
+        (true, other_agent.as_str(), "unknown recipient"),
+    ] {
+        let (s, v) = h
+            .room(
+                "alice",
+                &sid,
+                "lobby",
+                json!({
+                    "text": "@agent", "infer_text_mentions": false,
+                    "invoke_agent": invoke, "agent_id": agent_id
+                }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"], error);
     }
     let asset = h
         .upload(
@@ -531,7 +569,9 @@ async fn invalid_mention_spans_and_recipients_never_post_or_dispatch() {
                 sender,
                 space,
                 &thread.id,
-                json!({"text": "@bob", "mentions": [bob], "spans": [range]}),
+                json!({
+                    "text": "@bob", "infer_text_mentions": false, "mentions": [bob], "spans": [range]
+                }),
             )
             .await;
         assert_eq!(s, StatusCode::NOT_FOUND);
@@ -550,19 +590,20 @@ async fn invalid_mention_spans_and_recipients_never_post_or_dispatch() {
             "alice",
             &sid,
             &thread.id,
-            json!({"text": "@bob", "mentions": [bob], "spans": [range]}),
+            json!({
+                "text": "@bob", "infer_text_mentions": false, "mentions": [bob], "spans": [range]
+            }),
         )
         .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
     assert_eq!(v["error"], "unknown recipient");
     for save_note in [false, true] {
-        let (s, v) = h
-            .chat(
-                "alice",
-                json!({"text": "@agent", "save_note": save_note, "spans": []}),
-            )
-            .await;
-        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+        for (key, value) in [("spans", json!([])), ("infer_text_mentions", json!(false))] {
+            let mut body = json!({"text": "@agent", "save_note": save_note});
+            body[key] = value;
+            let (s, v) = h.chat("alice", body).await;
+            assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+        }
     }
     assert!(h.chat_events("alice").await.is_empty());
     assert!(h.room_events("alice", &sid, "lobby").await.1.is_empty());

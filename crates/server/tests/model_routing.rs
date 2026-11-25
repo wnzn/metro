@@ -2036,6 +2036,149 @@ async fn the_classifier_picks_among_agents_only_for_the_sender_who_opted_in() {
 }
 
 #[tokio::test]
+async fn authoritative_mentions_leave_stale_text_unaddressed() {
+    let h = H::start().await;
+    let sid = h.space("stale mention directory").await;
+    let coder = h
+        .agent(
+            &sid,
+            json!({"name": "Coder", "handle": "coder", "description": "Writes code."}),
+        )
+        .await;
+    let cases = [
+        ("@coder", json!({"kind": "agent", "agent_id": coder})),
+        ("@agent", json!({"kind": "agent"})),
+        ("@bob", json!({"kind": "user", "id": "bob"})),
+    ];
+    for (text, _) in &cases {
+        // The server knows these handles, but the client didn't resolve them.
+        // Omitting both mentions and spans must not turn on the legacy scan.
+        let e = h
+            .say(
+                "alice",
+                Some(&sid),
+                json!({"text": text, "infer_text_mentions": false}),
+            )
+            .await;
+        assert_eq!(e["text"], *text);
+        assert_eq!(e["mentions"], json!([]));
+        assert_eq!(e["audience"], "room");
+        assert!(e.get("spans").is_none());
+        h.quiet_after("alice", Some(&sid), e["id"].as_i64().unwrap())
+            .await;
+    }
+    assert_eq!(h.fake.calls(), 0);
+    assert!(h.model_calls().is_empty());
+
+    for (text, recipient) in cases {
+        let e = h.say("alice", Some(&sid), json!({"text": text})).await;
+        assert_eq!(e["mentions"], json!([recipient]));
+        if recipient["kind"] == "agent" {
+            let id = e["id"].as_i64().unwrap();
+            let started = h.started_after("alice", &sid, id).await;
+            assert_eq!(started["agent"]["handle"], &text[1..]);
+            assert_eq!(
+                h.answer_after("alice", Some(&sid), id).await["kind"],
+                "agent"
+            );
+        }
+    }
+    let e = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({"text": "@bob", "infer_text_mentions": true}),
+        )
+        .await;
+    assert_eq!(e["mentions"], json!([{"kind": "user", "id": "bob"}]));
+}
+
+#[tokio::test]
+async fn authoritative_mentions_preserve_space_classification_and_use_case_routing() {
+    let h = H::start().await;
+    let sid = h.space("authoritative routing").await;
+    let coder = h
+        .agent(
+            &sid,
+            json!({"name": "Coder", "handle": "coder", "description": "Writes code."}),
+        )
+        .await;
+    let (s, v) = h.put_routing("alice", routing_on(false, true)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = h
+        .put_prefs("alice", &sid, json!({"classify_unaddressed": true}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+
+    let text = "@agent @coder [pick2] review this code";
+    let bob = json!({"kind": "user", "id": "bob"});
+    let e = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({"text": text, "infer_text_mentions": false, "mentions": [bob]}),
+        )
+        .await;
+    assert_eq!(e["audience"], "users");
+    assert_eq!(e["mentions"], json!([bob]));
+    h.quiet_after("alice", Some(&sid), e["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(h.fake.calls(), 0);
+    assert!(h.model_calls().is_empty());
+
+    let e = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({"text": text, "infer_text_mentions": false}),
+        )
+        .await;
+    assert_eq!(
+        e["mentions"],
+        json!([{"kind": "agent", "agent_id": coder, "addressed_by": "classifier"}])
+    );
+    let id = e["id"].as_i64().unwrap();
+    let started = h.started_after("alice", &sid, id).await;
+    assert_eq!(started["agent"]["id"], coder.as_str());
+    assert_eq!(started["route"]["addressed_by"], "classifier");
+    assert_eq!(started["route"]["case_key"], "code");
+    assert_eq!(h.fake.calls(), 2);
+    let calls = h.fake.calls.lock().unwrap().clone();
+    assert!(calls[0].4["agent"]["criteria"].get("no_agent").is_some());
+    assert_eq!(calls[1].4["use_case"]["type"], "choice");
+    assert_eq!(
+        h.answer_after("alice", Some(&sid), id).await["text"],
+        "answered by code-model"
+    );
+
+    let e = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({
+                "text": text, "infer_text_mentions": false, "invoke_agent": true, "agent_id": coder
+            }),
+        )
+        .await;
+    assert_eq!(e["mentions"], json!([{"kind": "agent", "agent_id": coder}]));
+    let id = e["id"].as_i64().unwrap();
+    let started = h.started_after("alice", &sid, id).await;
+    assert_eq!(started["agent"]["id"], coder.as_str());
+    assert_eq!(started["route"]["addressed_by"], "explicit");
+    assert_eq!(started["route"]["case_key"], "code");
+    assert_eq!(
+        h.fake.calls(),
+        3,
+        "named Ask agent only calls use-case routing"
+    );
+    assert_eq!(h.fake.last_call().4["use_case"]["type"], "choice");
+    assert_eq!(
+        h.answer_after("alice", Some(&sid), id).await["text"],
+        "answered by code-model"
+    );
+}
+
+#[tokio::test]
 async fn mention_spans_keep_generic_and_named_recipients_distinct_from_run_targets() {
     let h = H::start().await;
     let sid = h.space("span routing").await;
@@ -2061,7 +2204,8 @@ async fn mention_spans_keep_generic_and_named_recipients_distinct_from_run_targe
             "alice",
             Some(&sid),
             json!({
-                "text": "@Bob @agent [pick2] go",
+                "text": "@Bob @agent [pick2] go, cc @alice",
+                "infer_text_mentions": false,
                 "mentions": [user, user, generic],
                 "spans": [{"start": 0, "end": 4, "index": 1}, {"start": 5, "end": 11, "index": 2}]
             }),

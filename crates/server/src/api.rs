@@ -553,6 +553,10 @@ pub struct PostMessage {
     agent_id: Option<String>,
     #[serde(default)]
     mentions: Vec<Mention>,
+    /// Set to false when the client has resolved addressing itself. Only
+    /// structured mentions and Ask agent can explicitly address recipients.
+    #[serde(default = "default_infer_text_mentions")]
+    infer_text_mentions: bool,
     /// Optional display ranges in the decoded, untrimmed `text`; each
     /// index refers to the explicit `mentions` list as submitted.
     #[serde(default)]
@@ -567,6 +571,10 @@ pub struct PostMessage {
     /// Library files of this Space to attach (see [`crate::attachments`]).
     #[serde(default)]
     asset_ids: Vec<String>,
+}
+
+fn default_infer_text_mentions() -> bool {
+    true
 }
 
 /// A model chosen for one turn, checked before anything is stored so a bad
@@ -677,7 +685,7 @@ pub async fn post_message(
         .map(|a| (a.id.clone(), a.handle.clone()))
         .collect();
     let (resolved, spans) = mentions::resolve_with_spans(
-        &text,
+        body.infer_text_mentions.then_some(text.as_str()),
         &body.mentions,
         body.invoke_agent,
         body.agent_id.as_deref(),
