@@ -40,6 +40,7 @@
 //! stands in for media: it answers [`UseError::MediaUnsupported`].
 
 pub mod api;
+mod budget;
 pub mod catalog;
 pub mod guard;
 mod listed;
@@ -390,6 +391,15 @@ fn no_redirect_client() -> anyhow::Result<DynHttpClient> {
     Ok(DynHttpClient::new(rig_reqwest::ReqwestClient::from(client)))
 }
 
+/// One process-wide no-redirect client, for models built without an
+/// [`AppState`] at hand.
+pub(crate) fn no_redirect_shared() -> DynHttpClient {
+    static SHARED: std::sync::OnceLock<DynHttpClient> = std::sync::OnceLock::new();
+    SHARED
+        .get_or_init(|| no_redirect_client().expect("the provider HTTP client builds"))
+        .clone()
+}
+
 /// Parse `METRO_PROVIDER_ALLOWED_BASE_URLS`: a JSON array of absolute
 /// `http`/`https` URLs without credentials, query or fragment. Each is kept
 /// as written minus trailing slashes, and matched exactly.
@@ -541,6 +551,10 @@ pub struct SelectedModel {
     /// An output cap the run must set: Anthropic's Messages API requires
     /// `max_tokens`, and Rig knows the limit only for catalogued models.
     pub max_tokens: Option<u64>,
+    /// The connection that runs (for a preset, the person's own one, not
+    /// the preset) and its `config_rev` (endpoint, credential and model)
+    /// when this model was built, when Metro tracks one.
+    pub built_from: Option<(String, i64)>,
     /// Internal binding of a device model. Unlike `connection_id`, this
     /// may be the caller's private connection behind a shared preset.
     pub effective_device: Option<EffectiveDevice>,
@@ -566,12 +580,15 @@ fn read_error(e: anyhow::Error) -> UseError {
     UseError::Internal
 }
 
-/// The model of `user_id`'s default chat connection, `Ok(None)` when they
-/// have none (the caller may then use the environment model), or why the
-/// default cannot be used (the caller must not fall back).
+/// The model of `user_id`'s default chat connection for a run in `space`
+/// (`None`: personal Chat), `Ok(None)` when they have none (the caller may
+/// then use the environment model), or why the default cannot be used (the
+/// caller must not fall back). In a Space, every request rechecks that they
+/// are still a member.
 pub async fn default_model(
     state: &AppState,
     user_id: &str,
+    space: Option<&str>,
 ) -> Result<Option<SelectedModel>, UseError> {
     let user = user_id.to_owned();
     let row = state
@@ -588,7 +605,7 @@ pub async fn default_model(
                 row,
                 access: Access::Own,
             };
-            build_model(state, user_id, None, authorized).map(Some)
+            build_model(state, user_id, space, authorized).map(Some)
         }
     }
 }
@@ -707,6 +724,7 @@ fn grant_for(state: &AppState, caller: &str, space: Option<&str>, a: &Authorized
         target: a.row.id.clone(),
         turn_check: None,
         slots,
+        config_rev: None,
     })
 }
 
@@ -735,6 +753,20 @@ fn build_model_for_turn(
     selection: Option<&turn::TurnSelection>,
 ) -> Result<SelectedModel, UseError> {
     let mut grant = grant_for(state, caller, space, &authorized);
+    // A use in a Space always carries it, so every request rechecks the
+    // caller's membership (own and organization-shared connections too).
+    if grant.is_none() && space.is_some() {
+        grant = Some(Grant {
+            db: state.db.clone(),
+            caller: caller.to_owned(),
+            space: space.map(str::to_owned),
+            chosen: authorized.chosen.clone(),
+            target: authorized.row.id.clone(),
+            turn_check: None,
+            slots: None,
+            config_rev: None,
+        });
+    }
     if let Some(selection) = selection {
         let grant = grant.get_or_insert_with(|| Grant {
             db: state.db.clone(),
@@ -744,6 +776,7 @@ fn build_model_for_turn(
             target: authorized.row.id.clone(),
             turn_check: None,
             slots: None,
+            config_rev: None,
         });
         grant.turn_check = Some(guard::TurnCheck {
             state: state.clone(),
@@ -751,6 +784,7 @@ fn build_model_for_turn(
         });
     }
     let Authorized { row, chosen, .. } = authorized;
+    let built_from = Some((row.id.clone(), row.config_rev));
     let entry = catalog::find(&row.provider_id).ok_or(UseError::Unsupported)?;
     if row.model.is_empty() {
         return Err(UseError::NoModel);
@@ -764,17 +798,32 @@ fn build_model_for_turn(
         }
         _ => None,
     };
-    let http = || match &grant {
-        None => state.providers.http(),
-        Some(grant) => DynHttpClient::new(GuardedHttp {
+    // Every server request, the owner's own included, is checked against
+    // the connection as it was when this model was built.
+    let http = || {
+        let mut grant = grant.clone().unwrap_or_else(|| Grant {
+            db: state.db.clone(),
+            caller: caller.to_owned(),
+            space: space.map(str::to_owned),
+            chosen: chosen.clone(),
+            target: row.id.clone(),
+            turn_check: None,
+            slots: None,
+            config_rev: None,
+        });
+        grant.config_rev = Some(row.config_rev);
+        DynHttpClient::new(GuardedHttp {
             inner: state.providers.http(),
-            grant: grant.clone(),
-        }),
+            grant,
+        })
     };
     let model = match entry.adapter {
         // Recheck an explicit model or preset before each relay request and
         // again before the answer is returned.
-        Adapter::Device if grant.is_some() && (selection.is_some() || row.user_id == caller) => {
+        Adapter::Device
+            if grant.is_some()
+                && (selection.is_some() || row.user_id == caller || space.is_some()) =>
+        {
             let mut grant = grant.clone().expect("checked");
             // The authenticated relay already caps borrowed device traffic.
             grant.slots = None;
@@ -831,6 +880,7 @@ fn build_model_for_turn(
         model_id: row.model,
         model,
         max_tokens,
+        built_from,
         effective_device: matches!(entry.adapter, Adapter::Device).then(|| EffectiveDevice(row.id)),
     })
 }
@@ -887,6 +937,18 @@ impl std::fmt::Display for ProviderError {
 impl std::error::Error for ProviderError {}
 
 impl ProviderError {
+    /// A fixed name of the failure, for logs.
+    pub fn category(&self) -> &'static str {
+        match self {
+            ProviderError::Use(_) => "unusable",
+            ProviderError::InvalidInput(_) => "invalid_input",
+            ProviderError::Device(e) => e.kind(),
+            ProviderError::Endpoint(_) => "endpoint",
+            ProviderError::Busy => "busy",
+            ProviderError::Internal => "internal",
+        }
+    }
+
     /// The HTTP status an API handler should answer with.
     pub fn status(&self) -> axum::http::StatusCode {
         use axum::http::StatusCode as S;
@@ -894,9 +956,9 @@ impl ProviderError {
             ProviderError::Use(UseError::NotFound) => S::NOT_FOUND,
             ProviderError::Use(UseError::Revoked) => S::FORBIDDEN,
             ProviderError::Use(UseError::Busy) | ProviderError::Busy => S::SERVICE_UNAVAILABLE,
-            ProviderError::Use(UseError::Internal) | ProviderError::Internal => {
-                S::INTERNAL_SERVER_ERROR
-            }
+            ProviderError::Use(UseError::Internal)
+            | ProviderError::Device(DeviceError::Internal)
+            | ProviderError::Internal => S::INTERNAL_SERVER_ERROR,
             ProviderError::Use(
                 UseError::Unsupported
                 | UseError::WrongCapability { .. }
@@ -929,7 +991,7 @@ struct TypedUse {
     caller: String,
     space: Option<String>,
     chosen: String,
-    access: Access,
+    device_generation: Option<u64>,
     _global: tokio::sync::OwnedSemaphorePermit,
     _borrowed: Option<tokio::sync::OwnedSemaphorePermit>,
 }
@@ -941,7 +1003,27 @@ async fn typed_use(
     id: &str,
     capability: Capability,
 ) -> Result<TypedUse, ProviderError> {
-    let authorized = resolve(state, caller, space, id).await?;
+    let (user, sid, id) = (caller.to_owned(), space.map(str::to_owned), id.to_owned());
+    let (authorized, device_generation) = state
+        .db
+        .call(move |db| {
+            let conn = db.lock();
+            let authorized = match sharing::authorize(&conn, &user, sid.as_deref(), &id) {
+                Ok(a) => a,
+                Err(e) => return Ok(Err(e)),
+            };
+            let row = &authorized.row;
+            let generation = if catalog::is_device(&row.provider_id) {
+                crate::device_relay::credential_of(&conn, &row.id)?
+                    .filter(|(owner, _)| owner == &row.user_id)
+                    .map(|(_, generation)| generation)
+            } else {
+                None
+            };
+            Ok(Ok((authorized, generation)))
+        })
+        .await
+        .map_err(read_error)??;
     if authorized.row.capability != capability {
         return Err(UseError::WrongCapability {
             expected: capability,
@@ -985,51 +1067,76 @@ async fn typed_use(
         caller: caller.to_owned(),
         space: space.map(str::to_owned),
         chosen,
-        access,
+        device_generation,
         _global: global,
         _borrowed: borrowed,
     })
 }
-/// Before a borrowed typed answer is returned: the grant must still hold,
-/// and the connection must still be the one that was called (same row,
-/// provider, model, revision and approved endpoint). Otherwise the answer
-/// is withheld as [`UseError::Revoked`]. Read in its own short database
-/// call after the request finished; nothing is locked while the request
-/// runs. The payload already sent cannot be unsent: this only keeps the
-/// result from someone who lost access meanwhile. Own connections pass.
-async fn recheck_typed(state: &AppState, u: &TypedUse) -> Result<(), ProviderError> {
-    if u.access == Access::Own {
-        return Ok(());
-    }
-    let now = match resolve(state, &u.caller, u.space.as_deref(), &u.chosen).await {
-        Ok(now) => now,
-        Err(UseError::NotFound) => return Err(UseError::Revoked.into()),
-        Err(e) => return Err(e.into()),
-    };
-    let same = now.row.id == u.row.id
-        && now.row.provider_id == u.row.provider_id
-        && now.row.model == u.row.model
-        && now.row.config_rev == u.row.config_rev
-        && now.row.capability == u.row.capability
-        && now.row.base_url == u.row.base_url
-        && match u.entry.execution {
-            Execution::Device => true,
-            Execution::Server => state
-                .providers
-                .effective_base_url(u.entry, now.row.base_url.as_deref())
-                .is_ok(),
-        };
-    if same {
-        Ok(())
-    } else {
-        Err(UseError::Revoked.into())
+/// Whether the typed call `u` prepared may still go ahead as prepared:
+/// the caller is still a member of its Space (when it has one), still has
+/// the grant they were admitted on, and the connection is still the same
+/// one (row, provider, model, revision, capability, credential and approved
+/// endpoint).
+/// Checked together, in one database call, immediately before the request
+/// is sent and again before its answer is returned, whatever the access
+/// (own, Space share, organization share). Lost access is
+/// [`UseError::Revoked`]; a changed connection is [`UseError::TurnChanged`]
+/// and is never silently retargeted; internal errors propagate.
+async fn still_current(state: &AppState, u: &TypedUse) -> Result<(), ProviderError> {
+    let (caller, space, chosen) = (u.caller.clone(), u.space.clone(), u.chosen.clone());
+    let prepared = u.row.clone();
+    let providers = state.providers.clone();
+    let entry = u.entry;
+    state
+        .db
+        .call(move |db| {
+            let conn = db.lock();
+            if let Some(sid) = &space
+                && !store::is_member(&conn, sid, &caller)?
+            {
+                return Ok(Err(UseError::Revoked));
+            }
+            let now = match sharing::authorize(&conn, &caller, space.as_deref(), &chosen) {
+                Ok(now) => now.row,
+                Err(UseError::NotFound) => return Ok(Err(UseError::Revoked)),
+                Err(e) => return Ok(Err(e)),
+            };
+            let same = now.id == prepared.id
+                && now.user_id == prepared.user_id
+                && now.provider_id == prepared.provider_id
+                && now.model == prepared.model
+                && now.config_rev == prepared.config_rev
+                && now.capability == prepared.capability
+                && now.base_url == prepared.base_url
+                // A typed key rotation does not bump the search index revision.
+                && now.sealed_key == prepared.sealed_key
+                && match entry.execution {
+                    Execution::Device => true,
+                    Execution::Server => providers
+                        .effective_base_url(entry, now.base_url.as_deref())
+                        .is_ok(),
+                };
+            Ok(same.then_some(()).ok_or(UseError::TurnChanged))
+        })
+        .await
+        .map_err(read_error)??;
+    Ok(())
+}
+
+/// Withhold an in-flight answer if its grant or connection changed.
+/// Unlike a refusal before sending, this is a revocation of the answer
+/// already computed. Internal errors keep their status.
+async fn recheck_typed_answer(state: &AppState, u: &TypedUse) -> Result<(), ProviderError> {
+    match still_current(state, u).await {
+        Err(ProviderError::Use(UseError::TurnChanged)) => Err(UseError::Revoked.into()),
+        result => result,
     }
 }
 
 /// Where a typed call runs: a server endpoint with its key, or a device.
 enum TypedTarget {
     Server { base: String, key: Option<String> },
-    Device,
+    Device(crate::device_relay::DispatchBinding),
 }
 
 fn typed_target(state: &AppState, u: &TypedUse) -> Result<TypedTarget, ProviderError> {
@@ -1038,16 +1145,23 @@ fn typed_target(state: &AppState, u: &TypedUse) -> Result<TypedTarget, ProviderE
             let (base, key) = state.providers.typed_endpoint(u.entry, &u.row)?;
             Ok(TypedTarget::Server { base, key })
         }
-        Adapter::Device => Ok(TypedTarget::Device),
+        Adapter::Device => Ok(TypedTarget::Device(crate::device_relay::DispatchBinding {
+            generation: u.device_generation.ok_or(DeviceError::NotPaired)?,
+            grant: guard::DeviceClaimGrant::typed(&u.caller, u.space.as_deref(), &u.chosen, &u.row),
+            advertised: None,
+        })),
         Adapter::Registered(_) | Adapter::Custom => Err(UseError::Unsupported.into()),
     }
 }
 
+/// Fixed fields only: an endpoint's or device's own text never reaches a
+/// log.
 fn log_typed_failure(u: &TypedUse, e: &ProviderError) {
     tracing::warn!(
         connection = %u.row.id,
         provider = %u.row.provider_id,
-        error = %e,
+        category = e.category(),
+        status = e.status().as_u16(),
         "typed model call failed"
     );
 }
@@ -1066,17 +1180,36 @@ pub async fn decide(
     questions: serde_json::Value,
 ) -> Result<serde_json::Value, ProviderError> {
     let u = typed_use(state, caller, space, id, Capability::SystemOne).await?;
+    decide_with(state, u, state_payload, questions).await
+}
+
+/// [`decide`] for a call already prepared by [`typed_use`].
+async fn decide_with(
+    state: &AppState,
+    u: TypedUse,
+    state_payload: serde_json::Value,
+    questions: serde_json::Value,
+) -> Result<serde_json::Value, ProviderError> {
+    let (caller, space) = (u.caller.clone(), u.space.clone());
+    let (caller, space) = (caller.as_str(), space.as_deref());
     let request = typed::decision_request(&u.row.model, state_payload, questions)?;
+    still_current(state, &u).await?;
     let answer = match typed_target(state, &u)? {
         TypedTarget::Server { base, key } => typed::decide(&base, key.as_deref(), request).await,
-        TypedTarget::Device => state
+        TypedTarget::Device(binding) => state
             .device
-            .decide(&state.db, &caller_of(caller, space), &u.row.id, request)
+            .decide_bound(
+                &state.db,
+                &caller_of(caller, space),
+                &u.row.id,
+                request,
+                Some(binding),
+            )
             .await
             .map_err(ProviderError::from),
     }
     .inspect_err(|e| log_typed_failure(&u, e))?;
-    recheck_typed(state, &u).await?;
+    recheck_typed_answer(state, &u).await?;
     Ok(answer)
 }
 
@@ -1091,11 +1224,18 @@ pub async fn embed(
 ) -> Result<Vec<Vec<f32>>, ProviderError> {
     let u = typed_use(state, caller, space, id, Capability::Embeddings).await?;
     let request = typed::embedding_request(&u.row.model, &inputs)?;
+    still_current(state, &u).await?;
     let vectors = match typed_target(state, &u)? {
         TypedTarget::Server { base, key } => typed::embed(&base, key.as_deref(), request).await,
-        TypedTarget::Device => state
+        TypedTarget::Device(binding) => state
             .device
-            .embed(&state.db, &caller_of(caller, space), &u.row.id, request)
+            .embed_bound(
+                &state.db,
+                &caller_of(caller, space),
+                &u.row.id,
+                request,
+                Some(binding),
+            )
             .await
             .map_err(ProviderError::from)
             .and_then(|answer| typed::vectors(&answer)),
@@ -1106,7 +1246,7 @@ pub async fn embed(
             "the model endpoint returned an invalid embeddings response".into(),
         ));
     }
-    recheck_typed(state, &u).await?;
+    recheck_typed_answer(state, &u).await?;
     Ok(vectors)
 }
 
@@ -1148,18 +1288,25 @@ pub async fn media_embed(
     // The slot is taken before the payload is checked or sent.
     let _media = state.providers.media_slot(caller, &u.row.id)?;
     let request = typed::media_request(&u.row.model, input)?;
+    still_current(state, &u).await?;
     let answer = match typed_target(state, &u)? {
         TypedTarget::Server { base, key } => {
             typed::media_embed(&base, key.as_deref(), request).await
         }
-        TypedTarget::Device => state
+        TypedTarget::Device(binding) => state
             .device
-            .media_embed_request(&state.db, &caller_of(caller, space), &u.row.id, request)
+            .media_embed_request_bound(
+                &state.db,
+                &caller_of(caller, space),
+                &u.row.id,
+                request,
+                Some(binding),
+            )
             .await
             .map_err(ProviderError::from),
     }
     .inspect_err(|e| log_typed_failure(&u, e))?;
-    recheck_typed(state, &u).await?;
+    recheck_typed_answer(state, &u).await?;
     Ok(answer)
 }
 
@@ -1308,6 +1455,10 @@ impl crate::device_relay::ConnectionDirectory for DeviceDirectory {
     ) -> anyhow::Result<bool> {
         device_shared_use_allowed(conn, connection, user, space)
     }
+
+    fn member(&self, conn: &rusqlite::Connection, space: &str, user: &str) -> anyhow::Result<bool> {
+        Ok(store::is_member(conn, space, user)?)
+    }
 }
 
 /// Whether `user` (not the owner) may use device connection `connection`
@@ -1354,4 +1505,268 @@ pub fn device_connection(
                 provider,
             },
         ))
+}
+
+/// A System One endpoint that answers every decision and counts them.
+#[cfg(test)]
+async fn counting_systemone() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use axum::routing::post;
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = count.clone();
+    let app = axum::Router::new().route(
+        "/v1/systemone",
+        post(move |axum::Json(req): axum::Json<serde_json::Value>| {
+            let seen = seen.clone();
+            async move {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let answers: serde_json::Map<String, serde_json::Value> = req["questions"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(|k| (k.clone(), serde_json::json!({"type": "noul", "noul": 0.9})))
+                    .collect();
+                axum::Json(serde_json::json!({"model": "probe-model", "answers": answers}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (base, count)
+}
+
+#[cfg(test)]
+async fn ask_typed_fixture(
+    state: &AppState,
+    u: TypedUse,
+) -> Result<serde_json::Value, ProviderError> {
+    decide_with(
+        state,
+        u,
+        serde_json::json!({"value": true}),
+        serde_json::json!({"check": {"type": "noul", "instructions": "Is value true?"}}),
+    )
+    .await
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn a_prepared_typed_call_cannot_use_a_replacement_pairing() {
+    use crate::device_relay::Device;
+
+    let state = api::probe_state(vec![]).await;
+    let row = api::probe_row(&state, catalog::DEVICE_SYSTEMONE, "unused");
+    state
+        .device
+        .issue_token(&state.db, "user", &row.id)
+        .await
+        .unwrap();
+    let prepared = typed_use(&state, "user", None, &row.id, Capability::SystemOne)
+        .await
+        .unwrap();
+    state
+        .device
+        .issue_token(&state.db, "user", &row.id)
+        .await
+        .unwrap();
+    let (owner, generation) = crate::device_relay::credential_of(&state.db.lock(), &row.id)
+        .unwrap()
+        .unwrap();
+    let replacement = Device {
+        connection: row.id,
+        owner,
+        generation,
+    };
+    assert!(
+        state
+            .device
+            .claim_checked(&state.db, &replacement)
+            .await
+            .is_none()
+    );
+    let watch_for_payload = async {
+        loop {
+            assert!(
+                state
+                    .device
+                    .claim_checked(&state.db, &replacement)
+                    .await
+                    .is_none(),
+                "the replacement pairing received the prepared payload"
+            );
+            tokio::task::yield_now().await;
+        }
+    };
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::select! {
+            result = ask_typed_fixture(&state, prepared) => result,
+            () = watch_for_payload => unreachable!(),
+        }
+    })
+    .await
+    .expect("the prepared call should be refused without waiting on a device");
+    assert_eq!(
+        result,
+        Err(ProviderError::Device(DeviceError::CredentialChanged))
+    );
+    assert!(
+        state
+            .device
+            .claim_checked(&state.db, &replacement)
+            .await
+            .is_none()
+    );
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn a_prepared_typed_call_does_not_follow_an_endpoint_rotation() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let ((a, to_a), (b, to_b)) = (counting_systemone().await, counting_systemone().await);
+    let state = api::probe_state(vec![a.clone(), b.clone()]).await;
+    let sid = state.db.create_space("user", "typed", 10).unwrap().id;
+
+    // The endpoint is rotated between preparation and dispatch.
+    let row = api::probe_row(&state, catalog::CUSTOM_SYSTEMONE, &a);
+    let u = typed_use(&state, "user", Some(&sid), &row.id, Capability::SystemOne)
+        .await
+        .unwrap();
+    let rotate = store::Patch {
+        base_url: Some(b.clone()),
+        ..store::Patch::default()
+    };
+    assert!(matches!(
+        store::patch(&mut state.db.lock(), "user", &row.id, &rotate, Some(&row)).unwrap(),
+        store::Patched::Saved(_)
+    ));
+    let r = ask_typed_fixture(&state, u).await;
+    assert_eq!(r, Err(ProviderError::Use(UseError::TurnChanged)));
+    assert_eq!(
+        (to_a.load(SeqCst), to_b.load(SeqCst)),
+        (0, 0),
+        "nothing was sent"
+    );
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn a_prepared_typed_call_is_not_sent_after_its_share_is_revoked() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let (a, to_a) = counting_systemone().await;
+    let state = api::probe_state(vec![a.clone()]).await;
+    let sid = state.db.create_space("user", "typed", 10).unwrap().id;
+    state.db.add_member(&sid, "bob", 100).unwrap();
+
+    // A Space share is revoked between preparation and dispatch.
+    let shared = api::probe_row(&state, catalog::CUSTOM_SYSTEMONE, &a);
+    let to_space = store::Share {
+        visibility: store::Visibility::Spaces,
+        space_ids: vec![sid.clone()],
+    };
+    assert!(store::set_share(&mut state.db.lock(), "user", &shared.id, &to_space).unwrap());
+    let u = typed_use(&state, "bob", Some(&sid), &shared.id, Capability::SystemOne)
+        .await
+        .unwrap();
+    let personal = store::Share {
+        visibility: store::Visibility::Personal,
+        space_ids: vec![],
+    };
+    assert!(store::set_share(&mut state.db.lock(), "user", &shared.id, &personal).unwrap());
+    let r = ask_typed_fixture(&state, u).await;
+    assert_eq!(r, Err(ProviderError::Use(UseError::Revoked)));
+    assert_eq!(to_a.load(SeqCst), 0, "the old endpoint got nothing");
+
+    // Unchanged, the prepared call goes out.
+    let u = typed_use(
+        &state,
+        "user",
+        Some(&sid),
+        &shared.id,
+        Capability::SystemOne,
+    )
+    .await
+    .unwrap();
+    assert!(ask_typed_fixture(&state, u).await.is_ok());
+    assert_eq!(to_a.load(SeqCst), 1);
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn a_prepared_typed_call_does_not_use_a_retired_key() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let (a, to_a) = counting_systemone().await;
+    let state = api::probe_state(vec![a.clone()]).await;
+    let row = api::probe_row(&state, catalog::CUSTOM_SYSTEMONE, &a);
+
+    // A typed credential change alone does not bump the index revision.
+    let u = typed_use(&state, "user", None, &row.id, Capability::SystemOne)
+        .await
+        .unwrap();
+    let rotate_key = store::Patch {
+        sealed_key: Some(Some(vec![1; 40])),
+        ..store::Patch::default()
+    };
+    let store::Patched::Saved(rotated) =
+        store::patch(&mut state.db.lock(), "user", &row.id, &rotate_key, None).unwrap()
+    else {
+        panic!("typed key rotation did not save");
+    };
+    assert_eq!(rotated.config_rev, row.config_rev);
+    assert_eq!(
+        ask_typed_fixture(&state, u).await,
+        Err(ProviderError::Use(UseError::TurnChanged))
+    );
+    assert_eq!(
+        to_a.load(SeqCst),
+        0,
+        "no request used the retired credential"
+    );
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn a_lost_membership_is_revoked_and_internal_errors_propagate() {
+    let (a, _) = counting_systemone().await;
+    let state = api::probe_state(vec![a.clone()]).await;
+    let sid = state.db.create_space("owner", "typed", 10).unwrap().id;
+    state.db.add_member(&sid, "user", 100).unwrap();
+    let row = api::probe_row(&state, catalog::CUSTOM_SYSTEMONE, &a);
+    let question = || {
+        (
+            serde_json::json!({"value": true}),
+            serde_json::json!({"check": {"type": "noul", "instructions": "Is value true?"}}),
+        )
+    };
+    // Admitted, then removed from the Space before dispatch.
+    let u = typed_use(&state, "user", Some(&sid), &row.id, Capability::SystemOne)
+        .await
+        .unwrap();
+    state.db.remove_member(&sid, "user").unwrap();
+    let (p, q) = question();
+    assert_eq!(
+        decide_with(&state, u, p, q).await,
+        Err(ProviderError::Use(UseError::Revoked))
+    );
+    // A database failure is reported as one, never as lost access.
+    state.db.add_member(&sid, "user", 100).unwrap();
+    let u = typed_use(&state, "user", Some(&sid), &row.id, Capability::SystemOne)
+        .await
+        .unwrap();
+    state
+        .db
+        .lock()
+        .execute_batch("ALTER TABLE space_members RENAME TO space_members_gone")
+        .unwrap();
+    assert_eq!(
+        recheck_typed_answer(&state, &u).await,
+        Err(ProviderError::Use(UseError::Internal))
+    );
+    let (p, q) = question();
+    assert_eq!(
+        decide_with(&state, u, p, q).await,
+        Err(ProviderError::Use(UseError::Internal))
+    );
 }

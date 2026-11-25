@@ -10,7 +10,7 @@ use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::AppState;
@@ -24,8 +24,9 @@ use crate::db::{
 };
 use crate::jobs::{CompleteError, JobOutcome};
 use crate::mentions::{self, Mention};
-use crate::model_routing::{self as routing, AddressedBy, Addressing, RoutingSettings};
-use crate::orchestration::RunStatus;
+use crate::model_routing::{
+    self as routing, AddressedBy, Addressing, AddressingNote, RoutingSettings,
+};
 use crate::tools::RunnerTool;
 
 #[derive(Debug)]
@@ -61,6 +62,9 @@ impl ApiError {
     }
     pub(crate) fn message(&self) -> &str {
         &self.message
+    }
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
     }
     pub fn internal(e: anyhow::Error) -> Self {
         tracing::error!(error = %format!("{e:#}"), "internal error");
@@ -636,32 +640,54 @@ async fn dispatch_of(
     text: &str,
     resolved: &[Mention],
     addressing: Addressing,
-) -> ApiResult<(Addressed, Option<(AddressedBy, RoutingSettings)>)> {
+) -> ApiResult<PersonalDispatch> {
     let settings = || async {
         routing::preferences(state, &who.id)
             .await
             .map_err(ApiError::internal)
     };
-    Ok(match addressing {
+    let (addressed, turn, note) = match addressing {
         // Attachments alone are ordinary conversation: never classified.
-        Addressing::Unaddressed if text.is_empty() => (addressed(resolved), None),
-        Addressing::PeopleOnly => (addressed(resolved), None),
+        Addressing::Unaddressed if text.is_empty() => (addressed(resolved), None, None),
+        Addressing::PeopleOnly => (addressed(resolved), None, None),
         Addressing::Agent => (
             addressed(resolved),
             Some((AddressedBy::Explicit, settings().await?)),
+            None,
         ),
         Addressing::Unaddressed => {
             let settings = settings().await?;
-            if routing::infer_addressed(state, &who.id, space, &settings, text).await {
-                (
+            match routing::infer_addressed(state, &who.id, space, &settings, text).await {
+                Ok(true) => (
                     routing::classifier_addressed(),
                     Some((AddressedBy::Classifier, settings)),
-                )
-            } else {
-                (addressed(resolved), None)
+                    None,
+                ),
+                Ok(false) => (addressed(resolved), None, None),
+                Err(why) => (addressed(resolved), None, Some(why.into())),
             }
         }
+    };
+    Ok(PersonalDispatch {
+        addressed,
+        turn,
+        note,
     })
+}
+
+struct PersonalDispatch {
+    addressed: Addressed,
+    turn: Option<(AddressedBy, RoutingSettings)>,
+    note: Option<AddressingNote>,
+}
+
+#[derive(Serialize)]
+pub struct PostedMessage {
+    #[serde(flatten)]
+    event: Event,
+    addressing_note: Option<AddressingNote>,
+    /// Sender-only: why their use-case routing could not choose a model.
+    routing_note: Option<AddressingNote>,
 }
 
 pub async fn post_message(
@@ -669,7 +695,7 @@ pub async fn post_message(
     who: Human,
     Path((sid, rid)): Path<(String, String)>,
     body: JsonBody<PostMessage>,
-) -> ApiResult<(StatusCode, Json<Event>)> {
+) -> ApiResult<(StatusCode, Json<PostedMessage>)> {
     let Json(body) = body?;
     let space = member_of(&state, &sid, &who).await?;
     let room = room_of(&state, &space, &rid).await?;
@@ -780,7 +806,7 @@ pub async fn post_message(
             .await;
     }
     // Mentioning only people never starts agent work.
-    crate::agent_dispatch::start_runs(
+    let started = crate::agent_dispatch::start_runs(
         &state,
         &space.id,
         &room,
@@ -792,7 +818,14 @@ pub async fn post_message(
         &prefs,
     )
     .await;
-    Ok((StatusCode::ACCEPTED, Json(event)))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(PostedMessage {
+            event,
+            addressing_note: plan.addressing_note,
+            routing_note: started.note,
+        }),
+    ))
 }
 
 /// Demo: a deterministic `workspace.list` of the workspace root on the
@@ -1006,7 +1039,7 @@ pub async fn chat_message(
     State(state): State<AppState>,
     who: Human,
     body: JsonBody<ChatMessage>,
-) -> ApiResult<(StatusCode, Json<Event>)> {
+) -> ApiResult<(StatusCode, Json<PostedMessage>)> {
     let Json(body) = body?;
     let text = check_message(&state, &who.id, None, &body.text, &body.asset_ids).await?;
     // Personal Chat has no other members: only `@agent` or the flag resolve.
@@ -1024,7 +1057,11 @@ pub async fn chat_message(
         addressing,
     )
     .await?;
-    let (addressed, turn) = dispatch_of(&state, &who, None, &text, &resolved, addressing).await?;
+    let PersonalDispatch {
+        addressed,
+        turn,
+        note,
+    } = dispatch_of(&state, &who, None, &text, &resolved, addressing).await?;
     let (uid, author, stored) = (who.id.clone(), who.author(), text.clone());
     let event = if body.asset_ids.is_empty() {
         db(&state, move |db| {
@@ -1060,7 +1097,14 @@ pub async fn chat_message(
             let _ = start_personal_run(&state, &uid, &event, route).await;
         });
     }
-    Ok((StatusCode::ACCEPTED, Json(event)))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(PostedMessage {
+            event,
+            addressing_note: note,
+            routing_note: None,
+        }),
+    ))
 }
 
 // ---- Runs ----
@@ -1069,14 +1113,58 @@ pub async fn list_runs(
     State(state): State<AppState>,
     who: Human,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let spaces = db(&state, move |db| db.list_spaces(&who.id)).await?;
+    let user = who.id.clone();
+    let spaces = db(&state, move |db| db.list_spaces(&user)).await?;
     let runs: Vec<_> = state
         .runs
-        .list()
+        .list_with_failures()
         .into_iter()
-        .filter(|r| spaces.iter().any(|s| s.id == r.space_id))
-        .collect();
+        .filter(|(r, _)| spaces.iter().any(|s| s.id == r.space_id))
+        .map(|(r, failure)| run_view(&who, r, failure))
+        .collect::<ApiResult<_>>()?;
     Ok(Json(json!({"runs": runs})))
+}
+
+/// A failed membership check on a run's Space, as the run's API answers
+/// it: not being a member reads like an unknown run (404); anything else
+/// (an internal error) keeps its own status.
+fn run_not_found(e: ApiError, not_found: impl FnOnce() -> ApiError) -> ApiError {
+    if e.status() == StatusCode::NOT_FOUND {
+        not_found()
+    } else {
+        e
+    }
+}
+
+/// One run, for a member of its Space: 404 for anyone else.
+pub async fn get_run(
+    State(state): State<AppState>,
+    who: Human,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let not_found = || ApiError::not_found("no such run");
+    let (run, failure) = state.runs.get_with_failure(&id).ok_or_else(not_found)?;
+    member_of(&state, &run.space_id, &who)
+        .await
+        .map_err(|e| run_not_found(e, not_found))?;
+    Ok(Json(run_view(&who, run, failure)?))
+}
+
+/// A run as `who` sees it: with `failure`, the full reason it failed, only
+/// when `who` started it (the room showed a generic error); never for
+/// other members, including the Space owner.
+fn run_view(
+    who: &Human,
+    run: crate::orchestration::RunInfo,
+    failure: Option<crate::orchestration::RunFailure>,
+) -> ApiResult<serde_json::Value> {
+    let failure = failure.filter(|_| run.actor == who.id);
+    let mut view = serde_json::to_value(&run).map_err(|e| ApiError::internal(e.into()))?;
+    if let Some(failure) = failure {
+        view["failure"] =
+            serde_json::to_value(failure).map_err(|e| ApiError::internal(e.into()))?;
+    }
+    Ok(view)
 }
 
 pub async fn stop_run(
@@ -1090,17 +1178,16 @@ pub async fn stop_run(
     let run = state.runs.get(&id).ok_or_else(not_found)?;
     let space = member_of(&state, &run.space_id, &who)
         .await
-        .map_err(|_| not_found())?;
+        .map_err(|e| run_not_found(e, not_found))?;
     if run.actor != who.id && space.role != Role::Owner {
         return Err(ApiError::forbidden(
             "only the person who started a run, or the Space owner, can stop it",
         ));
     }
-    if !state.runs.stop(&id) {
-        return Err(ApiError::conflict("the run is not running"));
-    }
-    let run = state.runs.get(&id).unwrap_or(run);
-    debug_assert_eq!(run.status, RunStatus::Cancelled);
+    let run = state
+        .runs
+        .stop(&id)
+        .ok_or_else(|| ApiError::conflict("the run is not running"))?;
     Ok(Json(
         serde_json::to_value(run).map_err(|e| ApiError::internal(e.into()))?,
     ))
@@ -1162,4 +1249,17 @@ pub async fn runner_result(
         Err(CompleteError::NotClaimed) => Err(ApiError::conflict("job has not been claimed")),
         Err(CompleteError::Unknown) => Err(ApiError::not_found("no such job")),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn only_a_failed_membership_reads_as_an_unknown_run() {
+    let unknown = || ApiError::not_found("no such run");
+    let outsider = run_not_found(ApiError::not_found(NO_SPACE), unknown);
+    assert_eq!(
+        (outsider.status(), outsider.message()),
+        (StatusCode::NOT_FOUND, "no such run")
+    );
+    let broken = run_not_found(ApiError::internal(anyhow::anyhow!("disk")), unknown);
+    assert_eq!(broken.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }

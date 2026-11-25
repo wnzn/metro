@@ -211,7 +211,7 @@ async fn delete_space(
                 .list()
                 .iter()
                 .filter(|r| r.space_id == space.id)
-                .filter(|r| state.runs.stop(&r.id))
+                .filter(|r| state.runs.stop(&r.id).is_some())
                 .count();
             if let Err(e) = state.device.shares_changed(&state.db, None).await {
                 tracing::warn!(error = %format!("{e:#}"), "rechecking borrowed device jobs");

@@ -854,6 +854,29 @@ def library(server_binary, connector, timeout):
         require(p_doc in ids(run.search("alice", "ledger", "space", s1)),
                 "removing Bob purged Alice's index of the Space (or its assets)")
 
+        # Withhold a held asset embedding too: report a missing file, not
+        # an unusable connection, and do not commit any of Bob's rows.
+        arrived, release = vb.hold_next(lambda kind, digest, _: kind == "asset" and digest == sha(doc))
+        outcome = {}
+        thread = threading.Thread(target=lambda: outcome.update(r=run.raw(
+            "bob", "POST", f"{LIB}/index", json.dumps({"asset_id": p_doc}).encode(),
+            {"Content-Type": "application/json"})))
+        thread.start()
+        try:
+            require(arrived.wait(10), "held file embed never reached Bob's provider")
+            run.call("alice", "DELETE", f"{SPACES}/{quote(s1, safe='')}/members",
+                     body={"user_id": "bob"}, expect=(200,))
+        finally:
+            release.set()
+            thread.join(15)
+        status, _, body = outcome["r"]
+        require(status == 404 and json.loads(body).get("error") == "file not found",
+                f"held file embed after removal: expected HTTP 404, got {status}")
+        run.call("alice", "POST", f"{SPACES}/{quote(s1, safe='')}/members", body={"user_id": "bob"},
+                 expect=(201,))
+        require(run.search("bob", "ledger", "space", s1) == [],
+                "held file embed became visible after Bob rejoined")
+
         # -- held index vs. delete, and vector purge on delete
         late = b"A late harbor ledger entry.\n"
         late_id, _ = run.upload("alice", "late.txt", late, "text/plain", "space", s1)

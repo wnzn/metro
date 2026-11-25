@@ -251,6 +251,14 @@ pub trait ConnectionDirectory: Send + Sync + 'static {
     ) -> anyhow::Result<bool> {
         Ok(false)
     }
+
+    /// Whether `user` is a member of Space `space` right now. Same locking
+    /// rule. Space-scoped work (the owner's own included) is released to a
+    /// device, and its result back, only while this holds. The default
+    /// answers no.
+    fn member(&self, _conn: &Connection, _space: &str, _user: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
 }
 
 /// Bounds of the relay.
@@ -369,9 +377,14 @@ impl std::fmt::Display for DeviceError {
             DeviceError::AccessRevoked => f.write_str(
                 "access to this shared model connection was revoked; the request was cancelled",
             ),
-            DeviceError::Device(e) => write!(f, "your device connector reported: {e}"),
-            DeviceError::BadResponse(e) => {
-                write!(f, "your device connector returned an invalid response: {e}")
+            // The device's own text stays out of every message and log: it
+            // can carry whatever the vendor or the connector echoed. The
+            // connector keeps it in its own log.
+            DeviceError::Device(_) => {
+                f.write_str("your device connector reported an error; see its own log")
+            }
+            DeviceError::BadResponse(_) => {
+                f.write_str("your device connector returned an invalid response")
             }
             DeviceError::Internal => f.write_str("internal error in the device relay"),
         }
@@ -379,6 +392,27 @@ impl std::fmt::Display for DeviceError {
 }
 
 impl std::error::Error for DeviceError {}
+
+impl DeviceError {
+    /// A fixed name of the failure, for logs.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            DeviceError::NotFound => "not_found",
+            DeviceError::NotPaired => "not_paired",
+            DeviceError::Offline => "offline",
+            DeviceError::QueueFull => "queue_full",
+            DeviceError::NotClaimed => "not_claimed",
+            DeviceError::TimedOut => "timed_out",
+            DeviceError::CredentialChanged => "credential_changed",
+            DeviceError::TooLarge => "too_large",
+            DeviceError::InvalidRequest(_) => "invalid_request",
+            DeviceError::AccessRevoked => "access_revoked",
+            DeviceError::Device(_) => "device_error",
+            DeviceError::BadResponse(_) => "bad_response",
+            DeviceError::Internal => "internal",
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Storage: one device credential per connection, as a hash.
@@ -487,7 +521,10 @@ fn delete_credential_in(conn: &Connection, connection: &str) -> anyhow::Result<O
 }
 
 /// `(owner, generation)` of the connection's current token.
-fn credential_of(conn: &Connection, connection: &str) -> rusqlite::Result<Option<(String, u64)>> {
+pub(crate) fn credential_of(
+    conn: &Connection,
+    connection: &str,
+) -> rusqlite::Result<Option<(String, u64)>> {
     conn.query_row(
         "SELECT owner_id, generation FROM device_credentials WHERE connection_id = ?1",
         params![connection],
@@ -605,11 +642,9 @@ struct Job {
     operation: Operation,
     /// An explicit turn validated against an upgraded connector's inventory.
     requires_inventory: bool,
-    claim_grant: Option<Arc<crate::providers::guard::DeviceClaimGrant>>,
+    access: JobAccess,
     /// The connection's owner when the job was queued.
     owner: String,
-    /// Set for borrowed work: the caller that isn't the owner.
-    borrowed: Option<Caller>,
     /// Taken when claimed, so the payload lives no longer than needed.
     request: Option<Value>,
     /// How long the device may take once it claimed the job.
@@ -624,6 +659,10 @@ struct Job {
 }
 
 impl Job {
+    fn access(&self) -> JobAccess {
+        self.access.clone()
+    }
+
     fn inventory_allows(&self, models: Option<&[String]>) -> bool {
         if self.operation != Operation::Complete {
             return true;
@@ -650,6 +689,19 @@ fn inventory_changed() -> DeviceError {
 pub(crate) struct ExpectedDevice {
     pub generation: u64,
     pub advertised: bool,
+}
+
+/// Pins prepared provider work to its pairing and connection snapshot.
+pub(crate) struct DispatchBinding {
+    pub generation: u64,
+    pub grant: crate::providers::guard::DeviceClaimGrant,
+    /// Only explicitly selected chat models rely on the advertised inventory.
+    pub advertised: Option<bool>,
+}
+
+struct WebDispatch {
+    grant: crate::web_tools::WebGrant,
+    run_timeout: Duration,
 }
 
 #[derive(Default)]
@@ -810,14 +862,82 @@ fn release(map: &mut HashMap<String, usize>, key: &str, bytes: usize) {
 /// What a device poll found.
 enum Next {
     Ready(ClaimedDeviceJob),
-    /// A borrowed or explicitly selected job, to re-check first.
+    /// A job whose scope, grant or connection snapshot must be checked first.
     Check {
         id: String,
-        caller: Option<Caller>,
-        grant: Option<Arc<crate::providers::guard::DeviceClaimGrant>>,
-        owner: String,
-        operation: Operation,
+        access: JobAccess,
     },
+}
+
+#[derive(Clone)]
+struct JobAccess {
+    borrowed: Option<Caller>,
+    grant: Option<Arc<crate::providers::guard::DeviceClaimGrant>>,
+    in_space: Option<Caller>,
+    web: Option<Arc<crate::web_tools::WebGrant>>,
+    operation: Operation,
+}
+
+impl JobAccess {
+    fn needs_check(&self) -> bool {
+        self.borrowed.is_some()
+            || self.grant.is_some()
+            || self.in_space.is_some()
+            || self.web.is_some()
+    }
+
+    /// Check the live grant and pairing with the database lock held.
+    fn check(
+        &self,
+        conn: &Connection,
+        directory: &dyn ConnectionDirectory,
+        device: &Device,
+    ) -> anyhow::Result<Result<(), DeviceError>> {
+        if let Some(web) = &self.web {
+            if web.caller.user != device.owner || web.denial(conn, self.operation)?.is_some() {
+                return Ok(Err(DeviceError::AccessRevoked));
+            }
+        } else if let Some(who) = &self.in_space
+            && let Some(space) = &who.space
+            && !directory.member(conn, space, &who.user)?
+        {
+            return Ok(Err(DeviceError::AccessRevoked));
+        }
+        if let Some(who) = &self.borrowed {
+            let allowed = match lookup(directory, conn, &device.connection)? {
+                Some(dc)
+                    if dc.id == device.connection
+                        && dc.owner_id == device.owner
+                        && dc.owner_id != who.user
+                        && dc.provider != DEVICE_WEB
+                        && dc.provider != SUBSCRIPTION_PROVIDER
+                        && serves(&dc.provider, self.operation) =>
+                {
+                    directory.shared_use_allowed(conn, &dc, &who.user, who.space.as_deref())?
+                }
+                _ => false,
+            };
+            if !allowed {
+                return Ok(Err(DeviceError::AccessRevoked));
+            }
+        }
+        if let Some(grant) = &self.grant
+            && !grant.allowed(conn)?
+        {
+            return Ok(Err(DeviceError::AccessRevoked));
+        }
+        if !credential_of(conn, &device.connection)?.is_some_and(|(owner, generation)| {
+            owner == device.owner && generation == device.generation
+        }) {
+            return Ok(Err(DeviceError::CredentialChanged));
+        }
+        Ok(Ok(()))
+    }
+}
+
+fn access_check_error(error: anyhow::Error) -> DeviceError {
+    tracing::error!(%error, "checking device job access");
+    DeviceError::Internal
 }
 
 /// Model ids of a validated `models` answer.
@@ -984,7 +1104,11 @@ impl DeviceRelay {
             request,
             size,
             true,
-            Some((expected, grant)),
+            Some(DispatchBinding {
+                generation: expected.generation,
+                grant,
+                advertised: Some(expected.advertised),
+            }),
             None,
         )
         .await
@@ -1001,11 +1125,31 @@ impl DeviceRelay {
         connection: &str,
         request: Value,
     ) -> Result<Value, DeviceError> {
+        self.decide_bound(db, caller, connection, request, None)
+            .await
+    }
+
+    pub(crate) async fn decide_bound(
+        &self,
+        db: &Db,
+        caller: &Caller,
+        connection: &str,
+        request: Value,
+        binding: Option<DispatchBinding>,
+    ) -> Result<Value, DeviceError> {
         let req = metro_model_protocol::check_decide_request(&request)
             .map_err(|e| DeviceError::InvalidRequest(e.to_string()))?;
         let body = serde_json::to_value(&req).map_err(|_| DeviceError::Internal)?;
         let response = self
-            .dispatch_as(db, caller, connection, Operation::Decide, body)
+            .dispatch_inner(
+                db,
+                caller,
+                connection,
+                Operation::Decide,
+                body,
+                true,
+                binding,
+            )
             .await?;
         metro_model_protocol::check_decide_response(&req, &response)
             .map_err(|e| DeviceError::BadResponse(e.to_string()))
@@ -1020,6 +1164,18 @@ impl DeviceRelay {
         connection: &str,
         request: Value,
     ) -> Result<Value, DeviceError> {
+        self.embed_bound(db, caller, connection, request, None)
+            .await
+    }
+
+    pub(crate) async fn embed_bound(
+        &self,
+        db: &Db,
+        caller: &Caller,
+        connection: &str,
+        request: Value,
+        binding: Option<DispatchBinding>,
+    ) -> Result<Value, DeviceError> {
         let req = metro_model_protocol::check_embed_request(&request)
             .map_err(|e| DeviceError::InvalidRequest(e.to_string()))?;
         let mut body = json!({"model": req.model, "input": req.input});
@@ -1027,7 +1183,15 @@ impl DeviceRelay {
             body["dimensions"] = json!(d);
         }
         let response = self
-            .dispatch_as(db, caller, connection, Operation::Embed, body)
+            .dispatch_inner(
+                db,
+                caller,
+                connection,
+                Operation::Embed,
+                body,
+                true,
+                binding,
+            )
             .await?;
         metro_model_protocol::check_embed_response(&req, &response)
             .map_err(|e| DeviceError::BadResponse(e.to_string()))
@@ -1059,6 +1223,18 @@ impl DeviceRelay {
         connection: &str,
         request: metro_model_protocol::MediaRequest,
     ) -> Result<Value, DeviceError> {
+        self.media_embed_request_bound(db, caller, connection, request, None)
+            .await
+    }
+
+    pub(crate) async fn media_embed_request_bound(
+        &self,
+        db: &Db,
+        caller: &Caller,
+        connection: &str,
+        request: metro_model_protocol::MediaRequest,
+        binding: Option<DispatchBinding>,
+    ) -> Result<Value, DeviceError> {
         let size = request.encoded_len();
         let shape = request.shape();
         let body = request.into_json();
@@ -1071,7 +1247,7 @@ impl DeviceRelay {
                 body,
                 size,
                 true,
-                None,
+                binding,
                 None,
             )
             .await?;
@@ -1100,6 +1276,7 @@ impl DeviceRelay {
             operation,
             request,
             false,
+            None,
         )
         .await
     }
@@ -1116,10 +1293,11 @@ impl DeviceRelay {
         operation: Operation,
         request: Value,
     ) -> Result<Value, DeviceError> {
-        self.dispatch_inner(db, caller, connection, operation, request, true)
+        self.dispatch_inner(db, caller, connection, operation, request, true, None)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_inner(
         &self,
         db: &Db,
@@ -1128,6 +1306,7 @@ impl DeviceRelay {
         operation: Operation,
         request: Value,
         allow_borrow: bool,
+        binding: Option<DispatchBinding>,
     ) -> Result<Value, DeviceError> {
         // Counted while serializing into nothing: no copy of the payload.
         let size = metro_model_protocol::json_len(&request);
@@ -1139,18 +1318,19 @@ impl DeviceRelay {
             request,
             size,
             allow_borrow,
-            None,
+            binding,
             None,
         )
         .await
     }
 
-    /// One web job (`web_search` / `web_fetch`) on `owner`'s own web device
-    /// `connection`, never borrowed, with its own `run_timeout`.
-    pub async fn dispatch_web(
+    /// One web job on the initiator's own device, never borrowed, with the
+    /// operation's own timeout. Recheck the Space or Chat permission at
+    /// claim and result delivery.
+    pub(crate) async fn dispatch_web(
         &self,
         db: &Db,
-        owner: &str,
+        grant: &crate::web_tools::WebGrant,
         connection: &str,
         operation: Operation,
         request: Value,
@@ -1162,14 +1342,17 @@ impl DeviceRelay {
         let size = metro_model_protocol::json_len(&request);
         self.dispatch_sized(
             db,
-            &Caller::personal(owner),
+            &grant.caller,
             connection,
             operation,
             request,
             size,
             false,
             None,
-            Some(run_timeout),
+            Some(WebDispatch {
+                grant: grant.clone(),
+                run_timeout,
+            }),
         )
         .await
     }
@@ -1185,9 +1368,12 @@ impl DeviceRelay {
         request: Value,
         size: usize,
         allow_borrow: bool,
-        selection: Option<(ExpectedDevice, crate::providers::guard::DeviceClaimGrant)>,
-        run_timeout: Option<Duration>,
+        binding: Option<DispatchBinding>,
+        web: Option<WebDispatch>,
     ) -> Result<Value, DeviceError> {
+        if matches!(operation, Operation::WebSearch | Operation::WebFetch) != web.is_some() {
+            return Err(DeviceError::NotFound);
+        }
         let media = operation == Operation::MediaEmbed;
         let cap = if media {
             self.limits.max_media_request_bytes
@@ -1199,6 +1385,7 @@ impl DeviceRelay {
         }
         let directory = self.directory.clone();
         let (who, c) = (caller.clone(), connection.to_owned());
+        let expected_generation = binding.as_ref().map(|b| b.generation);
         let (generation, owner, borrowed) = db
             .call(move |db| {
                 let conn = db.lock();
@@ -1226,9 +1413,13 @@ impl DeviceRelay {
                 Ok(match credential_of(&conn, &c)? {
                     // Only the owner's own token serves it; a token issued
                     // to someone else (the connection changed hands) never.
-                    Some((cred_owner, g)) if cred_owner == dc.owner_id => {
+                    Some((cred_owner, g))
+                        if cred_owner == dc.owner_id
+                            && expected_generation.is_none_or(|e| e == g) =>
+                    {
                         Ok((g, dc.owner_id, borrowed))
                     }
+                    _ if expected_generation.is_some() => Err(DeviceError::CredentialChanged),
                     _ => Err(DeviceError::NotPaired),
                 })
             })
@@ -1240,17 +1431,25 @@ impl DeviceRelay {
 
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, mut rx) = oneshot::channel();
+        let advertised = binding.as_ref().and_then(|b| b.advertised);
+        let (web, run_timeout) = match web {
+            Some(w) => (Some(Arc::new(w.grant)), w.run_timeout),
+            None => (None, self.limits.run_timeout),
+        };
+        let access = JobAccess {
+            borrowed: borrowed.then(|| caller.clone()),
+            grant: binding.map(|b| Arc::new(b.grant)),
+            in_space: (web.is_none() && caller.space.is_some()).then(|| caller.clone()),
+            web,
+            operation,
+        };
         {
             let mut inner = self.lock();
             if !inner.observe(connection, generation) {
                 return Err(DeviceError::CredentialChanged);
             }
             let q = inner.conns.entry(connection.to_owned()).or_default();
-            let expected = selection.as_ref().map(|(expected, _)| *expected);
-            if let Some(expected) = expected
-                && (generation != expected.generation
-                    || expected.advertised != q.approved_models.is_some())
-            {
+            if advertised.is_some_and(|expected| expected != q.approved_models.is_some()) {
                 return Err(DeviceError::CredentialChanged);
             }
             let online = q.last_seen.is_some_and(|(at, g)| {
@@ -1274,12 +1473,11 @@ impl DeviceRelay {
                     connection: connection.to_owned(),
                     generation,
                     operation,
-                    requires_inventory: expected.is_some_and(|e| e.advertised),
-                    claim_grant: selection.map(|(_, grant)| Arc::new(grant)),
+                    requires_inventory: advertised == Some(true),
+                    access: access.clone(),
                     owner: owner.clone(),
-                    borrowed: borrowed.then(|| caller.clone()),
                     request: Some(request),
-                    run_timeout: run_timeout.unwrap_or(self.limits.run_timeout),
+                    run_timeout,
                     media_bytes,
                     caller: caller.user.clone(),
                     state: JobState::Queued,
@@ -1287,7 +1485,7 @@ impl DeviceRelay {
                 },
             );
         }
-        tracing::debug!(job = %id, ?operation, borrowed, "device job queued");
+        tracing::debug!(job = %id, %connection, ?operation, borrowed, "device job queued");
         let _abandon = Abandon {
             relay: self,
             id: id.clone(),
@@ -1316,59 +1514,34 @@ impl DeviceRelay {
                         Ok(end) => deadline = end,
                         Err(why) => {
                             inner.fail(&id, None);
-                            tracing::debug!(job = %id, %why, "device job failed");
+                            tracing::debug!(job = %id, kind = why.kind(), "device job failed");
                             return Err(why);
                         }
                     }
                 }
             }
         };
-        // A borrowed result is handed back only while the grant still holds.
-        if borrowed
-            && outcome.is_ok()
-            && !self
-                .entitled(db, caller, connection, &owner, operation)
+        // A connector's failure is also an answer for web jobs. Recheck
+        // before returning it, but don't replace relay failures (including
+        // DB faults at claim) with a second access check.
+        let device_answer = outcome.is_ok()
+            || (access.web.is_some()
+                && matches!(
+                    &outcome,
+                    Err(DeviceError::Device(_) | DeviceError::BadResponse(_))
+                ));
+        if device_answer && access.needs_check() {
+            let directory = self.directory.clone();
+            let device = Device {
+                connection: connection.to_owned(),
+                owner,
+                generation,
+            };
+            db.call(move |db| access.check(&db.lock(), &*directory, &device))
                 .await
-        {
-            tracing::debug!(job = %id, "borrowed device result withheld: access revoked");
-            return Err(DeviceError::AccessRevoked);
+                .map_err(access_check_error)??;
         }
         outcome
-    }
-
-    /// Whether `caller` may still borrow `connection` from `owner` for
-    /// `operation`. Errors count as no.
-    async fn entitled(
-        &self,
-        db: &Db,
-        caller: &Caller,
-        connection: &str,
-        owner: &str,
-        operation: Operation,
-    ) -> bool {
-        let directory = self.directory.clone();
-        let (who, c, o) = (caller.clone(), connection.to_owned(), owner.to_owned());
-        db.call(move |db| {
-            let conn = db.lock();
-            let Some(dc) = lookup(&*directory, &conn, &c)? else {
-                return Ok(false);
-            };
-            if dc.id != c
-                || dc.owner_id != o
-                || dc.owner_id == who.user
-                || dc.provider == DEVICE_WEB
-                || dc.provider == SUBSCRIPTION_PROVIDER
-                || !serves(&dc.provider, operation)
-            {
-                return Ok(false);
-            }
-            directory.shared_use_allowed(&conn, &dc, &who.user, who.space.as_deref())
-        })
-        .await
-        .unwrap_or_else(|e| {
-            tracing::error!(error = %format!("{e:#}"), "device relay grant check");
-            false
-        })
     }
 
     /// Re-check every pending borrowed job of `connection` (`None`: of every
@@ -1376,38 +1549,44 @@ impl DeviceRelay {
     /// share is revoked or narrowed, or a member leaves a Space. The owner's
     /// own jobs are untouched.
     pub async fn shares_changed(&self, db: &Db, connection: Option<&str>) -> anyhow::Result<()> {
-        let borrowed: Vec<(String, Caller, String, String, Operation)> = {
+        let borrowed: Vec<_> = {
             let inner = self.lock();
             inner
                 .jobs
                 .iter()
                 .filter(|(_, j)| connection.is_none_or(|c| j.connection == c))
-                .filter_map(|(id, j)| {
-                    j.borrowed.clone().map(|caller| {
-                        (
-                            id.clone(),
-                            caller,
-                            j.connection.clone(),
-                            j.owner.clone(),
-                            j.operation,
-                        )
-                    })
+                .filter(|(_, job)| job.access.borrowed.is_some())
+                .map(|(id, job)| {
+                    (
+                        id.clone(),
+                        job.access(),
+                        Device {
+                            connection: job.connection.clone(),
+                            owner: job.owner.clone(),
+                            generation: job.generation,
+                        },
+                    )
                 })
                 .collect()
         };
-        for (id, caller, conn, owner, op) in borrowed {
-            if !self.entitled(db, &caller, &conn, &owner, op).await {
-                tracing::debug!(job = %id, "borrowed device job cancelled: access revoked");
-                self.lock().fail(&id, Some(DeviceError::AccessRevoked));
+        for (id, access, device) in borrowed {
+            let directory = self.directory.clone();
+            let checked = db
+                .call(move |db| access.check(&db.lock(), &*directory, &device))
+                .await
+                .map_err(access_check_error)
+                .and_then(|r| r);
+            if let Err(reason) = checked {
+                tracing::debug!(job = %id, kind = reason.kind(), "borrowed device job cancelled");
+                self.lock().fail(&id, Some(reason));
             }
         }
         Ok(())
     }
 
-    /// Pick the next job for `device`: owner jobs are claimed at once, a
-    /// borrowed one is marked [`JobState::Checking`] (when `borrowed` allows
-    /// it) and returned for its grant check.
-    fn next_job(&self, device: &Device, borrowed: bool) -> Option<Next> {
+    /// Pick the next job for `device`. A job needing an access check is
+    /// marked [`JobState::Checking`] and returned without its payload.
+    fn next_job(&self, device: &Device, check_access: bool) -> Option<Next> {
         let mut inner = self.lock();
         if !inner.observe(&device.connection, device.generation) {
             return None;
@@ -1431,22 +1610,14 @@ impl DeviceRelay {
                 inner.fail(&id, Some(inventory_changed()));
                 continue;
             }
-            let caller = job.borrowed.clone();
-            let grant = job.claim_grant.clone();
-            if caller.is_some() || grant.is_some() {
-                if !borrowed {
+            let access = job.access();
+            if access.needs_check() {
+                if !check_access {
                     continue;
                 }
                 job.state = JobState::Checking;
-                let (owner, operation) = (job.owner.clone(), job.operation);
                 inner.unqueue(&device.connection, &id);
-                return Some(Next::Check {
-                    id,
-                    caller,
-                    grant,
-                    owner,
-                    operation,
-                });
+                return Some(Next::Check { id, access });
             }
             job.state = JobState::Claimed { at: Instant::now() };
             let request = job.request.take().unwrap_or(Value::Null);
@@ -1462,9 +1633,8 @@ impl DeviceRelay {
         None
     }
 
-    /// The oldest of the owner's own jobs for `device`'s connection, marking
-    /// it claimed. Borrowed jobs need a grant check and are only handed out
-    /// by [`Self::claim_checked`] (which the claim route uses).
+    /// Claim the oldest job that needs no access check. The HTTP claim
+    /// route uses [`Self::claim_checked`] instead.
     pub fn claim(&self, device: &Device) -> Option<ClaimedDeviceJob> {
         match self.next_job(device, false) {
             Some(Next::Ready(job)) => Some(job),
@@ -1473,60 +1643,68 @@ impl DeviceRelay {
     }
 
     /// The oldest job for `device`'s connection, marking it claimed.
-    /// Recheck access before handing out borrowed or explicitly selected work.
+    /// Recheck access before handing out scoped, borrowed, or bound work.
     pub async fn claim_checked(&self, db: &Db, device: &Device) -> Option<ClaimedDeviceJob> {
         loop {
-            let (id, caller, grant, owner, operation) = match self.next_job(device, true)? {
+            let (id, access) = match self.next_job(device, true)? {
                 Next::Ready(job) => return Some(job),
-                Next::Check {
-                    id,
-                    caller,
-                    grant,
-                    owner,
-                    operation,
-                } => (id, caller, grant, owner, operation),
+                Next::Check { id, access } => (id, access),
             };
-            let mut ok = true;
-            if let Some(caller) = caller {
-                ok = self
-                    .entitled(db, &caller, &device.connection, &owner, operation)
-                    .await;
+            let (relay, device, job_id) = (self.clone(), device.clone(), id.clone());
+            match db
+                .call(move |db| {
+                    let conn = db.lock();
+                    let checked = access.check(&conn, &*relay.directory, &device)?;
+                    // Keep the DB lock until the checked payload has been taken;
+                    // a membership, connection or token write cannot interleave.
+                    Ok(relay.release_checked(&device, &job_id, checked))
+                })
+                .await
+            {
+                Ok(Some(job)) => return Some(job),
+                Ok(None) => {}
+                Err(e) => self.lock().fail(&id, Some(access_check_error(e))),
             }
-            if ok && let Some(grant) = grant {
-                ok = db
-                    .call(move |db| grant.allowed(&db.lock()))
-                    .await
-                    .unwrap_or(false);
-            }
-            let mut inner = self.lock();
-            let approved = inner
-                .conns
-                .get(&device.connection)
-                .and_then(|q| q.approved_models.clone());
-            let Some(job) = inner.jobs.get_mut(&id) else {
-                continue; // failed or withdrawn meanwhile
-            };
-            if !matches!(job.state, JobState::Checking) || job.generation != device.generation {
-                continue;
-            }
-            if !ok {
-                tracing::debug!(job = %id, "device job refused at claim: access revoked");
-                inner.fail(&id, Some(DeviceError::AccessRevoked));
-                continue;
-            }
-            if !job.inventory_allows(approved.as_deref()) {
-                inner.fail(&id, Some(inventory_changed()));
-                continue;
-            }
-            job.state = JobState::Claimed { at: Instant::now() };
-            let request = job.request.take().unwrap_or(Value::Null);
-            tracing::debug!(job = %id, ?operation, "checked device job claimed");
-            return Some(ClaimedDeviceJob {
-                id,
-                operation,
-                request,
-            });
         }
+    }
+
+    fn release_checked(
+        &self,
+        device: &Device,
+        id: &str,
+        checked: Result<(), DeviceError>,
+    ) -> Option<ClaimedDeviceJob> {
+        let mut inner = self.lock();
+        let approved = inner
+            .conns
+            .get(&device.connection)
+            .and_then(|q| q.approved_models.clone());
+        let job = inner.jobs.get_mut(id)?;
+        if !matches!(job.state, JobState::Checking)
+            || job.connection != device.connection
+            || job.owner != device.owner
+            || job.generation != device.generation
+        {
+            return None;
+        }
+        if let Err(reason) = checked {
+            tracing::debug!(job = %id, kind = reason.kind(), "device job refused at claim");
+            inner.fail(id, Some(reason));
+            return None;
+        }
+        if !job.inventory_allows(approved.as_deref()) {
+            inner.fail(id, Some(inventory_changed()));
+            return None;
+        }
+        job.state = JobState::Claimed { at: Instant::now() };
+        let request = job.request.take().unwrap_or(Value::Null);
+        let operation = job.operation;
+        tracing::debug!(job = %id, ?operation, "checked device job claimed");
+        Some(ClaimedDeviceJob {
+            id: id.to_owned(),
+            operation,
+            request,
+        })
     }
 
     /// Accept `device`'s result for job `id`. `Ok(true)` when accepted,

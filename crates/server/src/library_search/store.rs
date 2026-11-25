@@ -333,7 +333,7 @@ pub fn store_asset(
     grant: &GrantCheck,
     grant_key: &str,
     max_segments: usize,
-) -> rusqlite::Result<StoreOutcome> {
+) -> anyhow::Result<StoreOutcome> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if embedding_id(&tx, user)?.as_deref() != Some(a.connection_id) {
         return Ok(StoreOutcome::Switched);
@@ -360,6 +360,9 @@ pub fn store_asset(
     }
     match grant(&tx, a.space_id, a.connection_id) {
         Ok(key) if key == grant_key => {}
+        Err(e) if e.kind == super::MediaFailure::Internal => {
+            return Err(anyhow::anyhow!(e.message));
+        }
         _ => return Ok(StoreOutcome::Switched),
     }
     let others: i64 = tx.query_row(

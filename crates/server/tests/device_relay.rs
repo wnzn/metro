@@ -563,7 +563,8 @@ async fn mock_device_serves_models_and_completions() {
         .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     let err = waiter.await.unwrap().unwrap_err();
-    assert!(err.to_string().contains("signed out"), "{err}");
+    assert!(err.to_string().contains("reported an error"), "{err}");
+    assert!(!err.to_string().contains("signed out"), "{err}");
 
     // Shapes outside the wire are refused.
     let (status, _) = s
