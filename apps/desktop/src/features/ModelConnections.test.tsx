@@ -123,6 +123,60 @@ test("a failed refresh is reported separately after a successful endpoint change
   expect(app.shows(`id:endpoint-current:${custom.id} >> text:${NEW}`)).toBe(true);
 });
 
+for (const ack of ["lost", "malformed"] as const) {
+  test(`a ${ack} endpoint acknowledgement requires an authoritative reload; a committed change isn't sent again`, async () => {
+    const { f, custom } = fixture();
+    f.state.endpointAck.set(NEW, ack);
+    const app = await open("../../App.tsx", { modules: launched(), network: f.network as any, width: 1200, height: 900, platform: "linux", clock: {} });
+    await signIn(f, "alice", app);
+    await edit(app, custom.id);
+    await app.press(`id:endpoint-section:${custom.id} >> label:${NEW}`);
+    await app.press(`id:endpoint-save:${custom.id}`);
+    await app.waitFor("id:endpoint-feedback >> label:Reload connection");
+    expect(custom.base_url).toBe(NEW);
+    expect(app.shows(`id:endpoint-current:${custom.id} >> text:${OLD}`)).toBe(true);
+    expect(app.shows("text:Last known URL")).toBe(true);
+    expect(app.enabled(`id:endpoint-save:${custom.id}`)).toBe(false);
+    expect(app.shows("id:endpoint-feedback >> label:Try again")).toBe(false);
+
+    const late = f.answerLate("/v1/providers", TOKENS.alice!, 2000);
+    await app.press("id:endpoint-feedback >> label:Reload connection");
+    await app.waitUntil(() => late.arrived() === 1);
+    expect(app.enabled(`id:endpoint-save:${custom.id}`)).toBe(false);
+    expect(app.shows(`id:endpoint-current:${custom.id} >> text:${OLD}`)).toBe(true);
+    await app.clock!.runFor(2000);
+    await app.waitFor(`id:endpoint-current:${custom.id} >> text:${NEW}`);
+    await app.waitFor("id:endpoint-feedback >> text:/confirmed the new endpoint was saved/");
+    expect(app.shows(`id:endpoint-input:${custom.id}`)).toBe(false);
+    expect(patches(f, custom.id)).toHaveLength(1);
+  });
+}
+
+test("a failed endpoint reload keeps the editor locked; a later success can confirm the old endpoint", async () => {
+  const { f, custom } = fixture();
+  // An intermediary's generic 504 is not proof the server refused its probe.
+  f.state.endpointRefusals.set(NEW, { status: 504, error: "Gateway Timeout" });
+  const app = await signIn(f, "alice");
+  await edit(app, custom.id);
+  await app.press(`id:endpoint-section:${custom.id} >> label:${NEW}`);
+  await app.press(`id:endpoint-save:${custom.id}`);
+  await app.waitFor("id:endpoint-feedback >> label:Reload connection");
+  await app.press("id:connection-back");
+  await app.press(`id:connection:${custom.id}:open`);
+  await app.waitFor("id:endpoint-feedback >> label:Reload connection");
+  expect(app.enabled(`id:endpoint-save:${custom.id}`)).toBe(false);
+  f.state.providersReadStatus = 503;
+  await app.press("id:endpoint-feedback >> label:Reload connection");
+  await app.waitFor("id:endpoint-feedback >> text:/reload didn't confirm/");
+  expect(app.enabled(`id:endpoint-save:${custom.id}`)).toBe(false);
+  expect(patches(f, custom.id)).toHaveLength(1);
+  f.state.providersReadStatus = 200;
+  await app.press("id:endpoint-feedback >> label:Reload connection");
+  await app.waitFor("id:endpoint-feedback >> text:/still reports the previous endpoint/");
+  expect(app.enabled(`id:endpoint-save:${custom.id}`)).toBe(true);
+  expect(patches(f, custom.id)).toHaveLength(1);
+});
+
 test("only owners see endpoint details; built-in and device connections don't show a server endpoint editor", async () => {
   const { f, custom } = fixture();
   const builtIn = f.addConnection("bob", "openai", "Bob model", "gpt-fixture-1");

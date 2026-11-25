@@ -26,6 +26,7 @@ import {
   Column,
   Disclosure,
   CompactAudioPlayer,
+  ConfirmInline,
   FileIcon,
   FileList,
   FileRow,
@@ -418,7 +419,7 @@ const RERANK_NOTE = "With a System One connection, search also sends short extra
 export function MediaModelSettings(props: { separate?: boolean; canReveal?: boolean }) {
   untracked(() => void loadModels());
   const items = (): PickerItem[] => [
-    { value: "none", label: "None" },
+    { value: "none", label: "None", detail: "Indexing and file search are off." },
     ...mediaModels().map((m) => ({ value: m.connectionId, label: `${m.name}${m.model ? ` · ${m.model}` : ""}${m.owned ? "" : ` · shared by ${m.ownerId ?? "someone"}`}` })),
   ];
   const missing = () => modelsLoaded() && !modelsLoading() && modelDraft() !== null && !draftModel();
@@ -444,20 +445,26 @@ export function MediaModelSettings(props: { separate?: boolean; canReveal?: bool
         label="Index and search with"
         description={
           modelsLoading() ? "Loading media models…" : modelsUnsupported() ? "This server doesn't offer indexing and file search."
-            : !modelsLoaded() ? "The saved model hasn't been loaded."
+            : !modelsLoaded() ? "The server hasn't confirmed the saved model."
             : savedModel()
-              ? `Saved: ${savedModel()!.name}.`
-              : savedModelId() ? "The saved selection is unavailable; no other model takes its place."
+            ? `Saved: ${savedModel()!.name}.`
+              : savedModelId() ? "The saved selection is unavailable in personal scope; no other model takes its place."
               : mediaModels().length === 0
-                ? "No media models yet. Add EmbeddingGemma 2 in Model connections, or ask someone to share theirs."
+                ? "No media models yet. Add EmbeddingGemma 2 in Model connections, or ask for an organization share."
                 : "Nothing is chosen, so nothing can be indexed or searched."
         }
         stacked
       >
         <Column gap={2}>
-          <Picker testID="library-model-picker" accessibilityLabel="Media model" items={items()}
-            value={missing() ? null : modelDraft() ?? "none"} placeholder="Unavailable selection"
-            disabled={!modelsLoaded() || modelsLoading() || savingModel()} onChange={(v) => { modelDraft.set(v === "none" ? null : v); modelNotice.set(null); }} />
+          <If when={modelsLoaded() && !modelsLoading()}>
+            <Picker testID="library-model-picker" accessibilityLabel="Media model" items={items()}
+              value={missing() ? null : modelDraft() ?? "none"} placeholder="Unavailable selection"
+              disabled={savingModel()} onChange={(v) => {
+                if (!modelsLoaded() || modelsLoading() || savingModel()) return;
+                modelDraft.set(v === "none" ? null : v);
+                modelNotice.set(null);
+              }} />
+          </If>
           <If when={missing()}>
             <ProblemNote tone="warning" testID="library-model-missing"
               text="Choose another media model or clear this selection and save. Metro won't replace it automatically."
@@ -469,7 +476,7 @@ export function MediaModelSettings(props: { separate?: boolean; canReveal?: bool
           </If>
         </Column>
       </SettingRow>
-      <If when={draftModel()}>
+      <If when={modelsLoaded() && !modelsLoading() ? draftModel() : null}>
         {(m) => (
           <Column padX={4} padY={3} gap={1} testID="library-model-dataflow">
             <Label variant="strong">Where your files go</Label>
@@ -507,29 +514,37 @@ export function MediaModelFeedback() {
 
 export function MediaModelSaveBar(props: { separate?: boolean }) {
   const dirty = () => modelDraft() !== savedModelId();
+  const disabled = () => !dirty() || !modelsLoaded() || modelsLoading() || (modelDraft() !== null && !draftModel());
+  const save = (confirmed?: { previous: string; next: string | null }) => {
+    void saveModel(confirmed).then((saved) => {
+      if (saved && savedModelId()) mediaModelAsked.set(false);
+    });
+  };
   return (
     <If when={!props.separate || dirty() || savingModel()}>
-      <ActionBar justify="between">
-        <Column grow>
-          <If when={dirty()}><Label variant="caption" color="muted">Unsaved media model</Label></If>
-        </Column>
-        <Row gap={2}>
+      <Column gap={2}>
+        <ActionBar justify="between">
+          <Column grow>
+            <If when={dirty()}><Label variant="caption" color="muted">Unsaved media model</Label></If>
+          </Column>
           <Action testID="library-model-revert" label="Revert" disabled={!dirty() || savingModel()} variant="ghost" onPress={revertMediaModel} />
-          <Action
-            testID="library-model-save"
-            label={props.separate ? "Save media model" : "Save"}
-            busyLabel="Saving…"
-            busy={savingModel()}
-            disabled={!dirty() || !modelsLoaded() || modelsLoading() || (modelDraft() !== null && !draftModel())}
-            variant="primary"
-            onPress={() =>
-              void saveModel().then((saved) => {
-                if (saved && savedModelId()) mediaModelAsked.set(false);
-              })
-            }
-          />
-        </Row>
-      </ActionBar>
+          <If when={!savedModelId()}>
+            <Action testID="library-model-save" label={props.separate ? "Save media model" : "Save"} busyLabel="Saving…"
+              busy={savingModel()} disabled={disabled()} variant="primary" onPress={() => save()} />
+          </If>
+        </ActionBar>
+        <If when={savedModelId()}>
+          {(previous) => (
+            <ConfirmInline testID="library-model-save"
+              triggerLabel={modelDraft() === null ? "Clear media model…" : "Change media model…"}
+              confirmLabel={modelDraft() === null ? "Clear model and index" : "Change model and clear index"}
+              message="This removes your Documents & media index, not your files or anyone else's index. Index your files again to search them with a new model."
+              scopeKey={JSON.stringify([previous(), modelDraft(), modelsLoaded(), modelsLoading()])}
+              busy={savingModel()} busyLabel="Saving…" disabled={disabled()}
+              onConfirm={() => save({ previous: previous(), next: modelDraft() })} />
+          )}
+        </If>
+      </Column>
     </If>
   );
 }

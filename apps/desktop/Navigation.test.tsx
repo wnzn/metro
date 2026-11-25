@@ -1,5 +1,5 @@
 // Cross-lane navigation on the real app entry: the sidebar's Library, and the
-// media model chosen in Settings › Model providers, separate from the
+// media model chosen in Settings › Model choices, separate from the
 // Library itself. Headless, against the shared fake server plus the library
 // routes (fake tokens only, no network).
 
@@ -41,25 +41,30 @@ test("Library opens from the sidebar and lists only what I can access, without i
   expect(modelWork(w)).toBe(0);
 });
 
-test("the media model is chosen in Settings › Model providers: its data flow is disclosed, and saving indexes nothing", async () => {
+test("Model choices offers personal media models and discloses data flow; saving neither indexes nor searches", async () => {
   const w = libraryWorld();
   const mine = w.addAsset("alice", null, "notes.md", "# Notes\n\nThe rollback plan.");
   w.f.addConnection("alice", "custom-embeddings", "Text embeddings", "nomic-embed");
   const own = w.addMediaConnection("alice", "device-embeddinggemma-2", "My EG2");
-  w.addMediaConnection("bob", "embeddinggemma-2", "Bob's EG2 server", { visibility: "spaces", space_ids: ["acme"] });
+  w.addMediaConnection("bob", "embeddinggemma-2", "Bob's EG2 server", { visibility: "organization", space_ids: [] });
+  const spaceOnly = w.addMediaConnection("bob", "embeddinggemma-2", "Space-only EG2", { visibility: "spaces", space_ids: ["acme"] });
   const app = await signIn(w);
   await app.press("id:nav-library");
   await app.waitFor(`id:library-file:${mine.id}`);
 
   await app.press("id:nav-settings");
   await app.press("id:nav-settings:providers");
+  await app.waitFor("id:providers-settings");
+  expect(app.shows("id:library-model")).toBe(false);
+  await app.press("id:nav-settings:routing");
+  await app.waitFor("id:routing-settings >> text:Model choices");
   await app.waitFor("id:library-model");
-  // The page also lists saved connections: count what the picker adds.
-  const textOnly = app.count("text:/Text embeddings/");
   await app.press("id:library-model-picker");
   await app.waitFor("text:/Bob's EG2 server/");
-  // A text-only embeddings connection never stands in for media embedding.
-  expect(app.count("text:/Text embeddings/")).toBe(textOnly);
+  expect(app.shows("text:/Text embeddings/")).toBe(false);
+  expect(app.shows(`id:library-model-picker:${spaceOnly}`)).toBe(false);
+  expect(app.shows("text:/Space-only EG2/")).toBe(false);
+  expect(w.f.state.log.some((r) => r.path === "/v1/models/available" && r.user === "alice")).toBe(true);
   await app.press("text:/Bob's EG2 server/");
   await app.waitFor("id:library-model-dataflow");
   expect(text(app)).toContain("Shared by bob: it runs on bob's endpoint, so whoever runs that endpoint can see the files and queries sent, and bob may pay for it.");

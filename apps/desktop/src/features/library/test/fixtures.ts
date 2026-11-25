@@ -33,6 +33,8 @@ export function libraryWorld() {
     hits: [] as FakeHit[],
     ranking: "mixed" as "classifier" | "embeddings" | "mixed",
     settings: new Map<string, string | null>(),
+    settingsReadStatus: 200,
+    index: new Map<string, Set<string>>(),
     /** Server-configured file limit (bytes). */
     maxFileBytes: 8 * 1024 * 1024,
     /**
@@ -145,11 +147,16 @@ export function libraryWorld() {
       }
     }
     if (path === "/v1/library/settings") {
-      if (req.method === "GET") return ok({ embedding_id: l.settings.get(user) ?? null });
+      if (req.method === "GET") return l.settingsReadStatus === 200
+        ? ok({ embedding_id: l.settings.get(user) ?? null })
+        : err(l.settingsReadStatus, "could not load library settings");
       if (req.method === "PUT") {
         const id = body()?.embedding_id ?? null;
         const c = id ? (f.state.connections.get(id) as any) : null;
-        if (id && (!c || !String(c.provider_id).includes("embeddinggemma-2"))) return err(422, "that connection cannot embed documents, images, audio or video");
+        if (id && (!c || !(c.owner === user || c.share.visibility === "organization" ||
+          (c.share.visibility === "spaces" && c.share.space_ids.some((sid: string) => member(user, sid) && member(c.owner, sid)))))) return err(409, "that connection cannot be used");
+        if (id && !String(c.provider_id).includes("embeddinggemma-2")) return err(422, "that connection cannot embed documents, images, audio or video");
+        if (id !== (l.settings.get(user) ?? null)) l.index.delete(user);
         l.settings.set(user, id);
         return ok({ embedding_id: id });
       }
@@ -159,6 +166,7 @@ export function libraryWorld() {
       const id = body()?.asset_id;
       const a = l.assets.find((x) => x.id === id);
       if (!a || !visible(user, a)) return err(404, "asset not found");
+      l.index.set(user, new Set([...(l.index.get(user) ?? []), a.id]));
       return ok({ indexed_segments: 3, partial: false, items: [{ asset_id: a.id, status: "indexed", indexed_segments: 3, partial: false }] });
     }
     if (path === "/v1/library/search" && req.method === "POST") {

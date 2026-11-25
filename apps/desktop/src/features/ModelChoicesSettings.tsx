@@ -164,11 +164,12 @@ function modelDetail(m: AvailableModel): string {
     : m.runsOn === "your_own_sign_in"
       ? `Preset from ${m.ownerId ?? "someone"} · runs on your own sign-in`
       : `Shared by ${m.ownerId ?? "someone"}, who can see these requests`;
+  const scope = !m.owned && m.visibility === "spaces" ? " · Shared Spaces only, not personal Chat" : "";
   const model = defaultModelOf(m);
   const notReady = !m.model ? " · Add a model to it first"
     : m.ready === false && m.runsOn === "your_own_sign_in" ? " · Sign in with your own account first"
     : modelChoiceUsable(m, m.capability) ? "" : " · Not available now";
-  return [model, whose].filter(Boolean).join(" · ") + notReady;
+  return [model, whose].filter(Boolean).join(" · ") + scope + notReady;
 }
 
 /**
@@ -216,7 +217,7 @@ function RoutingModelPicker(props: {
         testID={props.testID}
         rememberAs="routing"
         accessibilityLabel={props.label}
-        options={optionsFor(props.capability, props.none)}
+        options={catalogReady() ? optionsFor(props.capability, props.none) : []}
         value={pinned() ? (missing() ? null : props.value) : props.none ? NONE : null}
         onChange={(v) => props.onChange(v ? v : null)}
         placeholder={pinned() ? (missing() ? "Unavailable selection" : "Checking saved selection…") : props.placeholder ?? props.none ?? "Choose a model"}
@@ -295,16 +296,17 @@ function RoutingGroup(props: { draft: RoutingDraft }) {
       <SectionMore testID="routing-learn-more">
         <FactList
           facts={[
-            { label: "Starts on", value: "Messages in personal Chat, and requests that start an agent in a Space." },
-            { label: "Override", value: "A model you pick for one turn overrides it." },
+            { label: "Applies to", value: "Agent runs you start when use-case routing is on and no model choice overrides it." },
+            { label: "Override", value: "A model you pick for one turn overrides it. Models chosen for a Space or agent also take priority there." },
             { label: "When off", value: "Your default chat connection answers." },
             { label: "Use cases", value: "System One reads each name and description to tell them apart." },
           ]}
         />
       </SectionMore>
-      <SettingRow label="Route by use case" description="Off by default. When on, each agent request you start is sent to System One to pick a model.">
+      <SettingRow label="Route by use case" description="Send eligible agent requests to System One to pick an answering model. Off by default.">
         <Toggle testID="routing-enabled" label="Route by use case" checked={d().enabled} disabled={routingSaving()} onChange={(on) => editRouting({ enabled: on })} />
       </SettingRow>
+      <SettingRow label="Space-only connections" description="A model shared only with a Space can answer there, not in personal Chat." />
       <SettingRow label="Minimum confidence" description="0 to 100%. Below it, the fallback model answers." stacked>
         <PercentField
           testID="routing-min-route"
@@ -479,13 +481,15 @@ function DataFlow(props: { draft: RoutingDraft }) {
   };
   return (
     <SettingsGroup title="Where your text goes" description="Draft changes take effect only after you save." testID="routing-dataflow">
+      <SettingRow label="Send in personal Chat" description="Send starts your Chat agent directly; System One never decides whether to start it." testID="dataflow-chat-send" />
+      <SettingRow label="Save note in personal Chat" description="Save note keeps the message in your Chat without starting an agent or routing a request." testID="dataflow-chat-note" />
       <FlowRow
         label="Use-case routing"
         on={d().enabled}
         off="Off: nothing is sent to pick a model. Your default chat connection answers."
         testID="dataflow-routing"
         facts={[
-          { label: "When", value: "Agent work starts for you" },
+          { label: "When", value: "Agent work starts for you, routing is enabled there, and no model choice overrides it" },
           { label: "Sends", value: "That message's text, and your use-case names and descriptions" },
           ...flow(d().classifierId, "system_one"),
           { label: "Then", value: "The model it picks answers as usual" },

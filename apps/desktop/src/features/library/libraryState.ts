@@ -78,6 +78,7 @@ export const modelsUnsupported = signal(false);
 export const savingModel = signal(false);
 let mediaModelsSeq = 0;
 let mediaVisit = 0;
+let mediaIndexRevision = 0;
 
 export const savedModel = computed(() => mediaModels().find((m) => m.connectionId === savedModelId()) ?? null);
 export const draftModel = computed(() => mediaModels().find((m) => m.connectionId === modelDraft()) ?? null);
@@ -321,7 +322,9 @@ export async function loadModels(): Promise<void> {
     modelsUnsupported.set(false);
   });
   try {
-    const [models, settings] = await Promise.all([c.availableModels(), api.librarySettings()]);
+    // This account-wide picker offers connections usable in personal scope.
+    // The server still checks the concrete scope of every index or search.
+    const [models, settings] = await Promise.all([c.availableModels(null), api.librarySettings()]);
     if (!live()) return;
     const edited = modelDraft() !== savedModelId();
     batch(() => {
@@ -334,9 +337,13 @@ export async function loadModels(): Promise<void> {
     });
   } catch (error) {
     if (!live()) return;
+    batch(() => {
+      modelsLoaded.set(false);
+      mediaModels.set([]);
+      suggestedModelId.set(null);
+    });
     if (statusOf(error) === 404) {
       modelsUnsupported.set(true);
-      modelsLoaded.set(false);
       return;
     }
     const message = failure(error, "Couldn't load media models");
@@ -346,10 +353,12 @@ export async function loadModels(): Promise<void> {
   }
 }
 
-export async function saveModel(): Promise<boolean> {
+export async function saveModel(confirmed?: { previous: string; next: string | null }): Promise<boolean> {
   const api = library();
   const id = modelDraft();
-  if (!api || !modelsLoaded() || modelsLoading() || savingModel() || id === savedModelId() || (id !== null && !draftModel())) return false;
+  const previous = savedModelId();
+  if (!api || !modelsLoaded() || modelsLoading() || savingModel() || id === previous || (id !== null && !draftModel())) return false;
+  if (previous !== null && (confirmed?.previous !== previous || confirmed.next !== id)) return false;
   const ok = sessionGuard();
   const visit = mediaVisit;
   batch(() => {
@@ -361,6 +370,14 @@ export async function saveModel(): Promise<boolean> {
     const saved = await api.putLibrarySettings(id);
     if (!ok()) return false;
     batch(() => {
+      if (previous !== null && saved.embeddingId !== previous) {
+        mediaIndexRevision++;
+        indexStates.set({});
+        libAnswer.set(null);
+        libSearchError.set(null);
+        libSearching.set(false);
+        lessRelevantOpen.set(false);
+      }
       savedModelId.set(saved.embeddingId);
       modelDraft.set(saved.embeddingId);
       if (saved.suggestedId) suggestedModelId.set(saved.suggestedId);
@@ -484,7 +501,9 @@ export async function indexAsset(asset: LibraryAsset): Promise<void> {
     indexStates.set({ ...indexStates(), [asset.id]: { state: "failed", message: "Choose and save a media model first." } });
     return;
   }
-  const ok = sessionGuard(asset.spaceId ?? undefined);
+  const sameSession = sessionGuard(asset.spaceId ?? undefined);
+  const revision = mediaIndexRevision;
+  const ok = () => sameSession() && revision === mediaIndexRevision;
   const set = (s: IndexState) => indexStates.set({ ...indexStates(), [asset.id]: s });
   set({ state: "indexing", message: `Sending to ${savedModel()?.name ?? "your media model"}…` });
   try {
@@ -588,7 +607,9 @@ export async function runLibrarySearch(): Promise<void> {
   }
   const scope = libScope();
   const kind = libKind();
-  const ok = sessionGuard();
+  const sameSession = sessionGuard();
+  const revision = mediaIndexRevision;
+  const ok = () => sameSession() && revision === mediaIndexRevision;
   const mine = ++seq;
   batch(() => {
     libSearching.set(true);

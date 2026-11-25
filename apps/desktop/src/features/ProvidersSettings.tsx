@@ -25,7 +25,7 @@
 // row, and in Sharing (the owner of the device or endpoint sees the requests
 // and may pay for them). Feedback shows in the page's fixed footer.
 
-import { cleanup, signal } from "nsh";
+import { cleanup, effect, signal } from "nsh";
 import {
   closeSharing,
   isSubscription,
@@ -58,6 +58,9 @@ import {
   deviceConfirmUnpair,
   deviceStatuses,
   deleteConnection,
+  dismissEndpointCheck,
+  endpointChecks,
+  endpointNeedsReload,
   fetchModels,
   isAllowedBaseUrl,
   isDeviceConnection,
@@ -68,6 +71,7 @@ import {
   providerById,
   providerConfirmDelete,
   providerNotice,
+  reloadEndpoint,
   removeConnectionModel,
   revealed,
   rotateDeviceToken,
@@ -162,7 +166,11 @@ const openDetails = (id: string) => {
 export function ProvidersSettings() {
   const device = () => revealed()?.kind === "device";
   const endpointFeedback = signal<EndpointFeedback | null>(null);
-  const currentFeedback = () => endpointFeedback()?.id === detailsOf() ? endpointFeedback() : null;
+  const currentFeedback = () => {
+    const id = detailsOf();
+    if (!id) return null;
+    return endpointCheckFeedback(id) ?? (endpointFeedback()?.id === id ? endpointFeedback() : null);
+  };
   const hasMessages = () => !device() && !!(catalogError() || connectionsError() || providerNotice() || currentFeedback());
   const open = () => {
     const id = detailsOf();
@@ -202,7 +210,33 @@ export function ProvidersSettings() {
   );
 }
 
-type EndpointFeedback = { id: string; message: string; tone: "success" | "warning" | "danger"; detail?: string; retry?: () => void };
+type EndpointFeedback = {
+  id: string; message: string; tone: "success" | "warning" | "danger"; detail?: string;
+  action?: { label: string; run: () => void; busy?: () => boolean };
+};
+
+function endpointCheckFeedback(id: string): EndpointFeedback | null {
+  const check = endpointChecks()[id];
+  if (!check) return null;
+  switch (check.phase) {
+    case "unknown":
+    case "reload-failed": return {
+      id, tone: "warning", detail: check.detail,
+      message: check.phase === "reload-failed"
+        ? "The reload didn't confirm the current endpoint. Try reloading again."
+        : "Metro couldn't confirm the endpoint change. Reload the connection before changing it again.",
+      action: { label: "Reload connection", run: () => void reloadEndpoint(id), busy: () => providerBusy() === `endpoint-reload:${id}` },
+    };
+    case "saved": {
+      const connection = connections()?.find((c) => c.id === id);
+      return { id, tone: "success", message: connection && providerById(connection.providerId)?.listsModels
+        ? "The server confirmed the new endpoint was saved. Use Refresh models to update the list."
+        : "The server confirmed the new endpoint was saved." };
+    }
+    case "unchanged": return { id, tone: "warning", message: "The server still reports the previous endpoint. You can test and save the new URL again." };
+    case "different": return { id, tone: "warning", message: "The server reports a different endpoint. Review the current URL before making another change." };
+  }
+}
 
 /** Errors and what the last change did, in the page's fixed footer. Technical text only on request. */
 function Messages(props: { endpoint: EndpointFeedback | null }) {
@@ -211,7 +245,8 @@ function Messages(props: { endpoint: EndpointFeedback | null }) {
     <Column gap={2}>
       <If when={props.endpoint}>
         {(result) => <Banner variant="inline" tone={result().tone} testID="endpoint-feedback" message={result().message}
-          action={result().retry ? <Action label="Try again" onPress={() => result().retry?.()} /> : undefined} />}
+          action={result().action ? <Action label={result().action!.label} busyLabel="Reloading…" busy={result().action!.busy?.()}
+            onPress={() => result().action?.run()} /> : undefined} />}
       </If>
       <If when={catalogError()}>{(message) => <Banner variant="inline" tone="danger" testID="catalog-error" message={message()}
         action={<Action label="Try again" onPress={() => void loadProviders()} />} />}</If>
@@ -541,25 +576,29 @@ function EndpointSection(props: { connection: ProviderConnection; feedback: (val
   const approved = () => catalog()?.allowedBaseUrls ?? [];
   const current = () => c().baseUrl ?? providerById(c().providerId)?.defaultBaseUrl ?? null;
   const canChange = () => !catalogError() && approved().some((url) => url !== current());
+  const check = () => endpointNeedsReload(id);
   const busy = () => providerBusy() === `endpoint:${id}` || providerBusy() === `endpoint-refresh:${id}`;
-  const editing = signal(false);
-  const value = signal("");
+  const editing = signal(check());
+  const value = signal(endpointChecks()[id]?.to ?? "");
   const error = signal<string | null>(null);
   let mounted = true;
   cleanup(() => { mounted = false; });
   const change = () => {
+    if (check()) return;
+    dismissEndpointCheck(id);
     value.set(current() ?? "");
     error.set(null);
     props.feedback(null);
     editing.set(true);
   };
   const edit = (url: string) => {
+    dismissEndpointCheck(id);
     value.set(url);
     error.set(null);
     props.feedback(null);
   };
   const submit = async () => {
-    if (!mounted || !editing() || providerBusy()) return;
+    if (!mounted || !editing() || providerBusy() || check()) return;
     const url = value();
     props.feedback(null);
     error.set(null);
@@ -571,8 +610,8 @@ function EndpointSection(props: { connection: ProviderConnection; feedback: (val
     if (!mounted) return;
     if (outcome.kind === "not-approved") {
       error.set(ENDPOINT_NOT_APPROVED);
-    } else if (outcome.kind === "failed") {
-      props.feedback({ id, tone: "danger", message: outcome.message, detail: outcome.detail, retry: () => void submit() });
+    } else if (outcome.kind === "refused") {
+      props.feedback({ id, tone: "danger", message: outcome.message, detail: outcome.detail, action: { label: "Try again", run: () => void submit() } });
     } else if (outcome.kind === "changed") {
       editing.set(false);
       const listing = outcome.listing;
@@ -589,15 +628,25 @@ function EndpointSection(props: { connection: ProviderConnection; feedback: (val
       });
     }
   };
+  effect(() => {
+    const result = endpointChecks()[id];
+    if (result?.phase === "unchanged") {
+      value.set(result.to);
+      editing.set(true);
+    } else if (result?.phase === "saved" || result?.phase === "different") {
+      // A committed or superseded draft is never offered for replay.
+      editing.set(false);
+    }
+  });
   return (
     <SettingsGroup title="Endpoint" description="Only endpoints the operator approved. Metro tests the new one before it switches." testID={`endpoint-section:${id}`}>
-      <SettingRow label="Current URL" stacked>
+      <SettingRow label={check() ? "Last known URL" : "Current URL"} stacked>
         <Row align="center" gap={3} wrap>
           <Column selectable grow testID={`endpoint-current:${id}`}>
             <Label variant="mono">{current() ?? "No endpoint set"}</Label>
           </Column>
           <If when={!editing()}>
-            <Action label="Change…" testID={`endpoint-change:${id}`} disabled={!canChange() || !!providerBusy()} onPress={change} />
+            <Action label="Change…" testID={`endpoint-change:${id}`} disabled={!canChange() || !!providerBusy() || !!check()} onPress={change} />
           </If>
         </Row>
         <If when={!editing() && !canChange() && !catalogError()}>
@@ -612,18 +661,18 @@ function EndpointSection(props: { connection: ProviderConnection; feedback: (val
           <Column gap={2}>
             <Row gap={2} wrap>
               <Each of={approved()} key={(url) => url}>
-                {(url) => <Chip label={url()} selected={value() === url()} disabled={!!providerBusy()} onPress={() => edit(url())} />}
+                {(url) => <Chip label={url()} selected={value() === url()} disabled={!!providerBusy() || !!check()} onPress={() => edit(url())} />}
               </Each>
             </Row>
-            <Field testID={`endpoint-input:${id}`} accessibilityLabel="Approved endpoint URL" value={value()} onChange={edit} disabled={!!providerBusy()} />
+            <Field testID={`endpoint-input:${id}`} accessibilityLabel="Approved endpoint URL" value={value()} onChange={edit} disabled={!!providerBusy() || !!check()} />
             <If when={error()}>
               {(message) => <ProblemNote tone="danger" testID={`endpoint-error:${id}`} text={message()} />}
             </If>
             <ActionBar>
-              <Action label="Cancel" variant="ghost" disabled={busy()} onPress={() => { editing.set(false); props.feedback(null); }} />
+              <Action label="Cancel" variant="ghost" disabled={busy() || check()} onPress={() => { dismissEndpointCheck(id); editing.set(false); props.feedback(null); }} />
               <Action label="Test and save" variant="primary" testID={`endpoint-save:${id}`} busy={busy()}
                 busyLabel={providerBusy() === `endpoint-refresh:${id}` ? "Refreshing models…" : "Testing and saving…"}
-                disabled={!value() || value() === current() || catalogError() !== null || (!!providerBusy() && !busy())} onPress={() => void submit()} />
+                disabled={!value() || value() === current() || !!check() || catalogError() !== null || (!!providerBusy() && !busy())} onPress={() => void submit()} />
             </ActionBar>
           </Column>
         </SettingRow>
@@ -667,7 +716,7 @@ function ModelsSection(props: { connection: ProviderConnection }) {
             label="Refresh models"
             busyLabel="Listing…"
             busy={listing()?.state === "loading"}
-            disabled={!!providerBusy()}
+            disabled={!!providerBusy() || endpointNeedsReload(c().id)}
             compact
             onPress={() => void fetchModels(c().id)}
           />

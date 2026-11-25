@@ -73,6 +73,11 @@ export function fakeServer() {
     /** Scripted endpoint test failures, before PATCH commits; never a live provider request. */
     endpointRefusals: new Map<string, { status: number; error: string }>(),
     endpointProbes: [] as string[],
+    /** Break only the response to a committed endpoint PATCH. */
+    endpointAck: new Map<string, "lost" | "malformed">(),
+    providersReadStatus: 200,
+    /** Scenario opts into modern flat chat inventory; other callers exercise the older shape. */
+    chatInventory: false,
     /** Device connection ids whose metro-connector is online. */
     online: new Set<string>(),
     /** Model routing per user (missing: the defaults, all off). */
@@ -249,6 +254,7 @@ export function fakeServer() {
     }
     if (path === "/v1/provider-catalog" && req.method === "GET") return ok({ ...CATALOG, allowed_base_urls: state.allowedBaseUrls });
     if (path === "/v1/providers" && req.method === "GET") {
+      if (state.providersReadStatus !== 200) return err(state.providersReadStatus, "could not load connections");
       return ok({ connections: [...state.connections.values()].filter((c) => c.owner === user).map(connJson) });
     }
     if (path === "/v1/providers" && req.method === "POST") {
@@ -287,6 +293,12 @@ export function fakeServer() {
             owner_id: c.owner, execution,
             runs_on: owned ? "your_connection" : preset ? "your_own_sign_in" : "owner_connection",
             billing: owned || preset ? "you" : "owner",
+            ...(state.chatInventory && c.capability === "chat" ? {
+              chat_models: modelViews(c).filter((m) => m.enabled).map((m) => ({
+                id: m.model_id, display_name: m.display_name, reasoning_efforts: m.reasoning_efforts,
+                is_default: m.is_default, available: m.available,
+              })),
+            } : {}),
             ...(preset ? { ready: [...state.connections.values()].some((x) => x.owner === user && x.provider_id === "device-openai-oauth" && !!x.model) } : {}),
             is_default: owned && c.is_default,
           };
@@ -402,6 +414,10 @@ export function fakeServer() {
             const refusal = state.endpointRefusals.get(url);
             if (refusal) return err(refusal.status, refusal.error);
             c.base_url = url;
+            const ack = state.endpointAck.get(url);
+            state.endpointAck.delete(url);
+            if (ack === "lost") return { error: "fixture lost the response" };
+            if (ack === "malformed") return ok({ unexpected: true });
           }
           return ok(connJson(c));
         }

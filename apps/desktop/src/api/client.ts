@@ -555,11 +555,19 @@ export function createClient(options: ClientOptions) {
       return { providers: providers.filter(isCatalogProvider).map(toCatalogProvider), allowedBaseUrls: allowed };
     },
 
-    async listProviders(): Promise<ProviderConnection[]> {
+    async listProviders(confirmEndpointOf?: string): Promise<ProviderConnection[]> {
       const data = await request("GET", "/v1/providers");
       const list = isObject(data) ? data.connections : undefined;
       if (!Array.isArray(list)) throw new ApiError("protocol", "GET /v1/providers did not return { connections: [...] }.");
-      return list.filter(isConnection).map(toConnection);
+      const connections = list.filter(isConnection);
+      if (confirmEndpointOf !== undefined) {
+        const matches = connections.filter((row) => String(row.id) === confirmEndpointOf);
+        const url = matches[0]?.base_url; // absent or null is valid for a provider's built-in URL
+        if (list.length !== connections.length || matches.length > 1 || (url != null && (typeof url !== "string" || !url))) {
+          throw new ApiError("protocol", "GET /v1/providers did not confirm the connection's endpoint.");
+        }
+      }
+      return connections.map(toConnection);
     },
 
     async createProvider(body: NewProviderConnection): Promise<ProviderConnection> {
