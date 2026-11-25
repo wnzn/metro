@@ -48,7 +48,7 @@ $Secret = '/run/secrets/metro_runner_token'
 # Fixed shell text for the container; settings reach it only as arguments or
 # environment values, never inside the text. Same as RUNNER_ENTRY and
 # PROBE_TCP in metro-runner-container.sh.
-$RunnerEntry = 'if [ -n "${METRO_DIRECT_NO_PROXY:-}" ]; then NO_PROXY="${NO_PROXY:-${no_proxy:-}}"; NO_PROXY="${NO_PROXY:+$NO_PROXY,}$METRO_DIRECT_NO_PROXY"; no_proxy="$NO_PROXY"; export NO_PROXY no_proxy; fi; unset METRO_DIRECT_NO_PROXY; IFS= read -r METRO_RUNNER_TOKEN < /run/secrets/metro_runner_token || [ -n "$METRO_RUNNER_TOKEN" ]; export METRO_RUNNER_TOKEN; exec /usr/local/bin/metro-runner'
+$RunnerEntry = 'if [ -n "${METRO_DIRECT_NO_PROXY:-}" ]; then NO_PROXY="${NO_PROXY-${no_proxy-}}"; NO_PROXY="${NO_PROXY:+$NO_PROXY,}$METRO_DIRECT_NO_PROXY"; no_proxy="$NO_PROXY"; export NO_PROXY no_proxy; fi; unset METRO_DIRECT_NO_PROXY; IFS= read -r METRO_RUNNER_TOKEN < /run/secrets/metro_runner_token || [ -n "$METRO_RUNNER_TOKEN" ]; export METRO_RUNNER_TOKEN; exec /usr/local/bin/metro-runner'
 $ProbeTcp = 'exec 3<>"/dev/tcp/$1/$2"'
 $ProbeToken = 'test -r "$1" && test -s "$1"'
 $DefaultRepo = 'ghcr.io/wnzn/metro-runner'

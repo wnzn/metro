@@ -333,7 +333,7 @@ PROBE_TCP='exec 3<>"/dev/tcp/$1/$2"'
 # only as environment values. Same text as $RunnerEntry in
 # metro-runner-container.ps1.
 # shellcheck disable=SC2016 # expanded by the container shell
-RUNNER_ENTRY='if [ -n "${METRO_DIRECT_NO_PROXY:-}" ]; then NO_PROXY="${NO_PROXY:-${no_proxy:-}}"; NO_PROXY="${NO_PROXY:+$NO_PROXY,}$METRO_DIRECT_NO_PROXY"; no_proxy="$NO_PROXY"; export NO_PROXY no_proxy; fi; unset METRO_DIRECT_NO_PROXY; IFS= read -r METRO_RUNNER_TOKEN < /run/secrets/metro_runner_token || [ -n "$METRO_RUNNER_TOKEN" ]; export METRO_RUNNER_TOKEN; exec /usr/local/bin/metro-runner'
+RUNNER_ENTRY='if [ -n "${METRO_DIRECT_NO_PROXY:-}" ]; then NO_PROXY="${NO_PROXY-${no_proxy-}}"; NO_PROXY="${NO_PROXY:+$NO_PROXY,}$METRO_DIRECT_NO_PROXY"; no_proxy="$NO_PROXY"; export NO_PROXY no_proxy; fi; unset METRO_DIRECT_NO_PROXY; IFS= read -r METRO_RUNNER_TOKEN < /run/secrets/metro_runner_token || [ -n "$METRO_RUNNER_TOKEN" ]; export METRO_RUNNER_TOKEN; exec /usr/local/bin/metro-runner'
 
 # Runner images up to 0.4.0 refuse plain http beyond loopback without this
 # opt-in; newer ones accept it, ignore it and print their own warning.

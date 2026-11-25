@@ -723,17 +723,19 @@ def runner_entry(script):
 class ContainerEntryTests(unittest.TestCase):
     """The runner container's fixed entry script, run here with sh."""
 
-    def run_entry(self, env):
-        entry = runner_entry(CONTAINER)
-        self.assertEqual(entry, runner_entry(CONTAINER_PS1), "the .sh and .ps1 entries must be the same text")
+    def run_entry(self, env, *, script=CONTAINER, shell="sh"):
+        self.assertEqual(runner_entry(CONTAINER), runner_entry(CONTAINER_PS1),
+                         "the .sh and .ps1 entries must be the same text")
+        entry = runner_entry(script)
         with tempfile.TemporaryDirectory() as d:
             token = Path(d) / "token"
+            token.touch(mode=0o600)
             token.write_text("metro_rt_v2_secret-value\n")
             # Only the secret's path and the final exec are swapped for the test.
             local = entry.replace("/run/secrets/metro_runner_token", str(token)).replace(
                 "exec /usr/local/bin/metro-runner", 'printf "NO_PROXY=%s|no_proxy=%s|direct=%s\\n" '
                 '"${NO_PROXY-unset}" "${no_proxy-unset}" "${METRO_DIRECT_NO_PROXY-unset}"')
-            return subprocess.run(["sh", "-c", local], text=True, capture_output=True, check=True,
+            return subprocess.run([shell, "-c", local], text=True, capture_output=True, check=True,
                                   env={"PATH": os.environ["PATH"], **env}).stdout.strip()
 
     def test_metro_host_is_appended_and_engine_exclusions_survive(self):
@@ -747,6 +749,15 @@ class ContainerEntryTests(unittest.TestCase):
         # An ordinary destination: the engine's settings stay exactly as they were.
         self.assertEqual(self.run_entry({"NO_PROXY": "corp.internal"}),
                          "NO_PROXY=corp.internal|no_proxy=unset|direct=unset")
+
+    def test_empty_uppercase_exclusions_do_not_inherit_lowercase_exclusions(self):
+        for script in (CONTAINER, CONTAINER_PS1):
+            for shell in ("sh", "dash", "bash"):
+                if shutil.which(shell):
+                    with self.subTest(script=script.name, shell=shell):
+                        got = self.run_entry({"NO_PROXY": "", "no_proxy": "corp.internal",
+                                              "METRO_DIRECT_NO_PROXY": "127.0.0.1"}, script=script, shell=shell)
+                        self.assertEqual(got, "NO_PROXY=127.0.0.1|no_proxy=127.0.0.1|direct=unset")
 
 
 class MacosInstallerTests(unittest.TestCase):
