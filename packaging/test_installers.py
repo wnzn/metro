@@ -353,6 +353,10 @@ printf 'url=%s ws=%s token_sha=%s insecure=%s file=%s\\n' "$METRO_SERVER_URL" "$
 """
 
 
+# The runner script as published in Metro 0.4.0 (before METRO_RUNNER_SELF_UPDATE).
+OLD_RUNNER_SCRIPT = HERE / "test-fixtures/install-metro-runner-linux-0.4.0.sh"
+
+
 class RunnerInstallerTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -483,6 +487,28 @@ class RunnerInstallerTests(unittest.TestCase):
         self.assertIn('METRO_RUNNER_SELF_UPDATE="1"', self.config.read_text())
         self.assertEqual(self.box.run(RUNNER, "run").returncode, 0)
         self.assertIn("--self-update must be on or off", self.box.run(RUNNER, *args, "--self-update", "yes").stderr)
+
+    def test_configure_upgrades_an_old_installed_script_copy(self):
+        # The script as shipped before METRO_RUNNER_SELF_UPDATE existed (0.4.0).
+        old = self.root / "old" / "install-metro-runner-linux.sh"
+        old.parent.mkdir()
+        old.write_bytes(OLD_RUNNER_SCRIPT.read_bytes())
+        old.chmod(0o755)
+        self.assertNotIn(b"METRO_RUNNER_SELF_UPDATE", old.read_bytes())
+        self.box.run(old, "install", "--archive", self.archive, check=True)
+        installed = self.install_root / "install-metro-runner-linux.sh"
+        self.assertEqual(installed.read_bytes(), old.read_bytes())
+        # Configuring with the new script writes the new key and replaces the old copy...
+        r = self.configure()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('METRO_RUNNER_SELF_UPDATE="1"', self.config.read_text())
+        self.assertEqual(installed.read_bytes(), RUNNER.read_bytes())
+        self.assertIn("Updated the installed copy", r.stdout)
+        # ...so the installed copy (what the unit runs) accepts the settings.
+        r = self.box.run(installed, "run")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # A copy that already knows the key is left alone.
+        self.assertNotIn("Updated the installed copy", self.configure().stdout)
 
     def test_refuses_desktop_archive_and_bad_checksum(self):
         desk = build_archive(self.root, "Metro-runner-0.3.2-linux-x64", runner_files(FAKE_RUNNER),

@@ -238,6 +238,13 @@ load_config() {
     done
 }
 
+keep_script_copy() { # this script, beside the install (`run` and the unit use it)
+    self=$(absolute "$0")
+    if [ "$self" != "$root/$PROG.sh" ]; then
+        cp -- "$self" "$root/.$PROG.new" && chmod 755 -- "$root/.$PROG.new" && mv -f -- "$root/.$PROG.new" "$root/$PROG.sh"
+    fi
+}
+
 configure() {
     if [ -z "$server_url" ] || [ -z "$workspace" ] || [ -z "$token_file" ]; then
         die "configure needs --server-url, --workspace and --token-file"
@@ -278,6 +285,13 @@ configure() {
     chmod 600 -- "$tmp"
     mv -f -- "$tmp" "$config"
     trap - EXIT
+    # An installed copy of an older script would refuse the new setting on
+    # its next `run`: replace it with this one (never a newer copy).
+    if [ -L "$root/current" ] && { [ ! -f "$root/$PROG.sh" ] ||
+        ! grep -q 'METRO_RUNNER_SELF_UPDATE' -- "$root/$PROG.sh"; }; then
+        keep_script_copy
+        say "Updated the installed copy of this script: $root/$PROG.sh"
+    fi
     say "Saved $config"
     say "The runner keeps each attached Space's files in $workspace/spaces/<space-id>/."
     if [ "$self_update" = on ]; then
@@ -352,10 +366,7 @@ install_runner() {
         [ "$other" = "$root/versions/$version" ] || rm -rf -- "$other"
     done
     # Keep a copy of this script beside the install for `run` and the unit.
-    self=$(absolute "$0")
-    if [ "$self" != "$root/$PROG.sh" ]; then
-        cp -- "$self" "$root/.$PROG.new" && chmod 755 -- "$root/.$PROG.new" && mv -f -- "$root/.$PROG.new" "$root/$PROG.sh"
-    fi
+    keep_script_copy
     say "Metro runner $version is installed in $root/versions/$version"
     if [ -f "$config" ]; then
         say "Existing settings kept: $config"
