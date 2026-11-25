@@ -16,7 +16,6 @@ use serde_json::{Value as Json_, json};
 
 use super::access::{self, Rights};
 use super::compile::{self, Compiled};
-use super::limits::{self, PageLimits};
 use super::spec::PageSpec;
 use super::store::{self, CreateError, NewVersion, PageRow, VersionRow};
 use super::{actions, data, generate, tsx};
@@ -227,7 +226,9 @@ fn too_many(e: CreateError) -> ApiError {
     match e {
         CreateError::TooMany(n) => ApiError::new(
             StatusCode::CONFLICT,
-            format!("this Space (or person) already has {n} pages, the most this server allows"),
+            format!(
+                "this Space or personal collection has reached the server limit for live pages ({n})"
+            ),
         ),
         CreateError::NotAllowed => ApiError::not_found("no such Space"),
     }
@@ -407,9 +408,8 @@ async fn create(
         return Ok(invalid(&compiled));
     }
     let version = new_version(&who, kind, &compiled)?;
-    let limits = limits::current(&state).await;
     let created = db(&state, move |db| {
-        store::create(db, space.as_deref(), &version, &limits)
+        store::create(db, space.as_deref(), &version)
     })
     .await?
     .map_err(too_many)?;
@@ -539,13 +539,8 @@ async fn patch_page(
         icon: body.icon,
         members_edit: body.members_edit,
     };
-    let limits = limits::current(&state).await;
     let (pid, uid) = (page.id.clone(), who.id.clone());
-    match db(&state, move |db| {
-        store::patch(db, &pid, &uid, &ops, &limits)
-    })
-    .await?
-    {
+    match db(&state, move |db| store::patch(db, &pid, &uid, &ops)).await? {
         Ok(()) => {}
         Err(store::PatchError::Denied(store::Denied::Gone)) => {
             return Err(ApiError::not_found(NO_PAGE));
@@ -595,9 +590,8 @@ async fn undelete(
     if !compile::valid_page_id(&pid) {
         return Err(ApiError::not_found(NO_PAGE));
     }
-    let limits: PageLimits = limits::current(&state).await;
     let (id, uid) = (pid.clone(), who.id.clone());
-    match db(&state, move |db| store::undelete(db, &id, &uid, &limits)).await? {
+    match db(&state, move |db| store::undelete(db, &id, &uid)).await? {
         Ok(()) => {}
         Err(store::UndeleteError::Denied(_)) => return Err(ApiError::not_found(NO_PAGE)),
         Err(store::UndeleteError::NotDeleted) => {
@@ -684,14 +678,9 @@ async fn save(
     base: i64,
     mut version: NewVersion,
 ) -> ApiResult<Response> {
-    let limits = limits::current(state).await;
     let id = page.id.clone();
     version.author_id = who.id.clone();
-    match db(state, move |db| {
-        store::add_version(db, &id, base, &version, &limits)
-    })
-    .await?
-    {
+    match db(state, move |db| store::add_version(db, &id, base, &version)).await? {
         Ok(_) => {
             let (page, rights) = load_live(state, who, &page.id).await?;
             Ok((
@@ -1251,10 +1240,9 @@ async fn apply_draft(
     // One transaction: the draft is still ready and theirs, the page is
     // created or the version saved with every check, then the draft is
     // consumed. Any refusal leaves the draft as it was.
-    let limits = limits::current(&state).await;
     let (did, uid) = (d.id.clone(), who.id.clone());
     let page_id = match db(&state, move |db| {
-        store::apply_draft(db, &did, &uid, &version, &limits)
+        store::apply_draft(db, &did, &uid, &version)
     })
     .await?
     {

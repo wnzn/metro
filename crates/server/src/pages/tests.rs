@@ -1311,7 +1311,6 @@ fn invisible_characters_and_comments_are_checked() {
 }
 
 mod store_tests {
-    use super::super::limits::PageLimits;
     use super::super::store::{self, CreateError, NewVersion};
     use crate::db::Db;
 
@@ -1338,31 +1337,30 @@ mod store_tests {
     #[test]
     fn page_limits_count_live_pages_per_space_and_person() {
         let (db, sid) = db_with_space();
-        let limits = PageLimits {
-            pages_per_space: 2,
-            versions_per_page: 200,
-        };
-        let a = store::create(&db, Some(&sid), &version("alice", "A"), &limits)
+        db.lock()
+            .execute("UPDATE admin_settings SET pages_per_space = 2", [])
+            .unwrap();
+        let a = store::create(&db, Some(&sid), &version("alice", "A"))
             .unwrap()
             .unwrap();
-        store::create(&db, Some(&sid), &version("bob", "B"), &limits)
+        store::create(&db, Some(&sid), &version("bob", "B"))
             .unwrap()
             .unwrap();
         assert_eq!(
-            store::create(&db, Some(&sid), &version("alice", "C"), &limits).unwrap(),
+            store::create(&db, Some(&sid), &version("alice", "C")).unwrap(),
             Err(CreateError::TooMany(2))
         );
         // Personal pages count per person, separately.
-        store::create(&db, None, &version("alice", "Mine"), &limits)
+        store::create(&db, None, &version("alice", "Mine"))
             .unwrap()
             .unwrap();
         // Deleting frees a slot; undeleting into a full Space is refused.
         assert_eq!(store::soft_delete(&db, &a.id, "alice").unwrap(), Ok(()));
-        store::create(&db, Some(&sid), &version("alice", "C"), &limits)
+        store::create(&db, Some(&sid), &version("alice", "C"))
             .unwrap()
             .unwrap();
         assert_eq!(
-            store::undelete(&db, &a.id, "alice", &limits).unwrap(),
+            store::undelete(&db, &a.id, "alice").unwrap(),
             Err(store::UndeleteError::TooMany(2))
         );
     }
@@ -1370,28 +1368,21 @@ mod store_tests {
     #[test]
     fn versions_are_optimistic_and_pruned_keeping_the_first() {
         let (db, sid) = db_with_space();
-        let limits = PageLimits {
-            pages_per_space: 50,
-            versions_per_page: 3,
-        };
-        let p = store::create(&db, Some(&sid), &version("alice", "v1"), &limits)
+        db.lock()
+            .execute("UPDATE admin_settings SET versions_per_page = 3", [])
+            .unwrap();
+        let p = store::create(&db, Some(&sid), &version("alice", "v1"))
             .unwrap()
             .unwrap();
         for n in 1..6 {
-            let head = store::add_version(
-                &db,
-                &p.id,
-                n,
-                &version("alice", &format!("v{}", n + 1)),
-                &limits,
-            )
-            .unwrap()
-            .unwrap();
+            let head = store::add_version(&db, &p.id, n, &version("alice", &format!("v{}", n + 1)))
+                .unwrap()
+                .unwrap();
             assert_eq!(head, n + 1);
         }
         // A save based on an old head never overwrites.
         assert_eq!(
-            store::add_version(&db, &p.id, 3, &version("alice", "stale"), &limits).unwrap(),
+            store::add_version(&db, &p.id, 3, &version("alice", "stale")).unwrap(),
             Err(store::SaveError::Conflict { head: 6 })
         );
         let kept: Vec<i64> = store::version_list(&db, &p.id)
@@ -1405,10 +1396,70 @@ mod store_tests {
     }
 
     #[test]
+    fn legacy_database_enforces_defaults_without_changing_existing_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sqlite");
+        let page = {
+            let db = Db::open(&path).unwrap();
+            let existing = store::create(&db, None, &version("alice", "Existing"))
+                .unwrap()
+                .unwrap();
+            db.lock().execute("DROP TABLE admin_settings", []).unwrap();
+            existing
+        };
+        let db = Db::open(&path).unwrap();
+        assert_eq!(store::get(&db, &page.id).unwrap(), Some(page.clone()));
+        for _ in 1..50 {
+            store::create(&db, None, &version("alice", "New"))
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            store::create(&db, None, &version("alice", "One too many")).unwrap(),
+            Err(CreateError::TooMany(50))
+        );
+        for base in 1..=201 {
+            assert_eq!(
+                store::add_version(&db, &page.id, base, &version("alice", "Updated")).unwrap(),
+                Ok(base + 1)
+            );
+        }
+        let saved: Vec<_> = store::version_list(&db, &page.id)
+            .unwrap()
+            .into_iter()
+            .map(|v| v.version)
+            .collect();
+        assert_eq!(saved, (3..=202).rev().chain([1]).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn bad_stored_retention_never_prunes_or_advances_the_head() {
+        let (db, sid) = db_with_space();
+        let page = store::create(&db, Some(&sid), &version("alice", "First"))
+            .unwrap()
+            .unwrap();
+        for base in 1..=3 {
+            store::add_version(&db, &page.id, base, &version("alice", "Updated"))
+                .unwrap()
+                .unwrap();
+        }
+        db.lock()
+            .execute("UPDATE admin_settings SET versions_per_page = 0", [])
+            .unwrap();
+        assert!(store::add_version(&db, &page.id, 4, &version("alice", "Rejected")).is_err());
+        assert_eq!(store::get(&db, &page.id).unwrap().unwrap().head_version, 4);
+        let kept: Vec<_> = store::version_list(&db, &page.id)
+            .unwrap()
+            .into_iter()
+            .map(|v| v.version)
+            .collect();
+        assert_eq!(kept, [4, 3, 2, 1]);
+    }
+
+    #[test]
     fn leaving_and_deleting_a_space_purge_page_state() {
         let (db, sid) = db_with_space();
-        let limits = PageLimits::default();
-        let p = store::create(&db, Some(&sid), &version("bob", "Bob's"), &limits)
+        let p = store::create(&db, Some(&sid), &version("bob", "Bob's"))
             .unwrap()
             .unwrap();
         store::put_prefs(
@@ -1457,7 +1508,7 @@ mod store_tests {
         // The page Bob created stays, like his messages.
         assert!(store::get(&db, &p.id).unwrap().is_some());
         // Deleting the Space removes its pages and versions.
-        let personal = store::create(&db, None, &version("alice", "Mine"), &limits)
+        let personal = store::create(&db, None, &version("alice", "Mine"))
             .unwrap()
             .unwrap();
         assert!(matches!(
@@ -1480,54 +1531,50 @@ mod store_tests {
     #[test]
     fn saves_recheck_membership_and_edit_rights_in_the_transaction() {
         let (db, sid) = db_with_space();
-        let limits = PageLimits::default();
         // Carol isn't a member: no Space page for her.
         assert_eq!(
-            store::create(&db, Some(&sid), &version("carol", "x"), &limits).unwrap(),
+            store::create(&db, Some(&sid), &version("carol", "x")).unwrap(),
             Err(CreateError::NotAllowed)
         );
-        let p = store::create(&db, Some(&sid), &version("bob", "Bob's"), &limits)
+        let p = store::create(&db, Some(&sid), &version("bob", "Bob's"))
             .unwrap()
             .unwrap();
         // Alice (owner) may; Dave-like members without rights may not.
         db.add_member(&sid, "dave", 10).unwrap();
         // Dave sees the page but may not edit it: 403, not 404.
         assert_eq!(
-            store::add_version(&db, &p.id, 1, &version("dave", "x"), &limits).unwrap(),
+            store::add_version(&db, &p.id, 1, &version("dave", "x")).unwrap(),
             Err(store::SaveError::Denied(store::Denied::Forbidden))
         );
         let ops = store::PatchOps {
             members_edit: Some(true),
             ..Default::default()
         };
+        assert_eq!(store::patch(&db, &p.id, "alice", &ops).unwrap(), Ok(()));
         assert_eq!(
-            store::patch(&db, &p.id, "alice", &ops, &limits).unwrap(),
-            Ok(())
-        );
-        assert_eq!(
-            store::add_version(&db, &p.id, 1, &version("dave", "x"), &limits).unwrap(),
+            store::add_version(&db, &p.id, 1, &version("dave", "x")).unwrap(),
             Ok(2)
         );
         // Removed between the API's check and the write: refused.
         db.remove_member(&sid, "bob").unwrap();
         assert_eq!(
-            store::add_version(&db, &p.id, 2, &version("bob", "y"), &limits).unwrap(),
+            store::add_version(&db, &p.id, 2, &version("bob", "y")).unwrap(),
             Err(store::SaveError::Denied(store::Denied::Gone))
         );
         assert_eq!(
-            store::create(&db, Some(&sid), &version("bob", "z"), &limits).unwrap(),
+            store::create(&db, Some(&sid), &version("bob", "z")).unwrap(),
             Err(CreateError::NotAllowed)
         );
         // Personal pages: only their owner.
-        let mine = store::create(&db, None, &version("alice", "Mine"), &limits)
+        let mine = store::create(&db, None, &version("alice", "Mine"))
             .unwrap()
             .unwrap();
         assert_eq!(
-            store::add_version(&db, &mine.id, 1, &version("bob", "x"), &limits).unwrap(),
+            store::add_version(&db, &mine.id, 1, &version("bob", "x")).unwrap(),
             Err(store::SaveError::Denied(store::Denied::Gone))
         );
         assert_eq!(
-            store::add_version(&db, &p.id, 2, &version("alice", "owner"), &limits).unwrap(),
+            store::add_version(&db, &p.id, 2, &version("alice", "owner")).unwrap(),
             Ok(3)
         );
     }
@@ -1704,8 +1751,7 @@ mod store_tests {
     #[test]
     fn expiry_and_the_restore_window_hold_on_direct_access() {
         let (db, sid) = db_with_space();
-        let limits = PageLimits::default();
-        let p = store::create(&db, Some(&sid), &version("alice", "A"), &limits)
+        let p = store::create(&db, Some(&sid), &version("alice", "A"))
             .unwrap()
             .unwrap();
         store::soft_delete(&db, &p.id, "alice").unwrap().unwrap();
@@ -1716,7 +1762,7 @@ mod store_tests {
             )
             .unwrap();
         assert_eq!(
-            store::undelete(&db, &p.id, "alice", &limits).unwrap(),
+            store::undelete(&db, &p.id, "alice").unwrap(),
             Err(store::UndeleteError::Denied(store::Denied::Gone))
         );
         assert!(store::list_for(&db, "alice", true).unwrap().is_empty());
@@ -1744,7 +1790,7 @@ mod store_tests {
             .unwrap();
         assert!(store::draft(&db, &d.id).unwrap().is_none());
         assert_eq!(
-            store::apply_draft(&db, &d.id, "alice", &version("alice", "x"), &limits).unwrap(),
+            store::apply_draft(&db, &d.id, "alice", &version("alice", "x")).unwrap(),
             Err(store::ApplyError::Gone)
         );
     }
@@ -1752,8 +1798,7 @@ mod store_tests {
     #[test]
     fn applying_a_draft_is_one_transaction() {
         let (db, sid) = db_with_space();
-        let limits = PageLimits::default();
-        let p = store::create(&db, Some(&sid), &version("bob", "B"), &limits)
+        let p = store::create(&db, Some(&sid), &version("bob", "B"))
             .unwrap()
             .unwrap();
         let new_draft = |db: &Db| {
@@ -1786,11 +1831,11 @@ mod store_tests {
         };
         // A conflict keeps the draft.
         let d = new_draft(&db);
-        store::add_version(&db, &p.id, 1, &version("bob", "v2"), &limits)
+        store::add_version(&db, &p.id, 1, &version("bob", "v2"))
             .unwrap()
             .unwrap();
         assert_eq!(
-            store::apply_draft(&db, &d, "bob", &version("bob", "x"), &limits).unwrap(),
+            store::apply_draft(&db, &d, "bob", &version("bob", "x")).unwrap(),
             Err(store::ApplyError::Conflict { head: 2 })
         );
         assert!(store::draft(&db, &d).unwrap().is_some());
@@ -1801,9 +1846,7 @@ mod store_tests {
             members_edit: Some(v),
             ..Default::default()
         };
-        store::patch(&db, &p.id, "bob", &on(true), &limits)
-            .unwrap()
-            .unwrap();
+        store::patch(&db, &p.id, "bob", &on(true)).unwrap().unwrap();
         let d2 = store::create_draft(
             &db,
             &store::NewDraft {
@@ -1830,53 +1873,49 @@ mod store_tests {
         )
         .unwrap();
         let d2 = d2.id;
-        store::patch(&db, &p.id, "bob", &on(false), &limits)
+        store::patch(&db, &p.id, "bob", &on(false))
             .unwrap()
             .unwrap();
         assert_eq!(
-            store::apply_draft(&db, &d2, "dave", &version("dave", "x"), &limits).unwrap(),
+            store::apply_draft(&db, &d2, "dave", &version("dave", "x")).unwrap(),
             Err(store::ApplyError::Denied(store::Denied::Forbidden)),
             "rights are checked before the head"
         );
         assert!(store::draft(&db, &d2).unwrap().is_some());
         // Someone else can't apply it; the author can, once rights return.
         assert_eq!(
-            store::apply_draft(&db, &d2, "alice", &version("alice", "x"), &limits).unwrap(),
+            store::apply_draft(&db, &d2, "alice", &version("alice", "x")).unwrap(),
             Err(store::ApplyError::Gone)
         );
-        store::patch(&db, &p.id, "bob", &on(true), &limits)
-            .unwrap()
-            .unwrap();
+        store::patch(&db, &p.id, "bob", &on(true)).unwrap().unwrap();
         db.lock()
             .execute(
                 "UPDATE page_drafts SET base_version = 2 WHERE id = ?1",
                 [&d2],
             )
             .unwrap();
-        store::patch(&db, &p.id, "bob", &on(false), &limits)
+        store::patch(&db, &p.id, "bob", &on(false))
             .unwrap()
             .unwrap();
         assert_eq!(
-            store::apply_draft(&db, &d2, "dave", &version("dave", "x"), &limits).unwrap(),
+            store::apply_draft(&db, &d2, "dave", &version("dave", "x")).unwrap(),
             Err(store::ApplyError::Denied(store::Denied::Forbidden))
         );
         assert!(store::draft(&db, &d2).unwrap().is_some(), "kept on refusal");
-        store::patch(&db, &p.id, "bob", &on(true), &limits)
-            .unwrap()
-            .unwrap();
+        store::patch(&db, &p.id, "bob", &on(true)).unwrap().unwrap();
         assert_eq!(
-            store::apply_draft(&db, &d2, "dave", &version("dave", "x"), &limits).unwrap(),
+            store::apply_draft(&db, &d2, "dave", &version("dave", "x")).unwrap(),
             Ok(p.id.clone())
         );
         assert_eq!(
-            store::apply_draft(&db, &d2, "dave", &version("dave", "x"), &limits).unwrap(),
+            store::apply_draft(&db, &d2, "dave", &version("dave", "x")).unwrap(),
             Err(store::ApplyError::Gone)
         );
         // A discarded draft can't be applied.
         let d3 = new_draft(&db);
         assert!(store::discard_draft(&db, &d3, "bob").unwrap());
         assert_eq!(
-            store::apply_draft(&db, &d3, "bob", &version("bob", "x"), &limits).unwrap(),
+            store::apply_draft(&db, &d3, "bob", &version("bob", "x")).unwrap(),
             Err(store::ApplyError::Gone)
         );
     }
@@ -1884,9 +1923,8 @@ mod store_tests {
     #[test]
     fn every_mutation_checks_rights_in_its_transaction() {
         let (db, sid) = db_with_space();
-        let limits = PageLimits::default();
         db.add_member(&sid, "dave", 10).unwrap();
-        let p = store::create(&db, Some(&sid), &version("bob", "B"), &limits)
+        let p = store::create(&db, Some(&sid), &version("bob", "B"))
             .unwrap()
             .unwrap();
         let prefs = store::Prefs {
@@ -1903,11 +1941,11 @@ mod store_tests {
         };
         // A member without rights: 403 for edits, fine for their own prefs.
         assert_eq!(
-            store::patch(&db, &p.id, "dave", &icon, &limits).unwrap(),
+            store::patch(&db, &p.id, "dave", &icon).unwrap(),
             Err(store::PatchError::Denied(store::Denied::Forbidden))
         );
         assert_eq!(
-            store::patch(&db, &p.id, "dave", &members, &limits).unwrap(),
+            store::patch(&db, &p.id, "dave", &members).unwrap(),
             Err(store::PatchError::Denied(store::Denied::Forbidden))
         );
         assert_eq!(
@@ -1924,7 +1962,7 @@ mod store_tests {
             Err(store::Denied::Gone)
         );
         assert_eq!(
-            store::patch(&db, &p.id, "carol", &icon, &limits).unwrap(),
+            store::patch(&db, &p.id, "carol", &icon).unwrap(),
             Err(store::PatchError::Denied(store::Denied::Gone))
         );
         assert_eq!(
@@ -1937,15 +1975,13 @@ mod store_tests {
             members_edit: Some(true),
             ..Default::default()
         };
-        store::patch(&db, &p.id, "bob", &members, &limits)
-            .unwrap()
-            .unwrap();
+        store::patch(&db, &p.id, "bob", &members).unwrap().unwrap();
         let both_dave = store::PatchOps {
             members_edit: Some(false),
             ..both
         };
         assert!(
-            store::patch(&db, &p.id, "dave", &both_dave, &limits)
+            store::patch(&db, &p.id, "dave", &both_dave)
                 .unwrap()
                 .is_err()
         );
@@ -1977,7 +2013,6 @@ mod store_tests {
                 members_edit: Some(false),
                 ..Default::default()
             },
-            &limits,
         )
         .unwrap()
         .unwrap();
@@ -1999,7 +2034,7 @@ mod store_tests {
             Err(store::Denied::Gone)
         );
         assert_eq!(
-            store::add_version(&db, &p.id, 1, &version("bob", "x"), &limits).unwrap(),
+            store::add_version(&db, &p.id, 1, &version("bob", "x")).unwrap(),
             Err(store::SaveError::Denied(store::Denied::Gone))
         );
     }
@@ -2027,25 +2062,13 @@ mod store_tests {
     #[test]
     fn a_superseded_click_writes_nothing() {
         let (db, sid) = db_with_space();
-        let limits = PageLimits::default();
         let src = r#"export default <Page title="P"><Button key="ask" label="Ask" action="runAgent" agent="agent" room="lobby" prompt="Go"/></Page>"#;
-        let p = store::create(
-            &db,
-            Some(&sid),
-            &compiled(&db, "alice", Some(&sid), src),
-            &limits,
-        )
-        .unwrap()
-        .unwrap();
-        store::add_version(
-            &db,
-            &p.id,
-            1,
-            &compiled(&db, "alice", Some(&sid), src),
-            &limits,
-        )
-        .unwrap()
-        .unwrap();
+        let p = store::create(&db, Some(&sid), &compiled(&db, "alice", Some(&sid), src))
+            .unwrap()
+            .unwrap();
+        store::add_version(&db, &p.id, 1, &compiled(&db, "alice", Some(&sid), src))
+            .unwrap()
+            .unwrap();
         let author = crate::db::Author {
             id: Some("alice".into()),
             name: "Alice".into(),
@@ -2121,8 +2144,7 @@ mod store_tests {
     #[test]
     fn version_and_run_reads_carry_the_viewers_grant() {
         let (db, sid) = db_with_space();
-        let limits = PageLimits::default();
-        let p = store::create(&db, Some(&sid), &version("alice", "v1"), &limits)
+        let p = store::create(&db, Some(&sid), &version("alice", "v1"))
             .unwrap()
             .unwrap();
         db.lock()
@@ -2140,7 +2162,7 @@ mod store_tests {
         );
         // Bob is removed; then Alice writes version 2.
         db.remove_member(&sid, "bob").unwrap();
-        store::add_version(&db, &p.id, 1, &version("alice", "v2 secret"), &limits)
+        store::add_version(&db, &p.id, 1, &version("alice", "v2 secret"))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -2202,14 +2224,9 @@ mod store_tests {
             </Page>"#,
             task.id
         );
-        let page = store::create(
-            &db,
-            Some(&sid),
-            &compiled(&db, "bob", Some(&sid), &source),
-            &PageLimits::default(),
-        )
-        .unwrap()
-        .unwrap();
+        let page = store::create(&db, Some(&sid), &compiled(&db, "bob", Some(&sid), &source))
+            .unwrap()
+            .unwrap();
         {
             let conn = db.lock();
             conn.execute(
@@ -2331,15 +2348,9 @@ mod store_tests {
             r#"export default <Page title="P"><Button key="run" label="x" action="runSchedule" schedule="{}"/></Page>"#,
             task.id
         );
-        let limits = PageLimits::default();
-        let p = store::create(
-            &db,
-            Some(&sid),
-            &compiled(&db, "alice", Some(&sid), &src),
-            &limits,
-        )
-        .unwrap()
-        .unwrap();
+        let p = store::create(&db, Some(&sid), &compiled(&db, "alice", Some(&sid), &src))
+            .unwrap()
+            .unwrap();
         let spec: super::super::spec::PageSpec =
             serde_json::from_str(&store::version(&db, &p.id, 1).unwrap().unwrap().spec).unwrap();
         let a = spec.block("run").unwrap().action.clone().unwrap();
@@ -2425,14 +2436,9 @@ mod store_tests {
         let page_id = {
             let db = Db::open(&path).unwrap();
             let space = db.create_space("alice", "Team", 10).unwrap();
-            let p = store::create(
-                &db,
-                Some(&space.id),
-                &version("alice", "Old"),
-                &PageLimits::default(),
-            )
-            .unwrap()
-            .unwrap();
+            let p = store::create(&db, Some(&space.id), &version("alice", "Old"))
+                .unwrap()
+                .unwrap();
             // Recreate the three tables exactly as the lane's first build did.
             db.lock()
                 .execute_batch(&format!(
@@ -2504,7 +2510,6 @@ mod store_tests {
                 kind: "rename",
                 ..version("alice", "R")
             },
-            &PageLimits::default(),
         )
         .unwrap()
         .unwrap();
@@ -2527,7 +2532,7 @@ mod store_tests {
         let path = dir.path().join("runs.sqlite");
         let page_id = {
             let db = Db::open(&path).unwrap();
-            let p = store::create(&db, None, &version("alice", "Mine"), &PageLimits::default())
+            let p = store::create(&db, None, &version("alice", "Mine"))
                 .unwrap()
                 .unwrap();
             let insert = |run: &str| {
@@ -2592,14 +2597,9 @@ mod store_tests {
     #[test]
     fn soft_deleted_pages_are_purged_after_retention() {
         let (db, sid) = db_with_space();
-        let p = store::create(
-            &db,
-            Some(&sid),
-            &version("alice", "A"),
-            &PageLimits::default(),
-        )
-        .unwrap()
-        .unwrap();
+        let p = store::create(&db, Some(&sid), &version("alice", "A"))
+            .unwrap()
+            .unwrap();
         store::soft_delete(&db, &p.id, "alice").unwrap().unwrap();
         let now = crate::db::now_ms();
         assert_eq!(store::purge_expired(&db, now).unwrap(), 0);
@@ -2616,7 +2616,6 @@ mod cancellation {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::super::limits::PageLimits;
     use super::super::{actions, api, store};
     use crate::auth::{AuthFailure, AuthFuture, Human, HumanAuth};
     use crate::db::Db;
@@ -2689,9 +2688,7 @@ mod cancellation {
             spec: serde_json::to_string(&spec).unwrap(),
             title: spec.title,
         };
-        let p = store::create(&st.db, Some(&space.id), &v, &PageLimits::default())
-            .unwrap()
-            .unwrap();
+        let p = store::create(&st.db, Some(&space.id), &v).unwrap().unwrap();
         let release = hold_lock(&st.db);
         let (s2, pid) = (st.clone(), p.id.clone());
         let caller = tokio::spawn(async move {
@@ -2758,9 +2755,7 @@ mod cancellation {
             spec: serde_json::to_string(&spec).unwrap(),
             title: spec.title.clone(),
         };
-        let p = store::create(&st.db, Some(&space.id), &v, &PageLimits::default())
-            .unwrap()
-            .unwrap();
+        let p = store::create(&st.db, Some(&space.id), &v).unwrap().unwrap();
         let out = super::super::data::resolve(&st, ctx(&p.id), spec.clone(), "bob".into(), None)
             .await
             .unwrap();
