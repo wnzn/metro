@@ -7,8 +7,13 @@
 //   or unloaded.
 // - Requests go only to this page's own origin, with the token in an
 //   Authorization header, no cookies, no redirects and no caching.
-// - Sign-in is refused before any network call on plain HTTP to a
-//   non-loopback host, inside a frame, or from a non-HTTP origin.
+// - Sign-in is refused before any network call inside a frame or from a
+//   non-HTTP origin.
+// - Plain HTTP works. On loopback and Tailscale hosts (100.64.0.0/10,
+//   fd7a:115c:a1e0::/48, *.ts.net) it's used without asking. On any other
+//   host the token field stays hidden until the person has read a warning
+//   and chosen "Sign in anyway"; that choice (never the token) is remembered
+//   for this server in localStorage.
 // - Server-supplied text is only ever written with textContent.
 "use strict";
 
@@ -18,6 +23,8 @@
     sessionBar: $("session-bar"), whoName: $("who-name"), whoId: $("who-id"), signOut: $("sign-out"),
     unsafe: $("unsafe"), unsafeReason: $("unsafe-reason"), unsafeSsh: $("unsafe-ssh"),
     unsafeLocal: $("unsafe-local"), unsafeLoopback: $("unsafe-loopback"),
+    plainHttp: $("plain-http"), plainHttpReason: $("plain-http-reason"), plainHttpAccept: $("plain-http-accept"),
+    plainHttpNote: $("plain-http-note"),
     signin: $("signin"), signinForm: $("signin-form"), signinError: $("signin-error"),
     token: $("token"), signinSubmit: $("signin-submit"),
     denied: $("denied"), deniedId: $("denied-id"), deniedBack: $("denied-back"),
@@ -36,10 +43,50 @@
 
   // ---------------------------------------------------------------- safety
 
-  function isLoopbackHost(host) {
-    const h = host.toLowerCase();
-    return h === "localhost" || h.endsWith(".localhost") || h === "[::1]" ||
-      /^127(\.\d{1,3}){3}$/.test(h);
+  // "loopback", "tailscale" or "other", for location.hostname (which the
+  // browser has already put in canonical form). Mirrors
+  // apps/desktop/src/api/serverUrl.ts and the metro-url-policy crate.
+  function hostClass(hostname) {
+    const h = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+    if (h === "localhost" || h.endsWith(".localhost")) return "loopback";
+    if (/^[^.].*[^.]\.ts\.net$/.test(h) && !h.includes("..")) return "tailscale";
+    const v4 = (text) => {
+      const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(text);
+      if (!m) return null;
+      const o = m.slice(1).map(Number);
+      if (o.some((n) => n > 255)) return null;
+      if (o[0] === 127) return "loopback";
+      if (o[0] === 100 && o[1] >= 64 && o[1] <= 127) return "tailscale";
+      return "other";
+    };
+    const ip4 = v4(h);
+    if (ip4) return ip4;
+    if (h === "::1") return "loopback";
+    // IPv4-mapped IPv6, as browsers write it: ::ffff:7f00:1
+    const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(h);
+    if (mapped) {
+      const a = parseInt(mapped[1], 16), b = parseInt(mapped[2], 16);
+      return v4([a >> 8, a & 255, b >> 8, b & 255].join(".")) || "other";
+    }
+    if (/^fd7a:115c:a1e0:/.test(h)) return "tailscale";
+    return "other";
+  }
+
+  // Plain HTTP to a host that is neither loopback nor Tailscale: the token
+  // would cross the network unencrypted, so the person is asked first.
+  function plainHttpRisk() {
+    return location.protocol === "http:" && hostClass(location.hostname) === "other";
+  }
+
+  const PLAIN_HTTP_KEY = "metro.admin.plainHttpAccepted";
+  let plainHttpAcceptedHere = false; // when localStorage isn't available
+  function plainHttpAccepted() {
+    if (plainHttpAcceptedHere) return true;
+    try { return localStorage.getItem(PLAIN_HTTP_KEY) === "1"; } catch { return false; }
+  }
+  function acceptPlainHttp() {
+    plainHttpAcceptedHere = true;
+    try { localStorage.setItem(PLAIN_HTTP_KEY, "1"); } catch { /* kept for this page only */ }
   }
 
   // Returns null when this page may take a credential, else the reason.
@@ -53,14 +100,29 @@
     if (proto !== "https:" && proto !== "http:") {
       return "This page wasn't loaded from a Metro server, so there's no server it can safely send a token to.";
     }
-    if (proto === "http:" && !isLoopbackHost(location.hostname)) {
-      return "This page was opened over plain HTTP from " + location.host +
-        ". Anyone on the network path could read an admin token sent from here.";
-    }
-    if (!window.isSecureContext) {
+    // Browsers never treat plain HTTP outside loopback as a secure context;
+    // that's what the plain-HTTP warning is for.
+    if (proto === "https:" && !window.isSecureContext) {
       return "Your browser doesn't treat this page as a secure context.";
     }
     return null;
+  }
+
+  // The sign-in form, or first the plain-HTTP warning when it applies and
+  // hasn't been accepted for this server yet.
+  function showSignIn() {
+    if (plainHttpRisk() && !plainHttpAccepted()) {
+      el.plainHttpReason.textContent = "Anyone on the network between you and " + location.host +
+        " could read the admin token you sign in with. Use it on networks you trust, such as Tailscale or a VPN.";
+      el.signin.hidden = true;
+      el.plainHttp.hidden = false;
+      el.plainHttpAccept.focus();
+      return false;
+    }
+    el.plainHttp.hidden = true;
+    el.plainHttpNote.hidden = !plainHttpRisk();
+    el.signin.hidden = false;
+    return true;
   }
 
   function showUnsafe(reason) {
@@ -70,6 +132,7 @@
     el.unsafeSsh.textContent = "ssh -N -L 8080:127.0.0.1:" + port + " <you>@" + host;
     el.unsafeLoopback.textContent = "http://127.0.0.1" + (location.port ? ":" + location.port : "") + "/admin";
     el.signin.hidden = true;
+    el.plainHttp.hidden = true;
     el.unsafe.hidden = false;
   }
 
@@ -102,6 +165,7 @@
     const s = session;
     if (!s) throw new SessionGone();
     if (unsafeReason()) throw new ApiError(0, "This page can't send credentials.");
+    if (plainHttpRisk() && !plainHttpAccepted()) throw new ApiError(0, "Confirm the unencrypted connection first.");
     const url = new URL(path, location.origin);
     if (url.origin !== location.origin) throw new ApiError(0, "Refusing a cross-origin request.");
     const headers = { Authorization: "Bearer " + s.token, Accept: "application/json" };
@@ -166,6 +230,7 @@
     hideAlert(el.signinError);
     const reason = unsafeReason();
     if (reason) { el.token.value = ""; showUnsafe(reason); return; }
+    if (plainHttpRisk() && !plainHttpAccepted()) { el.token.value = ""; showSignIn(); return; }
     let token = el.token.value.trim().replace(/^Bearer\s+/i, "");
     if (!token) {
       el.token.setAttribute("aria-invalid", "true");
@@ -248,7 +313,7 @@
     el.denied.hidden = true;
     const reason = unsafeReason();
     if (reason) { showUnsafe(reason); return; }
-    el.signin.hidden = false;
+    if (!showSignIn()) return;
     if (message) showAlert(el.signinError, message); else hideAlert(el.signinError);
     el.token.focus();
   }
@@ -561,6 +626,10 @@
       setRevealed(el.secretValue.type === "password"));
     el.secretCopy.addEventListener("click", copySecret);
     el.secretDone.addEventListener("click", finishSecret);
+    el.plainHttpAccept.addEventListener("click", () => {
+      acceptPlainHttp();
+      if (showSignIn()) el.token.focus();
+    });
     el.token.addEventListener("input", () => el.token.removeAttribute("aria-invalid"));
     el.addName.addEventListener("input", () => el.addName.removeAttribute("aria-invalid"));
     // Don't let the browser keep the session in its back/forward cache.
@@ -569,12 +638,11 @@
 
     const reason = unsafeReason();
     if (reason) { showUnsafe(reason); return; }
-    el.signin.hidden = false;
     if (hadSecretInUrl) {
       showAlert(el.signinError,
         "This page ignores credentials in its address. If you put a token in a link, it may be in your history or logs; rotate it.");
     }
-    el.token.focus();
+    if (showSignIn()) el.token.focus();
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);

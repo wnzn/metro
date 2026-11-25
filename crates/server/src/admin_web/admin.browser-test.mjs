@@ -116,7 +116,7 @@ async function startChrome() {
   chrome = spawn(executable, [
     "--headless=new", "--no-sandbox", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
     `--user-data-dir=${profile}`, "--remote-debugging-port=0",
-    "--host-resolver-rules=MAP metro.lan 127.0.0.1", "about:blank",
+    "--host-resolver-rules=MAP metro.lan 127.0.0.1, MAP metro.tail1234.ts.net 127.0.0.1", "about:blank",
   ], { stdio: "ignore" });
   chromeClosed = new Promise((resolve) => { chrome.once("close", resolve); });
 
@@ -567,20 +567,66 @@ await test("credentials in the URL are ignored and scrubbed", async () => {
   assert(apiCalls().length === 0, "used the URL token");
 });
 
-await test("plain HTTP on a non-loopback host refuses sign-in before any request", async () => {
+await test("plain HTTP on a Tailscale name signs in without a warning", async () => {
   mock.log.length = 0;
-  await goto(`http://metro.lan:${port}/admin`);
-  assert(await evaluate(vis("unsafe")), "warning not shown");
-  assert(!(await evaluate(vis("signin"))), "sign-in shown");
-  assert((await text("unsafe-ssh")).includes(`8080:127.0.0.1:${port}`) && (await text("unsafe-ssh")).includes("metro.lan"), "ssh hint");
-  // Even if someone un-hides the form, submission sends nothing.
+  const ts = `http://metro.tail1234.ts.net:${port}`;
+  await goto(ts + "/admin");
+  assert(await evaluate(vis("signin")), "sign-in hidden");
+  assert(!(await evaluate(vis("plain-http"))), "warning shown on Tailscale");
+  assert(!(await evaluate(vis("unsafe"))), "refused on Tailscale");
+  assert(!(await evaluate(vis("plain-http-note"))), "unencrypted note on Tailscale");
+  await signIn(ADMIN);
+  await waitFor(vis("panel"));
+  assert(apiCalls().length > 0 && apiCalls().every((r) => r.authOk), "sign-in didn't reach the server");
+  await click("#sign-out");
+});
+
+await test("plain HTTP on another host warns first; the token goes out only after Sign in anyway", async () => {
+  mock.log.length = 0;
+  const lan = `http://metro.lan:${port}`;
+  await goto(lan + "/admin");
+  await evaluate("localStorage.clear()");
+  await goto(lan + "/admin");
+  assert(await evaluate(vis("plain-http")), "warning not shown");
+  assert(!(await evaluate(vis("signin"))), "token field shown before the warning was accepted");
+  assert(!(await evaluate(vis("unsafe"))), "plain HTTP is refused outright");
+  const reason = await text("plain-http-reason");
+  assert(reason.includes(`metro.lan:${port}`) && reason.includes("could read the admin token"), "warning text: " + reason);
+  assert((await text("plain-http-accept")) === "Sign in anyway", "button label");
+  assert(await evaluate("document.activeElement.id") === "plain-http-accept", "warning button not focused");
+  // Even if someone un-hides the form, submission sends nothing before the warning is accepted.
   await evaluate("document.getElementById('signin').hidden = false");
   await signIn(ADMIN);
   await sleep(200);
-  assert(apiCalls().length === 0, "credential sent over plain HTTP");
+  assert(apiCalls().length === 0, "credential sent before Sign in anyway");
   assert(await evaluate("document.getElementById('token').value") === "", "token left in field");
-  await shot("admin-insecure.png", 900, 700);
+  assert(await evaluate(vis("plain-http")) && !(await evaluate(vis("signin"))), "warning not back");
+  await shot("admin-plain-http.png", 900, 700);
   await page("Emulation.clearDeviceMetricsOverride");
+
+  await click("#plain-http-accept");
+  assert(await evaluate(vis("signin")) && !(await evaluate(vis("plain-http"))), "form not shown after accepting");
+  assert(await evaluate(vis("plain-http-note")), "no unencrypted note");
+  assert(await evaluate("document.activeElement.id") === "token", "token field not focused");
+  await signIn(ADMIN);
+  await waitFor(vis("panel"));
+  assert(apiCalls().every((r) => r.authOk && !r.cookie), "bad request");
+  // The choice, never the token, is remembered for this server.
+  const stored = await evaluate("JSON.stringify(Object.entries(localStorage))");
+  assert(stored === JSON.stringify([["metro.admin.plainHttpAccepted", "1"]]), "storage: " + stored.replace(/metro_[a-f0-9]{36}/g, "<redacted>"));
+  await click("#sign-out");
+  assert(await evaluate(vis("signin")) && !(await evaluate(vis("plain-http"))), "asked again after sign-out");
+
+  await goto(lan + "/admin");
+  assert(await evaluate(vis("signin")) && !(await evaluate(vis("plain-http"))), "asked again on reload");
+  assert(await evaluate(vis("plain-http-note")), "no unencrypted note on reload");
+  await evaluate("localStorage.clear()");
+});
+
+await test("loopback pages never show the plain-HTTP warning", async () => {
+  await goto(base + "/admin");
+  assert(await evaluate(vis("signin")), "sign-in hidden");
+  assert(!(await evaluate(vis("plain-http"))) && !(await evaluate(vis("plain-http-note"))), "warning on loopback");
 });
 
 await test("a framed panel refuses sign-in", async () => {

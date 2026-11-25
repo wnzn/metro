@@ -41,14 +41,23 @@
   <section id="unsafe" class="card notice notice-danger" hidden aria-labelledby="unsafe-title">
     <h1 id="unsafe-title">Sign-in is turned off on this page</h1>
     <p id="unsafe-reason"></p>
-    <p><strong>Do not paste an admin token into this page.</strong> Open the panel over a protected connection instead:</p>
+    <p><strong>Do not paste an admin token into this page.</strong> Open the panel directly from your Metro server instead:</p>
     <ul class="steps">
       <li><strong>HTTPS:</strong> put Metro behind a TLS proxy and open <code>https://&lt;your-host&gt;/admin</code>.</li>
+      <li><strong>Tailscale:</strong> open <code>http://&lt;your-host&gt;.&lt;tailnet&gt;.ts.net/admin</code> or the server's <code>100.x.y.z</code> address.</li>
       <li><strong>SSH tunnel:</strong> from your computer run
         <code class="block" id="unsafe-ssh"></code>
         then open <a id="unsafe-local" href="http://localhost:8080/admin" rel="noreferrer">http://localhost:8080/admin</a>.</li>
       <li><strong>On the server itself:</strong> open <code id="unsafe-loopback">http://127.0.0.1/admin</code>.</li>
     </ul>
+  </section>
+
+  <!-- Plain HTTP to a host that is neither loopback nor Tailscale: asked once per server, before the token field appears. -->
+  <section id="plain-http" class="card notice notice-warning" hidden aria-labelledby="plain-http-title">
+    <h1 id="plain-http-title">This connection isn't encrypted</h1>
+    <p id="plain-http-reason"></p>
+    <p>HTTPS or an SSH tunnel to the server keeps the token private on any network.</p>
+    <button type="button" id="plain-http-accept" class="btn btn-primary">Sign in anyway</button>
   </section>
 
   <section id="signin" class="card signin" hidden aria-labelledby="signin-title">
@@ -60,6 +69,7 @@
       <label for="token" class="label">Admin access token</label>
       <input id="token" class="input" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" required aria-describedby="token-hint">
       <p id="token-hint" class="hint">Sent only to this server, in an Authorization header.</p>
+      <p id="plain-http-note" class="hint" hidden>This connection isn't encrypted.</p>
       <button type="submit" id="signin-submit" class="btn btn-primary">Sign in</button>
     </form>
   </section>
