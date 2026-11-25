@@ -43,6 +43,7 @@ import {
   captureTypedMentions, editMentionDraft, mentionIdentityKey, pickMention, prepareMentionSend, scanMentionDraft, updateMentionDraft,
 } from "./features/mentions/draft";
 import type { MentionDirectory, MentionDraft, MentionRecipient, MentionSelection, MentionSend } from "./features/mentions/draft";
+import { confirmChangedAutomaticMentions } from "./features/mentions/preflight";
 
 export type { Member, Mention, Room, RoomEvent, Run, Space };
 
@@ -185,8 +186,13 @@ export const mentions = computed(() =>
 // The composer supplies the locally verified names and handles; the store
 // independently verifies stable recipients before the POST.
 let directoryForMentions: (sid: string) => MentionDirectory | null = () => null;
-export function registerMentionDirectory(get: (sid: string) => MentionDirectory | null) {
+let refreshAgentsForMentions: ((sid: string, live: () => boolean) => Promise<MentionDirectory["agents"] | null>) | undefined;
+export function registerMentionDirectory(
+  get: (sid: string) => MentionDirectory | null,
+  refreshAgents: NonNullable<typeof refreshAgentsForMentions>,
+) {
   directoryForMentions = get;
+  refreshAgentsForMentions = refreshAgents;
 }
 
 // Space management (owners)
@@ -860,8 +866,8 @@ async function sendDraft(intent: DraftSend): Promise<void> {
     const directory = editDirectory();
     submittedDraft = captureForDirectory(mentionDraft(), directory, { finalize: true });
     writeMentionDraft(submittedDraft, directory);
-    // Finalization has already decided all typed occurrences. Validate
-    // preserved ids against a fresh roster after any uploads, not aliases.
+    // Finalize against the draft's directory. The fresh roster after any
+    // uploads can require confirmation, but never replaces a binding.
     const bound = submittedDraft.anchors.map(a => a.mention);
     const people = new Set((directory?.members ?? []).map(m => m.id));
     const named = new Set((directory?.agents ?? []).map(a => a.id));
@@ -913,13 +919,20 @@ async function sendDraft(intent: DraftSend): Promise<void> {
         return;
       }
       const body = address!;
-      if (!await verifySpaceRecipients(c, sid!, body, files, mayPost)) {
+      const verified = await verifySpaceRecipients(c, sid!, body, submittedDraft!, files, mayPost);
+      if (verified?.kind === "confirmation" && mayPost()) {
+        writeMentionDraft(verified.draft, verified.directory);
+        actionError.set("A mention no longer has the same recipient. Pick who you mean. Nothing was sent.");
+        return;
+      }
+      if (verified?.kind !== "ok" || !mayPost()) {
         if (here()) actionError.set(mayPost()
-          ? "A recipient is no longer in this Space. Remove their mention or choose someone else. Nothing was sent."
+          ? verified?.kind === "unverified"
+            ? "Could not verify the current recipient list. Nothing was sent."
+            : "A recipient is no longer in this Space. Remove their mention or choose someone else. Nothing was sent."
           : "The draft or destination changed. Nothing was sent; review the draft and send again.");
         return;
       }
-      if (!mayPost()) return;
       await c.sendMessage(sid!, rid!, body, ids, selected.choice);
     }
     if (!ok()) return;
@@ -1395,13 +1408,17 @@ function setMentionSendError(result: Extract<MentionSend, { ok: false }>) {
   });
 }
 
+type SpaceRecipientCheck = { kind: "ok" | "stale" | "unverified" }
+  | { kind: "confirmation"; draft: MentionDraft; directory: MentionDirectory };
+
 async function verifySpaceRecipients(
-  c: Client, sid: string, body: SpaceMessageBody, uploaded: boolean, mayPost: () => boolean,
-): Promise<boolean> {
+  c: Client, sid: string, body: SpaceMessageBody, submitted: MentionDraft, uploaded: boolean, mayPost: () => boolean,
+): Promise<SpaceRecipientCheck | null> {
   const people = body.mentions?.flatMap(m => m.kind === "user" ? [m.id] : []) ?? [];
   const agents = body.mentions?.flatMap(m => m.kind === "agent" && m.agent_id ? [m.agent_id] : []) ?? [];
   if (body.agent_id) agents.push(body.agent_id);
-  const checkMembers = uploaded || people.length > 0;
+  const checkAliases = submitted.anchors.some(a => !a.picked);
+  const checkMembers = checkAliases || uploaded || people.length > 0;
   const version = checkMembers ? nextMemberVersion(sid) : 0;
   const ok = guard(sid);
   const roster = checkMembers ? c.listMembers(sid).then(list => {
@@ -1411,16 +1428,35 @@ async function verifySpaceRecipients(
     if (ok() && !isAborted(error)) markMembersUnverified(sid, version, error);
     throw error;
   }) : null;
-  const [members, currentAgents] = await Promise.all([roster, agents.length ? c.spaceAgents(sid) : null]);
-  if (!mayPost()) return false;
+  const readAgents = () => c.spaceAgents(sid).then(list => list.agents.filter(a => a.spaceId === sid));
+  const [members, explicitAgents] = await Promise.all([roster, !checkAliases && agents.length ? readAgents() : null]);
+  if (!mayPost()) return null;
+  let currentAgents: MentionDirectory["agents"] | null = explicitAgents;
+  if (checkAliases) {
+    if (!members || !members.some(m => m.userId === me())) return { kind: "unverified" };
+    const freshPeople: MentionDirectory["members"][number][] = [];
+    for (let i = 0; i < members.length; i += 8) {
+      const batch = await Promise.all(members.slice(i, i + 8).map(async ({ userId }) => ({
+        id: userId, displayName: (await c.profileOf(userId))?.displayName,
+      })));
+      if (!mayPost()) return null;
+      freshPeople.push(...batch);
+    }
+    currentAgents = await (refreshAgentsForMentions ? refreshAgentsForMentions(sid, mayPost) : readAgents());
+    if (!mayPost()) return null;
+    if (!currentAgents || memberVersions.get(sid) !== version) return { kind: "unverified" };
+    const directory = { members: freshPeople, agents: currentAgents };
+    const confirmed = confirmChangedAutomaticMentions(submitted, directory);
+    if (confirmed !== submitted) return { kind: "confirmation", draft: confirmed, directory };
+  }
   if (checkMembers) {
     // If a newer refresh won, don't let the older result restore a revoked
     // identity. Require both snapshots to agree on the identities used.
     const ids = [me(), ...people];
     if (membersError() || ids.some(id => !members?.some(m => m.userId === id)
-      || !membersBySpace()[sid]?.some(m => m.userId === id))) return false;
+      || !membersBySpace()[sid]?.some(m => m.userId === id))) return { kind: "stale" };
   }
-  return agents.every(id => currentAgents?.agents.some(a => a.spaceId === sid && a.id === id));
+  return { kind: agents.every(id => currentAgents?.some(a => a.id === id)) ? "ok" : "stale" };
 }
 
 export async function addMember(userIdInput: string): Promise<boolean> {

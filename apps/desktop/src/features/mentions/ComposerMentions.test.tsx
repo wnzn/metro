@@ -260,7 +260,9 @@ test("a delayed upload rechecks recipient membership and retains draft and uploa
   const app = await inAcme(w.network);
   await waitDirectory(app);
   const text = "@bob please check";
-  await app.type("id:composer", text);
+  await app.type("id:composer", "@");
+  await app.press("id:pick:bob");
+  await app.type("id:composer", "please check");
   await app.waitFor("id:mention-chip:bob");
   app.onPick(() => [{ name: "note.txt", type: "text/plain", data: new TextEncoder().encode("note") }]);
   await app.press("id:attach");
@@ -278,6 +280,57 @@ test("a delayed upload rechecks recipient membership and retains draft and uploa
   await app.waitUntil(() => requests(app).length === 1);
   expect(JSON.parse(requests(app)[0].body!)).toEqual({
     text: "", infer_text_mentions: false, invoke_agent: false, asset_ids: [w.l.assets[0]!.id],
+  });
+});
+
+test("post-upload preflight detects a moved same-visit alias and keeps the draft until an explicit current pick", async () => {
+  const w = attachmentWorld();
+  const base = w.network[get]!;
+  const original = { id: "ag-a", space_id: "acme", name: "Original", handle: "coder", is_default: true };
+  const other = { id: "ag-b", space_id: "acme", name: "New Coder", handle: "review", is_default: false };
+  let moved = false, renamedAfterPick = false, held = 0;
+  w.network[get] = req => {
+    if (new URL(req.url).pathname !== "/v1/spaces/acme/agents") return base(req);
+    if (moved) held++;
+    return { status: 200, delay: moved ? 4_000 : 0, body: { tools: [], agents: renamedAfterPick
+      ? [original, { ...other, name: "Renamed after pick" }]
+      : moved ? [{ ...original, handle: "retired" }, { ...other, handle: "coder" }] : [original, other] } };
+  };
+  const app = await inAcme(w.network, 720, true);
+  await waitDirectory(app);
+  const text = "🌿 @coder please check";
+  await app.type("id:composer", text);
+  await app.waitFor("id:mention-chip:agent:ag-a");
+  app.onPick(() => [{ name: "note.txt", type: "text/plain", data: new TextEncoder().encode("note") }]);
+  await app.press("id:attach");
+  await app.waitFor("id:staged:note.txt");
+  w.knobs.uploadDelay = 2_000;
+  await app.press("id:send");
+  await app.waitUntil(() => w.l.assets.length === 1);
+  moved = true;
+  await app.clock!.runFor(2_100);
+  await app.waitUntil(() => held === 1, { timeout: 1_000 });
+  expect(requests(app)).toHaveLength(0);
+  expect(app.shows("id:mention-chip:agent:ag-a")).toBe(true);
+  await app.clock!.runFor(4_100);
+  await app.waitFor("text:/Pick who you mean\\. Nothing was sent/");
+  expect(app.value("id:composer")).toBe(text);
+  expect(app.shows("id:mention-chip:agent:ag-a")).toBe(false);
+  expect(app.shows("id:staged:note.txt >> text:/in the Library/")).toBe(true);
+  expect(requests(app)).toHaveLength(0);
+  if (!app.shows("id:mention-picker")) await app.press("id:mention");
+  await app.waitFor("id:mention-ambiguous");
+  await app.press("id:pick-agent:ag-b");
+  await app.waitFor("id:mention-chip:agent:ag-b");
+  // A deliberate pick is still valid when both aliases change again.
+  renamedAfterPick = true;
+  await app.press("id:send");
+  await app.clock!.runFor(4_100);
+  await app.waitUntil(() => requests(app).length === 1);
+  expect(w.l.assets).toHaveLength(1);
+  expect(JSON.parse(requests(app)[0].body!)).toMatchObject({
+    text: "🌿 @New Coder please check", infer_text_mentions: false, mentions: [{ kind: "agent", agent_id: "ag-b" }],
+    asset_ids: [w.l.assets[0]!.id],
   });
 });
 

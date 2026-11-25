@@ -4,7 +4,10 @@ import { personState, profileName } from "../profile/profileState";
 import { agentList, loadSpaceAgentsForVisit } from "../space/agents";
 import type { MentionDirectory } from "./draft";
 
-type AgentVisit = { sid: string; current: () => boolean; refresh: () => void; verified: () => boolean };
+type AgentVisit = {
+  sid: string; current: () => boolean; refresh: () => void; verified: () => boolean;
+  forSend: (live: () => boolean) => Promise<MentionDirectory["agents"] | null>;
+};
 const agentVisit = signal<AgentVisit | null>(null);
 
 export function verifiedMembers(sid: string) {
@@ -37,16 +40,24 @@ export function spaceMentionDirectory(sid: string): MentionDirectory | null {
 export function beginMentionAgentVisit(sid: string) {
   const live = mentionVisitGuard(sid);
   const verified = signal(false);
+  let request = 0;
   let running = false;
   const current = () => live() && agentVisit() === visit;
-  const refresh = () => {
-    if (!current() || running) return;
+  const forSend = async (stillSending: () => boolean): Promise<MentionDirectory["agents"] | null> => {
+    if (!current() || !stillSending()) return null;
+    const ticket = ++request;
     running = true;
-    void loadSpaceAgentsForVisit(sid, current).then(ok => {
-      if (current()) verified.set(ok);
-    }).finally(() => { running = false; });
+    try {
+      const ok = await loadSpaceAgentsForVisit(sid, () => current() && stillSending());
+      if (!current() || ticket !== request) return null;
+      if (stillSending()) verified.set(ok);
+      return ok && stillSending() ? agentList(sid)?.agents.filter(a => a.spaceId === sid) ?? null : null;
+    } finally {
+      if (ticket === request) running = false;
+    }
   };
-  const visit = { sid, current, refresh, verified };
+  const refresh = () => { if (!running) void forSend(() => true); };
+  const visit = { sid, current, refresh, verified, forSend };
   agentVisit.set(visit);
   refresh();
   return () => {
@@ -59,4 +70,7 @@ export function refreshMentionAgents(sid: string) {
   if (visit?.sid === sid) visit.refresh();
 }
 
-registerMentionDirectory(spaceMentionDirectory);
+registerMentionDirectory(spaceMentionDirectory, (sid, live) => {
+  const visit = agentVisit();
+  return visit?.sid === sid ? visit.forSend(live) : Promise.resolve(null);
+});
