@@ -143,12 +143,7 @@ pub async fn plan(
                             Err(why) => {
                                 // Keep the existing room error without revealing
                                 // changes to the sender's access or connection.
-                                let why = match why {
-                                    DecisionFailure::NotAllowed | DecisionFailure::Busy => {
-                                        DecisionFailure::Unreachable
-                                    }
-                                    other => other,
-                                };
+                                let why = why.shared();
                                 plan.errors.push(format!(
                                     "Your classifier could not choose an agent for this message: \
                                      {why}. No agent ran for @agent; mention an agent by its \
@@ -202,6 +197,16 @@ async fn generic(
     }
 }
 
+/// What [`start_runs`] did.
+#[derive(Debug, Default)]
+pub struct Started {
+    /// Why runs could not start, as posted in the room.
+    pub failures: Vec<String>,
+    /// The sender's own routing failure in full, for their POST response
+    /// only; the room got the generic text.
+    pub note: Option<AddressingNote>,
+}
+
 /// Start one run per target answering `event` (already stored) in `room`.
 /// `chosen` is the explicit model for the turn, if any. A run that can't
 /// start posts why in the room; the reasons are returned.
@@ -216,9 +221,9 @@ pub async fn start_runs(
     chosen: Option<Route>,
     settings: &RoutingSettings,
     prefs: &SpacePrefs,
-) -> Vec<String> {
+) -> Started {
     let user = author.id.clone().unwrap_or_default();
-    let mut failures = Vec::new();
+    let mut started = Started::default();
     for t in targets {
         let route = match &chosen {
             Some(route) => route.clone(),
@@ -236,6 +241,11 @@ pub async fn start_runs(
                 .await
             }
         };
+        if let Some(why) = route.routing_failure
+            && started.note.is_none()
+        {
+            started.note = Some(AddressingNote::routing_failed(why));
+        }
         if let Err(reason) = crate::agent::start_room_run(
             state,
             space,
@@ -257,8 +267,8 @@ pub async fn start_runs(
                     &reason,
                 )
                 .await;
-            failures.push(reason);
+            started.failures.push(reason);
         }
     }
-    failures
+    started
 }

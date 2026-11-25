@@ -19,6 +19,7 @@ use axum::routing::post;
 use metro_model_protocol::Capability;
 use metro_server::auth::{AuthFailure, AuthFuture, HumanAuth, UserIdentity};
 use metro_server::db::Db;
+use metro_server::device_relay::DeviceError;
 use metro_server::model_routing::{BoxFuture, Routing, RoutingBackend, submit_scheduled};
 use metro_server::providers::{ProviderError, SelectedModel, UseError};
 use metro_server::{AppState, Config, Limits, ModelConfig, router};
@@ -220,6 +221,16 @@ impl RoutingBackend for Backend {
             }
             if message.contains("[busy]") {
                 return Err(ProviderError::Busy.into());
+            }
+            // A device classifier's failures, as the relay reports them.
+            if message.contains("[device-bad]") {
+                return Err(ProviderError::Device(DeviceError::BadResponse(
+                    "missing answers".into(),
+                ))
+                .into());
+            }
+            if message.contains("[device-revoked]") {
+                return Err(ProviderError::Device(DeviceError::AccessRevoked).into());
             }
             Fake::answer(message, &questions).map_err(anyhow::Error::msg)
         })
@@ -771,6 +782,8 @@ async fn failed_classification_is_returned_only_on_the_senders_post() {
         ("[err] service failed", Some("unreachable")),
         ("[bad] malformed", Some("invalid_answer")),
         ("[timeout] delayed", Some("timeout")),
+        ("[device-bad] malformed", Some("invalid_answer")),
+        ("[device-revoked] share gone", Some("not_allowed")),
         ("[maybe] not sure", None),
         ("Lunch?", None),
     ] {
@@ -796,6 +809,29 @@ async fn failed_classification_is_returned_only_on_the_senders_post() {
             assert_eq!(stored["kind"], "message");
             assert_eq!(stored["text"], text);
             assert!(stored.get("addressing_note").is_none());
+        }
+    }
+    // No reason reached anyone's transcript, in any form.
+    for (who, space) in [
+        ("alice", Some(sid.as_str())),
+        ("bob", Some(sid.as_str())),
+        ("alice", None),
+    ] {
+        let transcript = serde_json::to_string(&h.events(who, space).await).unwrap();
+        for leak in [
+            "addressing_note",
+            "invalid_answer",
+            "not_allowed",
+            "malformed",
+            "not usable here",
+        ] {
+            let typed = transcript.matches(leak).count();
+            // The message texts themselves are the only allowed mentions.
+            let said = ["[bad] malformed", "[device-bad] malformed"]
+                .iter()
+                .filter(|t| t.contains(leak))
+                .count();
+            assert_eq!(typed, said, "{who}: {leak}");
         }
     }
 
@@ -831,6 +867,71 @@ async fn failed_classification_is_returned_only_on_the_senders_post() {
             .iter()
             .all(|e| e["kind"] == "message" && e.get("addressing_note").is_none())
     );
+}
+
+#[tokio::test]
+async fn routing_failures_in_a_room_do_not_reveal_the_senders_access() {
+    let h = H::start().await;
+    let sid = h.space("private routing failures").await;
+    let (s, v) = h.put_routing("alice", routing_on(false, true)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    h.agent(
+        &sid,
+        json!({"name": "Coder", "handle": "coder", "description": "Writes code."}),
+    )
+    .await;
+
+    // The routing Choice fails upstream...
+    let upstream = h
+        .say("alice", Some(&sid), json!({"text": "@coder [err] code"}))
+        .await;
+    assert_eq!(
+        upstream["routing_note"],
+        json!({"kind": "routing_failed", "reason": "unreachable"})
+    );
+    assert_eq!(upstream["addressing_note"], Value::Null);
+    let upstream_seen = h
+        .answer_after("bob", Some(&sid), upstream["id"].as_i64().unwrap())
+        .await;
+
+    // ...and then alice loses access to her classifier.
+    h.fake
+        .conns
+        .lock()
+        .unwrap()
+        .get_mut(&id(CLASSIFIER))
+        .unwrap()
+        .grants
+        .clear();
+    let calls = h.model_calls().len();
+    let revoked = h
+        .say("alice", Some(&sid), json!({"text": "@coder review code"}))
+        .await;
+    assert_eq!(
+        revoked["routing_note"],
+        json!({"kind": "routing_failed", "reason": "not_allowed"})
+    );
+    let revoked_seen = h
+        .answer_after("bob", Some(&sid), revoked["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(h.model_calls().len(), calls, "no model ran");
+
+    // Bob sees the same room error for both.
+    for seen in [&upstream_seen, &revoked_seen] {
+        assert_eq!(seen["kind"], "error", "{seen}");
+        assert!(
+            seen["text"]
+                .as_str()
+                .unwrap()
+                .contains(": the System One call failed."),
+            "{seen}"
+        );
+    }
+    assert_eq!(upstream_seen["text"], revoked_seen["text"]);
+    let transcript = serde_json::to_string(&h.events("bob", Some(&sid)).await).unwrap();
+    for leak in ["routing_note", "not_allowed", "not usable here"] {
+        assert!(!transcript.contains(leak), "{leak}");
+    }
 }
 
 #[tokio::test]

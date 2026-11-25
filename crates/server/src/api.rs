@@ -687,6 +687,8 @@ pub struct PostedMessage {
     #[serde(flatten)]
     event: Event,
     addressing_note: Option<AddressingNote>,
+    /// Sender-only: why their use-case routing could not choose a model.
+    routing_note: Option<AddressingNote>,
 }
 
 pub async fn post_message(
@@ -805,7 +807,7 @@ pub async fn post_message(
             .await;
     }
     // Mentioning only people never starts agent work.
-    crate::agent_dispatch::start_runs(
+    let started = crate::agent_dispatch::start_runs(
         &state,
         &space.id,
         &room,
@@ -822,6 +824,7 @@ pub async fn post_message(
         Json(PostedMessage {
             event,
             addressing_note: plan.addressing_note,
+            routing_note: started.note,
         }),
     ))
 }
@@ -1100,6 +1103,7 @@ pub async fn chat_message(
         Json(PostedMessage {
             event,
             addressing_note: note,
+            routing_note: None,
         }),
     ))
 }

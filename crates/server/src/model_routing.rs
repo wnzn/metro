@@ -617,6 +617,10 @@ pub struct Route {
     /// the turn fails with this text before any model is called. Never a
     /// silent switch to another model.
     pub blocked: Option<String>,
+    /// Why the person's routing could not decide, in full. Only for the
+    /// sender's own POST response: in a Space room, `blocked` names a
+    /// failure other members can't tell apart from an upstream one.
+    pub routing_failure: Option<DecisionFailure>,
 }
 
 impl Route {
@@ -626,6 +630,7 @@ impl Route {
             connection_id: None,
             turn_selection: None,
             blocked: None,
+            routing_failure: None,
             note: RouteNote {
                 source: RouteSource::Default,
                 addressed_by,
@@ -646,6 +651,7 @@ impl Route {
             connection_id: Some(connection_id.to_owned()),
             turn_selection: None,
             blocked: None,
+            routing_failure: None,
             note: RouteNote {
                 source: RouteSource::Override,
                 addressed_by,
@@ -672,6 +678,7 @@ impl Route {
             connection_id: parent.connection_id.clone(),
             turn_selection: parent.turn_selection.clone(),
             blocked: None,
+            routing_failure: None,
             note,
         }
     }
@@ -746,10 +753,27 @@ impl std::fmt::Display for DecisionFailure {
 }
 
 impl DecisionFailure {
+    /// The failure as other members of a Space room may see it: a lost
+    /// grant, a missing connection or a full queue reads like any other
+    /// failed call, so the room never learns about the sender's access.
+    pub fn shared(self) -> Self {
+        match self {
+            Self::NotAllowed | Self::Busy | Self::Unreachable => Self::Unreachable,
+            other => other,
+        }
+    }
+
     fn upstream(error: &anyhow::Error) -> Self {
+        use crate::device_relay::DeviceError;
         use crate::providers::ProviderError;
         match error.downcast_ref::<ProviderError>() {
             Some(ProviderError::Use(UseError::Busy) | ProviderError::Busy) => Self::Busy,
+            // A device classifier: a lost share and a malformed answer mean
+            // what they mean for a server connection.
+            Some(ProviderError::Device(DeviceError::AccessRevoked | DeviceError::NotFound)) => {
+                Self::NotAllowed
+            }
+            Some(ProviderError::Device(DeviceError::BadResponse(_))) => Self::InvalidAnswer,
             Some(ProviderError::Use(UseError::DeviceOffline | UseError::Internal)) => {
                 Self::Unreachable
             }
@@ -776,12 +800,36 @@ impl DecisionFailure {
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AddressingNote {
-    ClassificationFailed { reason: &'static str },
+    ClassificationFailed {
+        reason: &'static str,
+    },
+    /// Use-case routing could not choose a model for a turn the message
+    /// started; the room shows only a generic failure.
+    RoutingFailed {
+        reason: &'static str,
+    },
+}
+
+impl AddressingNote {
+    pub fn routing_failed(why: DecisionFailure) -> Self {
+        Self::RoutingFailed {
+            reason: why.reason(),
+        }
+    }
 }
 
 impl From<DecisionFailure> for AddressingNote {
     fn from(reason: DecisionFailure) -> Self {
-        let reason = match reason {
+        Self::ClassificationFailed {
+            reason: reason.reason(),
+        }
+    }
+}
+
+impl DecisionFailure {
+    /// The stable reason code of a sender-only note.
+    fn reason(self) -> &'static str {
+        match self {
             DecisionFailure::Unreachable
             | DecisionFailure::Busy
             | DecisionFailure::InvalidQuestion => "unreachable",
@@ -789,8 +837,7 @@ impl From<DecisionFailure> for AddressingNote {
             DecisionFailure::InvalidAnswer => "invalid_answer",
             DecisionFailure::NoClassifier => "no_classifier",
             DecisionFailure::NotAllowed => "not_allowed",
-        };
-        Self::ClassificationFailed { reason }
+        }
     }
 }
 
@@ -1093,6 +1140,7 @@ pub async fn route_turn(
                 connection_id: Some(id.clone()),
                 turn_selection: None,
                 blocked: None,
+                routing_failure: None,
                 note: RouteNote {
                     source: RouteSource::RoutingDefault,
                     connection_id: Some(id.clone()),
@@ -1117,11 +1165,15 @@ pub async fn route_turn(
         // connection could not answer, so nothing answers in its place.
         Decision::Failed(why) => {
             let mut route = Route::default_for(addressed_by);
+            // In a Space room every member reads this; the detail is
+            // returned to the sender alone (`routing_failure`).
+            let shown = if space.is_some() { why.shared() } else { why };
             route.blocked = Some(format!(
-                "Your model routing could not choose a model for this message: {why}. No \
+                "Your model routing could not choose a model for this message: {shown}. No \
                  model was used; check your System One connection in Settings."
             ));
-            route.note.reason = format!("routing failed: {why}");
+            route.note.reason = format!("routing failed: {shown}");
+            route.routing_failure = Some(why);
             return route;
         }
     };
@@ -1144,6 +1196,7 @@ pub async fn route_turn(
         connection_id: Some(case.connection_id.clone()),
         turn_selection: None,
         blocked: None,
+        routing_failure: None,
         note: RouteNote {
             source: RouteSource::Case,
             addressed_by,
@@ -1275,11 +1328,11 @@ pub async fn submit_scheduled(
                 pick: "Scheduled prompt: default agent".to_owned(),
                 addressed_by: AddressedBy::Schedule,
             }];
-            let failures = crate::agent_dispatch::start_runs(
+            let started = crate::agent_dispatch::start_runs(
                 state, space_id, &room, &author, &event, targets, None, &settings, &prefs,
             )
             .await;
-            if let Some(reason) = failures.into_iter().next() {
+            if let Some(reason) = started.failures.into_iter().next() {
                 anyhow::bail!(reason);
             }
             Ok(())
