@@ -1,5 +1,10 @@
 # Runners: dedicated and registered
 
+The setup steps below are for published releases. The desktop's
+[guarded local runner offer](next-source.md#this-computers-runner) and
+[runner update controls](updates.md#runner-and-server-updates) are in
+the source, not released.
+
 A runner is a `metro-runner` process on someone's machine. It gives a Space's
 agent tools over files on that machine. A Space works without one. This page
 explains the two kinds of runner, who controls each kind, and how to run a

@@ -243,7 +243,7 @@ fn addressed(resolved: &[Mention]) -> Addressed {
     Addressed {
         mentions: serde_json::to_value(resolved).unwrap_or_else(|_| json!([])),
         audience: mentions::audience(resolved).to_owned(),
-        spans: Vec::new(),
+        spans: None,
     }
 }
 
@@ -740,38 +740,34 @@ pub async fn post_message(
     // Only an unaddressed message can acquire a recipient here. Explicit
     // spans keep their canonical indices even if @agent's target is picked
     // by the classifier (that choice is run activity, not an edit to To:).
-    let addressed = plan.classified.clone().unwrap_or_else(|| Addressed {
-        spans,
-        ..addressed(&resolved)
-    });
+    let mut addressed = plan
+        .classified
+        .clone()
+        .unwrap_or_else(|| addressed(&resolved));
+    if !body.infer_text_mentions || !spans.is_empty() {
+        addressed.spans = Some(spans);
+    }
     let author = who.author();
-    let event = if body.asset_ids.is_empty() {
-        let (sid, rid, author, text) = (
-            space.id.clone(),
-            room.id.clone(),
-            author.clone(),
-            text.clone(),
-        );
-        db(&state, move |db| {
-            db.append_event_as_member(&sid, &rid, kind::MESSAGE, &author, &text, &addressed)
-        })
-        .await?
-        .ok_or_else(|| ApiError::not_found("no such room"))?
-    } else {
-        let place = Place::Space {
-            space_id: space.id.clone(),
-            room_id: room.id.clone(),
-        };
-        let (author, text, ids) = (author.clone(), text.clone(), body.asset_ids);
-        match db(&state, move |db| {
-            attachments::append_message(db, &place, &author, &text, &addressed, &ids)
-        })
-        .await?
-        {
-            Append::Posted(event) => *event,
-            Append::NoRoom => return Err(ApiError::not_found("no such room")),
-            Append::NoAsset => return Err(no_attachment()),
-        }
+    let place = Place::Space {
+        space_id: space.id.clone(),
+        room_id: room.id.clone(),
+    };
+    let (writer, ids) = (author.clone(), body.asset_ids);
+    // Include targets derived from classification or @agent as well as
+    // stored explicit recipients. A refusal reveals no classifier result.
+    let mut recipients = resolved;
+    recipients.extend(plan.targets.iter().map(|target| Mention::AgentId {
+        agent_id: target.agent.id.clone(),
+    }));
+    let event = match db(&state, move |db| {
+        attachments::append_message(db, &place, &writer, &text, &addressed, &ids, &recipients)
+    })
+    .await?
+    {
+        Append::Posted(event) => *event,
+        Append::NoRoom => return Err(ApiError::not_found("no such room")),
+        Append::NoRecipient => return Err(ApiError::bad_request("unknown recipient")),
+        Append::NoAsset => return Err(no_attachment()),
     };
     for reason in &plan.errors {
         state
@@ -1084,12 +1080,12 @@ pub async fn chat_message(
         let ids = body.asset_ids;
         let place = Place::Personal { user_id: uid };
         match db(&state, move |db| {
-            attachments::append_message(db, &place, &author, &stored, &addressed, &ids)
+            attachments::append_message(db, &place, &author, &stored, &addressed, &ids, &[])
         })
         .await?
         {
             Append::Posted(event) => *event,
-            Append::NoRoom | Append::NoAsset => return Err(no_attachment()),
+            Append::NoRoom | Append::NoAsset | Append::NoRecipient => return Err(no_attachment()),
         }
     };
     // With a choice: only that connection. Otherwise routing, if the sender

@@ -153,13 +153,17 @@ async function loadAttached(runnerId: string, scanWanted: () => boolean): Promis
   const checks = await Promise.all(owned.map(async ({ id }) => {
     const observation = beginSpaceRunnerObservation(id);
     try {
-      return { id, observation, ok: true as const, runner: await c.getSpaceRunner(id) };
+      const runner = await c.getSpaceRunner(id);
+      observation.finish(sameRunner());
+      return { id, observation, ok: true as const, runner };
     } catch (error) {
       const denied = isSpaceRunnerAccessDenied(error);
       // Withdraw this row as soon as its refusal settles. A sibling, page
       // close, or the scan budget must not keep current denied evidence alive.
       if (denied && sameRunner()) observation.denyAccess();
       return { ok: false as const, denied };
+    } finally {
+      observation.finish();
     }
   }));
   if (!stillScanning()) return;
@@ -332,7 +336,7 @@ export async function showRunnerFolder(sid: string): Promise<void> {
   if (!row) return;
   const valid = stillValid();
   const stillRow = () => valid() && runnerSpaces().includes(row);
-  const observation = beginSpaceRunnerObservation(sid);
+  const observation = beginSpaceRunnerObservation(sid, false); // Local bridge, not hosted access evidence.
   installedBusy.set(`folder:${sid}`);
   installedError.set(null);
   installedNotice.set(null);

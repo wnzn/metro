@@ -65,16 +65,22 @@ export async function startWorkspace(): Promise<void> {
   if (started) return;
   started = true;
   const availability = checkLocalWorkspace();
+  let explicit = false;
+  const restoring = restorePreferences(() => !manual && !explicit);
   try {
-    await Promise.all([restorePreferences(() => !manual), loadChoice()]);
+    await loadChoice();
     if (manual || status().phase !== "signedOut") return;
     const chosen = savedServers().find((s) => s.id === startupServerId());
     if (chosen) {
       // Tokens don't survive a restart. Show just this server's login; there
       // is no reason to contact it (or open the bundled server) yet.
+      explicit = true;
       batch(() => { serverUrlInput.set(chosen.baseUrl); startupPrompt.set(chosen); });
-    } else if (await availability === "available" && !manual && status().phase === "signedOut") {
-      await openLocalWorkspace();
+    } else {
+      await restoring; // keep the last remote address available when leaving local
+      if (await availability === "available" && !manual && status().phase === "signedOut") {
+        await openLocalWorkspace();
+      }
     }
   } finally {
     startupOpening.set(false);

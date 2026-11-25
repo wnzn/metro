@@ -92,9 +92,10 @@ pub struct Event {
     /// `[{"kind":"agent"}]`, `[{"kind":"user","id":"bob"}]`, ... Empty for
     /// everything but messages.
     pub mentions: serde_json::Value,
-    /// Display ranges in this event's `text`, indexed into its `mentions`.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub spans: Vec<crate::mentions::MentionSpan>,
+    /// Display ranges indexing `mentions`. Empty is authoritative; absent
+    /// leaves the spelling of mentions in older events unspecified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spans: Option<Vec<crate::mentions::MentionSpan>>,
     /// `room`, `agent`, `users` or `mixed`; `room` for non-messages.
     pub audience: String,
     /// The agent turn or Demo run that wrote this event, when the server
@@ -289,7 +290,7 @@ pub struct Addressed {
     /// A JSON array of mentions.
     pub mentions: serde_json::Value,
     pub audience: String,
-    pub spans: Vec<crate::mentions::MentionSpan>,
+    pub spans: Option<Vec<crate::mentions::MentionSpan>>,
 }
 
 impl Addressed {
@@ -298,7 +299,7 @@ impl Addressed {
         Self {
             mentions: serde_json::Value::Array(Vec::new()),
             audience: "room".to_owned(),
-            spans: Vec::new(),
+            spans: None,
         }
     }
 }
@@ -1077,7 +1078,7 @@ impl Db {
                 addressed.mentions.to_string(),
                 addressed.audience,
                 at,
-                event_metadata_json(activity, &addressed.spans)?,
+                event_metadata_json(activity, addressed.spans.as_deref())?,
             ],
         )?;
         Ok(new_event(
@@ -1089,6 +1090,56 @@ impl Db {
             activity,
             at,
         ))
+    }
+
+    pub(crate) fn room_member_in(
+        conn: &Connection,
+        space_id: &str,
+        room_id: &str,
+        user_id: &str,
+    ) -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM space_members WHERE space_id = ?1 AND user_id = ?2)
+                AND EXISTS (SELECT 1 FROM space_rooms WHERE space_id = ?1 AND id = ?3)",
+            params![space_id, user_id, room_id],
+            |r| r.get(0),
+        )
+    }
+
+    pub(crate) fn space_agent_exists_in(
+        conn: &Connection,
+        space_id: &str,
+        agent_id: &str,
+    ) -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM space_agents WHERE space_id = ?1 AND id = ?2)",
+            params![space_id, agent_id],
+            |r| r.get(0),
+        )
+    }
+
+    /// Recheck the concrete recipients in the transaction that writes a room message.
+    pub(crate) fn recipients_current_in(
+        conn: &Connection,
+        space_id: &str,
+        recipients: &[crate::mentions::Mention],
+    ) -> rusqlite::Result<bool> {
+        use crate::mentions::Mention;
+        for m in recipients {
+            let exists: bool = match m {
+                Mention::Agent => continue,
+                Mention::AgentId { agent_id } => Self::space_agent_exists_in(conn, space_id, agent_id)?,
+                Mention::User { id } => conn.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM space_members WHERE space_id = ?1 AND user_id = ?2)",
+                    params![space_id, id],
+                    |r| r.get(0),
+                )?,
+            };
+            if !exists {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Append a message written by `author` (a person) to `room_id` of
@@ -1109,13 +1160,7 @@ impl Db {
         };
         let conn = self.lock();
         let tx = conn.unchecked_transaction()?;
-        let allowed: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM space_members WHERE space_id = ?1 AND user_id = ?2)
-                AND EXISTS (SELECT 1 FROM space_rooms WHERE space_id = ?1 AND id = ?3)",
-            params![space_id, user_id, room_id],
-            |r| r.get(0),
-        )?;
-        if !allowed {
+        if !Self::room_member_in(&tx, space_id, room_id, user_id)? {
             return Ok(None);
         }
         let event =
@@ -1305,18 +1350,18 @@ fn row_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
     let mentions: String = r.get(5)?;
     let metadata: Option<String> = r.get(7)?;
     let kind: String = r.get(1)?;
-    #[derive(Deserialize)]
-    struct Spans {
-        spans: Vec<crate::mentions::MentionSpan>,
-    }
     let spans = if kind == kind::MESSAGE {
-        metadata
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<Spans>(s).ok())
-            .map(|m| m.spans)
-            .unwrap_or_default()
+        metadata.as_deref().and_then(|raw| {
+            // Unknown/malformed spans must not turn into legacy text inference.
+            match serde_json::from_str::<serde_json::Value>(raw) {
+                Ok(serde_json::Value::Object(mut m)) => m
+                    .remove("spans")
+                    .map(|v| serde_json::from_value(v).unwrap_or_default()),
+                _ => Some(Vec::new()),
+            }
+        })
     } else {
-        Vec::new()
+        None
     };
     Ok(Event {
         id: r.get(0)?,
@@ -1344,11 +1389,11 @@ fn activity_json(activity: Option<&Activity>) -> anyhow::Result<Option<String>> 
 /// readers. A span-only object has no activity id, so it is not a run event.
 fn event_metadata_json(
     activity: Option<&Activity>,
-    spans: &[crate::mentions::MentionSpan],
+    spans: Option<&[crate::mentions::MentionSpan]>,
 ) -> anyhow::Result<Option<String>> {
-    if spans.is_empty() {
+    let Some(spans) = spans else {
         return activity_json(activity);
-    }
+    };
     #[derive(Serialize)]
     struct Metadata<'a> {
         #[serde(flatten)]

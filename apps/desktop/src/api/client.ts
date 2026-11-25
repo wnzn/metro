@@ -13,6 +13,10 @@ import { spacesApi } from "./spaces";
 import type { RawFn } from "./profile";
 import { parseWebTool, webSearchPrefsApi } from "./webSearch";
 import type { WebToolNote } from "./webSearch";
+import type { MentionSend, WireMentionSpan } from "../features/mentions/draft";
+import { readMentionSpans } from "../features/mentions/sent";
+import { canonicalAddressing, canonicalEventTime, canonicalStableId, readPostedNotes } from "../features/senderNotices/response";
+import type { PostedSenderNotes } from "../features/senderNotices/response";
 
 /** `parentRoomId`: set on a thread an agent delegated from that room. */
 export type Room = { id: string; name: string; parentRoomId?: string };
@@ -20,13 +24,19 @@ export type Room = { id: string; name: string; parentRoomId?: string };
  * Who a message addresses: the Space's agent, or a member by their stable
  * user id. An agent mention with `agentId` names one of the Space's agents
  * (`@handle`); without it, it is the generic `@agent` (the Space's default
- * agent, or the sender's classifier pick). `handle` is only the draft's text
- * for it (`@coder`), never sent. On received events only, an agent mention may say it wasn't typed:
+ * agent, or the sender's classifier pick). An agent mention may say it wasn't typed:
  * `classifier` (the sender's opt-in System One judgement started the agent
  * from an unaddressed message) or `schedule` (the creator's scheduled
  * prompt). The server sets it; the app never sends it.
  */
-export type Mention = { kind: "agent"; agentId?: string; handle?: string; addressedBy?: "classifier" | "schedule" } | { kind: "user"; id: string };
+export type Mention = {
+  kind: "agent";
+  agentId?: string;
+  addressedBy?: "classifier" | "schedule";
+  /** If an old event stored its own spelling; never filled from the live roster. */
+  legacyHandle?: string;
+} | { kind: "user"; id: string };
+export type SpaceMessageBody = Extract<MentionSend, { ok: true }>["body"];
 /** For messages: who it was addressed to ("room" = nobody in particular). */
 export type Audience = "room" | "agent" | "users" | "mixed";
 /** Where a turn's activity comes from: an agent run, or the deterministic Demo (no model). */
@@ -80,6 +90,8 @@ export type RoomEvent = {
   actor: string;
   text: string;
   mentions?: Mention[];
+  /** Bytes in the stored text; [] forbids fallback, undefined is legacy. */
+  spans?: WireMentionSpan[];
   audience?: Audience;
   activity?: EventActivity;
   /** A person's stable id; absent for the agent, runner and system. */
@@ -108,7 +120,7 @@ export type Member = { userId: string; role: SpaceRole };
 export type Run = { id: string; spaceId: string; roomId: string; status: string; actor: string; task: string };
 
 /** Who is signed in. `isOrgAdmin`: may create and manage organization runners. */
-export type Me = { id: string; isOrgAdmin: boolean };
+export type Me = { id: string; canonicalId: string | null; isOrgAdmin: boolean };
 
 /** A registered runner the user can see (GET /v1/runners). */
 export type RunnerVisibility = "personal" | "organization";
@@ -562,7 +574,7 @@ export function createClient(options: ClientOptions) {
         throw new ApiError("protocol", "GET /v1/me did not return { id }.");
       }
       // An older server has no organization: nobody is its admin.
-      return { id: String(data.id), isOrgAdmin: data.is_org_admin === true };
+      return { id: String(data.id), canonicalId: canonicalStableId(data.id) ? data.id : null, isOrgAdmin: data.is_org_admin === true };
     },
 
     // ---- registered runners (personal or organization), reusable across Spaces
@@ -835,25 +847,29 @@ export function createClient(options: ClientOptions) {
       return events.filter(isEvent).map(toEvent);
     },
 
-    /** `agentId` (with `invokeAgent`): Ask agent asks that agent of the Space instead of the default (or the classifier's pick). */
+    /** A modern Space send. No fallback: legacy text inference could change who is notified or starts work. */
     async sendMessage(
       spaceId: string,
       roomId: string,
-      text: string,
-      invokeAgent: boolean,
-      mentions?: Mention[],
+      addressing: SpaceMessageBody,
       assetIds?: readonly string[],
       choice?: TurnModelChoice,
-      agentId?: string,
-    ): Promise<void> {
-      const body: Record<string, unknown> = { text, invoke_agent: invokeAgent, ...turnModelBody(choice) };
-      if (invokeAgent && agentId) body.agent_id = agentId;
-      // Only what a person can type: never `addressed_by`, which only the server sets.
-      if (mentions && mentions.length > 0)
-        body.mentions = mentions.map((m) => (m.kind === "agent" ? (m.agentId ? { kind: "agent", agent_id: m.agentId } : { kind: "agent" }) : { kind: "user", id: m.id }));
+    ): Promise<PostedSenderNotes | null> {
+      const body: Record<string, unknown> = { invoke_agent: false, ...addressing, infer_text_mentions: false, ...turnModelBody(choice) };
       const ids = assetIdsBody(assetIds);
       if (ids) body.asset_ids = ids;
-      await request("POST", `${room(spaceId, roomId)}/messages`, body);
+      try {
+        const data = await request("POST", `${room(spaceId, roomId)}/messages`, body);
+        return readPostedNotes(data, { ...addressing, kind: "space" });
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 422) {
+          throw new ApiError("http", "Update Metro Server to send Space messages with safe addressing. Your draft was kept and was not sent.", 422);
+        }
+        if (error instanceof ApiError && (error.kind === "network" || error.kind === "timeout" || error.kind === "protocol" || (error.status ?? 0) >= 500)) {
+          throw new ApiError(error.kind, "Could not confirm whether the message was sent. Your draft was kept. Check the conversation before sending again.", error.status);
+        }
+        throw error;
+      }
     },
 
     async runDemo(spaceId: string, roomId: string): Promise<void> {
@@ -868,12 +884,13 @@ export function createClient(options: ClientOptions) {
       return events.filter(isEvent).map(toEvent);
     },
 
-    async sendChatMessage(text: string, assetIds?: readonly string[], choice?: TurnModelChoice): Promise<void> {
+    async sendChatMessage(text: string, assetIds?: readonly string[], choice?: TurnModelChoice): Promise<PostedSenderNotes | null> {
       // Text sends also ask the agent on servers that require the legacy flag.
       const body: Record<string, unknown> = { text, invoke_agent: true, ...turnModelBody(choice) };
       const ids = assetIdsBody(assetIds);
       if (ids) body.asset_ids = ids;
-      await request("POST", "/v1/chat/messages", body);
+      const data = await request("POST", "/v1/chat/messages", body);
+      return readPostedNotes(data, { kind: "chat", text });
     },
 
     async saveChatNote(text: string, assetIds?: readonly string[]): Promise<void> {
@@ -1223,22 +1240,36 @@ function isRun(v: unknown): v is { id: string | number; space_id: string | numbe
   );
 }
 
+// Leave legacy rendering alone. Private receipt corroboration additionally
+// requires canonical raw identity, time, and addressing, before coercion.
+const canonicalMessageRows = new WeakSet<RoomEvent>();
+export const isCanonicalMessageRow = (event: RoomEvent) => canonicalMessageRows.has(event);
+
 function toEvent(v: RoomEvent): RoomEvent {
   const raw = v as unknown as Record<string, unknown>;
   const event: RoomEvent = { id: v.id, kind: v.kind, actor: v.actor, text: v.text };
+  const indexes = new Map<number, number>();
   if (Array.isArray(raw.mentions)) {
     const mentions: Mention[] = [];
-    for (const m of raw.mentions) {
+    for (const [index, m] of raw.mentions.entries()) {
+      let mention: Mention | undefined;
       if (isObject(m) && m.kind === "agent") {
-        const mention: Mention = { kind: "agent" };
-        if (typeof m.agent_id === "string" && m.agent_id.trim()) mention.agentId = m.agent_id.trim();
+        if (m.agent_id != null && (typeof m.agent_id !== "string" || !m.agent_id.trim())) continue;
+        mention = { kind: "agent" };
+        if (typeof m.agent_id === "string") mention.agentId = m.agent_id;
+        if (mention.agentId && typeof m.handle === "string" && /^[a-z0-9_-]{1,32}$/i.test(m.handle)) {
+          mention.legacyHandle = m.handle;
+        }
         if (m.addressed_by === "classifier" || m.addressed_by === "schedule") mention.addressedBy = m.addressed_by;
+      } else if (isObject(m) && m.kind === "user" && isId(m.id)) mention = { kind: "user", id: String(m.id) };
+      if (mention) {
+        if (mention.kind !== "agent" || !mention.addressedBy) indexes.set(index, mentions.length);
         mentions.push(mention);
       }
-      else if (isObject(m) && m.kind === "user" && isId(m.id)) mentions.push({ kind: "user", id: String(m.id) });
     }
     if (mentions.length) event.mentions = mentions;
   }
+  if ("spans" in raw) event.spans = readMentionSpans(raw.spans, event.text, indexes);
   if (raw.audience === "room" || raw.audience === "agent" || raw.audience === "users" || raw.audience === "mixed") event.audience = raw.audience;
   const activity = toActivity(raw.activity);
   if (activity) {
@@ -1251,6 +1282,8 @@ function toEvent(v: RoomEvent): RoomEvent {
   if (isId(raw.actor_id) && String(raw.actor_id).trim()) event.actorId = String(raw.actor_id);
   const createdAt = toCreatedAt(raw.created_at);
   if (createdAt) event.createdAt = createdAt;
+  if (event.kind === "message" && canonicalStableId(raw.actor_id) && canonicalEventTime(raw.created_at) &&
+    canonicalAddressing(raw.audience, raw.mentions)) canonicalMessageRows.add(event);
   const attachments = toAttachments(raw.attachments);
   if (attachments.length) event.attachments = attachments;
   return event;

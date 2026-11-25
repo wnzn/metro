@@ -21,6 +21,7 @@
 import { batch, effect, signal, untracked } from "nsh";
 import { ApiError, EndpointPatchError } from "./api/client";
 import { serverHost } from "./api/serverUrl";
+import { readStartupProviderCatalog } from "./startupModelRequests";
 import type { PageScope } from "./ui";
 import type {
   Capability,
@@ -218,10 +219,14 @@ export async function confirmRunnerAction(action: "rotate" | "delete", runnerId:
   const checks = await Promise.allSettled(spaces().map(async (s) => {
     const observation = beginSpaceRunnerObservation(s.id);
     try {
-      return { space: s, observation, runner: await c.getSpaceRunner(s.id) };
+      const runner = await c.getSpaceRunner(s.id);
+      observation.finish(opened());
+      return { space: s, observation, runner };
     } catch (error) {
       if (opened() && isSpaceRunnerAccessDenied(error)) observation.denyAccess();
       throw error;
+    } finally {
+      observation.finish();
     }
   }));
   if (!opened()) return;
@@ -370,12 +375,16 @@ async function reconcileSpaceRunner(
   const currentScope = () => stillLatest() && spaces().some((s) => s.id === sid);
   if (!c || !currentScope()) return undefined;
   const observation = beginSpaceRunnerObservation(sid);
-  const current = await c.getSpaceRunner(sid).catch((error: unknown) => {
+  try {
+    const current = await c.getSpaceRunner(sid);
+    if (!currentScope() || !observation.publish(current, allowFolderAdd(current))) return undefined;
+    return current;
+  } catch (error) {
     if (currentScope() && isSpaceRunnerAccessDenied(error)) observation.denyAccess();
     throw error;
-  });
-  if (!currentScope() || !observation.publish(current, allowFolderAdd(current))) return undefined;
-  return current;
+  } finally {
+    observation.finish();
+  }
 }
 
 // ------------------------------------------------------------------ model connections
@@ -436,7 +445,7 @@ async function loadCatalog(): Promise<void> {
   const seq = ++catalogSeq;
   const ok = sessionGuard();
   try {
-    const value = await c.providerCatalog();
+    const value = await readStartupProviderCatalog(c);
     if (!ok() || seq !== catalogSeq) return;
     batch(() => {
       catalog.set(value);

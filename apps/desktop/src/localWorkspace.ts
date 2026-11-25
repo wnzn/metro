@@ -18,7 +18,7 @@
 
 import { batch, computed, signal } from "nsh";
 import { BridgeError } from "./device/bridge";
-import { desktopBridge } from "./device/state";
+import { desktopBridge, startupBridgeStatus } from "./device/state";
 import { adoptConnection, connectedTo, connectError, describe, prepareConnection, status } from "./store";
 import type { PreparedConnection } from "./store";
 
@@ -50,10 +50,10 @@ let opening: AbortController | null = null;
 
 /** Asks the launcher whether it can host a local workspace. */
 export async function checkLocalWorkspace(): Promise<LocalAvailability> {
-  const bridge = desktopBridge();
-  if (!bridge) return "absent";
+  const pending = startupBridgeStatus();
+  if (!pending) return "absent";
   try {
-    const s = await bridge.status();
+    const s = await pending;
     // An older launcher that doesn't report `local` has no local server.
     const next: LocalAvailability = s.local === null || s.local === "unavailable" ? "unavailable" : "available";
     localAvailability.set(next);

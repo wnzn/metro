@@ -45,13 +45,14 @@ test("the @ list offers the generic @agent and each named agent; a named one is 
   await app.waitUntil(() => !app.shows("id:pick:agent") && !app.shows("id:pick:bob"));
   await app.press(`id:pick-agent:${coder.id}`);
   await app.waitFor(`id:mention-chip:agent:${coder.id}`);
-  expect(app.value("id:composer")).toBe("please @coder ");
+  expect(app.value("id:composer")).toBe("please @Coder ");
   await app.type("id:composer", "review the diff");
   const before = messages(w).length;
   await app.press("id:send");
   await app.waitUntil(() => messages(w).length === before + 1);
   // Only the wire form: the agent's id, never its handle or addressed_by.
-  expect(messages(w).at(-1)!.body).toEqual({ text: "please @coder review the diff", invoke_agent: false, mentions: [{ kind: "agent", agent_id: coder.id }] });
+  expect(messages(w).at(-1)!.body).toEqual({ text: "please @Coder review the diff", invoke_agent: false, infer_text_mentions: false,
+    mentions: [{ kind: "agent", agent_id: coder.id }], spans: [{ start: 7, end: 13, index: 0 }] });
 });
 
 test("Ask agent: one agent has no chooser; with two, the default is preselected and another can be chosen", async () => {
@@ -61,7 +62,7 @@ test("Ask agent: one agent has no chooser; with two, the default is preselected 
   await app.type("id:composer", "hello");
   await app.press("id:ask-agent");
   await app.waitUntil(() => messages(w).length > 0);
-  expect(messages(w).at(-1)!.body).toEqual({ text: "hello", invoke_agent: true });
+  expect(messages(w).at(-1)!.body).toEqual({ text: "hello", invoke_agent: true, infer_text_mentions: false });
 
   const w2 = spaceWorld();
   const coder = withCoder(w2);
@@ -77,7 +78,7 @@ test("Ask agent: one agent has no chooser; with two, the default is preselected 
   await app2.type("id:composer", "fix the build");
   await app2.press("id:ask-agent");
   await app2.waitUntil(() => messages(w2).length > 0);
-  expect(messages(w2).at(-1)!.body).toEqual({ text: "fix the build", invoke_agent: true, agent_id: coder.id });
+  expect(messages(w2).at(-1)!.body).toEqual({ text: "fix the build", invoke_agent: true, agent_id: coder.id, infer_text_mentions: false });
 
   // Back to the default: its id is sent explicitly.
   await app2.press("id:ask-agent-choose");
@@ -86,7 +87,7 @@ test("Ask agent: one agent has no chooser; with two, the default is preselected 
   await app2.type("id:composer", "status?");
   await app2.press("id:ask-agent");
   await app2.waitUntil(() => messages(w2).length > 1);
-  expect(messages(w2).at(-1)!.body).toEqual({ text: "status?", invoke_agent: true, agent_id: "ag-1" });
+  expect(messages(w2).at(-1)!.body).toEqual({ text: "status?", invoke_agent: true, agent_id: "ag-1", infer_text_mentions: false });
 });
 
 test("Let the classifier choose is offered only with classification on; it sends no agent id", async () => {
@@ -103,7 +104,7 @@ test("Let the classifier choose is offered only with classification on; it sends
   await app.type("id:composer", "which one?");
   await app.press("id:ask-agent");
   await app.waitUntil(() => messages(w).length > 0);
-  expect(messages(w).at(-1)!.body).toEqual({ text: "which one?", invoke_agent: true });
+  expect(messages(w).at(-1)!.body).toEqual({ text: "which one?", invoke_agent: true, infer_text_mentions: false });
 });
 
 test("a run and its reply show their agent: name, picture or initial, and how it was picked", async () => {

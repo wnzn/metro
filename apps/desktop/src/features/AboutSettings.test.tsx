@@ -87,6 +87,21 @@ async function download(app: App) {
   await app.press("id:update-start:confirm");
 }
 
+test("About Privacy distinguishes web device, provider, server activity, and model output", async () => {
+  const app = await harness(scenario());
+  for (const phrase of [
+    "your most recently seen online web device on this server",
+    "Each contacted provider sees the device's connecting IP address",
+    "your query or page URLs and options like search keywords or page focus",
+    "never uploaded to the Metro server",
+    "People who can read a Space room can see its activity",
+    "for this run only",
+    "Metro doesn't control what providers keep",
+  ]) {
+    expect(app.shows(`id:about-privacy >> text:/${phrase}/`)).toBe(true);
+  }
+});
+
 test("layout plus a supported bridge starts the health handshake once, without opening About", async () => {
   const f = scenario(available());
   f.readDelay = 700;

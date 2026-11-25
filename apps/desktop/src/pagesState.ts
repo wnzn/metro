@@ -57,7 +57,8 @@ export function goPages(next: PagesRoute = { kind: "home" }) {
     if (next.kind === "draft") draftLinks.set([{ route: { ...next }, valid: sessionGuard(next.spaceId) }, ...draftLinks().filter(entry => entry.route.id !== next.id && entry.valid())].slice(0, 20));
     route.set(next);
     pagesRouteMount.set(pagesRouteMount() + 1);
-    openPlace("pages");
+    // Keep mutation navigation guards in step even for Page A → B → A.
+    openPlace("pages", { subrouteChanged: true });
   });
 }
 

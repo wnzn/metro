@@ -26,7 +26,7 @@ import {
   MAX_SPACE_DESCRIPTION,
 } from "../../api/spaces";
 import type { AgentPatch, ModelSelection, SpaceAgent, SpaceDetails, SpacePrefs, SpacePrefsView } from "../../api/spaces";
-import { apiClient, closeSettings, describe, disconnect, isAborted, me, onManageOpen, onSessionEnd, onTransientClear, rememberMembers, sessionGuard, spaceGone, spaceRenamed, spaces } from "../../store";
+import { apiClient, beginMemberRosterRead, closeSettings, describe, disconnect, isAborted, me, onManageOpen, onSessionEnd, onTransientClear, sessionGuard, spaceGone, spaceRenamed, spaces } from "../../store";
 import { acknowledgeSpaceRunnerWrite, beginSpaceRunnerWrite, dismissReveal, revealDedicatedToken, revealed, spaceRunners } from "../../settings";
 import { beginSpaceRunnerObservation, isSpaceRunnerAccessDenied } from "../../spaceRunnerObservations";
 import { spaceRunnerExactPending } from "../../spaceRunnerOrder";
@@ -298,17 +298,18 @@ export async function loadMembers(): Promise<void> {
   const page = guardPage(sid, "members");
   const seq = ++memberRead;
   const live = () => page() && seq === memberRead;
+  const read = beginMemberRosterRead(sid);
   try {
     const list = await api.listMembers(sid);
-    if (!live()) return;
+    if (!live() || !read.publish(list)) return;
     batch(() => {
       roster.set(list);
       rosterError.set(null);
-      rememberMembers(sid, list);
     });
   } catch (error) {
-    if (!live() || lost(error, sid)) return;
-    rosterError.set(reason(error, "Couldn't load members"));
+    if (!live() || isAborted(error)) return;
+    const accepted = read.fail(error);
+    if (!lost(error, sid) && accepted) rosterError.set(reason(error, "Couldn't load members"));
   }
 }
 
@@ -391,6 +392,8 @@ async function refreshAssignment(
       throw error;
     }
     return undefined;
+  } finally {
+    observation.finish();
   }
 }
 

@@ -112,12 +112,13 @@ test("@mentions: pick a member, send, prune and clear on room change", async () 
   await app.waitFor("id:mention-chip:bob");
   expect(app.value("id:composer")).toBe("can you look @bob ");
   await app.press("id:send");
-  await app.waitFor("text:can you look @bob");
+  await app.waitUntil(() => f.posts().some(p => p.path.endsWith("/messages")));
   const sent = f.posts().find((p) => p.path.endsWith("/messages"))!;
-  expect(sent.body).toEqual({ text: "can you look @bob", invoke_agent: false, mentions: [{ kind: "user", id: "bob" }] });
+  expect(sent.body).toEqual({ text: "can you look @bob ", invoke_agent: false, infer_text_mentions: false,
+    mentions: [{ kind: "user", id: "bob" }], spans: [{ start: 13, end: 17, index: 0 }] });
   expect(f.state.events.get("acme/lobby")!.some((e) => e.actor === "agent")).toBe(false); // a person only
   // The header names the recipient itself: a pill for bob, no agent badge, no "to people" note.
-  const toBob = f.state.events.get("acme/lobby")!.find((e) => e.text === "can you look @bob")!;
+  const toBob = f.state.events.get("acme/lobby")!.find((e) => e.text.trim() === "can you look @bob")!;
   await app.waitFor(`id:recipient:${toBob.id}:bob`);
   expect(app.shows("text:@bob")).toBe(true);
   expect(app.shows("label:Addressed to @bob")).toBe(true);
@@ -129,7 +130,7 @@ test("@mentions: pick a member, send, prune and clear on room change", async () 
   // Ask agent with no mention: invoke_agent on the wire, and one "to the agent" badge.
   await app.type("id:composer", "summarise the lobby");
   await askAgent(app);
-  expect(f.posts().filter((p) => p.path.endsWith("/messages")).at(-1)!.body).toEqual({ text: "summarise the lobby", invoke_agent: true });
+  expect(f.posts().filter((p) => p.path.endsWith("/messages")).at(-1)!.body).toEqual({ text: "summarise the lobby", invoke_agent: true, infer_text_mentions: false });
   const asked = f.state.events.get("acme/lobby")!.find((e) => e.text === "summarise the lobby")!;
   await app.waitFor(`id:recipient:${asked.id}:ask-agent`);
   expect(app.count(`id:recipient:${asked.id}:ask-agent`)).toBe(1);
@@ -163,7 +164,7 @@ test("mixed @bob @agent is addressed to both and starts the agent with no extra 
   await app.waitFor("id:mention-chip:agent");
   await app.waitFor("id:mention-chip:bob");
   await app.press("id:send");
-  await app.waitFor("text:please both look @bob @agent");
+  await app.waitUntil(() => f.posts().some(p => p.path.endsWith("/messages")));
   const sent = f.posts().filter((p) => p.path.endsWith("/messages")).at(-1)!;
   const body = sent.body as { text: string; invoke_agent: boolean; mentions: { kind: string; id?: string }[] };
   // On the wire: both recipients, each once; the agent is addressed explicitly.
@@ -171,7 +172,7 @@ test("mixed @bob @agent is addressed to both and starts the agent with no extra 
   expect(body.mentions.filter((m) => m.kind === "agent")).toHaveLength(1);
   expect(body.mentions).toHaveLength(2);
   expect(body.invoke_agent === true || body.mentions.some((m) => m.kind === "agent")).toBe(true);
-  expect(body.text).toBe("please both look @bob @agent");
+  expect(body.text).toBe("please both look @bob @agent ");
   // In the transcript: exactly one agent badge (the @agent pill, no second
   // Ask agent badge) and one pill for bob; no verbose audience sentence.
   const ev = f.state.events.get("acme/lobby")!.find((e) => e.actor === "alice" && e.text.startsWith("please both look"))!;
@@ -188,15 +189,14 @@ test("mixed @bob @agent is addressed to both and starts the agent with no extra 
   expect(f.posts().some((p) => p.path === "/v1/systemone")).toBe(false);
 });
 
-test("a message that mentions me is highlighted as @you", async () => {
+test("a message that mentions me shows my current label and announces it as addressed to me", async () => {
   const f = world();
   const ev = f.post("acme/lobby", { kind: "message", actor: "bob", text: "@alice please review", mentions: [{ kind: "user", id: "alice" }, { kind: "agent" }], audience: "mixed" });
   const app = await openApp(f);
   await signIn(app, "alice");
   await openAcme(app);
   await app.waitFor(`id:recipient:${ev.id}:alice`);
-  // My pill reads @you, and says so to a screen reader; the agent has its one pill.
-  expect(app.shows("text:@you")).toBe(true);
+  expect(app.shows(`id:recipient:${ev.id}:alice >> text:@alice`)).toBe(true);
   expect(app.shows("label:Addressed to you")).toBe(true);
   expect(app.count(`id:recipient:${ev.id}:agent`)).toBe(1);
   expect(app.shows(`id:recipient:${ev.id}:ask-agent`)).toBe(false);

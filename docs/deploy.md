@@ -86,6 +86,11 @@ same environment file, port, volume and hardening. The repository's own
 
 ### 3. Open the admin panel
 
+These steps are for the published 0.4.0 server. See the source-only
+[transport changes](next-source.md#http-tailscale-and-proxies) and
+[Page limits API](pages.md#live-limits-in-the-organization-admin-panel)
+for later behaviour.
+
 The panel is served by the server itself at `/admin`, on the same origin as
 the API, and `/` redirects there. It's a static page that holds no data, and
 does nothing until an admin signs in with their token. The token stays in
@@ -150,7 +155,8 @@ first one it sees:
 
 ## Reaching the server from other machines
 
-Bearer tokens must never cross a network in clear text.
+Use these protected routes with the published 0.4.0 clients. Bearer
+tokens sent over ordinary plain HTTP can be read on the network.
 
 - **Team use:** put a TLS-terminating reverse proxy in front of
   `127.0.0.1:8787` and give people its `https://` URL.

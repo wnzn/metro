@@ -55,7 +55,8 @@ const lists = signal<Record<string, AgentList>>({});
 const pictures = signal<Record<string, string>>({});
 
 const checkedAt = new Map<string, number>();
-const inflight = new Map<string, Promise<void>>();
+const inflight = new Map<string, Promise<boolean>>();
+const loadTickets = new Map<string, object>();
 const pictureInflight = new Set<string>();
 const failedPictures = new Set<string>();
 let generation = 0;
@@ -85,15 +86,33 @@ export function agentById(spaceId: string | null | undefined, agentId: string | 
 }
 
 /** Loads the list once per `AGENTS_RECHECK_MS` (or now with `force`); concurrent calls share one request. */
-export function ensureSpaceAgents(spaceId: string, force = false): Promise<void> {
-  if (!spaceId) return Promise.resolve();
+export async function ensureSpaceAgents(spaceId: string, force = false): Promise<void> {
+  if (!spaceId) return;
   const running = inflight.get(spaceId);
-  if (running) return running;
+  if (running) { await running; return; }
   const last = checkedAt.get(spaceId);
-  if (!force && last !== undefined && Date.now() - last < AGENTS_RECHECK_MS) return Promise.resolve();
-  const work = loadAgents(spaceId).finally(() => inflight.delete(spaceId));
+  if (!force && last !== undefined && Date.now() - last < AGENTS_RECHECK_MS) return;
+  await startAgentLoad(spaceId, () => true);
+}
+
+/** A mention visit needs its own authorized roster response, not an older in-flight read. */
+export function loadSpaceAgentsForVisit(spaceId: string, isCurrentVisit: () => boolean): Promise<boolean> {
+  return startAgentLoad(spaceId, isCurrentVisit);
+}
+
+function startAgentLoad(spaceId: string, valid: () => boolean): Promise<boolean> {
+  const ticket = {};
+  loadTickets.set(spaceId, ticket);
+  const work = loadAgents(spaceId, () => loadTickets.get(spaceId) === ticket && valid()).finally(() => {
+    if (inflight.get(spaceId) === work) inflight.delete(spaceId);
+  });
   inflight.set(spaceId, work);
   return work;
+}
+
+function supersedeAgentLoad(spaceId: string) {
+  loadTickets.delete(spaceId);
+  inflight.delete(spaceId);
 }
 
 /** Drops the cached list (after an edit, or a membership change): the next read loads it again. */
@@ -101,29 +120,34 @@ export function invalidateSpaceAgents(spaceId: string) {
   checkedAt.delete(spaceId);
 }
 
-async function loadAgents(spaceId: string): Promise<void> {
+async function loadAgents(spaceId: string, valid: () => boolean): Promise<boolean> {
   const api = apiClient();
-  if (!api) return;
+  if (!api || !valid()) return false;
   const gen = generation;
-  const ok = sessionGuard();
-  const live = () => ok() && gen === generation;
+  const ok = sessionGuard(spaceId);
+  const live = () => ok() && gen === generation && valid();
   const current = untracked(lists)[spaceId];
   if (!current) setList(spaceId, { status: "loading", agents: EMPTY, tools: [], defaultTools: [], error: null });
   try {
     const { agents, tools, defaultTools } = await api.spaceAgents(spaceId);
-    if (!live()) return;
+    if (!live()) return false;
     checkedAt.set(spaceId, Date.now());
     setList(spaceId, { status: "ready", agents, tools, defaultTools, error: null });
+    return true;
   } catch (error) {
-    if (!live() || isAborted(error)) return;
-    if (error instanceof ApiError && error.kind === "auth") return disconnect(error.message);
+    if (!live() || isAborted(error)) return false;
+    if (error instanceof ApiError && error.kind === "auth") {
+      disconnect(error.message);
+      return false;
+    }
     if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found")) {
       forgetSpaceAgents(spaceId);
       setList(spaceId, { status: "hidden", agents: EMPTY, tools: [], defaultTools: [], error: null });
-      return;
+      return false;
     }
     const before = untracked(lists)[spaceId];
     setList(spaceId, { status: before?.status === "ready" ? "ready" : "error", agents: before?.agents ?? EMPTY, tools: before?.tools ?? [], defaultTools: before?.defaultTools ?? [], error: describe(error, "Couldn't load this Space's agents") });
+    return false;
   }
 }
 
@@ -134,6 +158,7 @@ function setList(spaceId: string, next: AgentList) {
 /** Puts an agent the server just returned into the cached list (create or edit). */
 export function adoptAgent(agent: SpaceAgent) {
   const sid = agent.spaceId;
+  supersedeAgentLoad(sid);
   const current = untracked(lists)[sid];
   if (!current) return;
   const others = current.agents.filter((a) => a.id !== agent.id);
@@ -146,6 +171,7 @@ export function adoptAgent(agent: SpaceAgent) {
 
 /** Drops an agent the owner just deleted; `defaultAgentId` is the server's default afterwards. */
 export function dropAgent(spaceId: string, agentId: string, defaultAgentId: string | null) {
+  supersedeAgentLoad(spaceId);
   const current = untracked(lists)[spaceId];
   if (!current) return;
   const agents = current.agents.filter((a) => a.id !== agentId).map((a) => (defaultAgentId ? { ...a, isDefault: a.id === defaultAgentId } : a));
@@ -155,6 +181,7 @@ export function dropAgent(spaceId: string, agentId: string, defaultAgentId: stri
 
 /** Forgets one Space's agents and pictures (deleted or left). */
 export function forgetSpaceAgents(spaceId: string) {
+  supersedeAgentLoad(spaceId);
   checkedAt.delete(spaceId);
   const { [spaceId]: _gone, ...rest } = untracked(lists);
   lists.set(rest);
@@ -280,6 +307,7 @@ export function resetSpaceAgents() {
   for (const url of Object.values(untracked(pictures))) URL.revokeObjectURL(url);
   checkedAt.clear();
   inflight.clear();
+  loadTickets.clear();
   pictureInflight.clear();
   failedPictures.clear();
   batch(() => {

@@ -7,11 +7,49 @@
 // with the user's credential, never a remote URL.
 
 import { Image, Text, View } from "nsh";
-import type { JSX } from "nsh";
-import { cx, toneSurfaceClass, toneTextClass } from "./tokens";
+import { Button } from "nsh/base";
+import type { JSX, ViewRef } from "nsh";
+import { cx, focusRingClass, toneSurfaceClass, toneTextClass } from "./tokens";
 import type { Tone } from "./tokens";
 
 type Testable = { testID?: string; accessibilityLabel?: string };
+
+/** One logical line of a message laid out as wrapped text and focusable chips. */
+export function MentionMessageLine(props: { children?: JSX.Element }) {
+  return <View class="min-h-[20px] flex-row flex-wrap items-baseline">{props.children}</View>;
+}
+
+export function MentionMessageText(props: { text: string }) {
+  return <Text class="min-w-0 max-w-full text-(length:--text-md) text-foreground">{props.text}</Text>;
+}
+
+/** An inline attachment, focusable only for a verified identity. */
+export function MentionToken(props: Testable & {
+  label: string; tone: "self" | "person" | "agent" | "unavailable";
+  onPress?: () => void; ref?: (node: ViewRef) => void;
+}) {
+  const colors = () => props.tone === "self" ? "bg-tone-warning text-tone-warning-foreground font-semibold"
+    : props.tone === "person" ? "bg-accent text-accent-foreground"
+    : props.tone === "agent" ? "bg-tone-agent text-tone-agent-foreground" : "bg-muted text-muted-foreground";
+  return (
+    <If when={props.onPress} else={
+      <View class={cx("max-w-[175px] rounded-full px-(--space-1)", colors())}
+        testID={props.testID} accessibilityLabel={props.accessibilityLabel}>
+        <Text class={colors()} style={{ numberOfLines: 1 }}>{props.label}</Text>
+      </View>
+    }>
+      <Button role="link" testID={props.testID} ref={props.ref} accessibilityLabel={props.accessibilityLabel}
+        onPress={props.onPress} class={cx("max-w-[175px] rounded-full px-(--space-1) hover:opacity-80", colors(), focusRingClass)}>
+        <Text class={colors()} testID={props.tone === "self" ? "mention-token-me" : undefined}
+          style={{ numberOfLines: 1 }}>{props.label}</Text>
+      </Button>
+    </If>
+  );
+}
+
+export function IdentityCardFrame(props: { children?: JSX.Element }) {
+  return <View class="flex-col w-[256px] max-w-full gap-(--space-2) p-(--space-2)">{props.children}</View>;
+}
 
 export type AvatarSize = "sm" | "md" | "lg";
 

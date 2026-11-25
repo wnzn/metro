@@ -681,6 +681,7 @@ function EndpointSection(props: { connection: ProviderConnection; feedback: (val
             <If when={error()}>
               {(message) => <ProblemNote tone="danger" testID={`endpoint-error:${id}`} text={message()} />}
             </If>
+            <Label>The test sends this connection’s API key, if configured, to the new URL before saving. The endpoint can receive the key even if the save fails. Only test an endpoint you trust with the key.</Label>
             <ActionBar>
               <Action label="Cancel" variant="ghost" disabled={busy() || check()} onPress={() => { dismissEndpointCheck(id); editing.set(false); props.feedback(null); }} />
               <Action label="Test and save" variant="primary" testID={`endpoint-save:${id}`} busy={busy()}

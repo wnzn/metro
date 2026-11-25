@@ -706,7 +706,9 @@ test("an older positive Space list cannot restore a forced removal, but a newer 
   await app.waitFor("id:space-settings-open");
 });
 
-test("a newer exact assignment read protects an existing Space from an older omission", async () => {
+for (const pending of [false, true]) test(
+  `a newer exact assignment read protects an existing Space from an older omission${pending ? " while the exact read is pending" : ""}`,
+  async () => {
   const f = world();
   const r = f.addRunner("This PC", "personal", "alice");
   f.addSpace("solo", "Solo", "alice");
@@ -721,17 +723,26 @@ test("a newer exact assignment read protects an existing Space from an older omi
     const reply = response as { status: number; body: { spaces: { id: string }[] } };
     return { ...reply, body: { ...reply.body, spaces: reply.body.spaces.filter((s) => s.id !== "solo") }, delay: 2400 };
   };
-  const app = await launch(fixture(f, r.id), { manual: true });
+  const t = fixture(f, r.id);
+  const app = await launch(t, { manual: true });
   await signIn(app);
   await app.waitFor("id:space:solo");
   armed = true;
   await app.clock!.runFor(11_000);
   await app.waitUntil(() => parked);
   await app.press("id:space:solo");
+  const exact = { sid: "solo", delay: 3600, parked: false };
+  if (pending) t.gate.runnerRead = exact;
   await openSpaceRunner(app);
-  await app.waitFor("id:attached-runner");
+  if (pending) await app.waitUntil(() => exact.parked);
+  else await app.waitFor("id:attached-runner");
   await app.clock!.runFor(2400);
   expect(app.shows("id:space:solo")).toBe(true);
+  if (pending) {
+    expect(app.shows("id:attached-runner")).toBe(false);
+    await app.clock!.runFor(1200);
+    await app.waitFor("id:attached-runner");
+  }
   expect(app.shows("id:attached-runner")).toBe(true);
 });
 

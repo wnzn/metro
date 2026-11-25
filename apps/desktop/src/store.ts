@@ -34,12 +34,19 @@
 //   here with onTransientClear / onSessionEnd).
 
 import { batch, computed, effect, signal, Storage, untracked } from "nsh";
-import { ApiError, createClient, parseReaction } from "./api/client";
-import type { Client, Me, Member, Mention, Room, RoomEvent, Run, Space, TurnModelChoice } from "./api/client";
+import { ApiError, createClient, isCanonicalMessageRow, parseReaction } from "./api/client";
+import type { Client, Me, Member, Mention, Room, RoomEvent, Run, Space, SpaceMessageBody, TurnModelChoice } from "./api/client";
 export { ApiError };
 import { DEFAULT_SERVER_URL, parseServerUrl, serverHost } from "./api/serverUrl";
 import { plainHttpAccepted } from "./plainHttp";
-import { acceptSpaceRunnerSummary, clearSpaceRunnerOrder, hasNewerSpaceAccessProof, nextSpaceRunnerStamp, recordSpaceAccessProof } from "./spaceRunnerOrder";
+import { acceptSpaceRunnerSummary, clearSpaceRunnerOrder } from "./spaceRunnerOrder";
+import {
+  captureTypedMentions, editMentionDraft, mentionIdentityKey, pickMention, prepareMentionSend, scanMentionDraft, updateMentionDraft,
+} from "./features/mentions/draft";
+import type { MentionDirectory, MentionDraft, MentionRecipient, MentionSelection, MentionSend } from "./features/mentions/draft";
+import { confirmChangedAutomaticMentions } from "./features/mentions/preflight";
+import type { PostedSenderNotes, SenderNoticeDetails } from "./features/senderNotices/response";
+import { renderedRecipientsKey } from "./features/senderNotices/response";
 
 export type { Member, Mention, Room, RoomEvent, Run, Space };
 
@@ -119,6 +126,8 @@ export const switchingSpace = signal(false);
 
 const roomsBySpace = signal<Record<string, readonly Room[]>>({});
 export const rooms = computed(() => roomsBySpace()[activeSpaceId() ?? ""] ?? EMPTY_ROOMS);
+/** The active Space returned a room list, possibly an empty one. */
+export const roomsLoaded = computed(() => roomsBySpace()[activeSpaceId() ?? ""] !== undefined);
 export const activeRoomId = signal<string | null>(null);
 export const activeRoom = computed(() => rooms().find((r) => r.id === activeRoomId()) ?? null);
 
@@ -138,7 +147,7 @@ export const activeReactions = computed(() => reactionsByScope()[activeScope()] 
 export const reactionPending = signal<string | null>(null);
 
 export const view = signal<View>("room");
-/** Set when the server has no personal Chat for this user (403/404); polling it stops. */
+/** Why personal Chat is unavailable, until a newer check can read or post to it. */
 export const chatUnavailable = signal<string | null>(null);
 
 // Runs and dispatch (meta controls in the Chat)
@@ -165,38 +174,228 @@ export const notice = signal<string | null>(null);
 // Members per Space (any member may list them; owners manage them)
 const membersBySpace = signal<Record<string, Member[]>>({});
 export const members = computed(() => membersBySpace()[activeSpaceId() ?? ""] ?? null);
-export const membersError = signal<string | null>(null);
+const memberFailures = signal<Record<string, string | null>>({});
+export const membersError = computed(() => memberFailures()[activeSpaceId() ?? ""] ?? null);
+const memberRequests = new Map<string, Promise<void>>();
+const memberVersions = new Map<string, number>();
+const memberEvidence = signal<Record<string, { version: number; roster: object }>>({});
+type MentionVisit = { sid: string; scope: string; navigation: number; token: object; verified: boolean };
+const mentionVisit = signal<MentionVisit | null>(null);
+type MemberAlias = { order: number; displayName: string | null };
+const aliasVisit = computed(() => {
+  const visit = mentionVisit();
+  return visit?.verified && currentMentionVisit(visit) ? visit.token : null;
+});
+const aliasRoster = computed(() => {
+  const sid = activeSpaceId();
+  return sid && !memberFailures()[sid] && members()?.some(m => m.userId === me()) ? memberEvidence()[sid]?.roster : null;
+});
+// Only the current verified visit and roster can share name evidence. Identical
+// roster replies preserve the scope; cached profiles from elsewhere cannot seed it.
+const memberAliasScope = computed(() => aliasVisit() && aliasRoster()
+  ? { entries: signal<ReadonlyMap<string, MemberAlias>>(new Map()), next: 0 } : null);
 
-/** Share a fresh membership read with the active room's existing cache. */
-export function rememberMembers(sid: string, list: Member[]) {
-  membersBySpace.set({ ...membersBySpace(), [sid]: list });
+const EMPTY_DIRECTORY: MentionDirectory = { members: [], agents: [] };
+const EMPTY_MENTION_DRAFT: MentionDraft = { text: "", anchors: [] };
+export const mentionDraft = signal<MentionDraft>(EMPTY_MENTION_DRAFT);
+const editDirectory = signal<MentionDirectory | null>(null);
+type MentionConfirmation = { directory: MentionDirectory; current: () => boolean };
+const mentionConfirmation = signal<MentionConfirmation | null>(null);
+export const mentions = computed(() =>
+  [...new Map(mentionDraft().anchors.map(a => [mentionIdentityKey(a.mention), a])).values()]);
+
+// The composer supplies the locally verified names and handles; the store
+// independently verifies stable recipients before the POST.
+let directoryForMentions: (sid: string) => MentionDirectory | null = () => null;
+let verifiedMentionAgents: (sid: string) => MentionDirectory["agents"] | null = () => null;
+let refreshAgentsForMentions: ((sid: string, live: () => boolean) => Promise<MentionDirectory["agents"] | null>) | undefined;
+export function registerMentionDirectory(
+  get: (sid: string) => MentionDirectory | null,
+  refreshAgents: NonNullable<typeof refreshAgentsForMentions>,
+  getAgents: typeof verifiedMentionAgents,
+) {
+  directoryForMentions = get;
+  refreshAgentsForMentions = refreshAgents;
+  verifiedMentionAgents = getAgents;
 }
-
-// Mentions picked in the room composer. Only for the active room; cleared when
-// the room or Space changes, and pruned when their text leaves the draft.
-export const mentions = signal<Mention[]>([]);
 
 // ------------------------------------------------------------------ session internals
 
 let client: Client | null = null;
+let noticeSenderId: string | null = null; // canonical raw /me id, not a legacy coercion
 let abort: AbortController | null = null;
 let session = 0;
 let navigationGeneration = 0;
+let roomEntryNavigation: number | undefined;
 let timer: number | undefined;
 let ticking = false;
 let tickAgain = false;
 let failures = 0;
 let lastListsRefresh = 0;
-// Lane-local membership fence. Reuse U12's accepted-list high-water and
-// Space denials when integrating; all of these must share one request order.
-let lastMembershipRequest = 0;
-const spaceDenials = new Map<string, number>();
 let lastRunsRefresh = 0;
 const cursors = new Map<string, number>();
 const inflight = new Map<string, Promise<void>>();
 const pollAgain = new Set<string>();
 const lastRoomBySpace = new Map<string, string>();
 const spaceEpoch = new Map<string, number>();
+
+// Order Space membership, room access and Chat availability by request start.
+let accessSequence = 0;
+const verifiedAccess = new Map<string, number>();
+export const nextAccessRequest = () => ++accessSequence;
+const newerAccess = (key: string, request: number) => (verifiedAccess.get(key) ?? 0) > request;
+function verifyAccess(key: string, request: number) {
+  if (!newerAccess(key, request)) verifiedAccess.set(key, request);
+}
+const pendingAccessReads = new Map<string, Map<number, Promise<void>>>();
+// A complete list observes every Space, including ids unknown at dispatch.
+const pendingMembershipReads = new Map<number, Promise<void>>();
+const spaceDenials = new Map<string, number>();
+// Keep tombstones after cache eviction and rejoin to fence older replies.
+const deniedRoomAccess = new Map<string, number>();
+const accessProbes = new Map<string, { request: number }>();
+let chatAvailabilityRequest = 0;
+let chatProbeAfter = 0;
+const roomListRequests = new Map<string, number>();
+// A newer complete snapshot also supersedes older discoveries of unknown ids.
+let lastMembershipRequest = 0;
+
+function trackAccessRead(reads: Map<number, Promise<void>>, request: number) {
+  let resolve!: () => void;
+  reads.set(request, new Promise<void>(done => { resolve = done; }));
+  return () => {
+    reads.delete(request);
+    resolve();
+  };
+}
+
+function trackScopedAccessRead(key: string, request: number) {
+  const reads = pendingAccessReads.get(key) ?? new Map<number, Promise<void>>();
+  pendingAccessReads.set(key, reads);
+  const settle = trackAccessRead(reads, request);
+  return () => {
+    settle();
+    if (!reads.size && pendingAccessReads.get(key) === reads) pendingAccessReads.delete(key);
+  };
+}
+
+function newerPendingRead(key: string, request: number) {
+  for (const [id, done] of pendingAccessReads.get(key) ?? []) {
+    if (id > request) return done;
+  }
+}
+
+function newerSpaceDenial(sid: string, request: number) {
+  return (spaceDenials.get(sid) ?? 0) > request;
+}
+
+// Assignment success proves access to the Space, not to any room. Keep its
+// source distinguishable so an assignment denial can withdraw just that proof.
+const runnerAccessKey = (sid: string) => scopeKey(sid, "\u0000runner");
+const verifiedSpaceRequest = (sid: string) => Math.max(
+  verifiedAccess.get(scopeKey(sid, "")) ?? 0, verifiedAccess.get(runnerAccessKey(sid)) ?? 0,
+);
+
+function currentSpaceEvidence(sid: string, request: number) {
+  return verifiedSpaceRequest(sid) <= request && !newerSpaceDenial(sid, request);
+}
+
+const roomDeniedAtOrAfter = (key: string, request: number) => (deniedRoomAccess.get(key) ?? 0) >= request;
+
+function verifyRoomAccess(sid: string, rid: string, request: number) {
+  if (newerSpaceDenial(sid, request)) return;
+  verifyAccess(scopeKey(sid, ""), request);
+  const key = scopeKey(sid, rid);
+  if (!roomDeniedAtOrAfter(key, request)) verifyAccess(key, request);
+}
+
+function keepNewerRooms(sid: string, list: readonly Room[], request: number, keepActiveOtherThan?: string): Room[] {
+  const listed = new Set(list.map(r => r.id));
+  return [...list, ...roomsOf(sid).filter(r => {
+    const key = scopeKey(sid, r.id);
+    return !listed.has(r.id) && (newerAccess(key, request) || newerPendingRead(key, request) ||
+      (keepActiveOtherThan !== undefined && r.id !== keepActiveOtherThan &&
+        activeSpaceId() === sid && activeRoomId() === r.id));
+  })];
+}
+
+/** Room lists and transcripts are also evidence for their Space. */
+function beginSpaceRead(sid: string, request = nextAccessRequest()) {
+  const key = scopeKey(sid, "");
+  const valid = guard(sid);
+  const settle = trackScopedAccessRead(key, request);
+  function finish(verified = false) {
+    if (verified && valid() && !newerSpaceDenial(sid, request)) verifyAccess(key, request);
+    settle();
+  }
+  return {
+    valid,
+    request,
+    finish,
+    finishRooms(list: readonly Room[]) {
+      finish(true);
+      if (!valid() || newerSpaceDenial(sid, request) || (roomListRequests.get(sid) ?? 0) > request) return;
+      roomListRequests.set(sid, request);
+      return list.filter(room => {
+        if (roomDeniedAtOrAfter(scopeKey(sid, room.id), request)) return false;
+        verifyRoomAccess(sid, room.id, request);
+        return true;
+      });
+    },
+    publishRooms(list: readonly Room[], keepActiveOtherThan?: string) {
+      roomsBySpace.set({ ...roomsBySpace(), [sid]: keepNewerRooms(sid, list, request, keepActiveOtherThan) });
+    },
+    async deny(apply: () => void) {
+      finish();
+      if (!valid() || !currentSpaceEvidence(sid, request) || spaceDenials.get(sid) === request) return false;
+      spaceDenials.set(sid, request);
+      while (valid() && verifiedSpaceRequest(sid) <= request && spaceDenials.get(sid) === request) {
+        const newer = newerPendingRead(key, request) ??
+          [...pendingMembershipReads].find(([id]) => id > request)?.[1];
+        if (!newer) {
+          apply(); // stamp/epoch and cache change together, without an intervening await
+          return true;
+        }
+        // A newer attempt isn't a grant. If inconclusive, this refusal still stands.
+        await newer;
+      }
+      return false;
+    },
+  };
+}
+
+/** Share the Space's access order and pending reads, without treating an
+ * unavailable runner endpoint (or a local bridge denial) as loss of membership. */
+export function beginRunnerAccessRead(sid: string, exactEndpoint: boolean) {
+  const request = nextAccessRequest();
+  const scope = guard(sid);
+  const valid = () => scope() && !newerSpaceDenial(sid, request);
+  const settle = exactEndpoint ? trackScopedAccessRead(scopeKey(sid, ""), request) : () => {};
+  const key = runnerAccessKey(sid);
+  return {
+    request,
+    valid,
+    finish(verified = false) {
+      if (exactEndpoint && verified && valid()) verifyAccess(key, request);
+      settle();
+    },
+    withdraw() {
+      if (valid() && !newerAccess(key, request)) verifiedAccess.delete(key);
+      settle();
+    },
+  };
+}
+
+// A successful but older POST may retire its draft, not undo a newer denial.
+function observeChatAvailability(request: number, problem: string | null) {
+  if (request < chatAvailabilityRequest) return;
+  chatAvailabilityRequest = request;
+  chatProbeAfter = problem ? Date.now() + LISTS_REFRESH_MS : 0;
+  batch(() => {
+    if (problem) forgetSenderNotices(CHAT);
+    chatUnavailable.set(problem);
+  });
+}
 
 // Other state modules (src/settings.ts) hook into the session's lifecycle
 // here instead of this module importing them.
@@ -258,6 +457,13 @@ export async function restorePreferences(mayRestore: () => boolean = () => true)
 
 // ------------------------------------------------------------------ connect / disconnect
 
+/** A pending startup read is reusable only during the same verified navigation. */
+export function startupReadGuard(spaceId?: string) {
+  const valid = guard(spaceId);
+  const navigation = navigationGeneration;
+  return () => valid() && navigation === navigationGeneration;
+}
+
 export type PreparedConnection = Readonly<{ baseUrl: string }>;
 const candidates = new WeakMap<PreparedConnection, {
   token: string; who: Me; list: Space[]; remembered: string | null; signal: AbortSignal;
@@ -277,11 +483,15 @@ function credentials(urlInput: string, tokenInput: string) {
   return { baseUrl: parsed.baseUrl, token };
 }
 
+function verifyConnection(c: Client, baseUrl: string) {
+  return Promise.all([c.me(), c.listSpaces(), rememberedSpace(baseUrl)]);
+}
+
 /** Probe a candidate without touching the live session, including on failure. */
 export async function prepareConnection(baseUrl: string, token: string, signal: AbortSignal): Promise<PreparedConnection> {
   const target = credentials(baseUrl, token);
   const c = createClient({ baseUrl: target.baseUrl, token: () => target.token, signal });
-  const [who, list, remembered] = await Promise.all([c.me(), c.listSpaces(), rememberedSpace(target.baseUrl)]);
+  const [who, list, remembered] = await verifyConnection(c, target.baseUrl);
   if (signal.aborted) throw new ApiError("aborted", "Cancelled");
   const prepared = Object.freeze({ baseUrl: target.baseUrl });
   candidates.set(prepared, { token: target.token, who, list, remembered, signal });
@@ -296,21 +506,37 @@ function beginSession(baseUrl: string, token: string) {
   return { sess, c: client };
 }
 
-function publishIdentity(baseUrl: string, who: Me, list: Space[], remember?: boolean) {
-  batch(() => {
+/** Publish the verified identity, membership and destination together. */
+function publishSession(baseUrl: string, token: string, who: Me, list: Space[], remembered: string | null, remember?: boolean) {
+  noticeSenderId = who.canonicalId;
+  return batch(() => {
     me.set(who.id);
     orgAdmin.set(who.isOrgAdmin);
     spaces.set(list);
     connectedTo.set(baseUrl);
-  });
-  if (remember !== false) Storage.setItem(SERVER_URL_KEY, baseUrl).catch(() => {});
-}
+    if (remember !== false) Storage.setItem(SERVER_URL_KEY, baseUrl).catch(() => {});
 
-function startOnline(baseUrl: string, token: string) {
-  lastListsRefresh = Date.now();
-  failures = 0;
-  status.set({ phase: "online" });
-  for (const fn of sessionStarters) fn({ baseUrl, token });
+    const initial = list.find((s) => s.id === remembered);
+    let hydration: Promise<void> | undefined;
+    if (initial) {
+      // Set the Space before exposing the Shell. Chat must not mount while
+      // we wait for the selected Space's rooms.
+      const current = guard();
+      const entering = enterSpace(initial.id, { place: "chat", spaceId: null });
+      const navigation = navigationGeneration; // enterSpace starts navigation before its first await
+      hydration = entering.then(() => {
+        // A running tick reads the active destination after any refreshLists await.
+        if (current() && !ticking && navigation === navigationGeneration) kick();
+      });
+    }
+    lastListsRefresh = Date.now();
+    failures = 0;
+    status.set({ phase: "online" });
+    // Membership sync belongs to the session, not to a room entry or transcript.
+    kick();
+    for (const fn of sessionStarters) fn({ baseUrl, token });
+    return hydration;
+  });
 }
 
 /** Consume a verified candidate synchronously. Subsequent requests have their own session lifetime. */
@@ -322,27 +548,7 @@ export function adoptConnection(prepared: PreparedConnection, opts: { remember?:
   batch(() => {
     beginSession(prepared.baseUrl, candidate.token);
     connectError.set(null);
-    publishIdentity(prepared.baseUrl, candidate.who, candidate.list, opts.remember);
-    startOnline(prepared.baseUrl, candidate.token);
-    const initial = candidate.list.find((s) => s.id === candidate.remembered);
-    if (initial) {
-      // Show the shell now; kick the first tick after enterSpace settles,
-      // bounded by listRooms' client timeout.
-      const current = guard();
-      const entering = enterSpace(initial.id, { place: "chat", spaceId: null });
-      const navigation = navigationGeneration; // enterSpace starts navigation before its first await
-      void entering.then(() => {
-        // A running tick reads the active room after any refreshLists await.
-        if (!current() || ticking) return;
-        const stillTarget = navigation === navigationGeneration &&
-          basePlace() === "space" && activeSpaceId() === initial.id && activeRoomId() !== null && view() === "room";
-        // Don't wake a later navigation, even if it returned to this Space.
-        // Still start the loop if none is scheduled (e.g. after falling back to Chat).
-        if (stillTarget || timer === undefined) kick();
-      });
-    } else {
-      kick();
-    }
+    void publishSession(prepared.baseUrl, candidate.token, candidate.who, candidate.list, candidate.remembered, opts.remember);
   });
 }
 
@@ -350,13 +556,13 @@ export function adoptConnection(prepared: PreparedConnection, opts: { remember?:
  * `remember: false` (the desktop-hosted local workspace): don't save this URL
  * as the server to offer next time, so the remote choice stays as it was.
  */
-export async function connect(urlInput: string, tokenInput: string, opts: { remember?: boolean } = {}): Promise<void> {
+export async function connect(urlInput: string, tokenInput: string, opts: { remember?: boolean } = {}): Promise<boolean> {
   let target: ReturnType<typeof credentials>;
   try {
     target = credentials(urlInput, tokenInput);
   } catch (error) {
     connectError.set((error as Error).message);
-    return;
+    return false;
   }
   const { baseUrl, token } = target;
   const { sess, c } = beginSession(baseUrl, token);
@@ -366,21 +572,18 @@ export async function connect(urlInput: string, tokenInput: string, opts: { reme
   });
 
   try {
-    const [who, list] = await Promise.all([c.me(), c.listSpaces()]);
-    if (sess !== session) return;
-    publishIdentity(baseUrl, who, list, opts.remember);
-    const remembered = await rememberedSpace(baseUrl);
-    if (sess !== session) return;
-    // A returning user lands in their last Space; everyone else in their Chat.
-    const initial = list.find((s) => s.id === remembered) ?? null;
-    if (initial) await enterSpace(initial.id, { place: "chat", spaceId: null });
-    if (sess !== session) return;
-    startOnline(baseUrl, token);
-    kick();
+    const [who, list, remembered] = await verifyConnection(c, baseUrl);
+    if (sess !== session) return false;
+    // The Shell can mount immediately, but don't offer to keep the token if
+    // room hydration lost the session or the person switched in the meantime.
+    await publishSession(baseUrl, token, who, list, remembered, opts.remember);
+    return sess === session;
   } catch (error) {
-    if (sess !== session) return;
-    endSession();
-    connectError.set(describe(error, "Could not connect"));
+    if (sess === session) {
+      endSession();
+      connectError.set(describe(error, "Could not connect"));
+    }
+    return false;
   }
 }
 
@@ -396,10 +599,17 @@ export function retryNow() {
 
 // ------------------------------------------------------------------ spaces
 
+function supersedeRoomEntry() {
+  // The read can still settle as access evidence, but no longer owns navigation.
+  roomEntryNavigation = undefined;
+  switchingSpace.set(false);
+}
+
 export function openChat() {
   if (basePlace() === "chat" && !settingsOpen()) return;
   navigationGeneration++;
   batch(() => {
+    supersedeRoomEntry();
     clearTransient();
     view.set("room");
     settingsOpen.set(false);
@@ -411,11 +621,15 @@ export function openChat() {
   kick();
 }
 
-/** Opens Search, Library or Scheduled tasks: the user's own pages, outside every Space. */
-export function openPlace(where: "search" | "library" | "pages" | "schedules") {
-  if (basePlace() === where && !settingsOpen()) return;
+/** Open a destination outside a Space. Explicit sub-route moves also supersede old navigation intents. */
+export function openPlace(where: "search" | "library" | "pages" | "schedules", { subrouteChanged = false } = {}) {
+  if (basePlace() === where && !settingsOpen()) {
+    if (subrouteChanged) navigationGeneration++;
+    return;
+  }
   navigationGeneration++;
   batch(() => {
+    supersedeRoomEntry();
     clearTransient();
     view.set("room");
     settingsOpen.set(false);
@@ -430,15 +644,23 @@ export function openPlace(where: "search" | "library" | "pages" | "schedules") {
 export async function openExactRoom(spaceId: string, roomId: string, stillHere: () => boolean): Promise<boolean> {
   const c = client;
   if (!c || switchingSpace() || !roomId || !spaces().some(s => s.id === spaceId)) return false;
-  const valid = guard(spaceId);
   const generation = navigationGeneration;
-  const list = await c.listRooms(spaceId);
-  if (!valid() || switchingSpace() || generation !== navigationGeneration || !stillHere() || !list.some(r => r.id === roomId)) return false;
+  const read = beginSpaceRead(spaceId);
+  let result: Room[];
+  try {
+    result = await c.listRooms(spaceId);
+  } catch (error) {
+    if (isAccessDenial(error)) void read.deny(() => dropLostSpace(spaceId));
+    else read.finish();
+    throw error;
+  }
+  const list = read.finishRooms(result);
+  if (switchingSpace() || generation !== navigationGeneration || !stillHere() || !list?.some(r => r.id === roomId)) return false;
   navigationGeneration++;
   lastRoomBySpace.set(spaceId, roomId);
   batch(() => {
     clearTransient();
-    roomsBySpace.set({ ...roomsBySpace(), [spaceId]: list });
+    read.publishRooms(list);
     activeSpaceId.set(spaceId);
     activeRoomId.set(roomId);
     view.set("room");
@@ -534,23 +756,34 @@ export function closeSettings() {
 }
 
 export async function selectSpace(spaceId: string): Promise<void> {
-  if (switchingSpace()) return;
-  if (spaceId === activeSpaceId() && roomsBySpace()[spaceId]) {
-    if (basePlace() === "space" && !settingsOpen()) return;
-    navigationGeneration++;
-    batch(() => {
-      clearTransient();
-      view.set("room");
-      settingsOpen.set(false);
-      basePlace.set("space");
-      actionError.set(null);
-      notice.set(null);
-    });
-    kick();
-    return;
+  if (!client || !spaces().some(s => s.id === spaceId)) return;
+  if (spaceId === activeSpaceId() && basePlace() === "space") {
+    // Repeated clicks on the pending target aren't a new entry. Clicking any
+    // other Space is deliberate navigation, even during startup hydration.
+    if (roomEntryNavigation === navigationGeneration) {
+      if (settingsOpen()) closeSettings();
+      return;
+    }
+    if (roomsBySpace()[spaceId] && !settingsOpen()) return;
   }
-  await enterSpace(spaceId, { place: basePlace(), spaceId: activeSpaceId() });
-  kick();
+  const current = guard();
+  const entering = enterSpace(spaceId, { place: basePlace(), spaceId: activeSpaceId() });
+  const navigation = navigationGeneration;
+  await entering;
+  if (current() && navigation === navigationGeneration) kick();
+}
+
+/** Publish an acknowledged Create without replacing newer access evidence. */
+function publishCreatedSpace(space: Space, request: number): boolean {
+  if (newerSpaceDenial(space.id, request)) return false;
+  const key = scopeKey(space.id, "");
+  const listed = spaces();
+  const previous = listed.find(s => s.id === space.id);
+  if (verifiedSpaceRequest(space.id) > request) return !!previous;
+  // The POST proves access even if the first room read is inconclusive.
+  verifyAccess(key, request);
+  spaces.set([...listed.filter(s => s.id !== space.id), mergeSpaceRunnerHint(space, previous, request)]);
+  return true;
 }
 
 type CreateSpaceOptions = {
@@ -574,39 +807,69 @@ export async function createSpace(nameInput: string, options?: CreateSpaceOption
     return false;
   }
   const ok = guard();
+  const origin = navigationGeneration;
+  const originPlace = place(), originView = view();
+  const stillHere = () => origin === navigationGeneration && originPlace === place() && originView === view();
   const source = createSpaceContext;
   let created = false;
+  let fromOriginalForm = false;
+  const captureForm = () => {
+    // Publishing the first Space can unmount onboarding. Check the actual
+    // submitting form before that expected transition, not after the read.
+    fromOriginalForm = stillHere() && source === createSpaceContext && !!options?.formIsCurrent();
+  };
   batch(() => {
     creatingSpace.set(true);
     actionError.set(null);
   });
   try {
+    const request = nextAccessRequest();
     const space = await c.createSpace(name);
     if (!ok()) return false;
     created = true;
-    // Onboarding can unmount as soon as we publish the first Space. Check
-    // the submitting form before that expected transition.
-    const fromOriginalForm = source === createSpaceContext && !!options?.formIsCurrent();
+    if (newerSpaceDenial(space.id, request)) return true;
+    if (lastMembershipRequest > request && !spaces().some(s => s.id === space.id)) {
+      // The newer list may have been taken before the POST committed, or
+      // after the Space disappeared. Only a fresh read can distinguish them.
+      // A failed check doesn't undo the accepted POST or make it safe to retry.
+      const checked = await refreshMembership(c, { beforePublish: captureForm }).catch(error => {
+        if (ok() && error instanceof ApiError && error.kind === "auth") disconnect(error.message);
+        return undefined;
+      });
+      if (!ok()) return false;
+      const verified = verifiedSpaceRequest(space.id);
+      if (checked === undefined || verified < checked || newerSpaceDenial(space.id, verified) ||
+        !spaces().some(s => s.id === space.id)) return true;
+    } else {
+      captureForm();
+      if (!publishCreatedSpace(space, request)) return true;
+    }
+    if (!stillHere()) return true; // the sidebar may update, but don't override navigation
+    const confirmed = spaces().find(s => s.id === space.id);
+    if (!confirmed) return true;
     const expectedContext = createSpaceContext + 1; // enterSpace clears transients once
     const spaceOK = guard(space.id);
-    recordSpaceAccessProof(space.id, nextSpaceRunnerStamp());
-    spaces.set([...spaces().filter((s) => s.id !== space.id), space]);
-    await enterSpace(space.id, { place: basePlace(), spaceId: activeSpaceId() });
-    kick();
+    const entering = enterSpace(confirmed.id, { place: basePlace(), spaceId: activeSpaceId() });
+    const navigation = navigationGeneration;
+    await entering;
+    if (!ok()) return false;
+    if (navigation === navigationGeneration) kick();
     // Returning to the same Space can show a missing attachment, but cannot
     // revive consent invalidated by a move or dialog.
     const mayShowOutcome = () => spaceOK() && basePlace() === "space" && view() === "room" && activeSpaceId() === space.id;
     if (options && mayShowOutcome()) {
-      await options.attachRunner(space, {
-        mayAttach: () => fromOriginalForm && createSpaceContext === expectedContext && mayShowOutcome(),
+      await options.attachRunner(confirmed, {
+        mayAttach: () => fromOriginalForm && navigation === navigationGeneration && createSpaceContext === expectedContext &&
+          mayShowOutcome() && !newerSpaceDenial(space.id, verifiedSpaceRequest(space.id)),
         mayShowOutcome,
       });
     }
-    return true;
+    return ok();
   } catch (error) {
-    // A follow-up failure must not turn a confirmed creation into a retry.
-    if (created) return ok();
-    if (ok()) handleActionError(error, "Could not create the Space");
+    if (!ok()) return false;
+    if (error instanceof ApiError && error.kind === "auth") disconnect(error.message);
+    else if (created) return true; // a follow-up failure doesn't undo the POST
+    else if (stillHere()) handleActionError(error, "Could not create the Space");
     return false;
   } finally {
     if (ok()) creatingSpace.set(false);
@@ -621,10 +884,11 @@ export async function createSpace(nameInput: string, options?: CreateSpaceOption
 async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId: string | null }): Promise<void> {
   const c = client;
   if (!c) return;
-  navigationGeneration++;
+  const navigation = ++navigationGeneration;
+  roomEntryNavigation = navigation;
   const currentSession = guard();
   const ok = guard(spaceId);
-  const accessRequest = nextSpaceRunnerStamp();
+  const read = !roomsBySpace()[spaceId] ? beginSpaceRead(spaceId) : undefined;
   batch(() => {
     clearTransient();
     view.set("room");
@@ -637,37 +901,56 @@ async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId
     switchingSpace.set(true);
   });
   try {
-    if (!roomsBySpace()[spaceId]) {
-      const list = await c.listRooms(spaceId);
-      if (!ok()) return;
+    if (read) {
+      const list = read.finishRooms(await c.listRooms(spaceId));
+      if (!ok() || navigation !== navigationGeneration) return;
       batch(() => {
-        roomsBySpace.set({ ...roomsBySpace(), [spaceId]: list });
-        if (activeSpaceId() === spaceId) activeRoomId.set(pickRoom(spaceId, list));
+        if (list) read.publishRooms(list);
+        if (activeSpaceId() === spaceId) activeRoomId.set(pickRoom(spaceId, roomsBySpace()[spaceId] ?? EMPTY_ROOMS));
       });
     }
     if (activeSpaceId() === spaceId) rememberSpace(spaceId);
   } catch (error) {
-    if (!ok() || isAborted(error)) return;
+    if (!ok() || isAborted(error)) { read?.finish(); return; }
     if (error instanceof ApiError && error.kind === "auth") {
+      read?.finish();
       disconnect(error.message);
       return;
     }
-    const name = spaces().find((s) => s.id === spaceId)?.name ?? spaceId;
-    if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found")) {
-      if (accessRequest >= lastMembershipRequest && !hasNewerSpaceAccessProof(spaceId, accessRequest)) {
-        purgeSpace(spaceId, true, accessRequest);
+    const failed = (unlist: boolean) => {
+      if (navigation !== navigationGeneration) {
+        if (unlist) dropLostSpace(spaceId);
+        return;
       }
+      const name = spaces().find(s => s.id === spaceId)?.name ?? spaceId;
+      const back = previous.spaceId && previous.spaceId !== spaceId &&
+        spaces().some(s => s.id === previous.spaceId) && roomsBySpace()[previous.spaceId] ? previous.spaceId : null;
+      batch(() => {
+        if (unlist) purgeSpace(spaceId, true);
+        activeSpaceId.set(back);
+        activeRoomId.set(back ? pickRoom(back, roomsBySpace()[back] ?? EMPTY_ROOMS) : null);
+        basePlace.set(back && previous.place === "space" ? "space" : "chat");
+        actionError.set(`Couldn't open ${name}: ${describe(error, "error")}`);
+      });
+    };
+    if (read && isAccessDenial(error)) {
+      if (await read.deny(() => failed(true))) return;
+    } else {
+      read?.finish();
     }
-    else purgeSpace(spaceId, false); // keep it listed; just don't keep half-loaded state
-    const back = previous.spaceId && spaces().some((s) => s.id === previous.spaceId) && roomsBySpace()[previous.spaceId] ? previous.spaceId : null;
-    batch(() => {
-      activeSpaceId.set(back);
-      activeRoomId.set(back ? pickRoom(back, roomsBySpace()[back] ?? EMPTY_ROOMS) : null);
-      basePlace.set(back && previous.place === "space" ? "space" : "chat");
-      actionError.set(`Couldn't open ${name}: ${describe(error, "error")}`);
-    });
+    if (!ok() || navigation !== navigationGeneration) return;
+    const verifiedRooms = roomsBySpace()[spaceId];
+    if (verifiedRooms) {
+      activeRoomId.set(pickRoom(spaceId, verifiedRooms));
+      rememberSpace(spaceId);
+      return;
+    }
+    failed(false);
   } finally {
-    if (currentSession()) switchingSpace.set(false);
+    if (currentSession() && roomEntryNavigation === navigation) {
+      roomEntryNavigation = undefined;
+      switchingSpace.set(false);
+    }
   }
 }
 
@@ -677,11 +960,20 @@ async function ensureRooms(spaceId: string): Promise<readonly Room[]> {
   if (cached) return cached;
   const c = client;
   if (!c) return EMPTY_ROOMS;
-  const ok = guard(spaceId);
-  const list = await c.listRooms(spaceId);
-  if (!ok()) return EMPTY_ROOMS;
-  roomsBySpace.set({ ...roomsBySpace(), [spaceId]: list });
-  return list;
+  const read = beginSpaceRead(spaceId);
+  try {
+    const list = read.finishRooms(await c.listRooms(spaceId));
+    if (list) read.publishRooms(list);
+    return read.valid() ? roomsBySpace()[spaceId] ?? EMPTY_ROOMS : EMPTY_ROOMS;
+  } catch (error) {
+    if (read.valid() && isAccessDenial(error)) {
+      const dropped = await read.deny(() => dropLostSpace(spaceId));
+      if (!dropped && read.valid() && roomsBySpace()[spaceId]) return roomsBySpace()[spaceId]!;
+    } else {
+      read.finish();
+    }
+    throw error;
+  }
 }
 
 function pickRoom(spaceId: string, list: readonly Room[]): string | null {
@@ -696,14 +988,23 @@ function pickRoom(spaceId: string, list: readonly Room[]): string | null {
 }
 
 /** Forgets everything cached for a Space; `unlist` also removes it from the list. */
-function purgeSpace(spaceId: string, unlist: boolean, deniedAt = 0) {
-  if (unlist && deniedAt > (spaceDenials.get(spaceId) ?? 0)) spaceDenials.set(spaceId, deniedAt);
+function purgeSpace(spaceId: string, unlist: boolean) {
   clearSpaceRunnerOrder(spaceId);
   spaceEpoch.set(spaceId, epochOf(spaceId) + 1);
+  // Keep denial evidence for the session. A complete list may still be on
+  // the wire from before the denial, even if this id was unknown to it.
+  roomListRequests.delete(spaceId);
   const prefix = scopeKey(spaceId, "");
+  for (const key of pendingAccessReads.keys()) if (key.startsWith(prefix)) pendingAccessReads.delete(key);
   for (const key of [...cursors.keys()]) if (key.startsWith(prefix)) cursors.delete(key);
   for (const key of [...inflight.keys()]) if (key.startsWith(prefix)) inflight.delete(key);
   for (const key of [...pollAgain]) if (key.startsWith(prefix)) pollAgain.delete(key);
+  for (const key of noticeEpochs.keys()) if (key.startsWith(prefix)) noticeEpochs.delete(key);
+  for (const key of verifiedAccess.keys()) if (key.startsWith(prefix)) verifiedAccess.delete(key);
+  for (const key of accessProbes.keys()) if (key.startsWith(prefix)) accessProbes.delete(key);
+  for (const [key, receipt] of pendingSenderNotices) {
+    if (receipt.destination.kind === "room" && receipt.destination.spaceId === spaceId) pendingSenderNotices.delete(key);
+  }
   lastRoomBySpace.delete(spaceId);
   const strip = <T,>(record: Record<string, T>) => {
     const next: Record<string, T> = {};
@@ -717,11 +1018,37 @@ function purgeSpace(spaceId: string, unlist: boolean, deniedAt = 0) {
     eventsByScope.set(strip(eventsByScope()));
     loadedScopes.set(strip(loadedScopes()));
     reactionsByScope.set(strip(reactionsByScope()));
+    senderNotices.set(strip(senderNotices()));
     if (unlist) spaces.set(spaces().filter((s) => s.id !== spaceId));
     if (dispatchTarget()?.spaceId === spaceId) dispatchTarget.set(null);
     const { [spaceId]: _members, ...restMembers } = membersBySpace();
     membersBySpace.set(restMembers);
-    if (activeSpaceId() === spaceId) clearTransient();
+    const { [spaceId]: _error, ...restErrors } = memberFailures();
+    memberFailures.set(restErrors);
+    const { [spaceId]: _evidence, ...restEvidence } = memberEvidence();
+    memberEvidence.set(restEvidence);
+    memberRequests.delete(spaceId);
+    memberVersions.delete(spaceId);
+    if (activeScope().startsWith(prefix)) writeMentionDraft(EMPTY_MENTION_DRAFT, null);
+    if (basePlace() === "space" && !settingsOpen() && activeSpaceId() === spaceId) clearTransient();
+  });
+}
+
+/** Remove only the scope of a verified refusal, not the user's newer destination. */
+function dropLostSpace(spaceId: string, show = true) {
+  const name = spaces().find(s => s.id === spaceId)?.name;
+  batch(() => {
+    purgeSpace(spaceId, true);
+    if (activeSpaceId() !== spaceId) return;
+    activeSpaceId.set(null);
+    activeRoomId.set(null);
+    if (basePlace() === "space") {
+      view.set("room");
+      actionError.set(null);
+      notice.set(show && name ? `You no longer have access to ${name}.` : null);
+      basePlace.set("chat");
+      if (!ticking) kick();
+    }
   });
 }
 
@@ -774,8 +1101,11 @@ export async function createRoom(nameInput: string): Promise<boolean> {
     actionError.set(null);
   });
   try {
+    const request = nextAccessRequest();
     const room = await c.createRoom(sid, name);
     if (!ok()) return false;
+    if (roomDeniedAtOrAfter(scopeKey(sid, room.id), request)) return true;
+    verifyRoomAccess(sid, room.id, request);
     const list = roomsBySpace()[sid] ?? EMPTY_ROOMS;
     batch(() => {
       if (!list.some((r) => r.id === room.id)) roomsBySpace.set({ ...roomsBySpace(), [sid]: [...list, room] });
@@ -799,6 +1129,141 @@ export async function createRoom(nameInput: string): Promise<boolean> {
  * library) or a Space's room or thread (files to that Space's library).
  */
 export type SendDestination = { kind: "chat" } | { kind: "room"; spaceId: string; roomId: string };
+
+// Only the initiating POST writes here. Not an event cache: it is never
+// merged into a transcript, persisted, or used for model/search history.
+export type SenderNotice = SenderNoticeDetails & { destination: SendDestination };
+type ConfirmedSenderNotice = { note: SenderNotice; row: RoomEvent };
+type PendingSenderNotice = PostedSenderNotes & { destination: SendDestination };
+const senderNotices = signal<Record<string, ReadonlyMap<number, ConfirmedSenderNotice | null>>>({});
+const pendingSenderNotices = new Map<string, PendingSenderNotice>();
+// FIFO across the session: only uncorroborated receipts hold a copy of the
+// text (at most 16k code units each), and an idle room can't block a new one.
+const MAX_PENDING_SENDER_NOTICES = 32;
+const noticeEpochs = new Map<string, number>();
+const noticeEpoch = (scope: string) => noticeEpochs.get(scope) ?? 0;
+const destinationScope = (to: SendDestination) => to.kind === "chat" ? CHAT : scopeKey(to.spaceId, to.roomId);
+const pendingKey = (scope: string, id: number) => JSON.stringify([scope, id]);
+
+function noticeDestinationVisible(to: SendDestination) {
+  return to.kind === "chat" ? !chatUnavailable() :
+    spaces().some(s => s.id === to.spaceId) && !!roomsBySpace()[to.spaceId]?.some(r => r.id === to.roomId);
+}
+
+function forgetSenderNotices(scope: string) {
+  noticeEpochs.set(scope, noticeEpoch(scope) + 1);
+  for (const [key, receipt] of pendingSenderNotices) {
+    if (destinationScope(receipt.destination) === scope) pendingSenderNotices.delete(key);
+  }
+  const { [scope]: removed, ...rest } = senderNotices();
+  if (removed) senderNotices.set(rest);
+}
+
+/** The POST belongs to this principal and destination even after navigation. */
+function captureSendOrigin(c: Client, to: SendDestination) {
+  const scope = destinationScope(to);
+  const sender = me();
+  const privateSender = noticeSenderId;
+  const valid = guard(to.kind === "room" ? to.spaceId : undefined);
+  const sameAccount = () => !!sender && me() === sender && client === c && valid();
+  const canRetireDraft = () => sameAccount() && (to.kind === "chat" || noticeDestinationVisible(to));
+  const request = nextAccessRequest();
+  const epoch = noticeEpoch(scope);
+  const after = cursors.get(scope) ?? 0;
+  const wasVisible = noticeDestinationVisible(to);
+  const current = () => sameAccount() && noticeEpoch(scope) === epoch;
+  return {
+    current,
+    canRetireDraft,
+    acknowledge(posted: PostedSenderNotes | null): boolean {
+      if (!sameAccount()) return false;
+      if (to.kind === "room" && noticeDestinationVisible(to)) verifyRoomAccess(to.spaceId, to.roomId, request);
+      else if (to.kind === "chat") {
+        verifyAccess(CHAT, request);
+        observeChatAvailability(request, null);
+      }
+      if (!posted || posted.senderId !== privateSender || posted.eventId <= after ||
+        !wasVisible || !current() || !noticeDestinationVisible(to)) return false;
+      const notes = senderNotices()[scope];
+      const key = pendingKey(scope, posted.eventId);
+      if (notes?.has(posted.eventId) || pendingSenderNotices.has(key)) return false;
+      const receipt = { ...posted, destination: to };
+      if (posted.eventId <= (cursors.get(scope) ?? 0)) {
+        const confirmed = corroborateSenderNotice(receipt, eventsByScope()[scope] ?? EMPTY_EVENTS);
+        if (!confirmed) return false;
+        senderNotices.set({ ...senderNotices(), [scope]: new Map(notes).set(posted.eventId, confirmed) });
+      } else {
+        if (pendingSenderNotices.size >= MAX_PENDING_SENDER_NOTICES) {
+          pendingSenderNotices.delete(pendingSenderNotices.keys().next().value!);
+        }
+        pendingSenderNotices.set(key, receipt);
+      }
+      return true;
+    },
+    deny() {
+      if (!current() || newerAccess(scope, request)) return;
+      forgetSenderNotices(scope);
+      if (to.kind === "room") void recheckRoomAccess(c, to, sameAccount, false);
+    },
+  };
+}
+
+function corroborateSenderNotice(receipt: PendingSenderNotice, rows: readonly RoomEvent[]): ConfirmedSenderNotice | null {
+  const { text, recipientsKey, ...note } = receipt;
+  const row = rows.find(e => e.id === note.eventId);
+  return row && row.actorId === note.senderId && isCanonicalMessageRow(row) &&
+    row.createdAt === note.createdAt && row.text === text &&
+    renderedRecipientsKey(row.mentions) === recipientsKey ? { note, row } : null;
+}
+
+/** Resolve POST evidence once, when polling reaches the id. Polls create no receipts. */
+function reconcileSenderNotices(scope: string, through: number, rows: readonly RoomEvent[]) {
+  const saved = senderNotices()[scope];
+  let next: Map<number, ConfirmedSenderNotice | null> | undefined;
+  if (saved && rows.length) {
+    for (const id of saved.keys()) if (id < rows[0]!.id) (next ??= new Map(saved)).delete(id);
+  }
+  for (const [key, receipt] of pendingSenderNotices) {
+    if (receipt.eventId > through || destinationScope(receipt.destination) !== scope) continue;
+    pendingSenderNotices.delete(key);
+    const confirmed = corroborateSenderNotice(receipt, rows);
+    if (confirmed) (next ??= new Map(saved)).set(receipt.eventId, confirmed);
+  }
+  if (next) senderNotices.set({ ...senderNotices(), [scope]: next });
+}
+
+export function activeSenderNotice(event: RoomEvent): SenderNotice | null {
+  if (event.kind !== "message" || !event.actorId || event.actorId !== me()) return null;
+  if (basePlace() !== "chat" && (basePlace() !== "space" || view() !== "room" || switchingSpace())) return null;
+  const entry = senderNotices()[activeScope()]?.get(event.id);
+  if (entry?.row !== event || !noticeDestinationVisible(entry.note.destination) || !activeEvents().includes(event)) return null;
+  return entry.note;
+}
+
+/** A delayed UI callback must not act on a notice from a place already left. */
+export function senderNoticeIsCurrent(note: SenderNotice) {
+  const scope = destinationScope(note.destination);
+  const entry = senderNotices()[scope]?.get(note.eventId);
+  return me() === note.senderId && !settingsOpen() && scope === activeScope() &&
+    (note.destination.kind === "chat" ? basePlace() === "chat" : inSpaceComposer()) &&
+    noticeDestinationVisible(note.destination) && entry?.note === note && !!eventsByScope()[scope]?.includes(entry.row);
+}
+
+export function dismissSenderNotice(note: SenderNotice) {
+  if (!senderNoticeIsCurrent(note)) return;
+  const scope = destinationScope(note.destination);
+  const notes = new Map(senderNotices()[scope]);
+  notes.set(note.eventId, null);
+  senderNotices.set({ ...senderNotices(), [scope]: notes });
+}
+
+/** Prepare a bound generic mention only in an empty Space draft. */
+export function prepareSenderNoticeDraft(note: SenderNotice): number | null {
+  if (note.addressing?.kind !== "classification_failed" || note.destination.kind !== "room" ||
+    !senderNoticeIsCurrent(note) || sending()) return null;
+  if (draft() || attachments?.pending(activeScope())) return draft().length; // focus the existing draft
+  return addMention({ kind: "agent" });
+}
 
 /**
  * Files staged in the composer, uploaded on submission. Registered by
@@ -825,13 +1290,15 @@ export function composerScope(): string {
 /** Asking the agent needs a typed question: files alone are saved to the Library, not sent to a model. */
 export const ASK_NEEDS_TEXT = "Type a question to ask the agent. Attached files are saved to the Library; they aren't sent to the agent.";
 
+type ModelChoice = () => { choice?: TurnModelChoice; error?: string | null };
+
 /**
  * Posts the draft (and any staged files) to the active place; `invokeAgent`
  * asks the agent to answer. Files are uploaded to the destination's library
  * first; if one fails nothing is posted and the draft and files stay. A
  * message may be files only, unless it asks an agent in a Space.
  */
-export async function send(invokeAgent: boolean, choice?: TurnModelChoice, agentId?: string): Promise<void> {
+export async function send(invokeAgent: boolean, choice?: TurnModelChoice | ModelChoice, agentId?: string): Promise<void> {
   await sendDraft({ kind: "message", invokeAgent, choice, agentId });
 }
 
@@ -840,7 +1307,7 @@ export async function saveChatNote(): Promise<void> {
 }
 
 type DraftSend =
-  | { kind: "message"; invokeAgent: boolean; choice?: TurnModelChoice; agentId?: string }
+  | { kind: "message"; invokeAgent: boolean; choice?: TurnModelChoice | ModelChoice; agentId?: string }
   | { kind: "chat-note" };
 
 async function sendDraft(intent: DraftSend): Promise<void> {
@@ -848,13 +1315,14 @@ async function sendDraft(intent: DraftSend): Promise<void> {
   const saveNote = intent.kind === "chat-note";
   if (saveNote && !chat) return;
   const retryAction = saveNote ? "Save note" : "Send";
-  const { invokeAgent, choice, agentId } = saveNote ? { invokeAgent: false } : intent;
-  const text = draft().trim();
+  const { invokeAgent, choice: pickModel, agentId } = saveNote ? { invokeAgent: false } : intent;
+  const submittedText = draft();
+  const text = submittedText.trim();
   const sid = activeSpaceId();
   const rid = activeRoomId();
   const c = client;
   const scope = activeScope();
-  if (!c || sending() || !scope || (!chat && (!sid || !rid))) return;
+  if (!c || sending() || !scope || (!chat && (!sid || !rid || !inSpaceComposer()))) return;
   const files = !!attachments?.pending(scope);
   if (!text && !files) return;
   if (!chat && invokeAgent && !text) {
@@ -867,19 +1335,50 @@ async function sendDraft(intent: DraftSend): Promise<void> {
   const to: SendDestination = chat ? { kind: "chat" } : { kind: "room", spaceId: sid!, roomId: rid! };
   const sameSession = guard();
   const ok = chat ? sameSession : guard(sid!);
+  const navigation = navigationGeneration;
   // Feedback only where it happened: never in a place the user moved to.
-  const here = () => ok() && activeScope() === scope;
+  const here = () => ok() && navigation === navigationGeneration && activeScope() === scope &&
+    (chat ? basePlace() === "chat" : inSpaceComposer());
+  let address: SpaceMessageBody | null = null;
+  let submittedDraft: MentionDraft | undefined;
+  if (!chat) {
+    const askAgent = invokeAgent ? { agentId } : undefined;
+    const directory = editDirectory();
+    submittedDraft = captureForDirectory(mentionDraft(), directory, { finalize: true });
+    writeMentionDraft(submittedDraft, directory);
+    // Finalize against the draft's directory. The fresh roster after any
+    // uploads can require confirmation, but never replaces a binding.
+    const bound = submittedDraft.anchors.map(a => a.mention);
+    const people = new Set((directory?.members ?? []).map(m => m.id));
+    const named = new Set((directory?.agents ?? []).map(a => a.id));
+    for (const recipient of bound) {
+      if (recipient.kind === "user") people.add(recipient.id);
+      else if (recipient.agentId) named.add(recipient.agentId);
+    }
+    if (askAgent?.agentId) named.add(askAgent.agentId);
+    const result = prepareMentionSend(submittedDraft, {
+      members: [...people].map(id => ({ id })),
+      agents: [...named].map(id => ({ id, handle: "", name: "" })),
+    }, { askAgent });
+    if (!result.ok) {
+      setMentionSendError(result);
+      return;
+    }
+    address = result.body;
+  }
+  const willAsk = invokeAgent || address?.mentions?.some(m => m.kind === "agent");
+  const selected = typeof pickModel === "function" ? (willAsk ? pickModel() : {}) : { choice: pickModel };
+  if (selected.error) {
+    actionError.set(selected.error);
+    return;
+  }
   batch(() => {
     sending.set(invokeAgent ? "agent" : "message");
     actionError.set(null);
     notice.set(null);
   });
-  const sentMentions = chat
-    ? []
-    : mentions().filter((m) => {
-        const literal = mentionLiteral(m);
-        return !literal || text.includes(literal);
-      });
+  const mayPost = () => here() && mentionDraft() === submittedDraft;
+  let origin: ReturnType<typeof captureSendOrigin> | undefined;
   try {
     let ids: string[] = [];
     let keys: string[] = [];
@@ -893,32 +1392,70 @@ async function sendDraft(intent: DraftSend): Promise<void> {
       ids = up.ids;
       keys = up.keys;
     }
-    if (saveNote) await c.saveChatNote(text, ids);
-    else if (chat) await c.sendChatMessage(text, ids, choice);
-    else await c.sendMessage(sid!, rid!, text, invokeAgent, sentMentions, ids, choice, invokeAgent ? agentId : undefined);
-    if (!ok()) return;
+    if (chat) {
+      origin = captureSendOrigin(c, to);
+      if (saveNote) {
+        await c.saveChatNote(text, ids);
+        origin.acknowledge(null);
+      } else origin.acknowledge(await c.sendChatMessage(text, ids, selected.choice));
+    } else {
+      if (!mayPost()) {
+        if (here()) actionError.set("The draft or destination changed. Nothing was sent; review the draft and send again.");
+        return;
+      }
+      const body = address!;
+      const verified = await verifySpaceRecipients(c, sid!, body, submittedDraft!, files, mayPost);
+      if (verified?.kind === "confirmation" && mayPost() && verified.confirmation.current()) {
+        batch(() => {
+          mentionConfirmation.set(verified.confirmation);
+          writeMentionDraft(verified.draft, verified.confirmation.directory);
+          actionError.set("A mention no longer has the same recipient. Pick who you mean. Nothing was sent.");
+        });
+        return;
+      }
+      if (verified?.kind !== "ok" || !mayPost() || !verified.current()) {
+        if (here()) actionError.set(mayPost()
+          ? verified?.kind !== "stale"
+            ? "Could not verify the current recipient list. Nothing was sent."
+            : "A recipient is no longer in this Space. Remove their mention or choose someone else. Nothing was sent."
+          : "The draft or destination changed. Nothing was sent; review the draft and send again.");
+        return;
+      }
+      origin = captureSendOrigin(c, to);
+      origin.acknowledge(await c.sendMessage(sid!, rid!, body, ids, selected.choice));
+    }
+    // Accepted files are identified by immutable staging keys, not by the
+    // current room epoch. Never leave them staged for a duplicate send after
+    // rejoin, and never touch a replacement account's staging.
+    if (!sameSession()) return;
     if (keys.length) attachments?.sent(scope, keys, to);
-    if (activeScope() === scope && draft().trim() === text) {
+    if (!origin.canRetireDraft()) return;
+    if (activeScope() === scope && (chat ? draft() === submittedText : mentionDraft() === submittedDraft)) {
       // unless the user typed something new meanwhile
       batch(() => {
-        draft.set("");
-        if (!chat) mentions.set([]);
+        if (chat) draft.set("");
+        else writeMentionDraft(EMPTY_MENTION_DRAFT, null);
       });
-    } else if (stashedDrafts()[scope]?.text.trim() === text) {
+    } else if (chat ? stashedDrafts()[scope]?.text === submittedText : stashedDrafts()[scope]?.mention === submittedDraft) {
       // Sent from a place the user has since left: its stashed draft is gone too.
       const { [scope]: _sent, ...rest } = stashedDrafts();
       stashedDrafts.set(rest);
     }
-    if (chat) {
-      if (chatUnavailable()) chatUnavailable.set(null);
-      lastRunsRefresh = 0;
-    }
+    if (chat) lastRunsRefresh = 0;
     kick();
   } catch (error) {
+    if (sameSession() && error instanceof ApiError && error.kind === "auth") {
+      disconnect(error.message);
+      return;
+    }
+    if (origin && !origin.current()) return;
+    if (origin && isAccessDenial(error)) origin.deny();
     if (!here()) return;
-    handleActionError(error, saveNote ? "Could not save the note" : invokeAgent ? (chat ? "Could not ask your agent" : "Could not ask the agent") : "Could not send the message", chat ? undefined : sid!);
+    handleActionError(error, saveNote ? "Could not save the note" : invokeAgent ? (chat ? "Could not ask your agent" : "Could not ask the agent") : "Could not send the message", origin || chat ? undefined : sid!);
     const shown = actionError();
-    if (files && shown) actionError.set(`${shown} Its files are already in the Library; ${retryAction} again won't upload them twice.`);
+    if (files && shown) actionError.set(chat
+      ? `${shown} Its files are already in the Library; ${retryAction} again won't upload them twice.`
+      : `${shown} The uploaded files remain in the Library.`);
   } finally {
     if (sameSession()) sending.set(null);
   }
@@ -953,60 +1490,105 @@ export async function followUp(run: Run): Promise<void> {
 }
 
 export async function setDispatchSpace(spaceId: string, roomId?: string): Promise<void> {
-  if (!spaces().some((s) => s.id === spaceId)) return;
+  const c = client;
+  if (!c || !spaces().some((s) => s.id === spaceId)) return;
+  const ok = guard(spaceId);
+  const navigation = navigationGeneration;
+  const pending = { spaceId, roomId: null };
+  const here = () => basePlace() === "chat" && navigation === navigationGeneration && dispatchTarget() === pending;
+  const sameSession = guard();
   dispatchError.set(null);
   dispatchNotice.set(null);
-  dispatchTarget.set({ spaceId, roomId: roomId ?? null });
+  dispatchTarget.set(pending);
+  const read = roomId === undefined ? undefined : beginSpaceRead(spaceId);
+  const unverified = "Couldn't verify that destination. Follow up again or choose another room.";
   try {
-    const list = await ensureRooms(spaceId);
-    const current = dispatchTarget();
-    if (current?.spaceId !== spaceId) return;
-    const chosen = roomId && list.some((r) => r.id === roomId) ? roomId : pickRoom(spaceId, list);
-    dispatchTarget.set({ spaceId, roomId: chosen });
+    if (!read || roomId === undefined) {
+      const list = await ensureRooms(spaceId);
+      if (ok() && here()) dispatchTarget.set({ spaceId, roomId: pickRoom(spaceId, list) });
+      return;
+    }
+    // Verify the exact destination from this read, never from a cached fallback.
+    const list = read.finishRooms(await c.listRooms(spaceId));
+    if (!ok()) return;
+    const key = scopeKey(spaceId, roomId);
+    const found = list?.some(r => r.id === roomId);
+    const stale = !list || (!found && (roomDeniedAtOrAfter(key, read.request) || newerAccess(key, read.request)));
+    batch(() => {
+      if (list && !stale) {
+        // An unrelated active room is left for its own poll to confirm.
+        read.publishRooms(list, roomId);
+        if (!found) void dropLostRoom(spaceId, roomId, read.request, false);
+      }
+      if (found && here()) dispatchTarget.set({ spaceId, roomId });
+      else if (!found && here()) dispatchError.set(stale ? unverified
+        : "That room or thread is no longer available. Choose another destination.");
+    });
   } catch (error) {
-    if (dispatchTarget()?.spaceId === spaceId) dispatchError.set(describe(error, "Could not load that Space's rooms"));
+    if (sameSession() && error instanceof ApiError && error.kind === "auth") {
+      read?.finish();
+      disconnect(error.message);
+    } else if (read && isAccessDenial(error)) {
+      const applied = await read.deny(() => batch(() => {
+        const show = here();
+        dropLostSpace(spaceId, false);
+        if (show) dispatchError.set(describe(error, "Could not load that Space's rooms"));
+      }));
+      if (!applied && ok() && here()) dispatchError.set(unverified);
+    } else {
+      read?.finish();
+      if (ok() && here()) dispatchError.set(describe(error, "Could not load that Space's rooms"));
+    }
   }
 }
 
 export function setDispatchRoom(roomId: string) {
   const t = dispatchTarget();
-  if (t) dispatchTarget.set({ spaceId: t.spaceId, roomId });
+  if (t && roomsBySpace()[t.spaceId]?.some(r => r.id === roomId)) {
+    dispatchTarget.set({ spaceId: t.spaceId, roomId });
+    dispatchError.set(null);
+  }
 }
 
 /** Sends the dispatch draft to the chosen Space and room and asks that Space's agent. */
 export async function sendDispatch(): Promise<void> {
-  const text = dispatchDraft().trim();
+  const text = dispatchDraft();
   const target = dispatchTarget();
   const c = client;
-  if (!text || !target?.roomId || !c || dispatching()) return;
+  if (!text.trim() || !target?.roomId || !c || dispatching()) return;
   const space = spaces().find((s) => s.id === target.spaceId);
   const room = roomsBySpace()[target.spaceId]?.find((r) => r.id === target.roomId);
   if (!space || !room) {
     dispatchError.set("Choose a Space and room you belong to first.");
     return;
   }
-  const ok = guard(target.spaceId);
+  const sameSession = guard();
+  const navigation = navigationGeneration;
+  const here = () => basePlace() === "chat" && navigation === navigationGeneration && dispatchTarget() === target;
+  const origin = captureSendOrigin(c, { kind: "room", spaceId: target.spaceId, roomId: target.roomId });
   batch(() => {
     dispatching.set(true);
     dispatchError.set(null);
     dispatchNotice.set(null);
   });
   try {
-    await c.sendMessage(target.spaceId, target.roomId, text, true);
-    if (!ok()) return;
-    if (dispatchDraft().trim() === text) dispatchDraft.set("");
-    dispatchNotice.set(`Sent to the agent in ${space.name} › #${room.name}.`);
+    // Dispatch is an explicit request to the chosen Space's agent, not a
+    // mention composer. Its text cannot add recipients implicitly.
+    const hadNotice = origin.acknowledge(await c.sendMessage(target.spaceId, target.roomId, { text, invoke_agent: true }));
+    if (!origin.canRetireDraft()) return;
+    if (dispatchTarget() === target && dispatchDraft() === text) dispatchDraft.set("");
+    if (here()) dispatchNotice.set(hadNotice ? `Posted in ${space.name} › #${room.name}.` :
+      `Sent to the agent in ${space.name} › #${room.name}.`);
     lastRunsRefresh = 0;
     kick();
   } catch (error) {
-    if (!ok()) return;
-    if (error instanceof ApiError && error.kind === "auth") disconnect(error.message);
-    else {
-      dispatchError.set(describe(error, "Could not send the task"));
-      if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found")) void lostAccess(target.spaceId, null);
+    if (sameSession() && error instanceof ApiError && error.kind === "auth") disconnect(error.message);
+    else if (origin.current()) {
+      if (isAccessDenial(error)) origin.deny();
+      if (here() && !isAborted(error)) dispatchError.set(describe(error, "Could not send the task"));
     }
   } finally {
-    if (ok()) dispatching.set(false);
+    if (sameSession()) dispatching.set(false);
   }
 }
 
@@ -1146,85 +1728,325 @@ export function openManage(section: "members" | "runner" = "members") {
   for (const fn of manageOpeners) fn(sid, section);
 }
 
-/** Loads the active Space's members for the mention picker (any member may). */
-export async function loadMembersForMentions(): Promise<void> {
+/** Start a distinct visit even on re-entry to the same cached Space. */
+export function beginMentionVisit(sid: string, scope: string) {
+  const visit: MentionVisit = { sid, scope, navigation: navigationGeneration, token: {}, verified: false };
+  mentionVisit.set(visit);
+  void loadMembersForMentions(true);
+  return () => {
+    if (mentionVisit()?.token === visit.token) mentionVisit.set(null);
+  };
+}
+
+function currentMentionVisit(visit: MentionVisit) {
+  return visit.navigation === navigationGeneration && activeScope() === visit.scope && inSpaceComposer()
+    && mentionVisit()?.token === visit.token;
+}
+
+export function mentionVisitVerified(sid: string) {
+  const visit = mentionVisit();
+  return !!visit?.verified && visit.sid === sid && currentMentionVisit(visit);
+}
+
+export function mentionVisitGuard(sid: string) {
+  const visit = mentionVisit();
+  const ok = guard(sid);
+  return () => !!visit && visit.sid === sid && ok() && currentMentionVisit(visit);
+}
+
+/** Same key through background cache refreshes, different on navigation or leaving the composer. */
+export function mentionVisitKey() {
+  const scope = activeScope();
+  return scope && inSpaceComposer() ? `${navigationGeneration}:${scope}` : null;
+}
+
+/** Read evidence for a current member, shared by preflight and profile refresh. */
+export function mentionProfileEvidence(userId: string) {
+  const scope = memberAliasScope();
+  if (!scope || !members()?.some(m => m.userId === userId)) return null;
+  return {
+    scope,
+    verified: scope.entries().has(userId),
+    start: () => {
+      if (memberAliasScope() !== scope) return null;
+      const order = ++scope.next;
+      return (displayName: string | null | undefined) => {
+        if (memberAliasScope() !== scope) return;
+        const entries = scope.entries();
+        if ((entries.get(userId)?.order ?? 0) >= order) return;
+        scope.entries.set(new Map(entries).set(userId, { order, displayName: displayName || null }));
+      };
+    },
+  };
+}
+
+/** Require every current member, including verified profiles with no readable name. */
+export function mentionMemberNames(sid: string): MentionDirectory["members"] | null {
+  if (activeSpaceId() !== sid) return null;
+  const entries = memberAliasScope()?.entries();
+  const list = members();
+  if (!entries || !list || !list.every(m => entries.has(m.userId))) return null;
+  return list.map(({ userId }) => ({ id: userId, displayName: entries.get(userId)!.displayName }));
+}
+
+/** A new visit must not reuse an older visit's in-flight roster request. */
+export function loadMembersForMentions(fresh = false): Promise<void> {
   const sid = activeSpaceId();
   const c = client;
-  if (!sid || !c) return;
+  const visit = mentionVisit();
+  if (!sid || !c || !visit || visit.sid !== sid || !currentMentionVisit(visit)) return Promise.resolve();
+  const existing = memberRequests.get(sid);
+  if (existing && !fresh) return existing;
   const ok = guard(sid);
-  membersError.set(null);
-  try {
-    const list = await c.listMembers(sid);
-    if (ok()) membersBySpace.set({ ...membersBySpace(), [sid]: list });
-  } catch (error) {
-    if (!ok() || isAborted(error)) return;
+  const version = nextMemberVersion(sid);
+  const work = c.listMembers(sid).then(list => {
+    if (ok() && currentMentionVisit(visit)) {
+      batch(() => {
+        if (adoptMembers(sid, version, list) && !visit.verified) mentionVisit.set({ ...visit, verified: true });
+      });
+    }
+  }, error => {
+    if (!ok() || !currentMentionVisit(visit) || isAborted(error)) return;
+    if (!markMembersUnverified(sid, version, error)) return;
     if (error instanceof ApiError && error.kind === "auth") disconnect(error.message);
-    else if (activeSpaceId() === sid) membersError.set(describe(error, "Could not load members"));
-  }
+    else if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found")) void lostAccess(sid, null);
+  }).finally(() => {
+    if (memberRequests.get(sid) === work) memberRequests.delete(sid);
+  });
+  memberRequests.set(sid, work);
+  return work;
 }
 
 // ------------------------------------------------------------------ mentions
 
-export function mentionLiteral(m: Mention): string | null {
-  // A named agent by its @handle; the generic @agent (the default agent, or the classifier's pick) otherwise.
-  if (m.kind === "agent") return m.agentId ? (m.handle && /^[a-z0-9_-]+$/.test(m.handle) ? `@${m.handle}` : null) : "@agent";
-  return /^\S+$/.test(m.id) ? `@${m.id}` : null; // ids with spaces go only in the explicit list
+function nextMemberVersion(sid: string) {
+  const version = (memberVersions.get(sid) ?? 0) + 1;
+  memberVersions.set(sid, version);
+  return version;
 }
 
-export function sameMention(a: Mention, b: Mention) {
-  if (a.kind === "agent" && b.kind === "agent") return (a.agentId ?? null) === (b.agentId ?? null);
-  return a.kind === "user" && b.kind === "user" && a.id === b.id;
+function sameMemberIds(a: readonly Member[] | undefined, b: readonly Member[]) {
+  const ids = new Set(a?.map(m => m.userId));
+  return a?.length === b.length && b.every(m => ids.has(m.userId));
 }
 
-function escapeRegExp(text: string) {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function literalIn(text: string, literal: string) {
-  return new RegExp(`(^|\\s)${escapeRegExp(literal)}(?=$|[\\s.,;:!?)])`).test(text);
-}
-
-/** The "@partial" being typed at the end of the draft, if any. */
-export function mentionQuery(text: string): string | null {
-  const m = /(^|\s)@([^\s@]*)$/.exec(text);
-  return m ? m[2] : null;
-}
-
-/** Adds a mention: its literal replaces a trailing "@partial" or is appended. */
-export function addMention(m: Mention) {
-  if (basePlace() !== "space") return;
-  const literal = mentionLiteral(m);
+function adoptMembers(sid: string, version: number, list: Member[]) {
+  const before = memberEvidence()[sid];
+  if (before && version < before.version) return false;
+  // In-flight requests aren't evidence. Identical successful replies keep
+  // the same roster token, including reordering or changes to a role.
+  const roster = before && !memberFailures()[sid] && sameMemberIds(membersBySpace()[sid], list) ? before.roster : {};
   batch(() => {
-    if (!mentions().some((x) => sameMention(x, m))) mentions.set([...mentions(), m]);
-    if (!literal) return;
-    const text = draft();
-    if (mentionQuery(text) !== null) draft.set(text.replace(/@[^\s@]*$/, `${literal} `));
-    else if (!literalIn(text, literal)) draft.set(`${text}${text && !/\s$/.test(text) ? " " : ""}${literal} `);
+    membersBySpace.set({ ...membersBySpace(), [sid]: list });
+    memberEvidence.set({ ...memberEvidence(), [sid]: { version, roster } });
+    if (memberFailures()[sid]) memberFailures.set({ ...memberFailures(), [sid]: null });
+  });
+  return true;
+}
+
+function markMembersUnverified(sid: string, version: number, error: unknown) {
+  const before = memberEvidence()[sid];
+  if (before && version < before.version) return false;
+  batch(() => {
+    memberEvidence.set({ ...memberEvidence(), [sid]: { version, roster: {} } });
+    memberFailures.set({ ...memberFailures(), [sid]: describe(error, "Could not verify members") });
+  });
+  return true;
+}
+
+/** Space settings shares the composer/Dispatch roster order, not its visit. */
+export function beginMemberRosterRead(sid: string) {
+  const version = nextMemberVersion(sid);
+  const current = guard(sid);
+  return {
+    publish: (list: Member[]) => current() && adoptMembers(sid, version, list),
+    fail: (error: unknown) => current() && markMembersUnverified(sid, version, error),
+  };
+}
+
+/** The visible, permission-scoped room/thread, never the Space left beneath another view. */
+export function inSpaceComposer() {
+  return basePlace() === "space" && !settingsOpen() && view() === "room" && !!activeSpace() && !!activeRoom() && !switchingSpace();
+}
+
+function captureForDirectory(value: MentionDraft, directory: MentionDirectory | null, options?: { finalize?: boolean; caret?: number }): MentionDraft {
+  const captured = captureTypedMentions(value, directory ?? EMPTY_DIRECTORY, options);
+  if (directory || captured === value) return captured;
+  // Without a verified directory even the reserved generic token could be
+  // a prefix of a longer label. Only an explicit pick may bind it now.
+  const asPlain = ({ start, end, literal }: MentionSelection) => ({ start, end, literal, kind: "unresolved" as const });
+  const decisions = [
+    ...(captured.decisions ?? []).map(d => d.kind === "ambiguous" && !value.decisions?.includes(d) ? asPlain(d) : d),
+    ...captured.anchors.filter(a => !value.anchors.includes(a)).map(asPlain),
+  ];
+  return { text: captured.text, anchors: value.anchors, decisions };
+}
+
+function writeMentionDraft(value: MentionDraft, directory: MentionDirectory | null) {
+  batch(() => {
+    if (!value.decisions?.some(d => d.kind === "ambiguous" && d.preflight)) mentionConfirmation.set(null);
+    mentionDraft.set(value);
+    editDirectory.set(directory);
+    draft.set(value.text);
   });
 }
 
-/** Removes a mention chip and its text from the draft. */
-export function removeMention(m: Mention) {
-  const literal = mentionLiteral(m);
-  batch(() => {
-    mentions.set(mentions().filter((x) => !sameMention(x, m)));
-    if (literal) {
-      const re = new RegExp(`(^|\\s)${escapeRegExp(literal)}(?=$|[\\s.,;:!?)])`, "g");
-      draft.set(draft().replace(re, "$1").replace(/[ \t]{2,}/g, " ").trimStart());
+/** Use the same snapshot for preview and finalization; never capture on roster refresh. */
+export function previewMentionDraft() {
+  return captureForDirectory(mentionDraft(), editDirectory(), { finalize: true });
+}
+
+export function previewMentionMatches(value: MentionDraft) {
+  return scanMentionDraft(value, editDirectory() ?? EMPTY_DIRECTORY, { finalize: true });
+}
+
+/** Never fall back to cached profiles when a send required a fresh confirmation. */
+export function verifiedConfirmationDirectory() {
+  const confirmation = mentionConfirmation();
+  return confirmation?.current() ? confirmation.directory : null;
+}
+
+/** Picking can only use current data and the exact literal the chooser showed. */
+export function addMention(mention: MentionRecipient, selection?: MentionSelection): number | null {
+  const sid = activeSpaceId();
+  if (!sid || !inSpaceComposer()) return null;
+  const value = mentionDraft();
+  const end = value.text.length;
+  const range = selection ?? { start: end, end, literal: "" };
+  const decision = value.decisions?.find(d => d.start === range.start && d.end === range.end && d.literal === range.literal);
+  const directory = decision?.kind === "ambiguous" && decision.preflight ? verifiedConfirmationDirectory() : directoryForMentions(sid);
+  if (decision?.kind === "ambiguous" && decision.preflight
+    && (!directory || !decision.choices.some(m => mentionIdentityKey(m) === mentionIdentityKey(mention)))) return null;
+  const picked = pickMention(value, range, mention, directory ?? EMPTY_DIRECTORY);
+  if (!picked) return null;
+  writeMentionDraft(picked, editDirectory());
+  const caret = range.end + picked.text.length - value.text.length;
+  return picked.text[caret] === " " ? caret + 1 : caret;
+}
+
+/** Remove only the exact tracked occurrences of this recipient. */
+export function removeMention(mention: MentionRecipient) {
+  if (!inSpaceComposer()) return;
+  const key = mentionIdentityKey(mention);
+  let value = mentionDraft();
+  for (const a of [...value.anchors].reverse()) {
+    if (mentionIdentityKey(a.mention) === key) {
+      const end = a.end + (value.text[a.end] === " " ? 1 : 0);
+      value = editMentionDraft(value, { start: a.start, end, replacement: "" }) ?? value;
     }
+  }
+  writeMentionDraft(value, editDirectory());
+}
+
+export function setDraft(text: string) {
+  const sid = activeSpaceId();
+  if (basePlace() !== "space" || !sid) {
+    draft.set(text);
+    return;
+  }
+  const before = mentionDraft();
+  if (before.text === text) return;
+  // NSH gives us a value snapshot, not a native edit range. The helper
+  // conservatively preserves only anchors outside ambiguous edit ranges.
+  let caret = text.length;
+  for (let i = before.text.length; caret > 0 && i > 0 && before.text[i - 1] === text[caret - 1]; i--) caret--;
+  const directory = directoryForMentions(sid);
+  writeMentionDraft(captureForDirectory(updateMentionDraft(before, text), directory, { caret }), directory);
+}
+
+function setMentionSendError(result: Extract<MentionSend, { ok: false }>) {
+  const message = {
+    ambiguous: "Pick who you mean before sending.",
+    "invalid-text": "The draft contains invalid text. Edit it and try again.",
+    "invalid-anchor": "A mention changed. Edit it or choose its recipient again.",
+    "stale-recipient": "A recipient could not be verified. Remove their mention or choose someone else.",
+    "too-many-spans": "A message can contain up to 64 mentions. Remove some before sending.",
+    "too-many-recipients": "A message can address up to 32 recipients. Remove some before sending.",
+  }[result.reason];
+  batch(() => {
+    actionError.set(message);
+    notice.set(null);
   });
 }
 
-/** Sets the draft and drops mention chips whose text the user deleted. */
-export function setDraft(text: string) {
-  batch(() => {
-    draft.set(text);
-    const kept = mentions().filter((m) => {
-      const literal = mentionLiteral(m);
-      return !literal || literalIn(text, literal);
-    });
-    if (kept.length !== mentions().length) mentions.set(kept);
-  });
+type SpaceRecipientCheck = { kind: "stale" | "unverified" }
+  | { kind: "ok"; current: () => boolean }
+  | { kind: "confirmation"; draft: MentionDraft; confirmation: MentionConfirmation };
+
+async function verifySpaceRecipients(
+  c: Client, sid: string, body: SpaceMessageBody, submitted: MentionDraft, uploaded: boolean, mayPost: () => boolean,
+): Promise<SpaceRecipientCheck | null> {
+  const people = body.mentions?.flatMap(m => m.kind === "user" ? [m.id] : []) ?? [];
+  const agents = body.mentions?.flatMap(m => m.kind === "agent" && m.agent_id ? [m.agent_id] : []) ?? [];
+  if (body.agent_id) agents.push(body.agent_id);
+  const checkAliases = submitted.anchors.some(a => !a.picked);
+  const checkMembers = checkAliases || uploaded || people.length > 0;
+  const version = checkMembers ? nextMemberVersion(sid) : 0;
+  const visit = mentionVisitGuard(sid);
+  const roster = checkMembers ? c.listMembers(sid).then(list => {
+    if (mayPost()) adoptMembers(sid, version, list);
+    return { list, evidence: memberEvidence()[sid]?.roster };
+  }, error => {
+    if (mayPost() && !isAborted(error)) markMembersUnverified(sid, version, error);
+    throw error;
+  }) : null;
+  const readAgents = () => c.spaceAgents(sid).then(list => list.agents.filter(a => a.spaceId === sid));
+  const [checked, explicitAgents] = await Promise.all([roster, !checkAliases && agents.length ? readAgents() : null]);
+  if (!mayPost()) return null;
+  const members = checked?.list;
+  let currentAgents: MentionDirectory["agents"] | null = explicitAgents;
+  let aliasesCurrent = () => true;
+  if (checkAliases) {
+    if (!members || !members.some(m => m.userId === me())) return { kind: "unverified" };
+    for (let i = 0; i < members.length; i += 8) {
+      const read = await Promise.all(members.slice(i, i + 8).map(async ({ userId }) => {
+        const complete = mentionProfileEvidence(userId)?.start();
+        if (!complete) return false;
+        const profile = await c.profileOf(userId);
+        if (profile && profile.id !== userId) return false;
+        if (mayPost()) complete(profile?.displayName);
+        return true;
+      }));
+      if (!mayPost()) return null;
+      if (read.some(ok => !ok)) return { kind: "unverified" };
+    }
+    currentAgents = await refreshAgentsForMentions?.(sid, mayPost) ?? null;
+    if (!mayPost()) return null;
+    const rosterCurrent = () => checked?.evidence === memberEvidence()[sid]?.roster
+      && !membersError() && sameMemberIds(membersBySpace()[sid], members);
+    // Use the newest completed observations, not necessarily the replies
+    // from this send: a newer background read may have resolved first.
+    const freshPeople = mentionMemberNames(sid);
+    if (!currentAgents || !freshPeople || !rosterCurrent()) return { kind: "unverified" };
+    const directory = { members: freshPeople, agents: currentAgents };
+    const personNames = new Map(freshPeople.map(m => [m.id, m.displayName]));
+    const agentNames = new Map(currentAgents.map(a => [a.id, a]));
+    aliasesCurrent = () => {
+      if (!visit() || !rosterCurrent()) return false;
+      const people = mentionMemberNames(sid);
+      if (!people || people.length !== personNames.size || !people.every(m => personNames.get(m.id) === m.displayName)) return false;
+      const latest = verifiedMentionAgents(sid);
+      return !!latest && latest.length === agentNames.size && latest.every(a => {
+        const saved = agentNames.get(a.id);
+        return saved?.name === a.name && saved.handle === a.handle;
+      });
+    };
+    const confirmed = confirmChangedAutomaticMentions(submitted, directory);
+    if (confirmed !== submitted) {
+      let expired = false;
+      const current = () => {
+        if (!expired && !aliasesCurrent()) expired = true;
+        return !expired;
+      };
+      return { kind: "confirmation", draft: confirmed, confirmation: { directory, current } };
+    }
+  }
+  // Require both snapshots to agree on the concrete members in use.
+  const ids = [me(), ...people];
+  const membersCurrent = () => !checkMembers || !membersError() && ids.every(id =>
+    members?.some(m => m.userId === id) && membersBySpace()[sid]?.some(m => m.userId === id));
+  if (!membersCurrent() || !agents.every(id => currentAgents?.some(a => a.id === id))) return { kind: "stale" };
+  return { kind: "ok", current: () => aliasesCurrent() && membersCurrent() };
 }
 
 /** Marks whether anyone serves a Space (a dedicated token or an attached runner). */
@@ -1238,9 +2060,9 @@ function clearTransient() {
 }
 
 // Drafts are per place: each room or thread, and the personal Chat, keeps its
-// own text and mention chips. `draft` and `mentions` are the active place's;
+// own text and range bindings. `draft` and `mentionDraft` are the active place's;
 // switching stashes them under the place left and restores the new one's.
-const stashedDrafts = signal<Record<string, { text: string; mentions: Mention[] }>>({});
+const stashedDrafts = signal<Record<string, { text: string; mention: MentionDraft; directory: MentionDirectory | null }>>({});
 /** Some place other than the active one has a draft not sent yet. */
 export const stashedDraftPending = computed(() => Object.values(stashedDrafts()).some((d) => d.text.trim().length > 0));
 let mentionScope = "";
@@ -1251,15 +2073,16 @@ effect(() => {
     const left = mentionScope;
     mentionScope = scope;
     const stash = { ...stashedDrafts() };
-    if (left && (draft() || mentions().length)) stash[left] = { text: draft(), mentions: mentions() };
+    if (left && draft()) stash[left] = { text: draft(), mention: mentionDraft(), directory: editDirectory() };
     else delete stash[left];
     const back = stash[scope];
     delete stash[scope];
     batch(() => {
       stashedDrafts.set(stash);
       draft.set(back?.text ?? "");
-      mentions.set(back?.mentions ?? []);
-      if (membersError()) membersError.set(null);
+      mentionDraft.set(back?.mention ?? EMPTY_MENTION_DRAFT);
+      editDirectory.set(back?.directory ?? null);
+      mentionConfirmation.set(null);
     });
   });
 });
@@ -1271,20 +2094,34 @@ function endSession() {
   abort?.abort();
   abort = null;
   client = null;
+  noticeSenderId = null;
   if (timer !== undefined) clearTimeout(timer);
   timer = undefined;
   ticking = false;
   tickAgain = false;
   failures = 0;
   lastListsRefresh = 0;
-  lastMembershipRequest = 0;
-  spaceDenials.clear();
   lastRunsRefresh = 0;
   cursors.clear();
   inflight.clear();
   pollAgain.clear();
   lastRoomBySpace.clear();
   spaceEpoch.clear();
+  roomEntryNavigation = undefined;
+  pendingAccessReads.clear();
+  pendingMembershipReads.clear();
+  spaceDenials.clear();
+  roomListRequests.clear();
+  verifiedAccess.clear();
+  lastMembershipRequest = 0;
+  noticeEpochs.clear();
+  pendingSenderNotices.clear();
+  deniedRoomAccess.clear();
+  accessProbes.clear();
+  chatAvailabilityRequest = 0;
+  chatProbeAfter = 0;
+  memberRequests.clear();
+  memberVersions.clear();
   batch(() => {
     status.set({ phase: "signedOut" });
     connectedTo.set(null);
@@ -1308,6 +2145,7 @@ function endSession() {
     roomsBySpace.set({});
     activeRoomId.set(null);
     eventsByScope.set({});
+    senderNotices.set({});
     loadedScopes.set({});
     reactionsByScope.set({});
     reactionPending.set(null);
@@ -1321,8 +2159,12 @@ function endSession() {
     actionError.set(null);
     notice.set(null);
     membersBySpace.set({});
-    membersError.set(null);
-    mentions.set([]);
+    memberFailures.set({});
+    memberEvidence.set({});
+    mentionVisit.set(null);
+    mentionConfirmation.set(null);
+    mentionDraft.set(EMPTY_MENTION_DRAFT);
+    editDirectory.set(null);
     orgAdmin.set(false);
     settingsSection.set("profile");
     settingsAnchor.set(null);
@@ -1357,7 +2199,7 @@ async function tick(sess: number) {
     if (Date.now() - lastListsRefresh >= LISTS_REFRESH_MS) await refreshLists();
     if (sess !== session) return;
     if (basePlace() === "chat") {
-      if (!chatUnavailable()) await pollChat();
+      if (Date.now() >= chatProbeAfter) await pollChat();
       if (sess === session && Date.now() - lastRunsRefresh >= RUNS_REFRESH_MS) await refreshRuns();
     } else if (basePlace() === "space") {
       const sid = activeSpaceId();
@@ -1386,14 +2228,94 @@ async function handleLoopError(error: unknown): Promise<number | null> {
     disconnect(error.message);
     return null;
   }
-  if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found") && basePlace() === "space") {
-    await lostAccess(activeSpaceId(), activeRoomId());
-    return 0;
-  }
   failures++;
   const retryInMs = Math.min(MAX_BACKOFF_MS, 1000 * 2 ** (failures - 1));
   status.set({ phase: "retrying", attempt: failures, retryInMs, message: describe(error, "Connection problem") });
   return retryInMs;
+}
+
+/** A POST or poll denial invalidates the originating room's notes now.
+ * Only a scoped, still-current access check may drop its public state. */
+async function recheckRoomAccess(c: Client, to: Extract<SendDestination, { kind: "room" }>, valid: () => boolean, show: boolean) {
+  const { spaceId, roomId } = to;
+  const scope = scopeKey(spaceId, roomId);
+  const inProgress = accessProbes.get(scope);
+  // A stream of denials must not keep replacing its own slow probe. A
+  // denial after fresh positive evidence, however, needs a fresh check.
+  if (inProgress && !newerAccess(scope, inProgress.request) && verifiedSpaceRequest(spaceId) <= inProgress.request) return;
+  const sameSession = guard();
+  const probe = { request: 0 };
+  accessProbes.set(scope, probe);
+  const current = () => valid() && accessProbes.get(scope) === probe;
+  try {
+    const spaceRequest = await refreshMembership(c, {
+      started: request => { probe.request = request; },
+      showLoss: sid => sid !== spaceId || show,
+      keepPollCadence: true,
+    });
+    if (!current() || !spaces().some(s => s.id === spaceId) ||
+      (spaceDenials.get(spaceId) ?? 0) >= verifiedSpaceRequest(spaceId)) return;
+    // A newer membership snapshot can settle the Space leg, not the room leg.
+    // Only newer evidence for this exact room makes the latter redundant.
+    if (spaceRequest === undefined && (verifiedSpaceRequest(spaceId) <= probe.request ||
+      newerAccess(scope, probe.request) || roomDeniedAtOrAfter(scope, probe.request))) return;
+    // The room read is a new observation. Access verified while the Space
+    // list was in flight does not outrank a denial on this later leg.
+    const read = beginSpaceRead(spaceId);
+    const roomRequest = probe.request = read.request;
+    try {
+      const list = await c.listRooms(spaceId);
+      read.finish(current());
+      if (!current() || newerSpaceDenial(spaceId, roomRequest)) return;
+      if (list.some(r => r.id === roomId)) verifyRoomAccess(spaceId, roomId, roomRequest);
+      else void dropLostRoom(spaceId, roomId, roomRequest, show);
+    } catch (error) {
+      if (current() && isAccessDenial(error)) await read.deny(() => dropLostSpace(spaceId, show));
+      else {
+        read.finish();
+        throw error;
+      }
+    }
+  } catch (error) {
+    if (sameSession() && error instanceof ApiError && error.kind === "auth") disconnect(error.message);
+  } finally {
+    if (accessProbes.get(scope) === probe) accessProbes.delete(scope);
+  }
+}
+
+function recordRoomDenial(key: string, request: number) {
+  if (roomDeniedAtOrAfter(key, request) || newerAccess(key, request)) return false;
+  deniedRoomAccess.set(key, request);
+  return true;
+}
+
+async function dropLostRoom(spaceId: string, roomId: string, request: number, show: boolean) {
+  const key = scopeKey(spaceId, roomId);
+  if (!recordRoomDenial(key, request)) return;
+  const valid = guard(spaceId);
+  // Record the fence now, but don't evict a room with a newer transcript on
+  // the wire. An empty successful transcript proves access too.
+  for (let pending = newerPendingRead(key, request); pending; pending = newerPendingRead(key, request)) {
+    await pending;
+    if (!valid() || newerAccess(key, request) || deniedRoomAccess.get(key) !== request) return;
+  }
+  cursors.delete(key);
+  if (lastRoomBySpace.get(spaceId) === roomId) lastRoomBySpace.delete(spaceId);
+  batch(() => {
+    forgetSenderNotices(key);
+    roomsBySpace.set({ ...roomsBySpace(), [spaceId]: roomsOf(spaceId).filter(r => r.id !== roomId) });
+    const target = dispatchTarget();
+    if (target?.spaceId === spaceId && target.roomId === roomId) {
+      dispatchTarget.set({ spaceId, roomId: null });
+    }
+    const { [key]: _e, ...events } = eventsByScope();
+    eventsByScope.set(events);
+    if (activeSpaceId() === spaceId && activeRoomId() === roomId) {
+      activeRoomId.set(pickRoom(spaceId, roomsOf(spaceId)));
+      if (show && basePlace() === "space") notice.set("That room is no longer available.");
+      else if (basePlace() === "space") actionError.set(null);
+    }
+  });
 }
 
 /**
@@ -1401,28 +2323,17 @@ async function handleLoopError(error: unknown): Promise<number | null> {
  * the Space" (purge it, move on) from "this room is gone" (drop the room).
  */
 async function lostAccess(spaceId: string | null, roomId: string | null) {
-  if (!spaceId) return;
-  const before = spaces().find((s) => s.id === spaceId);
+  const c = client;
+  if (!spaceId || !c) return;
+  if (roomId) {
+    forgetSenderNotices(scopeKey(spaceId, roomId));
+    await recheckRoomAccess(c, { kind: "room", spaceId, roomId }, guard(spaceId), true);
+    return;
+  }
   try {
     await refreshLists(true);
   } catch {
     /* the next tick deals with it */
-  }
-  if (spaces().some((s) => s.id === spaceId)) {
-    if (!roomId) return;
-    const key = scopeKey(spaceId, roomId);
-    cursors.delete(key);
-    batch(() => {
-      roomsBySpace.set({ ...roomsBySpace(), [spaceId]: (roomsBySpace()[spaceId] ?? EMPTY_ROOMS).filter((r) => r.id !== roomId) });
-      const { [key]: _e, ...events } = eventsByScope();
-      eventsByScope.set(events);
-      if (activeSpaceId() === spaceId && activeRoomId() === roomId) {
-        activeRoomId.set(pickRoom(spaceId, roomsBySpace()[spaceId] ?? EMPTY_ROOMS));
-        notice.set("That room is no longer available.");
-      }
-    });
-  } else if (before) {
-    notice.set(`You no longer have access to ${before.name}.`);
   }
 }
 
@@ -1431,13 +2342,63 @@ async function lostAccess(spaceId: string | null, roomId: string | null) {
  * list, which forgets it and leaves it if it was open, then say what happened.
  */
 export async function spaceGone(spaceId: string, message: string): Promise<void> {
+  const current = guard();
   await lostAccess(spaceId, null);
-  if (!spaces().some((s) => s.id === spaceId)) notice.set(message);
+  if (current() && !spaces().some((s) => s.id === spaceId)) notice.set(message);
 }
 
 /** A Space's name changed (src/features/space): show it everywhere at once. */
 export function spaceRenamed(spaceId: string, name: string) {
   spaces.set(spaces().map((s) => (s.id === spaceId ? { ...s, name } : s)));
+}
+
+function mergeSpaceRunnerHint(s: Space, previous: Space | undefined, request: number): Space {
+  const accepted = acceptSpaceRunnerSummary(s.id, request);
+  return previous && !accepted ? { ...s, runnerPaired: previous.runnerPaired } : s;
+}
+
+/** Apply just the ordered membership snapshot, with no room or event reads. */
+async function refreshMembership(c: Client, options?: {
+  beforePublish?: () => void;
+  started?: (request: number) => void;
+  showLoss?: (spaceId: string) => boolean;
+  keepPollCadence?: boolean;
+}): Promise<number | undefined> {
+  const ok = guard();
+  const request = nextAccessRequest();
+  const settle = trackAccessRead(pendingMembershipReads, request);
+  try {
+    options?.started?.(request);
+    const list = await c.listSpaces();
+    if (!ok() || request <= lastMembershipRequest) return;
+    options?.beforePublish?.();
+    lastMembershipRequest = request;
+    // A denial-triggered probe is ordered like every snapshot, but must not
+    // postpone the regular scan (including rediscovery after a rejoin).
+    if (!options?.keepPollCadence) lastListsRefresh = Date.now();
+    const listed = new Set(list.map(s => s.id));
+    batch(() => {
+      const previous = new Map(spaces().map(s => [s.id, s]));
+      const accepted = list.flatMap(s => {
+        if (!currentSpaceEvidence(s.id, request)) return [];
+        verifyAccess(scopeKey(s.id, ""), request);
+        return [mergeSpaceRunnerHint(s, previous.get(s.id), request)];
+      });
+      // Include ids published by an earlier list while this one was in
+      // flight. Scope evidence still outranks an older complete snapshot.
+      const known = new Set([...spaces().map(s => s.id), ...spaceDenials.keys()]);
+      for (const id of known) {
+        if (!listed.has(id)) void beginSpaceRead(id, request).deny(() => {
+          if (spaces().some(s => s.id === id)) dropLostSpace(id, options?.showLoss?.(id));
+        });
+      }
+      const updated = new Set(accepted.map(s => s.id));
+      spaces.set([...accepted, ...spaces().filter(s => !updated.has(s.id))]);
+    });
+    return request;
+  } finally {
+    settle();
+  }
 }
 
 /** Reloads the Space list and the active Space's rooms. */
@@ -1446,50 +2407,42 @@ async function refreshLists(force = false) {
   if (!c) return;
   if (!force && Date.now() - lastListsRefresh < LISTS_REFRESH_MS) return;
   const ok = guard();
-  const runnerStamp = nextSpaceRunnerStamp();
-  const response = await c.listSpaces();
-  if (!ok() || runnerStamp <= lastMembershipRequest) return;
-  lastMembershipRequest = runnerStamp;
-  lastListsRefresh = Date.now();
-  const list = response.filter((s) => (spaceDenials.get(s.id) ?? 0) < runnerStamp);
-  const known = new Set(list.map((s) => s.id));
-  const omitted = spaces().filter((s) => !known.has(s.id));
-  const retained = omitted.filter((s) => hasNewerSpaceAccessProof(s.id, runnerStamp));
-  for (const space of retained) known.add(space.id);
-  const lost = omitted.filter((s) => !known.has(s.id));
-  for (const space of lost) purgeSpace(space.id, true, runnerStamp);
-  const previousSpaces = new Map(spaces().map((s) => [s.id, s]));
-  spaces.set([...list.map((space) => {
-    spaceDenials.delete(space.id); // An accepted newer positive is a rejoin.
-    const previous = previousSpaces.get(space.id);
-    const accepted = acceptSpaceRunnerSummary(space.id, runnerStamp);
-    return previous && !accepted ? { ...space, runnerPaired: previous.runnerPaired } : space;
-  }), ...retained]);
-  const active = activeSpaceId();
-  if (active && !known.has(active)) {
-    const lostSpace = lost.find((s) => s.id === active);
-    const wasHere = basePlace() === "space";
-    batch(() => {
-      activeSpaceId.set(null);
-      activeRoomId.set(null);
-      view.set("room");
-      if (lostSpace) notice.set(`You no longer have access to ${lostSpace.name}.`);
-    });
-    // Never fall back to another Space silently: go to the Chat, which says what happened.
-    if (wasHere) basePlace.set("chat");
-    return;
-  }
+  const request = await refreshMembership(c);
+  if (!ok() || request !== lastMembershipRequest) return;
+  const active = basePlace() === "space" && !switchingSpace() ? activeSpaceId() : null;
   if (active) {
-    const okSpace = guard(active);
-    const rooms = await c.listRooms(active);
-    if (!okSpace()) return;
+    const read = beginSpaceRead(active);
+    let rooms: Room[];
+    try {
+      rooms = await c.listRooms(active);
+    } catch (error) {
+      if (isAccessDenial(error)) {
+        void read.deny(() => dropLostSpace(active));
+        return;
+      }
+      read.finish();
+      if (!read.valid()) return;
+      throw error;
+    }
+    const snapshotIds = new Set(rooms.map(r => r.id));
+    const list = read.finishRooms(rooms);
+    if (!list) return;
+    const roomRequest = read.request;
     const previous = roomsBySpace()[active] ?? EMPTY_ROOMS;
     const current = activeRoomId();
     batch(() => {
-      // Keep a room we just created even if the list is a moment behind; the
-      // events poll will say 404 if it really is gone.
-      const local = current ? previous.find((r) => r.id === current && !rooms.some((x) => x.id === r.id)) : undefined;
-      roomsBySpace.set({ ...roomsBySpace(), [active]: local ? [...rooms, local] : rooms });
+      // Newer room access, including a successful create, wins over an
+      // older omission. An authoritative loss must also clear Dispatch.
+      read.publishRooms(list);
+      for (const r of previous) {
+        if (!snapshotIds.has(r.id)) void dropLostRoom(active, r.id, roomRequest, true);
+      }
+      // An absent room can have an intermediate positive read still in
+      // flight. Advance existing tombstones even when no row is cached.
+      const prefix = scopeKey(active, "");
+      for (const key of deniedRoomAccess.keys()) {
+        if (key.startsWith(prefix) && !snapshotIds.has(key.slice(prefix.length))) recordRoomDenial(key, roomRequest);
+      }
       if (activeSpaceId() === active && (!current || !roomsBySpace()[active].some((r) => r.id === current))) {
         activeRoomId.set(pickRoom(active, roomsBySpace()[active]));
       }
@@ -1497,16 +2450,58 @@ async function refreshLists(force = false) {
   }
 }
 
-function pollRoom(spaceId: string, roomId: string): Promise<void> {
-  return poll(scopeKey(spaceId, roomId), guard(spaceId), (c, after) => c.listEvents(spaceId, roomId, after));
+async function pollRoom(spaceId: string, roomId: string): Promise<void> {
+  const scope = scopeKey(spaceId, roomId);
+  const sameSpace = guard(spaceId);
+  const epoch = noticeEpoch(scope);
+  const ok = () => sameSpace() && noticeEpoch(scope) === epoch;
+  let request = 0;
+  try {
+    await poll(scope, ok, async (c, after) => {
+      const read = beginSpaceRead(spaceId);
+      request = read.request;
+      const settleRoom = trackScopedAccessRead(scope, request);
+      try {
+        const events = await c.listEvents(spaceId, roomId, after);
+        if (!read.valid() || newerSpaceDenial(spaceId, request)) return null;
+        // A notice epoch change fences rendering, not the server's access evidence.
+        verifyRoomAccess(spaceId, roomId, request);
+        return ok() && !roomDeniedAtOrAfter(scope, request) ? events : null;
+      } finally {
+        settleRoom();
+        read.finish();
+      }
+    });
+  } catch (error) {
+    if (!ok()) return;
+    if (isAccessDenial(error)) {
+      // Do not park the polling loop behind the recheck; fresh room access
+      // must be able to supersede a slow denial.
+      if (request && !newerAccess(scope, request)) void lostAccess(spaceId, roomId);
+    } else throw error;
+  }
 }
 
 async function pollChat(): Promise<void> {
+  const sameSession = guard();
+  const epoch = noticeEpoch(CHAT);
+  const ok = () => sameSession() && noticeEpoch(CHAT) === epoch;
+  let request = 0;
   try {
-    await poll(CHAT, guard(), (c, after) => c.listChatEvents(after));
+    await poll(CHAT, ok, async (c, after) => {
+      request = nextAccessRequest();
+      const events = await c.listChatEvents(after);
+      if (ok()) {
+        verifyAccess(CHAT, request);
+        observeChatAvailability(request, null);
+      }
+      return events;
+    });
   } catch (error) {
+    if (!ok()) return;
     if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found" || error.kind === "protocol")) {
-      chatUnavailable.set(`Your Chat isn't available on this server: ${error.message}`);
+      if (!request || newerAccess(CHAT, request)) return;
+      observeChatAvailability(request, `Your Chat isn't available on this server: ${error.message}`);
       return;
     }
     throw error;
@@ -1514,7 +2509,7 @@ async function pollChat(): Promise<void> {
 }
 
 /** Fetches events after the scope's cursor; one request per scope at a time. */
-function poll(key: string, ok: () => boolean, fetch: (c: Client, after: number) => Promise<RoomEvent[]>): Promise<void> {
+function poll(key: string, ok: () => boolean, fetch: (c: Client, after: number) => Promise<RoomEvent[] | null>): Promise<void> {
   const running = inflight.get(key);
   if (running) {
     pollAgain.add(key);
@@ -1528,7 +2523,7 @@ function poll(key: string, ok: () => boolean, fetch: (c: Client, after: number) 
       if (!c || !ok()) return;
       const firstLoad = !loadedScopes()[key];
       const events = await fetch(c, cursors.get(key) ?? 0);
-      if (!ok()) return;
+      if (!events || !ok()) return;
       const added = merge(key, events);
       pages++;
       // Catch up a long history in a few quick pages on first load; otherwise
@@ -1581,20 +2576,24 @@ function merge(key: string, events: RoomEvent[]): number {
   batch(() => {
     if (!loadedScopes()[key]) loadedScopes.set({ ...loadedScopes(), [key]: true });
     if (fresh.length === 0) return;
-    cursors.set(key, fresh[fresh.length - 1].id);
+    const through = fresh[fresh.length - 1].id;
+    cursors.set(key, through);
     if (reactions) reactionsByScope.set({ ...reactionsByScope(), [key]: reactions });
-    if (shown.length === 0) return;
     const current = eventsByScope()[key] ?? EMPTY_EVENTS;
-    const next = current.concat(shown);
-    eventsByScope.set({
-      ...eventsByScope(),
-      [key]: next.length > MAX_EVENTS_PER_ROOM ? next.slice(next.length - MAX_EVENTS_PER_ROOM) : next,
-    });
+    let rows = current;
+    if (shown.length) {
+      rows = current.concat(shown).slice(-MAX_EVENTS_PER_ROOM);
+      eventsByScope.set({ ...eventsByScope(), [key]: rows });
+    }
+    reconcileSenderNotices(key, through, rows);
   });
   return fresh.length;
 }
 
 // ------------------------------------------------------------------ errors
+
+const isAccessDenial = (error: unknown) => error instanceof ApiError &&
+  (error.kind === "forbidden" || error.kind === "not_found");
 
 function handleActionError(error: unknown, what: string, spaceId?: string) {
   if (isAborted(error)) return;

@@ -1,5 +1,8 @@
 # Installers: desktop and runners
 
+This guide uses published installers. The [update controls and Linux
+journal diagnostic](updates.md) are in the source, not released.
+
 > **Latest release: [Metro 0.4.0](https://github.com/wnzn/metro/releases/tag/v0.4.0)**
 > (2026-11-25, from `1a743e5`). Releases are published automatically when a
 > version bump is merged into the protected `main` branch
@@ -84,15 +87,15 @@ against the Sigstore-verified `SHA256SUMS` before you run it
 come back once a certificate is set up and it says `signed`
 ([deploy.md](deploy.md#windows-releases-signed-or-unsigned)).
 
-**Not verified by a person on native Windows.** For 0.3.2 and 0.4.0, the release
-run's `windows-distribution / preview` job, on a GitHub `windows-2025`
-runner, installed the unsigned MSI into a chosen folder, checked its
+**Unattended checks on native Windows.** For 0.3.2 and 0.4.0, the release
+run's `windows-distribution / preview` job on a GitHub `windows-2025`
+runner installed the unsigned MSI into a chosen folder, checked its
 payload, ran the server and uninstalled it, and passed the MSI lane's
 native tests (upgrade, repair, downgrade, uninstall), all unattended
 ([acceptance](acceptance.md#published-metro-040-2026-11-25-github-release-v040), [0.3.2](acceptance.md#published-metro-032-2026-11-24-github-release-v032)).
-Nobody has seen its wizard or the desktop app on screen on Windows. Other
-Windows checks ran under Wine on Linux, which has its own Windows Installer
-([MSI notes](../packaging/windows-msi/README.md), [acceptance.md](acceptance.md)).
+Earlier local desktop GUI smoke tests ran under Wine on Linux, not on
+native Windows. **No person has verified the desktop GUI or the MSI
+wizard on native Windows.** See the [MSI notes](../packaging/windows-msi/README.md).
 
 ### The MSI
 

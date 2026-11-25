@@ -1,8 +1,8 @@
 import { batch, signal } from "nsh";
 import { ApiError } from "./api/client";
 import type { SpaceRunner } from "./api/client";
-import { onSessionEnd, sessionGuard, setRunnerPaired } from "./store";
-import { clearSpaceRunnerOrder, discardSpaceAccessProof, hasNewerSpaceRunnerStamp, isSpaceRunnerStampCurrent, nextSpaceRunnerStamp, recordSpaceAccessProof, recordSpaceRunnerStamp, spaceRunnerExactPending } from "./spaceRunnerOrder";
+import { beginRunnerAccessRead, nextAccessRequest, onSessionEnd, setRunnerPaired } from "./store";
+import { clearSpaceRunnerOrder, hasNewerSpaceRunnerStamp, isSpaceRunnerStampCurrent, recordSpaceRunnerStamp, spaceRunnerExactPending } from "./spaceRunnerOrder";
 
 /** Missing means not observed; null is an observed empty assignment. */
 export const spaceRunners = signal<Record<string, SpaceRunner | null>>({});
@@ -15,7 +15,7 @@ export function onSpaceRunnerObserved(listener: (sid: string, runner: SpaceRunne
 
 /** A local mutation invalidates older observations of just its own Space. */
 export function invalidateSpaceRunnerObservations(sid: string) {
-  recordSpaceRunnerStamp(sid, nextSpaceRunnerStamp(), spaceRunnerExactPending(sid));
+  recordSpaceRunnerStamp(sid, nextAccessRequest(), spaceRunnerExactPending(sid));
 }
 
 export function isSpaceRunnerAccessDenied(error: unknown) {
@@ -29,7 +29,7 @@ export function forgetDisprovedSpaceRunner(sid: string, previous: SpaceRunner | 
   if (current !== undefined && current !== previous && !(previous === null && current === atDispatch) &&
       !(current && previous?.assignmentRevision &&
       current.kind === previous.kind && current.assignmentRevision === previous.assignmentRevision)) return;
-  hideSpaceRunner(sid, nextSpaceRunnerStamp());
+  hideSpaceRunner(sid, nextAccessRequest());
 }
 
 function hideSpaceRunner(sid: string, stamp: number) {
@@ -46,23 +46,27 @@ function hideSpaceRunner(sid: string, stamp: number) {
 }
 
 /** Take a ticket at dispatch. A newer accepted answer wins, not one merely in flight. */
-export function beginSpaceRunnerObservation(sid: string) {
-  const stamp = nextSpaceRunnerStamp();
-  const inScope = sessionGuard(sid);
-  const isCurrent = () => inScope() && isSpaceRunnerStampCurrent(sid, stamp);
+export function beginSpaceRunnerObservation(sid: string, exactEndpoint = true) {
+  const access = beginRunnerAccessRead(sid, exactEndpoint);
+  const stamp = access.request;
+  const isCurrent = () => access.valid() && isSpaceRunnerStampCurrent(sid, stamp);
   return {
     isCurrent,
-    hasNewer: () => !inScope() || hasNewerSpaceRunnerStamp(sid, stamp),
+    finish: access.finish,
+    hasNewer: () => !access.valid() || hasNewerSpaceRunnerStamp(sid, stamp),
     denyAccess() {
-      if (!isCurrent()) return false;
-      discardSpaceAccessProof(sid, stamp);
+      if (!isCurrent()) {
+        access.finish();
+        return false;
+      }
+      access.withdraw();
       hideSpaceRunner(sid, stamp);
       return true;
     },
     publish(runner: SpaceRunner | null, allowFolderAdd = true, exact = true) {
+      access.finish(exact);
       if (!isCurrent()) return false;
       recordSpaceRunnerStamp(sid, stamp);
-      if (exact) recordSpaceAccessProof(sid, stamp);
       batch(() => {
         spaceRunners.set({ ...spaceRunners(), [sid]: runner });
         setRunnerPaired(sid, runner !== null);
