@@ -762,8 +762,14 @@ async fn the_release_floor_survives_restarts_and_never_hides_an_offer() {
     };
     let mut a = s.state.clone();
     a.updates = metro_server::updates::Updates::new(true).with_floor_file(floor.clone());
+    // A second process may have loaded the file before the first ever wrote.
+    let mut stale = s.state.clone();
+    stale.updates = metro_server::updates::Updates::new(true).with_floor_file(floor.clone());
     check(&a, &fixture_github("9.2.0", None)).await;
     assert_eq!(a.updates.latest().unwrap().version.to_string(), "9.2.0");
+    assert_eq!(std::fs::read_to_string(&floor).unwrap(), "9.2.0");
+    check(&stale, &fixture_github("9.1.0", None)).await;
+    assert!(stale.updates.latest().is_none());
     assert_eq!(std::fs::read_to_string(&floor).unwrap(), "9.2.0");
     // "Restart": a fresh state with the same floor file sees an older release.
     let mut b = s.state.clone();

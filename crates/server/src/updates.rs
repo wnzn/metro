@@ -207,6 +207,15 @@ impl Updates {
         if inner.floor_unreadable {
             return Err(error());
         }
+        let _disk_lock = if let Some(path) = &self.floor_file {
+            let file = lock_floor_file(path).map_err(|_| error())?;
+            if let Some(saved) = read_floor(path).map_err(|_| error())? {
+                inner.floor = Some(inner.floor.map_or(saved, |floor| floor.max(saved)));
+            }
+            Some(file)
+        } else {
+            None
+        };
         if inner
             .floor
             .into_iter()
@@ -288,6 +297,27 @@ fn read_floor(path: &std::path::Path) -> std::io::Result<Option<Version>> {
         return Err(invalid());
     }
     Version::parse(value.trim()).map(Some).ok_or_else(invalid)
+}
+
+fn lock_floor_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let name = path.file_name().unwrap_or_default();
+    let mut name = name.to_os_string();
+    name.push(".lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path.with_file_name(name))?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    file.try_lock().map_err(std::io::Error::from)?;
+    Ok(file)
 }
 
 /// The presence key of a runner credential (a dedicated runner is its Space).
