@@ -76,6 +76,13 @@ pub fn fingerprint(k: &Secret) -> String {
         .collect()
 }
 
+fn unreadable() -> anyhow::Error {
+    SafeError::new(
+        "the saved web search keys can't be read; reset them (this deletes every saved key) and add them again",
+    )
+    .into()
+}
+
 pub struct KeyStore {
     dir: PathBuf,
 }
@@ -94,17 +101,14 @@ impl KeyStore {
     /// The saved keys; none when nothing is saved. A file that can't be read
     /// is an error, and no key from it is used.
     pub fn load(&self) -> Result<Keys> {
-        let Some(stored) = read_private(&self.path(), 64 * 1024)? else {
+        // Only a missing file is "no keys"; anything else is a fixed error.
+        let Some(stored) = read_private(&self.path(), 64 * 1024).map_err(|_| unreadable())? else {
             return Ok(Keys::default());
         };
-        let mut plain = unseal(stored).map_err(|_| {
-            SafeError::new("the saved web search keys can't be read; delete and add them again")
-        })?;
+        let mut plain = unseal(stored).map_err(|_| unreadable())?;
         let parsed = serde_json::from_slice::<Wire>(&plain);
         plain.zeroize();
-        let w = parsed.map_err(|_| {
-            SafeError::new("the saved web search keys can't be read; delete and add them again")
-        })?;
+        let w = parsed.map_err(|_| unreadable())?;
         if w.v != 1 {
             bail!(SafeError::new(
                 "the saved web search keys have an unknown format"
@@ -141,19 +145,26 @@ impl KeyStore {
         write_private(&self.path(), &sealed)
     }
 
-    /// Save `key` for `p` (replacing any). The key is checked first.
+    /// Save `key` for `p` (replacing any). The key is checked first. A key
+    /// file that can't be read is left untouched (an error); [`Self::reset`]
+    /// is the explicit way out.
     pub fn set(&self, p: ProviderId, key: Secret) -> Result<()> {
         validate_key(&key)?;
-        // A broken file is replaced only by an explicit save.
-        let mut keys = self.load().map(|k| k.0).unwrap_or_default();
+        let mut keys = self.load()?.0;
         keys.insert(p.as_str().into(), key);
         self.store(&keys)
+    }
+
+    /// Delete every saved key, readable or not: the explicit recovery from a
+    /// key file that can't be read. `true` if there was a file.
+    pub fn reset(&self) -> Result<bool> {
+        remove_private(&self.path())
     }
 
     /// Delete `p`'s key; `true` if there was one. The provider goes back to
     /// its free mode.
     pub fn delete(&self, p: ProviderId) -> Result<bool> {
-        let mut keys = self.load().map(|k| k.0).unwrap_or_default();
+        let mut keys = self.load()?.0;
         let had = keys.remove(p.as_str()).is_some();
         self.store(&keys)?;
         Ok(had)

@@ -45,33 +45,58 @@ pub fn rfc3339(secs: u64) -> String {
     )
 }
 
+fn leap(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+fn days_in_month(y: i64, m: u32) -> u32 {
+    match m {
+        2 if leap(y) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+/// Exactly `n` ASCII digits.
+fn digits(s: &str, n: usize) -> Option<u64> {
+    (s.len() == n && s.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| s.parse().ok())
+        .flatten()
+}
+
 /// An IMF-fixdate (`Wed, 21 Oct 2015 07:28:00 GMT`) as seconds since the
-/// epoch; `None` for anything else.
+/// epoch; `None` for anything else: a 4-digit year, a real calendar date,
+/// a valid time of day, and no arithmetic that could overflow.
 pub fn parse_http_date(s: &str) -> Option<u64> {
-    let parts: Vec<&str> = s.split_whitespace().collect();
+    let parts: Vec<&str> = s.split(' ').collect();
     if parts.len() != 6 || parts[5] != "GMT" {
         return None;
     }
-    let d: u32 = parts[1].parse().ok()?;
+    if !["Mon,", "Tue,", "Wed,", "Thu,", "Fri,", "Sat,", "Sun,"].contains(&parts[0]) {
+        return None;
+    }
+    let d = digits(parts[1], 2)? as u32;
     let m = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ]
     .iter()
     .position(|x| *x == parts[2])? as u32
         + 1;
-    let y: i64 = parts[3].parse().ok()?;
-    let hms: Vec<u64> = parts[4]
-        .split(':')
-        .map(|x| x.parse().ok())
-        .collect::<Option<_>>()?;
-    if hms.len() != 3 || hms[0] > 23 || hms[1] > 59 || hms[2] > 60 || !(1..=31).contains(&d) {
+    let y = digits(parts[3], 4)? as i64;
+    let hms: Vec<&str> = parts[4].split(':').collect();
+    if hms.len() != 3 {
         return None;
     }
-    let days = days_from_civil(y, m, d);
-    if days < 0 {
+    let (h, mi, sec) = (digits(hms[0], 2)?, digits(hms[1], 2)?, digits(hms[2], 2)?);
+    if h > 23 || mi > 59 || sec > 60 || d == 0 || d > days_in_month(y, m) {
         return None;
     }
-    Some(days as u64 * 86_400 + hms[0] * 3600 + hms[1] * 60 + hms[2])
+    let days = u64::try_from(days_from_civil(y, m, d)).ok()?;
+    days.checked_mul(86_400)?
+        .checked_add(h * 3600)?
+        .checked_add(mi * 60)?
+        .checked_add(sec)
 }
 
 #[cfg(test)]
@@ -88,6 +113,29 @@ mod tests {
             Some(1_445_412_480)
         );
         assert_eq!(parse_http_date("21 Oct 2015"), None);
+        assert_eq!(
+            parse_http_date("Thu, 29 Feb 2024 00:00:00 GMT"),
+            Some(1_709_164_800)
+        );
+        for bad in [
+            "Mon, 31 Feb 2026 00:00:00 GMT",
+            "Sun, 29 Feb 2025 00:00:00 GMT",
+            "Mon, 31 Apr 2026 00:00:00 GMT",
+            "Mon, 00 Jan 2026 00:00:00 GMT",
+            "Mon, 01 Jan 20260 00:00:00 GMT",
+            "Mon, 01 Jan 26 00:00:00 GMT",
+            "Mon, 01 Jan 1969 00:00:00 GMT",
+            "Mon, 01 Jan 2026 24:00:00 GMT",
+            "Mon, 01 Jan 2026 23:60:00 GMT",
+            "Mon, 1 Jan 2026 00:00:00 GMT",
+            "Mon, 01 Jan +026 00:00:00 GMT",
+            "Mon, 01 Jan 2026 00:00:00 UTC",
+            "Xyz, 01 Jan 2026 00:00:00 GMT",
+            "Mon, 01 Jan 2026 0:00:00 GMT",
+            "Mon,  01 Jan 2026 00:00:00 GMT",
+        ] {
+            assert_eq!(parse_http_date(bad), None, "{bad}");
+        }
         assert_eq!(parse_http_date("Wed, 21 Foo 2015 07:28:00 GMT"), None);
         for t in [951_782_400u64, 1_709_164_800, 4_102_444_799] {
             let s = rfc3339(t);
@@ -103,6 +151,42 @@ mod tests {
                 ymd[0]
             );
             assert_eq!(parse_http_date(&http), Some(t), "{http}");
+        }
+    }
+
+    /// Deterministic mutations of a valid date: never a panic, and anything
+    /// accepted formats back to a real date.
+    #[test]
+    fn mutated_dates_never_panic() {
+        let base = b"Wed, 21 Oct 2015 07:28:00 GMT".to_vec();
+        let alphabet = b"0123456789: ,GMTWedOctFebX+-9";
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..20_000 {
+            let mut s = base.clone();
+            for _ in 0..(next() % 4 + 1) {
+                let i = (next() as usize) % s.len();
+                match next() % 3 {
+                    0 => s[i] = alphabet[(next() as usize) % alphabet.len()],
+                    1 => {
+                        s.remove(i);
+                    }
+                    _ => s.insert(i, alphabet[(next() as usize) % alphabet.len()]),
+                }
+                if s.is_empty() {
+                    s = base.clone();
+                }
+            }
+            if let Ok(text) = std::str::from_utf8(&s)
+                && let Some(t) = parse_http_date(text)
+            {
+                assert!(rfc3339(t).len() == 20, "{text}");
+            }
         }
     }
 }

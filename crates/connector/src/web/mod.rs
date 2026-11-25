@@ -818,7 +818,12 @@ impl Engine {
     /// Try the person's providers in order until one answers. Always returns
     /// Metro's answer object; `provider: null` when every one failed.
     pub async fn rotate(&self, job_id: &str, op: &Op, deadline: Instant) -> Value {
-        let snapshot = settings::load(&self.dir).unwrap_or_default();
+        // Consent at the time of the job: unreadable preferences, or web
+        // search turned off (by anyone, in any process), contact nobody.
+        let snapshot = match settings::load(&self.dir) {
+            Ok(s) if s.enabled => s,
+            _ => return json!({"v": 1, "provider": null, "attempts": []}),
+        };
         let keys = keys::KeyStore::new(&self.dir).load().unwrap_or_else(|_| {
             log(job_id, op, None, None, "saved keys unreadable; using none");
             Default::default()

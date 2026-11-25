@@ -129,6 +129,11 @@ pub(crate) async fn search(c: &Call<'_>, base: &str, r: &SearchReq) -> Result<An
         json!({"query": r.query, "numResults": r.max_results}),
     )
     .await?;
+    // Without text, the structured output is the answer: it needs a
+    // `results` array (`[]` is a real empty result).
+    if text.trim().is_empty() && !result["structuredContent"]["results"].is_array() {
+        return Err(Failure::of(Outcome::BadResponse));
+    }
     let mut results = structured_results(&result);
     results.truncate(r.max_results as usize);
     Ok(Answer {

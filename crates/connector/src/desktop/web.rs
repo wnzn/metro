@@ -339,8 +339,8 @@ impl WebSearch {
             return Ok(());
         }
         let p = self.profile(server, account)?;
-        let s = settings::load(&p.dir).unwrap_or_default();
-        if !s.enabled {
+        // Unreadable preferences count as off.
+        if !settings::load(&p.dir).is_ok_and(|s| s.enabled) {
             return Ok(());
         }
         let engine = self.engine(&p)?;
@@ -432,7 +432,16 @@ impl WebSearch {
     }
 
     fn view(&self, p: &Profile, server: &str, account: &str) -> Value {
-        let s = settings::load(&p.dir).unwrap_or_default();
+        // Unreadable settings are shown as off, with the reason.
+        let loaded = settings::load(&p.dir);
+        let settings_error = loaded
+            .as_ref()
+            .err()
+            .map(|_| "The web search settings on this computer can't be read; turn web search off to reset them".to_owned());
+        let s = loaded.unwrap_or_else(|_| settings::Settings {
+            enabled: false,
+            ..Default::default()
+        });
         let k = keys::KeyStore::new(&p.dir)
             .load()
             .map_err(|e| local(e, "the saved keys can't be read").message);
@@ -457,6 +466,7 @@ impl WebSearch {
                 "detail": detail,
             },
             "keys_error": k.as_ref().err(),
+            "settings_error": settings_error,
             "endpoints_error": self.endpoints.as_ref().err(),
             "providers": providers,
         })
@@ -490,23 +500,25 @@ impl WebSearch {
             ),
             None => None,
         };
-        let before = settings::load(&p.dir).unwrap_or_default();
+        let was_on = settings::load(&p.dir).is_ok_and(|s| s.enabled);
         let engine = self.engine(&p)?;
         let changed = engine
             .edit(|dir| {
-                let mut s = settings::load(dir).unwrap_or_default();
-                if let Some(list) = &list {
-                    s.set_providers(list)
-                        .map_err(|m| anyhow::anyhow!(SafeError::new(m)))?;
-                }
-                if let Some(a) = notice_acknowledged {
-                    s.notice_acknowledged = a;
-                }
-                if let Some(e) = enabled {
-                    s.enabled = e;
-                }
-                settings::save(dir, &s)?;
-                Ok(s.enabled != before.enabled)
+                // Only turning web search off may start over from an
+                // unreadable file.
+                settings::update_prefs(dir, enabled == Some(false), |s| {
+                    if let Some(list) = &list {
+                        s.set_providers(list)
+                            .map_err(|m| anyhow::anyhow!(SafeError::new(m)))?;
+                    }
+                    if let Some(a) = notice_acknowledged {
+                        s.notice_acknowledged = a;
+                    }
+                    if let Some(e) = enabled {
+                        s.enabled = e;
+                    }
+                    Ok(s.enabled != was_on)
+                })
             })
             .await
             .map_err(|e| {
@@ -563,6 +575,19 @@ impl WebSearch {
         self.row(&p, pid)
     }
 
+    /// `POST /v1/web-search/keys/reset`: delete every saved key on this
+    /// computer (the explicit recovery from an unreadable key file).
+    pub async fn reset_keys(&self, server: &str, account: &str, epoch: u64) -> R<Value> {
+        let _g = self.bound_ops(server, account, epoch).await?;
+        let p = self.profile(server, account)?;
+        let engine = self.engine(&p)?;
+        engine
+            .edit(|dir| keys::KeyStore::new(dir).reset().map(|_| ()))
+            .await
+            .map_err(|e| local(e, "The keys can't be deleted"))?;
+        Ok(self.view(&p, server, account))
+    }
+
     /// `POST /v1/web-search/providers/{id}/test`: one fixed query, now.
     pub async fn test(&self, server: &str, account: &str, epoch: u64, id: &str) -> R<Value> {
         // Checked, not held: a vendor call mustn't delay a sign-out.
@@ -590,10 +615,13 @@ impl WebSearch {
         let engine = self.engine(&p)?;
         engine
             .edit(|dir| {
-                let mut s = settings::load(dir).unwrap_or_default();
-                settings::clear_cooldowns(&mut s, pid);
-                s.rejected_keys.remove(pid.as_str());
-                settings::save(dir, &s)
+                // An explicit action: it may start over from an unreadable
+                // state file (cooldowns only, never preferences).
+                settings::update_state(dir, true, |s| {
+                    settings::clear_cooldowns(s, pid);
+                    s.rejected_keys.remove(pid.as_str());
+                    Ok(())
+                })
             })
             .await
             .map_err(|e| local(e, "The settings can't be saved"))?;
@@ -601,7 +629,10 @@ impl WebSearch {
     }
 
     fn row(&self, p: &Profile, pid: ProviderId) -> R<Value> {
-        let s = settings::load(&p.dir).unwrap_or_default();
+        let s = settings::load(&p.dir).unwrap_or_else(|_| settings::Settings {
+            enabled: false,
+            ..Default::default()
+        });
         let k = keys::KeyStore::new(&p.dir)
             .load()
             .map_err(|e| local(e, "the saved keys can't be read").message);

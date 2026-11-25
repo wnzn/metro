@@ -263,6 +263,7 @@ fn router(ctx: Arc<Ctx>) -> Router {
             "/v1/web-search/providers/{id}/key",
             put(web_key_set).delete(web_key_delete),
         )
+        .route("/v1/web-search/keys/reset", post(web_reset_keys))
         .route("/v1/web-search/providers/{id}/test", post(web_test))
         .route(
             "/v1/web-search/providers/{id}/clear-cooldown",
@@ -472,6 +473,13 @@ async fn web_key_set(State(ctx): State<Arc<Ctx>>, Path(id): Path<String>, b: Byt
             let key = Secret::new(std::mem::take(&mut k.api_key));
             reply(ctx.desktop.web_set_key(&id, key).await)
         }
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn web_reset_keys(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
+    match body::<Empty>(&b) {
+        Ok(_) => reply(ctx.desktop.web_reset_keys().await),
         Err(e) => e.into_response(),
     }
 }

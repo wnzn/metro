@@ -33,6 +33,8 @@ USAGE
   metro-connector web status [--profile NAME]
   metro-connector web key set PROVIDER --from-file PATH [--profile NAME]
   metro-connector web key delete PROVIDER [--profile NAME]
+  metro-connector web key reset [--profile NAME]
+        Delete every saved key (the way out when the key file can't be read).
   metro-connector web enable | disable [--profile NAME]
   metro-connector web order PROVIDER,PROVIDER,... [--profile NAME]
         The try order; providers left out are turned off.
@@ -121,9 +123,14 @@ fn profile(a: &Args) -> Result<Profile> {
 /// fingerprint>`, so re-pairing a profile for someone else never reuses
 /// the previous person's keys.
 fn data_dir(p: &Profile, b: &Binding) -> Result<std::path::PathBuf> {
+    owner_dir(p, &b.server_url, &b.owner)
+}
+
+/// [`data_dir`] for (server, owner), whether or not they are bound now.
+fn owner_dir(p: &Profile, server: &str, owner: &str) -> Result<std::path::PathBuf> {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    for part in [b.server_url.as_str(), b.owner.as_str()] {
+    for part in [server, owner] {
         h.update((part.len() as u64).to_be_bytes());
         h.update(part.as_bytes());
     }
@@ -136,6 +143,36 @@ fn data_dir(p: &Profile, b: &Binding) -> Result<std::path::PathBuf> {
     let dir = accounts.join(name);
     crate::desktop::store::prepare_private_dir(&dir)?;
     Ok(dir)
+}
+
+/// The web device Metro registered for one (server, owner) on this profile,
+/// kept beside that owner's keys and settings (not in the active binding),
+/// so switching accounts back and forth reuses each one's own device.
+const OWNER_DEVICE: &str = "web-device-id.json";
+
+fn owner_device(dir: &std::path::Path) -> Option<String> {
+    let bytes = crate::fsutil::read_private(&dir.join(OWNER_DEVICE), 4096).ok()??;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    v["device_id"]
+        .as_str()
+        .filter(|id| crate::metro::valid_job_id(id))
+        .map(str::to_owned)
+}
+
+fn save_owner_device(dir: &std::path::Path, id: &str) -> Result<()> {
+    crate::fsutil::write_private(
+        &dir.join(OWNER_DEVICE),
+        serde_json::json!({"v": 1, "device_id": id})
+            .to_string()
+            .as_bytes(),
+    )
+}
+
+/// Per-profile setup lock (interprocess): one setup at a time, from reading
+/// the current binding through registration, publication and cleanup.
+async fn setup_lock(p: &Profile) -> Result<crate::fsutil::FileLock> {
+    let path = p.dir.join("setup.lock");
+    tokio::task::spawn_blocking(move || crate::fsutil::lock_exclusive(&path)).await?
 }
 
 /// The profile's binding: identity and credential from one record.
@@ -165,6 +202,7 @@ async fn setup(a: Args) -> Result<()> {
             .context("--server-url is required")?,
         "server_url",
     )?;
+    let _setup = setup_lock(&p).await?;
     let existing = binding::load(&p.dir)?;
     // `created`: a registration this setup made, removed again if the local
     // part fails.
@@ -181,10 +219,12 @@ async fn setup(a: Args) -> Result<()> {
             let owner = format!("account:{account}");
             // The same person on the same server keeps one device: its
             // token is rotated instead of registering another.
-            let reuse = existing
-                .as_ref()
-                .filter(|b| b.server_url == server && b.owner == owner)
-                .and_then(|b| b.device_id.clone());
+            let reuse = owner_device(&owner_dir(&p, &server, &owner)?).or_else(|| {
+                existing
+                    .as_ref()
+                    .filter(|b| b.server_url == server && b.owner == owner)
+                    .and_then(|b| b.device_id.clone())
+            });
             let rotated = match reuse {
                 Some(id) => match api.rotate_web_device(&id).await {
                     Ok(t) => Some((id, t)),
@@ -224,12 +264,13 @@ async fn setup(a: Args) -> Result<()> {
     let publish = || -> Result<()> {
         let b = Binding::new(&server, &owner, id.clone(), token)?;
         let dir = data_dir(&p, &b)?;
-        let s = settings::load(&dir)?;
-        settings::save(&dir, &s)?;
         if a.fail_before_publish {
             bail!("setup interrupted (test)");
         }
-        // One atomic write: identity and credential together.
+        if let Some(id) = &id {
+            save_owner_device(&dir, id)?;
+        }
+        // The commit point, one atomic write: identity and credential.
         binding::save(&p.dir, &b)
     };
     if let Err(e) = publish() {
@@ -369,12 +410,20 @@ fn status(a: Args) -> Result<()> {
     Ok(())
 }
 
-fn edit(a: &Args, f: impl FnOnce(&mut settings::Settings) -> Result<()>) -> Result<()> {
+/// Change the person's preferences only. `off`: this change turns web
+/// search off, which may start over from an unreadable file.
+fn edit(a: &Args, off: bool, f: impl FnOnce(&mut settings::Settings) -> Result<()>) -> Result<()> {
     let p = profile(a)?;
     let dir = data_dir(&p, &device(&p)?)?;
-    let mut s = settings::load(&dir)?;
-    f(&mut s)?;
-    settings::save(&dir, &s)
+    settings::update_prefs(&dir, off, f)
+}
+
+/// Change what jobs learned (an explicit action: may start over from an
+/// unreadable state file).
+fn edit_state(a: &Args, f: impl FnOnce(&mut settings::Settings) -> Result<()>) -> Result<()> {
+    let p = profile(a)?;
+    let dir = data_dir(&p, &device(&p)?)?;
+    settings::update_state(&dir, true, f)
 }
 
 /// `metro-connector web …`.
@@ -412,7 +461,7 @@ async fn command(cmd: &str, a: Args) -> Result<i32> {
         "status" => status(a).map(|_| 0),
         "enable" | "disable" => {
             let on = cmd == "enable";
-            edit(&a, |s| {
+            edit(&a, !on, |s| {
                 s.enabled = on;
                 Ok(())
             })
@@ -433,12 +482,14 @@ async fn command(cmd: &str, a: Args) -> Result<i32> {
                     full.push((p, false));
                 }
             }
-            edit(&a, |s| s.set_providers(&full).map_err(anyhow::Error::msg))
+            edit(&a, false, |s| {
+                s.set_providers(&full).map_err(anyhow::Error::msg)
+            })
         })()
         .map(|_| 0),
         "clear-cooldown" => (|| {
             let pid = provider(pos.first())?;
-            edit(&a, |s| {
+            edit_state(&a, |s| {
                 settings::clear_cooldowns(s, pid);
                 s.rejected_keys.remove(pid.as_str());
                 Ok(())
@@ -467,8 +518,13 @@ async fn command(cmd: &str, a: Args) -> Result<i32> {
                         format!("No key was saved for {}.", pid.name())
                     });
                 }
+                Some("reset") => {
+                    store.reset()?;
+                    say("Deleted every saved web search key on this computer.");
+                }
                 _ => bail!(
-                    "use `web key set PROVIDER --from-file PATH` or `web key delete PROVIDER`"
+                    "use `web key set PROVIDER --from-file PATH`, `web key delete PROVIDER` or \
+                     `web key reset`"
                 ),
             }
             Ok(())
@@ -527,6 +583,8 @@ mod tests {
         created: u32,
         rotated: u32,
         deleted: Vec<String>,
+        /// device id -> its currently valid token
+        tokens: std::collections::HashMap<String, String>,
     }
 
     fn who(h: &HeaderMap) -> Option<&'static str> {
@@ -569,6 +627,7 @@ mod tests {
                         let id = format!("wd_{:032x}", m.created);
                         m.devices.insert(id.clone(), owner.clone());
                         let token = token_of(&owner, m.created);
+                        m.tokens.insert(id.clone(), token.clone());
                         (axum::http::StatusCode::CREATED, axum::Json(json!({"id": id, "token": token})))
                             .into_response()
                     }
@@ -586,6 +645,7 @@ mod tests {
                         }
                         m.rotated += 1;
                         let token = token_of(owner, 1000 + m.rotated);
+                        m.tokens.insert(id.clone(), token.clone());
                         (axum::http::StatusCode::CREATED, axum::Json(json!({"token": token})))
                             .into_response()
                     }
@@ -860,5 +920,51 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         writer.join().unwrap();
         assert_eq!(seen.len(), 2, "both identities were observed");
+    }
+
+    #[tokio::test]
+    async fn alternating_accounts_each_keep_their_own_device() {
+        let (base, _, metro) = fakes().await;
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("home");
+        let (alice, bob) = session_files(t.path());
+        let setup = |session: &str| {
+            args(
+                &root,
+                &["--server-url", &base, "--session-token-file", session],
+            )
+        };
+        for _ in 0..3 {
+            for who in [&alice, &bob] {
+                assert_eq!(command("setup", setup(who)).await.unwrap(), 0);
+            }
+        }
+        let m = metro.lock().unwrap();
+        assert_eq!(m.created, 2, "exactly one registration each");
+        assert_eq!(m.devices.len(), 2);
+        assert_eq!(m.rotated, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlapping_setups_register_once_and_leave_a_working_binding() {
+        let (base, _, metro) = fakes().await;
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("home");
+        let (alice, _) = session_files(t.path());
+        let setup = || {
+            args(
+                &root,
+                &["--server-url", &base, "--session-token-file", &alice],
+            )
+        };
+        let (a, b) = tokio::join!(command("setup", setup()), command("setup", setup()));
+        assert_eq!((a.unwrap(), b.unwrap()), (0, 0));
+        let p = profile(&args(&root, &[])).unwrap();
+        let bound = device(&p).unwrap();
+        let m = metro.lock().unwrap();
+        assert_eq!(m.created, 1, "no duplicate registration");
+        let id = bound.device_id.clone().unwrap();
+        // The published token is the one Metro accepts now (it can claim).
+        assert_eq!(m.tokens[&id], bound.token().expose());
     }
 }

@@ -37,6 +37,8 @@ struct Reply {
     status: u16,
     headers: Vec<(&'static str, String)>,
     body: Vec<u8>,
+    /// Wait this long before answering.
+    delay_ms: u64,
 }
 
 fn reply(status: u16, body: Value) -> Reply {
@@ -44,6 +46,7 @@ fn reply(status: u16, body: Value) -> Reply {
         status,
         headers: vec![("content-type", "application/json".into())],
         body: body.to_string().into_bytes(),
+        delay_ms: 0,
     }
 }
 
@@ -68,7 +71,11 @@ impl Fixture {
         let app = axum::Router::new().fallback(
             move |method: Method, uri: Uri, headers: HeaderMap, body: Bytes| {
                 let f = state.clone();
-                async move { f.handle(method, uri, headers, body) }
+                async move {
+                    let (resp, delay) = f.handle(method, uri, headers, body);
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    resp
+                }
             },
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -77,7 +84,7 @@ impl Fixture {
         (f, base)
     }
 
-    fn handle(&self, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
+    fn handle(&self, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> (Response, u64) {
         let body = String::from_utf8_lossy(&body).to_string();
         let path = uri.path().to_owned();
         let rpc = serde_json::from_str::<Value>(&body)
@@ -119,6 +126,7 @@ impl Fixture {
                 status: 202,
                 headers: vec![],
                 body: vec![],
+                delay_ms: 0,
             },
             _ => reply(500, json!({"error": "unscripted"})),
         };
@@ -134,7 +142,7 @@ impl Fixture {
         for (k, v) in r.headers {
             resp.headers_mut().insert(k, v.parse().unwrap());
         }
-        resp
+        (resp, r.delay_ms)
     }
 
     fn push(&self, key: &str, r: Reply) {
@@ -583,6 +591,7 @@ fn mcp_sse(text: &str) -> Reply {
         headers: vec![("content-type", "text/event-stream".into())],
         body: format!("event: message\ndata: {note}\n\nevent: message\ndata: {res}\n\n")
             .into_bytes(),
+        delay_ms: 0,
     }
 }
 
@@ -832,6 +841,7 @@ async fn caps_redirects_and_deadlines() {
             status: 200,
             headers: vec![("content-type", "application/json".into())],
             body: vec![b' '; 3 * 1024 * 1024],
+            delay_ms: 0,
         },
     );
     // A redirect is never followed.
@@ -1294,4 +1304,210 @@ async fn mcp_replies_must_answer_the_request_id_and_overlapping_calls_get_their_
         .collect();
     let unique: std::collections::HashSet<_> = ids.iter().collect();
     assert_eq!(unique.len(), ids.len(), "ids reused: {ids:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turning_off_during_a_job_holds_for_the_next_one_across_processes() {
+    let s = Setup::new(&[ProviderId::Tavily]).await;
+    let mut slow = tavily_ok();
+    slow.delay_ms = 400;
+    s.fixture.push("/tavily/search", slow);
+    // "Process A": the worker, with a job in flight.
+    let worker = Arc::new(s.engine());
+    let job = {
+        let w = worker.clone();
+        tokio::spawn(async move {
+            w.handle(
+                "j1",
+                "web_search",
+                &json!({"v": 1, "query": "q"}),
+                deadline(),
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        s.fixture.seen_at("/tavily").len(),
+        1,
+        "the job is in flight"
+    );
+    // "Process B": the person turns web search off meanwhile.
+    let dir = s.dir.clone();
+    tokio::task::spawn_blocking(move || {
+        settings::update_prefs(&dir, true, |st| {
+            st.enabled = false;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    // The in-flight job finishes and records its outcome...
+    assert_eq!(job.await.unwrap()["ok"], true);
+    assert_eq!(s.settings().last["tavily"].outcome, "ok");
+    // ...without bringing the switch back: the next job contacts nobody.
+    assert!(
+        !s.settings().enabled,
+        "the worker overwrote the person's choice"
+    );
+    let r = worker
+        .handle(
+            "j2",
+            "web_search",
+            &json!({"v": 1, "query": "q"}),
+            deadline(),
+        )
+        .await;
+    assert_eq!(
+        r,
+        json!({"ok": false, "error": "web search is turned off on this computer"})
+    );
+    let v = worker.rotate("j3", &search("q"), deadline()).await;
+    assert_eq!(v["attempts"], json!([]));
+    assert_eq!(
+        s.fixture.seen_at("/tavily").len(),
+        1,
+        "no vendor request after the switch"
+    );
+}
+
+#[tokio::test]
+async fn unreadable_preferences_mean_off_and_are_never_replaced_by_defaults() {
+    let s = Setup::new(&[ProviderId::Tavily]).await;
+    let path = s.dir.join(settings::FILE);
+    crate::fsutil::write_private(&path, b"{broken").unwrap();
+    let e = s.engine();
+    let r = e
+        .handle(
+            "j",
+            "web_search",
+            &json!({"v": 1, "query": "q"}),
+            deadline(),
+        )
+        .await;
+    assert_eq!(r["ok"], false);
+    assert!(e.rotate("j", &search("q"), deadline()).await["attempts"] == json!([]));
+    assert!(s.fixture.seen().is_empty());
+    // Outcomes and preference changes don't rewrite it with defaults.
+    let mut u = settings::Updates::default();
+    u.last.push((ProviderId::Tavily, Outcome::Ok, NOW));
+    settings::apply(&s.dir, &u).unwrap();
+    assert!(
+        settings::update_prefs(&s.dir, false, |st| {
+            st.notice_acknowledged = true;
+            Ok(())
+        })
+        .is_err()
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"{broken");
+    // Turning off starts over, off.
+    settings::update_prefs(&s.dir, true, |st| {
+        st.enabled = false;
+        Ok(())
+    })
+    .unwrap();
+    assert!(!s.settings().enabled);
+    // An unreadable state file is left alone by jobs too.
+    crate::fsutil::write_private(&s.dir.join(settings::STATE_FILE), b"[").unwrap();
+    assert!(settings::apply(&s.dir, &u).is_err());
+    assert_eq!(
+        std::fs::read(s.dir.join(settings::STATE_FILE)).unwrap(),
+        b"["
+    );
+}
+
+#[test]
+fn an_unreadable_key_file_is_never_overwritten_only_reset() {
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().join("web");
+    crate::fsutil::ensure_private_dir(&dir).unwrap();
+    let store = keys::KeyStore::new(&dir);
+    let path = dir.join(keys::FILE);
+    crate::fsutil::write_private(&path, b"{\"v\":1,\"keys\":{\"tavily\":\"KEEPSAKE-12345").unwrap();
+    let before = std::fs::read(&path).unwrap();
+    for e in [
+        store.set(ProviderId::Exa, Secret::new(CANARY)).unwrap_err(),
+        store.delete(ProviderId::Tavily).unwrap_err(),
+        store.load().err().unwrap(),
+    ] {
+        let msg = crate::secret::metro_error_text(&e);
+        assert!(msg.contains("can't be read; reset them"), "{msg}");
+        assert!(!msg.contains("KEEPSAKE"));
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before, "untouched");
+    // Missing is the only "empty".
+    assert!(store.reset().unwrap());
+    assert!(!store.load().unwrap().has("tavily"));
+    store.set(ProviderId::Exa, Secret::new(CANARY)).unwrap();
+    assert!(store.load().unwrap().has("exa"));
+}
+
+#[tokio::test]
+async fn structured_only_search_needs_a_results_array() {
+    for p in [ProviderId::Exa, ProviderId::Parallel] {
+        let path = format!("/{}#tools/call", p.as_str());
+        let s = Setup::new(&[p]).await;
+        let answer = |structured: Value| {
+            reply(
+                200,
+                json!({"jsonrpc": "2.0", "id": 2, "result": {"content": [], "structuredContent": structured}}),
+            )
+        };
+        s.fixture.push(&path, answer(json!({"results": []})));
+        let v = s.engine().rotate("j", &search("q"), deadline()).await;
+        assert_eq!(v["provider"], p.as_str(), "{v}");
+        assert_eq!(v["results"], json!([]));
+        for (i, bad) in [
+            json!({}),
+            json!({"results": "x"}),
+            json!({"results": {"url": "https://x.example/"}}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            s.now.store(
+                NOW + 3600 * (i as u64 + 1),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            s.fixture.push(&path, answer(bad.clone()));
+            let v = s.engine().rotate("j", &search("q"), deadline()).await;
+            assert_eq!(v["attempts"][0]["outcome"], "bad_response", "{p:?} {bad}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_invalid_retry_after_date_falls_back_to_the_default_cooldown() {
+    let s = Setup::new(&[ProviderId::Tavily]).await;
+    s.fixture.push(
+        "/tavily/search",
+        with(
+            reply(429, json!({})),
+            "retry-after",
+            "Mon, 31 Feb 2026 00:00:00 GMT",
+        ),
+    );
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(v["attempts"][0]["until"], rfc3339(NOW + 600));
+}
+
+#[test]
+fn the_settings_lock_excludes_a_second_holder_until_released() {
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join(settings::LOCK_FILE);
+    let first = crate::fsutil::lock_exclusive(&path).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let p = path.clone();
+    let waiter = std::thread::spawn(move || {
+        let _second = crate::fsutil::lock_exclusive(&p).unwrap();
+        tx.send(()).unwrap();
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "not exclusive"
+    );
+    drop(first);
+    rx.recv_timeout(Duration::from_secs(5)).expect("released");
+    waiter.join().unwrap();
 }

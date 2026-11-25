@@ -22,6 +22,7 @@
 //! | `PUT /v1/web-search` | `{enabled?, notice_acknowledged?, providers?: [{id, enabled}]}` | the same |
 //! | `PUT /v1/web-search/providers/{id}/key` | `{api_key}` | provider row (`key_saved`, never the key) |
 //! | `DELETE /v1/web-search/providers/{id}/key` | | provider row (back to free mode) |
+//! | `POST /v1/web-search/keys/reset` | `{}` | the web search state; every saved key deleted |
 //! | `POST /v1/web-search/providers/{id}/test` | `{}` | provider row with `test.outcome` |
 //! | `POST /v1/web-search/providers/{id}/clear-cooldown` | `{}` | provider row |
 //! | `POST /v1/local-workspace/open` | `{}` | `{server_url, token}` |

@@ -129,6 +129,11 @@ pub(crate) fn structured_results(result: &Value, text: &str) -> Vec<Hit> {
 
 pub(crate) async fn search(c: &Call<'_>, base: &str, r: &SearchReq) -> Result<Answer, Failure> {
     let (text, result) = call(c, base, "web_search", search_arguments(r)).await?;
+    // Without text, the structured output is the answer: it needs a
+    // `results` array (`[]` is a real empty result).
+    if text.trim().is_empty() && !result["structuredContent"]["results"].is_array() {
+        return Err(Failure::of(Outcome::BadResponse));
+    }
     let mut results = structured_results(&result, &text);
     results.truncate(r.max_results as usize);
     Ok(Answer {

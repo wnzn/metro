@@ -1611,6 +1611,12 @@ impl Desktop {
         self.web.delete_key(&server, &account, epoch, id).await
     }
 
+    /// `POST /v1/web-search/keys/reset`.
+    pub async fn web_reset_keys(&self) -> R<Value> {
+        let (server, account, _, epoch) = self.session_epoch()?;
+        self.web.reset_keys(&server, &account, epoch).await
+    }
+
     /// `POST /v1/web-search/providers/{id}/test`.
     pub async fn web_test(&self, id: &str) -> R<Value> {
         let (server, account, _, epoch) = self.session_epoch()?;

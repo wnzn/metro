@@ -10,6 +10,17 @@
 //!   provider is skipped until the key changes (never silently keyless).
 //! - `last`: each provider's latest outcome, for Settings.
 //!
+//! Two files, so the worker can never overwrite a person's choice:
+//! - `web-settings.json`: the person's **preferences** (`enabled`,
+//!   `notice_acknowledged`, `providers`), written only by their own actions
+//!   ([`update_prefs`]);
+//! - `web-state.json`: what jobs learned (`cooldowns`, `rejected_keys`,
+//!   `last`), written by the worker ([`apply`]) and by "Try again now".
+//!
+//! Every read-modify-write holds an interprocess lock (`web.lock`), and a
+//! file that can't be read is an error, never replaced by defaults. Readers
+//! that can't read the preferences treat web search as turned off.
+//!
 //! The server never sees any of this.
 
 use std::collections::BTreeMap;
@@ -109,8 +120,12 @@ impl Settings {
     }
 }
 
+pub const STATE_FILE: &str = "web-state.json";
+pub const LOCK_FILE: &str = "web.lock";
+
 #[derive(Serialize, Deserialize)]
-struct Wire {
+#[serde(deny_unknown_fields)]
+struct PrefsWire {
     v: u32,
     #[serde(default = "yes")]
     enabled: bool,
@@ -118,6 +133,13 @@ struct Wire {
     notice_acknowledged: bool,
     #[serde(default)]
     providers: Vec<WireProvider>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct StateWire {
+    #[serde(default)]
+    v: u32,
     #[serde(default)]
     cooldowns: BTreeMap<String, Cooldown>,
     #[serde(default)]
@@ -131,19 +153,17 @@ fn yes() -> bool {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireProvider {
     id: String,
     enabled: bool,
 }
 
-/// The settings in `dir`, or the defaults when there are none. Unknown or
-/// repeated providers are dropped and missing ones appended in the default
-/// order, enabled.
-pub fn load(dir: &Path) -> Result<Settings> {
+fn read_prefs(dir: &Path, s: &mut Settings) -> Result<()> {
     let Some(bytes) = read_private(&dir.join(FILE), 256 * 1024)? else {
-        return Ok(Settings::default());
+        return Ok(());
     };
-    let w: Wire = serde_json::from_slice(&bytes).context("web-settings.json is not valid")?;
+    let w: PrefsWire = serde_json::from_slice(&bytes).context("web-settings.json is not valid")?;
     let mut providers: Vec<ProviderSetting> = Vec::new();
     for p in &w.providers {
         if let Some(id) = ProviderId::parse(&p.id)
@@ -160,19 +180,25 @@ pub fn load(dir: &Path) -> Result<Settings> {
             providers.push(ProviderSetting { id, enabled: true });
         }
     }
-    Ok(Settings {
-        enabled: w.enabled,
-        notice_acknowledged: w.notice_acknowledged,
-        providers,
-        cooldowns: w.cooldowns,
-        rejected_keys: w.rejected_keys,
-        last: w.last,
-    })
+    s.enabled = w.enabled;
+    s.notice_acknowledged = w.notice_acknowledged;
+    s.providers = providers;
+    Ok(())
 }
 
-pub fn save(dir: &Path, s: &Settings) -> Result<()> {
-    crate::fsutil::ensure_private_dir(dir)?;
-    let w = Wire {
+fn read_state(dir: &Path, s: &mut Settings) -> Result<()> {
+    let Some(bytes) = read_private(&dir.join(STATE_FILE), 1024 * 1024)? else {
+        return Ok(());
+    };
+    let w: StateWire = serde_json::from_slice(&bytes).context("web-state.json is not valid")?;
+    s.cooldowns = w.cooldowns;
+    s.rejected_keys = w.rejected_keys;
+    s.last = w.last;
+    Ok(())
+}
+
+fn write_prefs(dir: &Path, s: &Settings) -> Result<()> {
+    let w = PrefsWire {
         v: 1,
         enabled: s.enabled,
         notice_acknowledged: s.notice_acknowledged,
@@ -184,13 +210,98 @@ pub fn save(dir: &Path, s: &Settings) -> Result<()> {
                 enabled: p.enabled,
             })
             .collect(),
+    };
+    let mut json = serde_json::to_vec_pretty(&w)?;
+    json.push(b'\n');
+    write_private(&dir.join(FILE), &json)
+}
+
+fn write_state(dir: &Path, s: &Settings) -> Result<()> {
+    let w = StateWire {
+        v: 1,
         cooldowns: s.cooldowns.clone(),
         rejected_keys: s.rejected_keys.clone(),
         last: s.last.clone(),
     };
     let mut json = serde_json::to_vec_pretty(&w)?;
     json.push(b'\n');
-    write_private(&dir.join(FILE), &json)
+    write_private(&dir.join(STATE_FILE), &json)
+}
+
+fn locked<T>(dir: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    crate::fsutil::ensure_private_dir(dir)?;
+    let _lock = crate::fsutil::lock_exclusive(&dir.join(LOCK_FILE))?;
+    f()
+}
+
+/// The settings in `dir`: defaults where a file is missing; an error (never
+/// defaults) when a file exists but can't be read. Unknown or repeated
+/// providers are dropped and missing ones appended in the default order,
+/// enabled.
+pub fn load(dir: &Path) -> Result<Settings> {
+    let mut s = Settings::default();
+    read_prefs(dir, &mut s)?;
+    read_state(dir, &mut s)?;
+    Ok(s)
+}
+
+/// Save everything (setup and tests). Under the lock.
+pub fn save(dir: &Path, s: &Settings) -> Result<()> {
+    locked(dir, || {
+        write_prefs(dir, s)?;
+        write_state(dir, s)
+    })
+}
+
+/// Change the person's preferences: read (strictly), `f`, write the
+/// preferences only, all under the lock. Changes `f` makes to the state
+/// fields are discarded.
+///
+/// An unreadable preferences file is an error and left as it is, except
+/// with `reset_unreadable`, which a caller uses only to turn web search
+/// *off* (starting from defaults with the switch off is always safe).
+pub fn update_prefs<T>(
+    dir: &Path,
+    reset_unreadable: bool,
+    f: impl FnOnce(&mut Settings) -> Result<T>,
+) -> Result<T> {
+    locked(dir, || {
+        let mut s = Settings::default();
+        if let Err(e) = read_prefs(dir, &mut s) {
+            if !reset_unreadable {
+                return Err(e);
+            }
+            s = Settings {
+                enabled: false,
+                ..Settings::default()
+            };
+        }
+        let out = f(&mut s)?;
+        write_prefs(dir, &s)?;
+        Ok(out)
+    })
+}
+
+/// Change what jobs learned (cooldowns, rejected keys, outcomes); never the
+/// preferences. Strict: an unreadable state file is left as it is. With
+/// `reset_unreadable` (an explicit person's action), it starts over.
+pub fn update_state<T>(
+    dir: &Path,
+    reset_unreadable: bool,
+    f: impl FnOnce(&mut Settings) -> Result<T>,
+) -> Result<T> {
+    locked(dir, || {
+        let mut s = Settings::default();
+        if let Err(e) = read_state(dir, &mut s) {
+            if !reset_unreadable {
+                return Err(e);
+            }
+            s = Settings::default();
+        }
+        let out = f(&mut s)?;
+        write_state(dir, &s)?;
+        Ok(out)
+    })
 }
 
 /// What one job learned, applied to the file as it is now (other jobs may
@@ -217,32 +328,33 @@ pub fn apply(dir: &Path, u: &Updates) -> Result<()> {
     if u.is_empty() {
         return Ok(());
     }
-    let mut s = load(dir).unwrap_or_default();
-    for &(p, mode, until, outcome) in &u.cooldowns {
-        s.cooldowns.insert(
-            cooldown_key(p, mode),
-            Cooldown {
-                until,
-                outcome: outcome.as_str().into(),
-            },
-        );
-    }
-    for (p, fp) in &u.rejected {
-        s.rejected_keys.insert(p.as_str().into(), fp.clone());
-    }
-    for &(p, outcome, at) in &u.last {
-        s.last.insert(
-            p.as_str().into(),
-            Last {
-                outcome: outcome.as_str().into(),
-                at,
-            },
-        );
-    }
-    for p in &u.cleared {
-        clear_cooldowns(&mut s, *p);
-    }
-    save(dir, &s)
+    update_state(dir, false, |s| {
+        for &(p, mode, until, outcome) in &u.cooldowns {
+            s.cooldowns.insert(
+                cooldown_key(p, mode),
+                Cooldown {
+                    until,
+                    outcome: outcome.as_str().into(),
+                },
+            );
+        }
+        for (p, fp) in &u.rejected {
+            s.rejected_keys.insert(p.as_str().into(), fp.clone());
+        }
+        for &(p, outcome, at) in &u.last {
+            s.last.insert(
+                p.as_str().into(),
+                Last {
+                    outcome: outcome.as_str().into(),
+                    at,
+                },
+            );
+        }
+        for p in &u.cleared {
+            clear_cooldowns(s, *p);
+        }
+        Ok(())
+    })
 }
 
 /// End every cooldown of `p` ("Try again now").
