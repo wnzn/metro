@@ -415,15 +415,15 @@ pub fn discard_staged(kind: &InstallKind, update_dir: &Path) {
         return;
     };
     match kind {
-        InstallKind::LinuxInstaller { root } | InstallKind::WindowsScript { root } => {
-            if script_state(root, &j.from) {
-                let dest = root.join("versions").join(&j.to);
-                if plain_dir(&dest) {
-                    let _ = fs::remove_dir_all(dest);
-                }
-                let _ = fs::remove_dir_all(stage_assets(update_dir, &j.id));
-                let _ = fs::remove_file(&path);
+        InstallKind::LinuxInstaller { root } | InstallKind::WindowsScript { root }
+            if script_state(root, &j.from) =>
+        {
+            let dest = root.join("versions").join(&j.to);
+            if plain_dir(&dest) {
+                let _ = fs::remove_dir_all(dest);
             }
+            let _ = fs::remove_dir_all(stage_assets(update_dir, &j.id));
+            let _ = fs::remove_file(&path);
         }
         _ => {}
     }

@@ -162,6 +162,53 @@ fn install() -> Install {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn desktop_updater_and_published_uninstaller_exclude_each_other() {
+    use std::process::{Command, Stdio};
+    let i = install();
+    let published = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../packaging/test-fixtures/install-metro-linux-0.4.0.sh");
+    let command = || {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg(&published)
+            .arg("uninstall")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", i._dir.path())
+            .env("METRO_INSTALL_DIR", &i.root);
+        cmd
+    };
+    let lock = install::Lock::take(&i.root).unwrap();
+    let refused = command().output().unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("an install is running"));
+    assert_eq!(install::read_pointer(&i.root).as_deref(), Some(OLD));
+    drop(lock);
+
+    // Stop the published script just after it took its own lock.
+    exec_file(
+        &i.install_dir.join("install-desktop"),
+        b"#!/bin/sh\nprintf 'locked\\n' >&2\nread -r done\n",
+    );
+    let mut holder = command()
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut marker = String::new();
+    BufReader::new(holder.stderr.take().unwrap())
+        .read_line(&mut marker)
+        .unwrap();
+    let refused = install::Lock::take(&i.root);
+    drop(holder.stdin.take());
+    assert!(holder.wait().unwrap().success());
+    assert_eq!(marker, "locked\n");
+    assert_eq!(refused.err().unwrap().code, "installer_busy");
+    assert!(!i.root.exists());
+}
+
 fn updater(i: &Install, f: &Fixture, channel: Channel) -> Arc<Updater> {
     let own = Version::parse(OLD).unwrap();
     Updater::new(UpdaterConfig {

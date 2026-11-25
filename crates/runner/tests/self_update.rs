@@ -132,6 +132,70 @@ fn set_exec(p: &Path) {
     fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+#[test]
+fn runner_updater_and_published_installer_exclude_each_other() {
+    use std::process::{Command, Stdio};
+    let r = managed_root();
+    let temp = tempfile::tempdir().unwrap();
+    let archive = temp
+        .path()
+        .join(format!("Metro-runner-{NEW}-linux-x64.tar.gz"));
+    let bytes = runner_archive(NEW, "runner", &stub(0));
+    let sum = metro_release::hex(&metro_release::sha256(&bytes));
+    fs::write(&archive, bytes).unwrap();
+    for (name, script) in [
+        ("getconf", "#!/bin/sh\nprintf 'glibc 2.39\\n'\n"),
+        (
+            "uname",
+            "#!/bin/sh\ncase \"$1\" in -s) echo Linux;; -m) echo x86_64;; -r) echo 6.6.0;; esac\n",
+        ),
+        (
+            "tar",
+            "#!/bin/sh\nprintf 'locked\\n' >&2\nread -r done\nexit 1\n",
+        ),
+    ] {
+        let path = temp.path().join(name);
+        fs::write(&path, script).unwrap();
+        set_exec(&path);
+    }
+    let published = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../packaging/test-fixtures/install-metro-runner-linux-0.4.0.sh");
+    let command = || {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg(&published)
+            .args(["update", "--archive"])
+            .arg(&archive)
+            .args(["--sha256", &sum])
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", temp.path().display()))
+            .env("HOME", temp.path())
+            .env("METRO_RUNNER_INSTALL_DIR", &r.path);
+        cmd
+    };
+    let lock = update::Lock::take(&r.path).unwrap();
+    let refused = command().output().unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("another install is running"));
+    drop(lock);
+
+    let mut holder = command()
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut marker = String::new();
+    let mut errors = BufReader::new(holder.stderr.take().unwrap());
+    errors.read_line(&mut marker).unwrap();
+    let refused = update::Lock::take(&r.path);
+    drop(holder.stdin.take());
+    assert!(!holder.wait().unwrap().success()); // the tar fixture stops there
+    assert_eq!(marker, "locked\n");
+    assert_eq!(refused.err().unwrap().code, "installer_busy");
+    assert_eq!(current(&r.path), Path::new("versions").join(OLD));
+    assert!(!r.path.join(update::LOCK).exists());
+}
+
 fn updater(root: &Path, f: &Fixture) -> Updater {
     Updater {
         root: root.to_path_buf(),
