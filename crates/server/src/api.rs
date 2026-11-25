@@ -19,14 +19,12 @@ use crate::attachments::{self, Append, IdsError, Place};
 use crate::auth::{Human, Runner, new_runner_token, runner_token_hash, valid_id};
 use crate::db::reactions::{ReactionScope, Reactor, valid_emoji};
 use crate::db::{
-    Activity, AddMember, Addressed, Author, Event, LimitError, RemoveMember, Role, Room, SpaceView,
-    activity, actor, kind,
+    Activity, AddMember, Addressed, Author, Event, LimitError, MessageMeta, RemoveMember, Role,
+    Room, SpaceView, activity, actor, kind,
 };
 use crate::jobs::{CompleteError, JobOutcome};
-use crate::mentions::{self, Mention, MentionSpan, ValidatedSpans};
-use crate::model_routing::{
-    self as routing, AddressedBy, Addressing, AddressingNote, RoutingSettings,
-};
+use crate::mentions::{self, Mention, MentionSpan};
+use crate::model_routing::{self as routing, AddressedBy, Addressing, AddressingNote};
 use crate::tools::RunnerTool;
 
 #[derive(Debug)]
@@ -67,10 +65,10 @@ impl ApiError {
     fn conflict(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, message)
     }
-    pub(crate) fn message(&self) -> &str {
+    pub fn message(&self) -> &str {
         &self.message
     }
-    pub(crate) fn status(&self) -> StatusCode {
+    pub fn status(&self) -> StatusCode {
         self.status
     }
     pub fn internal(e: anyhow::Error) -> Self {
@@ -140,7 +138,7 @@ pub(crate) async fn owner_of(state: &AppState, sid: &str, who: &Human) -> ApiRes
     Ok(space)
 }
 
-async fn room_of(state: &AppState, space: &SpaceView, rid: &str) -> ApiResult<Room> {
+pub(crate) async fn room_of(state: &AppState, space: &SpaceView, rid: &str) -> ApiResult<Room> {
     if crate::config::validate_id(rid).is_err() {
         return Err(ApiError::not_found("no such room"));
     }
@@ -161,7 +159,7 @@ pub(crate) fn check_name(state: &AppState, name: &str) -> ApiResult<String> {
     Ok(name)
 }
 
-fn check_text(state: &AppState, text: &str) -> ApiResult<String> {
+pub(crate) fn check_text(state: &AppState, text: &str) -> ApiResult<String> {
     let text = text.trim().to_owned();
     let max = state.config.limits.max_message_chars;
     if text.is_empty() || text.chars().count() > max {
@@ -175,7 +173,7 @@ fn check_text(state: &AppState, text: &str) -> ApiResult<String> {
 /// A message's text and attachments checked together: the text may be
 /// empty only when files are attached, and the ids must be distinct, at
 /// most [`attachments::MAX_ATTACHMENTS`], and shaped like library ids.
-async fn check_message(
+pub(crate) async fn check_message(
     state: &AppState,
     sender: &str,
     space: Option<&str>,
@@ -225,12 +223,12 @@ async fn check_message(
     Ok(text)
 }
 
-fn no_attachment() -> ApiError {
+pub(crate) fn no_attachment() -> ApiError {
     ApiError::not_found("no such attachment")
 }
 
 /// Attachments are for people: a message for the agent needs words.
-fn agent_needs_text(text: &str, addressing: Addressing) -> ApiResult<()> {
+pub(crate) fn agent_needs_text(text: &str, addressing: Addressing) -> ApiResult<()> {
     if text.is_empty() && addressing == Addressing::Agent {
         return Err(ApiError::bad_request(
             "a message for the agent needs a question; the agent does not read attachments",
@@ -507,6 +505,11 @@ pub async fn create_room(
     let space = member_of(&state, &sid, &who).await?;
     let Json(body) = body?;
     let name = check_name(&state, &body.name)?;
+    if crate::replies::is_reply_thread_name(&name) {
+        return Err(ApiError::bad_request(
+            "names like reply-1 are reserved for reply threads",
+        ));
+    }
     let limits = state.config.limits.clone();
     match db(&state, move |db| {
         Ok(db.create_room(
@@ -541,6 +544,9 @@ pub async fn list_events(
     let page = state.config.limits.events_page;
     let events = db(&state, move |db| {
         let mut events = db.events_after(&space.id, &room.id, after, page)?;
+        if room.parent_room_id.is_none() {
+            crate::replies::hydrate(db, &space.id, &room.id, &mut events)?;
+        }
         let place = Place::Space {
             space_id: space.id,
             room_id: room.id,
@@ -550,6 +556,38 @@ pub async fn list_events(
     })
     .await?;
     Ok(Json(json!({"events": events})))
+}
+
+/// The reply thread of event `eid` in top-level room `rid`: 200 when it
+/// exists, 201 when this call created it.
+pub async fn reply_thread(
+    State(state): State<AppState>,
+    who: Human,
+    Path((sid, rid, eid)): Path<(String, String, i64)>,
+    body: axum::body::Bytes,
+) -> ApiResult<(StatusCode, Json<Room>)> {
+    use crate::replies::ThreadError;
+    empty_object(&body)?;
+    let space = member_of(&state, &sid, &who).await?;
+    let room = room_of(&state, &space, &rid).await?;
+    let max = state.config.limits.max_reply_threads;
+    match db(&state, move |db| {
+        crate::replies::get_or_create(db, &space.id, &room.id, eid, &who.id, max)
+    })
+    .await?
+    {
+        Ok((thread, true)) => Ok((StatusCode::CREATED, Json(thread))),
+        Ok((thread, false)) => Ok((StatusCode::OK, Json(thread))),
+        Err(ThreadError::NotFound) => Err(ApiError::not_found("no such event")),
+        Err(ThreadError::Nested) => Err(ApiError::conflict("threads can't have threads")),
+        Err(ThreadError::Kind) => Err(ApiError::conflict("this event can't have a thread")),
+        Err(ThreadError::TooMany) => Err(ApiError::conflict(format!(
+            "a Space can have at most {max} reply threads"
+        ))),
+        Err(ThreadError::NameTaken) => Err(ApiError::conflict(
+            "this thread can't be created: an older room has its name",
+        )),
+    }
 }
 
 #[derive(Deserialize)]
@@ -566,7 +604,7 @@ pub struct PostMessage {
     mentions: Vec<Mention>,
     /// Set to false when the client has resolved addressing itself. Only
     /// structured mentions and Ask agent can explicitly address recipients.
-    #[serde(default = "default_infer_text_mentions")]
+    #[serde(default = "default_true")]
     infer_text_mentions: bool,
     /// Optional display ranges in the decoded, untrimmed `text`; each
     /// index refers to the explicit `mentions` list as submitted.
@@ -582,15 +620,22 @@ pub struct PostMessage {
     /// Library files of this Space to attach (see [`crate::attachments`]).
     #[serde(default)]
     asset_ids: Vec<String>,
+    /// In a thread: the event of this thread, or the reply thread's
+    /// anchor, this message replies to (see [`crate::replies`]).
+    #[serde(default)]
+    reply_to: Option<i64>,
+    /// `false`: replying to an agent's message doesn't ask that agent.
+    #[serde(default = "default_true")]
+    reply_to_agent: bool,
 }
 
-fn default_infer_text_mentions() -> bool {
+fn default_true() -> bool {
     true
 }
 
 /// A model chosen for one turn, checked before anything is stored so a bad
 /// choice never leaves a message the agent then answers some other way.
-async fn check_choice(
+pub(crate) async fn check_choice(
     state: &AppState,
     who: &Human,
     space: Option<&str>,
@@ -657,7 +702,7 @@ async fn check_choice(
 pub struct PostedMessage {
     #[serde(flatten)]
     event: Event,
-    addressing_note: Option<AddressingNote>,
+    addressing_note: Option<crate::messages::SenderNote>,
     /// Sender-only: why their use-case routing could not choose a model.
     routing_note: Option<AddressingNote>,
 }
@@ -669,136 +714,33 @@ pub async fn post_message(
     body: JsonBody<PostMessage>,
 ) -> ApiResult<(StatusCode, Json<PostedMessage>)> {
     let Json(body) = body?;
-    let space = member_of(&state, &sid, &who).await?;
-    let room = room_of(&state, &space, &rid).await?;
-    let spans = ValidatedSpans::new(&body.text, body.mentions.len(), body.spans)
-        .map_err(ApiError::bad_request)?;
-    let text = check_message(
-        &state,
-        &who.id,
-        Some(&space.id),
-        &body.text,
-        &body.asset_ids,
-    )
-    .await?;
-    let space_id = space.id.clone();
-    let (member_ids, agents) = db(&state, move |db| {
-        let members: Vec<String> = db
-            .list_members(&space_id)?
-            .into_iter()
-            .map(|m| m.user_id)
-            .collect();
-        Ok((members, db.space_agents(&space_id)?))
-    })
-    .await?;
-    let agent_handles: Vec<(String, String)> = agents
-        .iter()
-        .map(|a| (a.id.clone(), a.handle.clone()))
-        .collect();
-    let (resolved, spans) = mentions::resolve_with_spans(
-        body.infer_text_mentions.then_some(text.as_str()),
-        &body.mentions,
-        body.invoke_agent,
-        body.agent_id.as_deref(),
-        &member_ids,
-        &agent_handles,
-        spans,
-    )
-    .map_err(ApiError::bad_request)?;
-    let addressing = Addressing::of(&resolved);
-    agent_needs_text(&text, addressing)?;
-    let chosen = check_choice(
+    let posted = crate::messages::post_room_message(
         &state,
         &who,
-        Some(&space.id),
-        body.provider_connection_id,
-        body.model_id,
-        body.reasoning_effort,
-        addressing,
+        &sid,
+        &rid,
+        crate::messages::Outgoing {
+            invoke_agent: body.invoke_agent,
+            agent_id: body.agent_id,
+            mentions: body.mentions,
+            infer_text_mentions: body.infer_text_mentions,
+            spans: body.spans,
+            provider_connection_id: body.provider_connection_id,
+            model_id: body.model_id,
+            reasoning_effort: body.reasoning_effort,
+            asset_ids: body.asset_ids,
+            reply_to: body.reply_to,
+            reply_to_agent: body.reply_to_agent,
+            ..crate::messages::Outgoing::new(body.text)
+        },
     )
     .await?;
-    // People-only messages never reach System One or the preferences.
-    let (settings, prefs) = if addressing == Addressing::PeopleOnly {
-        (
-            RoutingSettings::default(),
-            crate::space_prefs::SpacePrefs::default(),
-        )
-    } else {
-        (
-            routing::preferences(&state, &who.id)
-                .await
-                .map_err(ApiError::internal)?,
-            crate::space_prefs::load(&state, &space.id, &who.id)
-                .await
-                .map_err(ApiError::internal)?,
-        )
-    };
-    let plan = crate::agent_dispatch::plan(
-        &state, &who.id, &space.id, &text, &resolved, addressing, &settings, &prefs, &agents,
-    )
-    .await;
-    // Only an unaddressed message can acquire a recipient here. Explicit
-    // spans keep their canonical indices even if @agent's target is picked
-    // by the classifier (that choice is run activity, not an edit to To:).
-    let mut addressed = plan
-        .classified
-        .clone()
-        .unwrap_or_else(|| addressed(&resolved));
-    if !body.infer_text_mentions || !spans.is_empty() {
-        addressed.spans = Some(spans);
-    }
-    let author = who.author();
-    let place = Place::Space {
-        space_id: space.id.clone(),
-        room_id: room.id.clone(),
-    };
-    let (writer, ids) = (author.clone(), body.asset_ids);
-    // Include targets derived from classification or @agent as well as
-    // stored explicit recipients. A refusal reveals no classifier result.
-    let mut recipients = resolved;
-    recipients.extend(plan.targets.iter().map(|target| Mention::AgentId {
-        agent_id: target.agent.id.clone(),
-    }));
-    let event = match db(&state, move |db| {
-        attachments::append_message(db, &place, &writer, &text, &addressed, &ids, &recipients)
-    })
-    .await?
-    {
-        Append::Posted(event) => *event,
-        Append::NoRoom => return Err(ApiError::not_found("no such room")),
-        Append::NoRecipient => return Err(ApiError::bad_request("unknown recipient")),
-        Append::NoAsset => return Err(no_attachment()),
-    };
-    for reason in &plan.errors {
-        state
-            .append(
-                &space.id,
-                &room.id,
-                kind::ERROR,
-                &Author::server(actor::SYSTEM),
-                reason,
-            )
-            .await;
-    }
-    // Mentioning only people never starts agent work.
-    let started = crate::agent_dispatch::start_runs(
-        &state,
-        &space.id,
-        &room,
-        &author,
-        &event,
-        plan.targets,
-        chosen,
-        &settings,
-        &prefs,
-    )
-    .await;
     Ok((
         StatusCode::ACCEPTED,
         Json(PostedMessage {
-            event,
-            addressing_note: plan.addressing_note,
-            routing_note: started.note,
+            event: posted.event,
+            addressing_note: posted.addressing_note,
+            routing_note: posted.routing_note,
         }),
     ))
 }
@@ -1080,12 +1022,23 @@ pub async fn chat_message(
         let ids = body.asset_ids;
         let place = Place::Personal { user_id: uid };
         match db(&state, move |db| {
-            attachments::append_message(db, &place, &author, &stored, &addressed, &ids, &[])
+            attachments::append_message(
+                db,
+                &place,
+                &author,
+                &stored,
+                &addressed,
+                &ids,
+                &[],
+                &MessageMeta::default(),
+            )
         })
         .await?
         {
             Append::Posted(event) => *event,
-            Append::NoRoom | Append::NoAsset | Append::NoRecipient => return Err(no_attachment()),
+            Append::NoRoom | Append::NoAsset | Append::NoRecipient | Append::NoReplyTarget => {
+                return Err(no_attachment());
+            }
         }
     };
     // With a choice: only that connection. Otherwise routing, if the sender

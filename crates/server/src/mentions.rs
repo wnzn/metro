@@ -343,6 +343,35 @@ pub(crate) fn resolve_with_spans(
     Ok((out, spans))
 }
 
+/// How a stored agent recipient came to be addressed when it wasn't the
+/// sender's own mention: stored as its `addressed_by` (the classifier's
+/// pick is stored as `"classifier"` by [`crate::agent_dispatch`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AddressedBy {
+    /// A reply in a thread to that agent's message.
+    Reply,
+    /// The sender's personal Chat (Metro) addressed it for them.
+    Metro,
+}
+
+/// The stored mentions of a message: `resolved`, with each agent recipient
+/// in `tagged` (by id) carrying its `addressed_by`.
+pub fn stored(resolved: &[Mention], tagged: &[(&str, AddressedBy)]) -> serde_json::Value {
+    resolved
+        .iter()
+        .map(|m| {
+            let mut v = serde_json::to_value(m).unwrap_or_default();
+            if let Mention::AgentId { agent_id } = m
+                && let Some((_, by)) = tagged.iter().find(|(id, _)| id == agent_id)
+            {
+                v["addressed_by"] = serde_json::to_value(by).unwrap_or_default();
+            }
+            v
+        })
+        .collect()
+}
+
 /// `"room"` (no recipients), `"agent"`, `"users"` or `"mixed"`.
 pub fn audience(mentions: &[Mention]) -> &'static str {
     let agent = mentions.iter().any(Mention::is_agent);
