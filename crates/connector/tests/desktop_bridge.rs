@@ -439,14 +439,22 @@ async fn pairing_sessions_and_workers() {
         (s, e["error"]["code"].as_str()),
         (502, Some("server_unreachable"))
     );
-    let (s, e) = ui
-        .call(
-            "POST",
-            "/v1/session",
-            Some(json!({"server_url": "http://metro.example.com", "session_token": "tok-alice"})),
-        )
-        .await;
-    assert_eq!((s, e["error"]["code"].as_str()), (422, Some("invalid")));
+    // Plain http to any host passes the URL check (the app asked the person
+    // first); a bad scheme or embedded credentials don't.
+    for bad in ["ftp://metro.example.com", "http://u:p@192.168.1.5:8787"] {
+        let (s, e) = ui
+            .call(
+                "POST",
+                "/v1/session",
+                Some(json!({"server_url": bad, "session_token": "tok-alice"})),
+            )
+            .await;
+        assert_eq!(
+            (s, e["error"]["code"].as_str()),
+            (422, Some("invalid")),
+            "{bad}"
+        );
+    }
     let (s, st) = ui
         .call(
             "POST",

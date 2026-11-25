@@ -10,11 +10,12 @@ import { BASE, TOKENS, world } from "../../test/fakeServer";
 import { headerAudience, textNamesRecipients } from "./transcriptRows";
 import theme from "../../theme/theme.json";
 import { APPEARANCE_KEY } from "../ui";
+import { launched } from "../../test/launched";
 
 type F = ReturnType<typeof world>;
 
 async function inAcme(f: F, storage: Record<string, string> = {}) {
-  const app = await open("../../App.tsx", { network: f.network as any, platform: "linux", width: 1200, height: 800, storage });
+  const app = await open("../../App.tsx", { modules: launched(), network: f.network as any, platform: "linux", width: 1200, height: 800, storage });
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS.alice!);

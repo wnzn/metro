@@ -6,6 +6,7 @@ import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, TOKENS, world } from "../../test/fakeServer";
 import { BRIDGE, BRIDGE_TOKEN, bridgeEnv, fakeBridge } from "../device/test/fakeBridge";
+import { launched } from "../../test/launched";
 
 type F = ReturnType<typeof world>;
 type B = ReturnType<typeof fakeBridge>;
@@ -32,7 +33,7 @@ function monitoringWorld() {
 
 async function launch(f: F, b: B | null = null) {
   const network = { ...(f.network as any), ...(b ? (b.network as any) : {}) };
-  return open("../../App.tsx", { network, platform: "linux", width: 1200, height: 900, clock: {}, ...(b ? { modules: bridgeEnv() as any } : {}) });
+  return open("../../App.tsx", { network, platform: "linux", width: 1200, height: 900, clock: {}, modules: (b ? bridgeEnv() : launched()) as any });
 }
 
 async function signIn(app: App, user: string) {

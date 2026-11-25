@@ -29,6 +29,8 @@ pub enum EventKind {
     DeviceWorkerFailed,
     DeviceWorkerUnauthorized,
     DeviceModelDiscoveryFailed,
+    WebWorkerFailed,
+    WebWorkerUnauthorized,
 }
 
 impl EventKind {
@@ -94,6 +96,16 @@ impl EventKind {
                 "device_connector",
                 "device_model_discovery_failed",
                 "An on-device connection could not list available models.",
+            ),
+            WebWorkerFailed => (
+                "web_search",
+                "web_worker_failed",
+                "Web search on this computer stopped after an error.",
+            ),
+            WebWorkerUnauthorized => (
+                "web_search",
+                "web_worker_unauthorized",
+                "Metro stopped accepting this computer for web search.",
             ),
         }
     }

@@ -27,6 +27,9 @@ SLOW_FILES = {
 }
 RESULTS = ("passed", "failed", "errors", "skipped", "todo")
 FILE_TIMEOUT_SECONDS = 600
+# A few desktop tests import this same fixture as the Rust, browser and
+# installer tests. Preserve that relative import in each worker.
+HOST_VECTORS = Path("crates/url-policy/testdata/host_vectors.json")
 
 
 class CannotShard(Exception):
@@ -114,11 +117,20 @@ def prepare(app, scratch, nsh, env):
         list(entries(Path(directory), ignored))
         return ignored
 
+    desktop_layout = app.parts[-2:] == ("apps", "desktop")
+    if desktop_layout:
+        vectors = app.parent.parent / HOST_VECTORS
+        if not stat.S_ISREG(vectors.lstat().st_mode):
+            raise CannotShard("shared host vectors are not a regular file")
     contexts = []
     for index in range(min(workers, len(files))):
         worker = scratch / f"worker-{index}"
-        copied = worker / "app"
         worker.mkdir(mode=0o700)
+        copied = worker / ("apps/desktop" if desktop_layout else "app")
+        if desktop_layout:
+            fixture = worker / HOST_VECTORS
+            fixture.parent.mkdir(parents=True)
+            shutil.copyfile(vectors, fixture)
         shutil.copytree(app, copied, ignore=ignore)
         if discover(copied) != files:
             raise CannotShard("worker discovery differs from the original")

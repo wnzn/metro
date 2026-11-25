@@ -21,6 +21,8 @@ path = "src/lib.rs"
 anyhow = "1.0.100"
 # System One and embeddings clients, shared with metro-server.
 metro-model-protocol = { path = "../model-protocol" }
+# netpolicy.rs: how a plain-HTTP Metro server URL is treated.
+metro-url-policy = { path = "../url-policy" }
 # openai_oauth: PKCE and state encoding.
 base64 = "0.22"
 # openai_oauth: ID-token parsing. Same single crypto backend as metro-auth;

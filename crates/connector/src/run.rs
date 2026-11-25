@@ -212,7 +212,12 @@ pub async fn handle_job_observed(
 
 /// Post a result with bounded retries, never past `until` (after that Metro
 /// has given up on the job anyway). Returns `Err` only for 401/403.
-async fn deliver(client: &MetroClient, id: &str, body: &Value, until: Instant) -> Result<(), Stop> {
+pub(crate) async fn deliver(
+    client: &MetroClient,
+    id: &str,
+    body: &Value,
+    until: Instant,
+) -> Result<(), Stop> {
     let mut delay = Duration::from_secs(1);
     for attempt in 1..=RESULT_ATTEMPTS {
         let left = until.saturating_duration_since(Instant::now());

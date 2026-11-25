@@ -14,6 +14,8 @@ path = "src/main.rs"
 # Every version below is one Cargo.lock already resolves.
 [dependencies]
 metro-connector = { path = "../connector" }
+# The UI's NO_PROXY: loopback and Tailscale reached directly.
+metro-url-policy = { path = "../url-policy" }
 tokio = { version = "1.53.1", features = ["macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 
 [target.'cfg(unix)'.dependencies]

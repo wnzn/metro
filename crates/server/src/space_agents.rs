@@ -59,15 +59,20 @@ pub const COLORS: [&str; 8] = [
 ];
 const NO_AGENT: &str = "no such agent";
 
-/// Every entry an agent's tool allowlist may hold.
+/// Every entry an agent's tool allowlist may hold. The web tools run on the
+/// computer of whoever asks (`crate::web_tools`).
 pub fn all_tools() -> Vec<String> {
     default_tools()
         .into_iter()
         .chain(crate::pages::agent_tools::NAMES.map(str::to_owned))
+        .chain([
+            crate::web_tools::WEB_SEARCH.to_owned(),
+            crate::web_tools::WEB_FETCH.to_owned(),
+        ])
         .collect()
 }
 
-/// Page tools are opt-in, even for the Space's built-in agent.
+/// Pages and web tools are opt-in, even for the Space's built-in agent.
 pub(crate) fn default_tools() -> Vec<String> {
     RunnerTool::ALL
         .iter()

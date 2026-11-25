@@ -7,8 +7,13 @@ use reqwest::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use url::Host;
 
+/// Check the `--server` origin: `https://host[:port]`, or plain
+/// `http://host[:port]` to any host (see `plain_http_warning`). IP
+/// addresses must be written in their usual form, so `127.1` or
+/// `0x7f000001` can't pass for something else.
 pub fn origin(input: &str) -> Result<Url, &'static str> {
-    const INVALID: &str = "Use an HTTPS origin or a literal loopback HTTP origin, without credentials, a path, query, or fragment.";
+    const INVALID: &str =
+        "Use an HTTPS or HTTP origin, without credentials, a path, query, or fragment.";
     let (scheme, rest) = input.split_once("://").ok_or(INVALID)?;
     let authority = rest.strip_suffix('/').unwrap_or(rest);
     if authority.is_empty()
@@ -25,18 +30,26 @@ pub fn origin(input: &str) -> Result<Url, &'static str> {
         ("http", Some(Host::Ipv4(ip))) => {
             // WHATWG accepts spellings such as 127.1 and 0x7f000001.
             let literal = authority.split(':').next().unwrap_or_default();
-            (ip.is_loopback() && literal.parse() == Ok(ip))
+            (!ip.is_unspecified() && literal.parse() == Ok(ip))
                 .then_some(url)
                 .ok_or(INVALID)
         }
-        ("http", Some(Host::Ipv6(ip))) if ip.is_loopback() => {
+        ("http", Some(Host::Ipv6(ip))) => {
             let literal = authority.strip_prefix('[').and_then(|s| s.split_once(']'));
-            (literal.and_then(|(s, _)| s.parse().ok()) == Some(IpAddr::V6(ip)))
-                .then_some(url)
-                .ok_or(INVALID)
+            (!ip.is_unspecified()
+                && literal.and_then(|(s, _)| s.parse().ok()) == Some(IpAddr::V6(ip)))
+            .then_some(url)
+            .ok_or(INVALID)
         }
+        ("http", Some(Host::Domain(_))) => Ok(url),
         _ => Err(INVALID),
     }
+}
+
+/// A warning to show before the token is sent when `origin` is plain HTTP
+/// to a host that is neither loopback nor Tailscale; `None` otherwise.
+pub fn plain_http_warning(origin: &Url) -> Option<String> {
+    metro_url_policy::plain_http_warning(origin.scheme(), origin.host_str()?, "Metro token")
 }
 
 #[derive(Clone)]
@@ -344,17 +357,27 @@ mod tests {
             "http://127.0.0.1:8080",
             "http://127.7.8.9",
             "http://[::1]:8080",
+            "http://localhost",
+            "http://[::ffff:127.0.0.1]",
+            "http://100.101.102.103:8787",
+            "http://[fd7a:115c:a1e0::1]:8787",
+            "http://metro.tail1234.ts.net",
+            "http://192.168.1.5:8787",
+            "http://metro.example.org/",
         ] {
             assert!(origin(good).is_ok(), "{good}");
         }
         for bad in [
             "localhost",
-            "http://localhost",
+            "http://100.64.0.1.",
+            "http://127.0.0.1.",
             "http://127.1",
             "http://0x7f000001",
             "http://127.000.0.1",
-            "http://[::ffff:127.0.0.1]",
+            "http://192.168.1.005",
             "http://0.0.0.0",
+            "http://[::]",
+            "http://host/api",
             "https://host/api",
             "https://host//",
             "https://host/.",
@@ -362,6 +385,7 @@ mod tests {
             "https://host/#",
             "https://@host",
             "https://user:pass@host",
+            "http://user:pass@192.168.1.5",
             "https://host\\other",
             "https://host\n",
             "https:///host",
@@ -369,6 +393,28 @@ mod tests {
             "file:///",
         ] {
             assert!(origin(bad).is_err(), "{bad}");
+        }
+        for quiet in [
+            "https://192.168.1.5",
+            "http://127.0.0.1:8080",
+            "http://localhost",
+            "http://[::1]:8080",
+            "http://100.64.0.9",
+            "http://metro.tail1234.ts.net",
+        ] {
+            assert_eq!(plain_http_warning(&origin(quiet).unwrap()), None, "{quiet}");
+        }
+        for loud in [
+            "http://192.168.1.5:8787",
+            "http://metro.example.org",
+            "http://100.128.0.1",
+            "http://localhost.",
+        ] {
+            let w = plain_http_warning(&origin(loud).unwrap()).unwrap();
+            assert!(
+                w.contains("isn't encrypted") && w.contains("Metro token"),
+                "{w}"
+            );
         }
         let api = Api::new(origin("https://example.org").unwrap(), "test-token").unwrap();
         let url = api

@@ -30,7 +30,7 @@ const INPUT_TICK: Duration = Duration::from_millis(75);
 #[derive(Parser)]
 #[command(version, about = "Metro conversations in an interactive terminal")]
 struct Args {
-    /// Explicit Metro origin (HTTPS, or HTTP with a literal loopback IP)
+    /// Explicit Metro origin (HTTPS or HTTP; plain HTTP outside loopback and Tailscale prints a warning)
     #[arg(long, value_name = "ORIGIN")]
     server: String,
     /// Read a token from a private regular file instead of prompting without echo
@@ -142,6 +142,9 @@ fn install_interrupt_handlers(flag: &Arc<AtomicBool>) -> Result<(), ctrlc::Error
 
 fn run(args: Args) -> Result<(), &'static str> {
     let origin = api::origin(&args.server)?;
+    if let Some(w) = api::plain_http_warning(&origin) {
+        eprintln!("metro-tui: warning: {w}");
+    }
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("An interactive terminal is required (allocate a PTY when using SSH).");
     }

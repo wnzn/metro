@@ -112,6 +112,12 @@ const PERSONAL_PREAMBLE: &str = "You are the Metro agent in the user's private p
 sees this conversation. You have no tools and no access to the user's Spaces from here. Answer concisely in \
 plain text.";
 
+/// [`PERSONAL_PREAMBLE`] for a person who turned on web tools in their own
+/// Chat.
+const PERSONAL_WEB_PREAMBLE: &str = "You are the Metro agent in the user's private personal Chat. Only this \
+user sees this conversation. You have no access to the user's Spaces from here; the user turned on web search \
+for this Chat, so you may search the web and read web pages for them. Answer concisely in plain text.";
+
 fn model(config: &ModelConfig) -> rig_core::Model<rig_core::providers::openai::wire::Chat> {
     OpenAIConfig::with_key(&METRO_DIALECT, config.api_key.clone())
         .with_base_url(config.base_url.clone())
@@ -749,18 +755,34 @@ async fn execute_room_run(
 ) {
     let limits = state.config.limits.clone();
     let loaded = {
-        let (space, room_id, before, n) = (
+        // A thread's task came from its parent room: URLs people wrote
+        // there before the thread was created may be fetched by the thread
+        // too. Read only when this run may fetch.
+        let parent = room
+            .parent_room_id
+            .clone()
+            .filter(|_| agent.allows(crate::web_tools::WEB_FETCH));
+        let (space, room_id, before, n, thread_id, thread_name) = (
             space_id.to_owned(),
             room.id.clone(),
             trigger.id,
             limits.agent_history,
+            room.id.clone(),
+            room.name.clone(),
         );
         state
             .db
             .call(move |db| {
+                let parent_events = match &parent {
+                    Some(parent) => {
+                        db.events_before_thread(&space, parent, &thread_id, &thread_name, n)?
+                    }
+                    None => Vec::new(),
+                };
                 Ok((
                     db.events_before(&space, &room_id, before, n)?,
                     db.runner_paired(&space)?,
+                    parent_events,
                 ))
             })
             .await
@@ -774,7 +796,7 @@ async fn execute_room_run(
                 Code::AgentHistoryUnavailable,
             )
         }
-        Ok((earlier, paired)) => {
+        Ok((earlier, paired, parent_events)) => {
             let is_thread = room.parent_room_id.is_some();
             // The agent's own tools only: its allowlist filters the run's.
             let allowed: Vec<RunnerTool> = RunnerTool::ALL
@@ -805,6 +827,39 @@ async fn execute_room_run(
                         .map(|t| runner_tool(state, space_id, &room.id, initiator, turn, *t))
                         .collect(),
                 );
+            }
+            // Web tools: only when the agent may use them, and only on the
+            // computer of the person who started the run.
+            let (search, fetch) = (
+                agent.allows(crate::web_tools::WEB_SEARCH),
+                agent.allows(crate::web_tools::WEB_FETCH),
+            );
+            if search || fetch {
+                let user = initiator.id.clone().unwrap_or_default();
+                if crate::web_devices::has_device(state, &user).await {
+                    let provenance = crate::web_tools::Provenance::from_messages(
+                        parent_events
+                            .iter()
+                            .chain(earlier.iter())
+                            .chain(std::iter::once(trigger)),
+                    );
+                    let ctx = crate::web_tools::WebContext {
+                        state: state.clone(),
+                        scope: crate::web_tools::WebScope::Room {
+                            space_id: space_id.to_owned(),
+                            room_id: room.id.clone(),
+                        },
+                        initiator: initiator.clone(),
+                        turn: turn.clone(),
+                        provenance: Arc::new(provenance),
+                        agent_id: Some(agent.id.clone()),
+                    };
+                    builder = builder
+                        .append_preamble(crate::web_tools::WEB_PREAMBLE)
+                        .dynamic_tools(crate::web_tools::tools(&ctx, search, fetch));
+                } else {
+                    builder = builder.append_preamble(crate::web_tools::NO_WEB_DEVICE_PREAMBLE);
+                }
             }
             if is_thread {
                 builder = builder.append_preamble(THREAD_CHILD_PREAMBLE);
@@ -1170,7 +1225,7 @@ impl Threads {
                         &self.parent_room_id,
                         kind::THREAD,
                         &Author::server(actor::AGENT),
-                        &format!("Started thread \"{}\" ({}).", child.name, child.id),
+                        &crate::db::thread_started_text(&child.name, &child.id),
                         Some(&self.turn),
                     )
                     .await;
@@ -1481,10 +1536,51 @@ async fn execute_personal_run(
             return;
         }
     };
-    let mut builder = model
-        .builder()
-        .preamble(PREAMBLE)
-        .append_preamble(PERSONAL_PREAMBLE);
+    // Web tools only for a person who turned them on for their own Chat,
+    // always on their own computer.
+    let web = {
+        let user = user_id.clone();
+        state
+            .db
+            .call(move |db| {
+                Ok(crate::web_devices::personal_chat_enabled(
+                    &db.lock(),
+                    &user,
+                )?)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %format!("{e:#}"), "reading web search prefs");
+                false
+            })
+    };
+    let mut builder = model.builder().preamble(PREAMBLE).append_preamble(if web {
+        PERSONAL_WEB_PREAMBLE
+    } else {
+        PERSONAL_PREAMBLE
+    });
+    if web {
+        if crate::web_devices::has_device(&state, &user_id).await {
+            let ctx = crate::web_tools::WebContext {
+                state: state.clone(),
+                scope: crate::web_tools::WebScope::Personal,
+                initiator: Author {
+                    id: Some(user_id.clone()),
+                    name: String::new(),
+                },
+                turn: turn.clone(),
+                provenance: Arc::new(crate::web_tools::Provenance::from_messages(
+                    earlier.iter().chain(std::iter::once(&trigger)),
+                )),
+                agent_id: None,
+            };
+            builder = builder
+                .append_preamble(crate::web_tools::WEB_PREAMBLE)
+                .dynamic_tools(crate::web_tools::tools(&ctx, true, true));
+        } else {
+            builder = builder.append_preamble(crate::web_tools::NO_WEB_DEVICE_PREAMBLE);
+        }
+    }
     let mut reacted = Arc::new(AtomicBool::new(false));
     // Reactions are for Chat messages; a page-only conversation has none.
     if lane == PersonalLane::Chat
@@ -1543,6 +1639,31 @@ async fn execute_personal_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_tool_events_never_become_model_history() {
+        let key = TurnKey::new();
+        let web = "<web-data id=\"abc\" source=\"exa\">page text</web-data id=\"abc\">";
+        let events = vec![
+            event(kind::MESSAGE, "search please", Some(1)),
+            event(kind::TOOL_CALL, "web_search \"q\"", Some(2)),
+            event(kind::TOOL_RESULT, web, Some(3)),
+            event(
+                kind::ERROR,
+                "web_fetch refused: a URL didn't come from a person",
+                Some(4),
+            ),
+            event(kind::REASONING_SUMMARY, web, Some(5)),
+            event(kind::AGENT, "my own summary", Some(6)),
+        ];
+        let h = history(&events, &key);
+        assert_eq!(h.len(), 2);
+        let all = format!("{h:?}");
+        assert!(
+            !all.contains("web-data") && !all.contains("page text") && !all.contains("refused")
+        );
+        assert!(all.contains("my own summary"));
+    }
 
     fn event(kind: &str, text: &str, created_at: Option<i64>) -> Event {
         Event {

@@ -13,7 +13,9 @@ use anyhow::{Context, Result, bail};
 use crate::Secret;
 use crate::fsutil::read_secret_input;
 use crate::metro::MetroClient;
-use crate::netpolicy::{url_is_loopback, validate_base_url};
+use crate::netpolicy::{
+    server_plain_http_warning, url_is_loopback, validate_base_url, validate_server_url,
+};
 use crate::openai_compat::{self, Endpoint};
 use crate::profile::{
     DEFAULT_PROFILE, DEFAULT_REQUEST_TIMEOUT_SECS, Kind, Profile, ProfileConfig, list_profiles,
@@ -53,6 +55,8 @@ USAGE
                                       Set the approved models (replaces the list)
   metro-connector status  [--profile NAME]
   metro-connector list                List connection profiles
+  metro-connector web ...             Run web searches for Metro on this
+                                      computer (see `metro-connector web --help`)
   metro-connector help | --help | --version
 
 SETUP OPTIONS (anything you leave out is asked interactively)
@@ -425,16 +429,19 @@ async fn cmd_setup(a: Args) -> Result<()> {
 
     // ---- Metro server and device token.
     let server_url = match &a.server_url {
-        Some(u) => validate_base_url(u, "--server-url")?,
+        Some(u) => validate_server_url(u, "--server-url")?,
         None => {
             let def = previous.as_ref().map(|p| p.server_url.clone());
             let u = ask(
                 "Metro server URL (shown on Metro's connection page)",
                 def.as_deref(),
             )?;
-            validate_base_url(&u, "server URL")?
+            validate_server_url(&u, "server URL")?
         }
     };
+    if let Some(w) = server_plain_http_warning(&server_url, "device token") {
+        say(format!("metro-connector: warning: {w}"));
+    }
     let kind = match (&a.kind, &previous) {
         (None, Some(p)) if !interactive() => p.kind,
         _ => choose_kind(&a)?,
@@ -827,6 +834,9 @@ async fn cmd_run(a: Args) -> Result<i32> {
         );
     }
     let token = profile.device_token_for(&cfg.server_url)?;
+    if let Some(w) = server_plain_http_warning(&cfg.server_url, "device token") {
+        say(format!("metro-connector: warning: {w}"));
+    }
     let client = if cfg.kind.embeds_media() {
         // Claims may carry an 8 MiB asset: more room and time to read them.
         MetroClient::new(&cfg.server_url, token, Duration::from_secs(120))?.with_media_claims()
@@ -886,6 +896,9 @@ pub async fn main_with(args: Vec<String>) -> i32 {
             return 2;
         }
     };
+    if cmd == "web" {
+        return crate::web::cli::main(rest).await;
+    }
     if matches!(cmd, "help" | "--help" | "-h") || rest.iter().any(|a| a == "--help" || a == "-h") {
         print!("{HELP}");
         return 0;

@@ -7,6 +7,7 @@ import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, fakeServer, header, TOKENS, world } from "../../test/fakeServer";
 import { BRIDGE, BRIDGE_DEVICE_SECRET, BRIDGE_TOKEN, bridgeEnv, fakeBridge, LOCAL_MODELS } from "./test/fakeBridge";
+import { launched } from "../../test/launched";
 
 type F = ReturnType<typeof fakeServer>;
 type B = ReturnType<typeof fakeBridge>;
@@ -15,7 +16,7 @@ const VENDOR_KEY = "sk-vendor-fixture-not-real-123456";
 
 async function openPackaged(f: F, b: B | null, env: object | null = bridgeEnv(), platform: "linux" | "windows" = "linux") {
   const network = { ...(f.network as any), ...(b ? (b.network as any) : {}) };
-  return open("../../App.tsx", { network, platform, width: 1280, height: 900, ...(env ? { modules: env as any } : {}) });
+  return open("../../App.tsx", { network, platform, width: 1280, height: 900, modules: (env ? env : launched()) as any });
 }
 
 async function signIn(app: App, user: string) {

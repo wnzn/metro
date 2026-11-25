@@ -10,6 +10,7 @@ import {
   activeSaved,
   addressLabel,
   cancelSwitch,
+  confirmPlainHttp,
   defaultName,
   forgetServer,
   hasToken,
@@ -25,7 +26,9 @@ import {
   unsentDraft,
 } from "../savedWorkspaces";
 import type { SavedServer, WorkspaceTarget } from "../savedWorkspaces";
+import { pendingPlainHttp } from "../plainHttp";
 import { connectedTo } from "../store";
+import { PlainHttpConsent, SERVER_URL_HINT } from "./PlainHttpConsent";
 import { setStartupServer, startupError, startupServerId } from "../startupWorkspace";
 import { Action, Banner, Column, Field, FormRow, Label, Modal, Row, SavedServerChoice, ScrollArea, Spacer, Toggle } from "../ui";
 import type { AccountMenuItem } from "../ui";
@@ -238,10 +241,17 @@ function TokenForm(props: { server: SavedServer; onCancel: () => void }) {
   const token = signal("");
   const keep = signal(false);
   const busy = () => switching() !== null;
+  const consent = signal<string | null>(null);
   const submit = async () => {
     const value = token();
     if (!value.trim()) {
       savedError.set(`Enter your access token for ${props.server.name}.`);
+      return;
+    }
+    const unconfirmed = pendingPlainHttp(props.server.baseUrl);
+    if (unconfirmed) {
+      savedError.set(null);
+      consent.set(unconfirmed);
       return;
     }
     // Checked before anything changes: a refused token keeps this dialog (and the current session) as they are.
@@ -263,10 +273,26 @@ function TokenForm(props: { server: SavedServer; onCancel: () => void }) {
         Metro checks the token first. Your current session ends only once it works.
       </Label>
       <ErrorLine />
-      <Row gap={2} justify="end">
-        <Action label="Cancel" variant="secondary" onPress={props.onCancel} />
-        <Action testID="workspace-sign-in" label="Sign in" busyLabel="Checking…" busy={busy()} variant="primary" onPress={() => void submit()} />
-      </Row>
+      <If when={consent()}>
+        {(url) => (
+          <PlainHttpConsent
+            testID="workspace-plain-http"
+            baseUrl={url()}
+            onCancel={() => consent.set(null)}
+            onAccept={() => {
+              void confirmPlainHttp(url());
+              consent.set(null);
+              void submit();
+            }}
+          />
+        )}
+      </If>
+      <If when={!consent()}>
+        <Row gap={2} justify="end">
+          <Action label="Cancel" variant="secondary" onPress={props.onCancel} />
+          <Action testID="workspace-sign-in" label="Sign in" busyLabel="Checking…" busy={busy()} variant="primary" onPress={() => void submit()} />
+        </Row>
+      </If>
     </Column>
   );
 }
@@ -278,6 +304,8 @@ function AddForm(props: { onCancel: () => void }) {
   const keep = signal(false);
   const busy = signal(false);
   const confirm = signal(false);
+  /** A plain-HTTP address waiting for the person's one-time confirmation. */
+  const consent = signal<string | null>(null);
   const submit = async (discard = false) => {
     if (busy()) return;
     const value = token();
@@ -287,6 +315,12 @@ function AddForm(props: { onCancel: () => void }) {
     }
     const server = serverCandidate(url(), name());
     if (!server) return;
+    const unconfirmed = pendingPlainHttp(server.baseUrl);
+    if (unconfirmed) {
+      savedError.set(null);
+      consent.set(unconfirmed);
+      return;
+    }
     if (!discard && unsentDraft()) {
       confirm.set(true);
       return;
@@ -317,8 +351,8 @@ function AddForm(props: { onCancel: () => void }) {
         <FormRow label="Name" hint="Optional display name.">
           <Field testID="add-server-name" accessibilityLabel="Server name" value={name()} onChange={name.set} placeholder="Work" maxLength={MAX_SERVER_NAME} />
         </FormRow>
-        <FormRow label="Server URL" hint="Use HTTPS, or HTTP on loopback.">
-          <Field testID="add-server-url" accessibilityLabel="Server URL" value={url()} onChange={url.set} placeholder="https://metro.example.org" autoFocus />
+        <FormRow label="Server URL" hint={SERVER_URL_HINT}>
+          <Field testID="add-server-url" accessibilityLabel="Server URL" value={url()} onChange={(next) => { consent.set(null); url.set(next); }} placeholder="https://metro.example.org" autoFocus />
         </FormRow>
         <FormRow label="Access token" hint="Never saved to disk.">
           <Field testID="add-server-token" accessibilityLabel="Access token" value={token()} onChange={token.set} placeholder="Paste your bearer token" masked onSubmit={() => void submit()} />
@@ -328,10 +362,26 @@ function AddForm(props: { onCancel: () => void }) {
           Only the verified server’s name and address are saved.
         </Label>
         <ErrorLine />
-        <Row gap={2} justify="end">
-          <Action label="Cancel" variant="secondary" onPress={props.onCancel} />
-          <Action testID="add-server-submit" label="Save and sign in" busyLabel="Checking…" busy={busy()} variant="primary" onPress={() => void submit()} />
-        </Row>
+        <If when={consent()}>
+          {(pending) => (
+            <PlainHttpConsent
+              testID="add-server-plain-http"
+              baseUrl={pending()}
+              onCancel={() => consent.set(null)}
+              onAccept={() => {
+                void confirmPlainHttp(pending());
+                consent.set(null);
+                void submit();
+              }}
+            />
+          )}
+        </If>
+        <If when={!consent()}>
+          <Row gap={2} justify="end">
+            <Action label="Cancel" variant="secondary" onPress={props.onCancel} />
+            <Action testID="add-server-submit" label="Save and sign in" busyLabel="Checking…" busy={busy()} variant="primary" onPress={() => void submit()} />
+          </Row>
+        </If>
       </If>
     </Column>
   );

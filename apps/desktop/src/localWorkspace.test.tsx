@@ -6,6 +6,7 @@
 import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, fakeServer, header, TOKENS, world } from "../test/fakeServer";
+import { LAUNCHED_ENV, launched } from "../test/launched";
 
 const BRIDGE = "http://127.0.0.1:47123";
 const BRIDGE_TOKEN = "cd".repeat(32);
@@ -51,11 +52,11 @@ function atLocal(server: F) {
   return network;
 }
 
-const env = { process: { "default.env": { METRO_DESKTOP_BRIDGE_URL: BRIDGE, METRO_DESKTOP_BRIDGE_TOKEN: BRIDGE_TOKEN } } };
+const env = { process: { "default.env": { ...LAUNCHED_ENV, METRO_DESKTOP_BRIDGE_URL: BRIDGE, METRO_DESKTOP_BRIDGE_TOKEN: BRIDGE_TOKEN } } };
 
 async function launch(remote: F, local: F, bridge: ReturnType<typeof fakeLauncher> | null, storage: Record<string, string> = {}, manualClock = false) {
   const network = { ...(remote.network as any), ...atLocal(local), ...(bridge ? bridge.network : {}) };
-  return open("../App.tsx", { network, platform: "linux", width: 1200, height: 800, storage, ...(bridge ? { modules: env as any } : {}), ...(manualClock ? { clock: {} } : {}) });
+  return open("../App.tsx", { network, platform: "linux", width: 1200, height: 800, storage, modules: (bridge ? env : launched()) as any, ...(manualClock ? { clock: {} } : {}) });
 }
 
 const text = (app: App) => app.texts().join(" | ");

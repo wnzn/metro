@@ -1,0 +1,536 @@
+{
+  "comment": [
+    "Shared host classification vectors for a plain-HTTP Metro server URL.",
+    "class: what every classifier returns for this exact host string: metro-url-policy (Rust), classifyHost",
+    "(apps/desktop/src/api/serverUrl.ts) and hostClass (crates/server/src/admin_web/admin.js).",
+    "installer: what the runner installers (install-metro-runner-linux.sh, metro-runner-container.sh and",
+    "metro-runner-container.ps1) do with http://<host>:8787 when it differs from class. They take only the exact",
+    "loopback literals localhost, 127.0.0.1 and [::1], and refuse other names for this machine, trailing dots and",
+    "malformed hosts. A trailing dot sends the name through the resolver, so 100.64.0.1. and localhost. are other.",
+    "Numeric hosts must be a canonical dotted quad: resolvers read 100.077.0.1 as octal (100.63.0.1),",
+    "0x64 as hex and 100.64.1 as shorthand, so classifiers never call those Tailscale; installers refuse them.",
+    "no_proxy: how ureq 3 (NSH fetch, runners up to 0.4.0) matches a NO_PROXY value against a URI host.",
+    "Authorities: after an IPv6 literal's ] only :<digits> may follow ([::1]:99] is refused), and names are checked for DNS characters before any shell splitting (*.ts.net, box.. are refused).",
+    "launcher_no_proxy_entries: exactly metro_url_policy::loopback_no_proxy_entries(), exact hosts the desktop launcher adds to the UI's NO_PROXY; loopback_uri_hosts must match them, not_exempted_by_default must not (no prefixes: 100.64.office.example keeps the proxy)."
+  ],
+  "hosts": [
+    {
+      "host": "localhost",
+      "class": "loopback"
+    },
+    {
+      "host": "LOCALHOST",
+      "class": "loopback",
+      "installer": "refused"
+    },
+    {
+      "host": "127.0.0.1",
+      "class": "loopback"
+    },
+    {
+      "host": "127.255.0.9",
+      "class": "loopback",
+      "installer": "refused"
+    },
+    {
+      "host": "[::1]",
+      "class": "loopback"
+    },
+    {
+      "host": "::1",
+      "class": "loopback",
+      "installer": "refused"
+    },
+    {
+      "host": "[0:0:0:0:0:0:0:1]",
+      "class": "loopback",
+      "installer": "refused"
+    },
+    {
+      "host": "[::ffff:127.0.0.1]",
+      "class": "loopback",
+      "installer": "refused"
+    },
+    {
+      "host": "[::ffff:7f00:1]",
+      "class": "loopback",
+      "installer": "refused"
+    },
+    {
+      "host": "localhost.",
+      "class": "other"
+    },
+    {
+      "host": "127.0.0.1.",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "foo.localhost",
+      "class": "other"
+    },
+    {
+      "host": "localhost.example.com",
+      "class": "other"
+    },
+    {
+      "host": "127.0.0.1.evil.com",
+      "class": "other"
+    },
+    {
+      "host": "127.1",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "128.0.0.1",
+      "class": "other"
+    },
+    {
+      "host": "100.64.0.0",
+      "class": "tailscale"
+    },
+    {
+      "host": "100.64.0.1",
+      "class": "tailscale"
+    },
+    {
+      "host": "100.101.102.103",
+      "class": "tailscale"
+    },
+    {
+      "host": "100.127.255.255",
+      "class": "tailscale"
+    },
+    {
+      "host": "[fd7a:115c:a1e0::1]",
+      "class": "tailscale"
+    },
+    {
+      "host": "[FD7A:115C:A1E0:AB12:4843:CD96:6258:B240]",
+      "class": "tailscale"
+    },
+    {
+      "host": "fd7a:115c:a1e0::53",
+      "class": "tailscale",
+      "installer": "refused"
+    },
+    {
+      "host": "[::ffff:100.100.100.100]",
+      "class": "tailscale",
+      "installer": "refused"
+    },
+    {
+      "host": "[::ffff:6464:6464]",
+      "class": "tailscale",
+      "installer": "refused"
+    },
+    {
+      "host": "metro.tail1234.ts.net",
+      "class": "tailscale"
+    },
+    {
+      "host": "Metro.Tail-Net.TS.NET",
+      "class": "tailscale"
+    },
+    {
+      "host": "a.ts.net",
+      "class": "tailscale"
+    },
+    {
+      "host": "x1.y-2.ts.net",
+      "class": "tailscale"
+    },
+    {
+      "host": "metro.tail1234.ts.net.",
+      "class": "tailscale"
+    },
+    {
+      "host": "100.64.0.1.",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "100.63.255.255",
+      "class": "other"
+    },
+    {
+      "host": "100.128.0.0",
+      "class": "other"
+    },
+    {
+      "host": "99.64.0.1",
+      "class": "other"
+    },
+    {
+      "host": "10.0.0.1",
+      "class": "other"
+    },
+    {
+      "host": "192.168.1.5",
+      "class": "other"
+    },
+    {
+      "host": "0.0.0.0",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "1.2.3.999",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "[fd7a:115c:a1e1::1]",
+      "class": "other"
+    },
+    {
+      "host": "[fd7a:115c::1]",
+      "class": "other"
+    },
+    {
+      "host": "[fe80::1]",
+      "class": "other"
+    },
+    {
+      "host": "[::ffff:c0a8:1]",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "ts.net",
+      "class": "other"
+    },
+    {
+      "host": ".ts.net",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "a..ts.net",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "-a.ts.net",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "a-.ts.net",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "a_b.ts.net",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "evilts.net",
+      "class": "other"
+    },
+    {
+      "host": "metro.ts.net.evil.com",
+      "class": "other"
+    },
+    {
+      "host": "metro.example.com",
+      "class": "other"
+    },
+    {
+      "host": "",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "localhost-office.example",
+      "class": "other"
+    },
+    {
+      "host": "a.b-c.example",
+      "class": "other"
+    },
+    {
+      "host": "metro.example.com.",
+      "class": "other"
+    },
+    {
+      "host": "office.metro.ts.net.",
+      "class": "tailscale"
+    },
+    {
+      "host": "[fd7a:115c:a1e0:::]",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "[fd7a:115c:a1e0::1::2]",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "[1:2:3:4:5:6:7:8]",
+      "class": "other"
+    },
+    {
+      "host": "[1:2:3:4:5:6:7:8:9]",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "[::]",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "[12345::1]",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "100.077.0.1",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "100.00077.0.1",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "100.064.0.1",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "100.64.0.01",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "100.64.1",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "0x64.64.0.1",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "100.64.0.0x1",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "1681915905",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "100.64.0.256",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "[::1]:99]",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "[::1]x",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "*.ts.net",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "box..",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "box.ts.net..",
+      "class": "other",
+      "installer": "refused"
+    }
+  ],
+  "no_proxy": [
+    {
+      "no_proxy": "*",
+      "host": "anything",
+      "match": true
+    },
+    {
+      "no_proxy": ".ts.net",
+      "host": "a.ts.net",
+      "match": true
+    },
+    {
+      "no_proxy": ".ts.net",
+      "host": "ts.net",
+      "match": false
+    },
+    {
+      "no_proxy": ".ts.net",
+      "host": "a.ts.net.",
+      "match": false
+    },
+    {
+      "no_proxy": "*.ts.net.",
+      "host": "a.ts.net.",
+      "match": true
+    },
+    {
+      "no_proxy": "*.ts.net",
+      "host": "a.ts.net",
+      "match": true
+    },
+    {
+      "no_proxy": "100.64.",
+      "host": "100.64.0.1",
+      "match": true
+    },
+    {
+      "no_proxy": "100.64.",
+      "host": "100.640.0.1",
+      "match": false
+    },
+    {
+      "no_proxy": "100.6*",
+      "host": "100.64.0.1",
+      "match": true
+    },
+    {
+      "no_proxy": "[fd7a:115c:a1e0:*",
+      "host": "[fd7a:115c:a1e0::1]",
+      "match": true
+    },
+    {
+      "no_proxy": "[fd7a:115c:a1e0:*",
+      "host": "[fd7a:115c:a1e1::1]",
+      "match": false
+    },
+    {
+      "no_proxy": "::1",
+      "host": "[::1]",
+      "match": false
+    },
+    {
+      "no_proxy": "[::1]",
+      "host": "[::1]",
+      "match": true
+    },
+    {
+      "no_proxy": "example.com",
+      "host": "EXAMPLE.com",
+      "match": true
+    },
+    {
+      "no_proxy": "example.com",
+      "host": "a.example.com",
+      "match": false
+    },
+    {
+      "no_proxy": "a,b",
+      "host": "b",
+      "match": true
+    },
+    {
+      "no_proxy": "a, b",
+      "host": "b",
+      "match": false
+    },
+    {
+      "no_proxy": "",
+      "host": "x",
+      "match": false
+    },
+    {
+      "no_proxy": "127.",
+      "host": "127.0.0.1",
+      "match": true
+    },
+    {
+      "no_proxy": "\u212abox.ts.net",
+      "host": "kbox.ts.net",
+      "match": false
+    },
+    {
+      "no_proxy": "*.\u212abox.ts.net",
+      "host": "office.kbox.ts.net",
+      "match": false
+    },
+    {
+      "no_proxy": "\u212abox*",
+      "host": "kbox.ts.net",
+      "match": false
+    },
+    {
+      "no_proxy": "Kbox.TS.NET",
+      "host": "kbox.ts.net",
+      "match": true
+    },
+    {
+      "no_proxy": " kbox.ts.net,kbox.ts.net ,\tkbox.ts.net",
+      "host": "kbox.ts.net",
+      "match": false
+    },
+    {
+      "no_proxy": "kbox.ts.net:8787",
+      "host": "kbox.ts.net",
+      "match": false
+    },
+    {
+      "no_proxy": "[::1]:8787",
+      "host": "[::1]",
+      "match": false
+    },
+    {
+      "no_proxy": ".ts.net,*",
+      "host": "ts.net",
+      "match": true
+    },
+    {
+      "no_proxy": " * ,**,*box*",
+      "host": "kbox.ts.net",
+      "match": false
+    },
+    {
+      "no_proxy": ",,",
+      "host": "kbox.ts.net",
+      "match": false
+    },
+    {
+      "no_proxy": ",kbox.ts.net,,",
+      "host": "kbox.ts.net",
+      "match": true
+    }
+  ],
+  "launcher_no_proxy_entries": [
+    "localhost",
+    "127.0.0.1",
+    "::1",
+    "[::1]"
+  ],
+  "loopback_uri_hosts": [
+    "localhost",
+    "127.0.0.1",
+    "[::1]"
+  ],
+  "not_exempted_by_default": [
+    "100.64.office.example",
+    "127.foo.example",
+    "100.101.102.103",
+    "box.tail1234.ts.net",
+    "box.tail1234.ts.net.",
+    "[fd7a:115c:a1e0::1]",
+    "127.0.0.2",
+    "192.168.1.5",
+    "metro.example.com"
+  ]
+}

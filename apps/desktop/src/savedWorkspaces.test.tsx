@@ -6,6 +6,7 @@
 import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, header, TOKENS, world } from "../test/fakeServer";
+import { LAUNCHED_ENV, launched } from "../test/launched";
 
 type F = ReturnType<typeof world>;
 type Req = { method: string; url: string; headers: Record<string, string>; body?: string | null };
@@ -15,7 +16,7 @@ const DOWN = "https://down.example.org";
 const BRIDGE = "http://127.0.0.1:47123";
 const BRIDGE_TOKEN = "cd".repeat(32);
 const LOCAL = "http://127.0.0.1:41234";
-const env = { process: { "default.env": { METRO_DESKTOP_BRIDGE_URL: BRIDGE, METRO_DESKTOP_BRIDGE_TOKEN: BRIDGE_TOKEN } } };
+const env = { process: { "default.env": { ...LAUNCHED_ENV, METRO_DESKTOP_BRIDGE_URL: BRIDGE, METRO_DESKTOP_BRIDGE_TOKEN: BRIDGE_TOKEN } } };
 
 /** Serves `server` at `origin` instead of BASE. */
 function at(origin: string, server: F) {
@@ -59,7 +60,7 @@ function servers() {
 
 async function launch(s: ReturnType<typeof servers>, opts: { storage?: Record<string, string>; bridge?: ReturnType<typeof launcher> } = {}): Promise<App> {
   const network = { ...(s.a.network as any), ...at(REMOTE, s.b), ...at(LOCAL, s.local), ...(opts.bridge ? opts.bridge.network : {}) };
-  return open("../App.tsx", { network, platform: "linux", width: 1200, height: 820, storage: opts.storage ?? {}, ...(opts.bridge ? { modules: env as any } : {}) });
+  return open("../App.tsx", { network, platform: "linux", width: 1200, height: 820, storage: opts.storage ?? {}, modules: (opts.bridge ? env : launched()) as any });
 }
 
 async function signIn(app: App, user: string, url = BASE, opts: { keep?: boolean } = {}) {
@@ -241,7 +242,7 @@ test("after a restart the saved list is there and no token is: the first screen 
 
 test("a saved list with a bad address is read without it", async () => {
   const s = servers();
-  const list = JSON.stringify([{ id: "x", name: "Plain", baseUrl: "http://example.org" }, { id: "y", name: "Ok", baseUrl: REMOTE }, "junk"]);
+  const list = JSON.stringify([{ id: "x", name: "Bad", baseUrl: "ftp://example.org" }, { id: "y", name: "Ok", baseUrl: REMOTE }, "junk"]);
   const app = await launch(s, { storage: { "metro.savedServers": list } });
   await app.waitFor("id:saved-server:y");
   expect(app.shows("id:saved-server:x")).toBe(false);

@@ -9,6 +9,7 @@ import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, TOKENS } from "../../../test/fakeServer";
 import { libraryWorld } from "./test/fixtures";
+import { launched } from "../../../test/launched";
 
 type W = ReturnType<typeof libraryWorld>;
 
@@ -20,7 +21,7 @@ async function connect(app: App, user: string) {
 }
 
 async function signIn(w: W, user: "alice" | "bob" | "carol" = "alice"): Promise<App> {
-  const app = await open("../../../App.tsx", { network: w.network as any, platform: "linux", width: 1280, height: 900 });
+  const app = await open("../../../App.tsx", { modules: launched(), network: w.network as any, platform: "linux", width: 1280, height: 900 });
   await connect(app, user);
   await app.waitFor("id:top-search");
   return app;
@@ -186,7 +187,7 @@ test("the media model settings offer only media-capable connections and disclose
   w.f.addConnection("alice", "custom-embeddings", "Text embeddings", "nomic-embed");
   const own = w.addMediaConnection("alice", "device-embeddinggemma-2", "My EG2");
   w.addMediaConnection("bob", "embeddinggemma-2", "Bob's EG2 server", { visibility: "spaces", space_ids: ["acme"] });
-  const app = await open("./test/ModelHarness.tsx", { network: w.network as any, platform: "linux", width: 1280, height: 900 });
+  const app = await open("./test/ModelHarness.tsx", { modules: launched(), network: w.network as any, platform: "linux", width: 1280, height: 900 });
   await connect(app, "alice");
   await app.waitFor("id:library-model");
   await app.waitFor(`id:library-file:${s.mine.id}`);
