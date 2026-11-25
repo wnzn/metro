@@ -305,14 +305,25 @@ export const runnerUpdateBusy = signal<string | null>(null);
 export const runnerUpdateErrors = signal<Record<string, string>>({});
 
 // One read-only poll for the visible Runners page while an accepted update
-// is pending. A slow current read must not be invalidated by the next tick.
+// is pending. Keep the flight across roster changes and page lifetimes;
+// the session client aborts it on disconnect, not on a roster mutation.
+let runnerRosterPoll: Promise<void> | null = null;
+const shouldPollRunnerRoster = computed(() =>
+  place() === "settings" && settingsSection() === "runners" && !!runners()?.some((r) => r.update?.pending));
+
 effect(() => {
-  if (place() !== "settings" || settingsSection() !== "runners" || !runners()?.some((r) => r.update?.pending)) return;
-  let reading = false;
+  if (!shouldPollRunnerRoster()) return;
+  const valid = sessionGuard();
   const timer = setInterval(async () => {
-    if (reading || runnerBusy() || runnerUpdateBusy()) return;
-    reading = true;
-    try { await loadRunners(); } finally { reading = false; }
+    if (!valid() || !shouldPollRunnerRoster() || runnerRosterPoll || runnerBusy() || runnerUpdateBusy()) return;
+    const read = loadRunners();
+    runnerRosterPoll = read;
+    try {
+      await read;
+    } finally {
+      // A cancelled old session must not release a new session's flight.
+      if (runnerRosterPoll === read) runnerRosterPoll = null;
+    }
   }, RUNNER_REFRESH_MS);
   cleanup(() => clearInterval(timer));
 });
@@ -356,6 +367,7 @@ onSessionEnd(() => {
   offerFresh.set(false);
   attachFeedback.set(null);
   runnerAttachBusy.set(false);
+  runnerRosterPoll = null;
   runnerUpdateBusy.set(null);
   runnerUpdateErrors.set({});
 });

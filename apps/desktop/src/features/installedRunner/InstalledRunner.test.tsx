@@ -668,7 +668,7 @@ test("managed runner updates require confirmation, report denial and accepted pr
   expect(posts()).toHaveLength(3);
 });
 
-test("a pre-acceptance roster reply cannot erase the accepted update or stop authoritative polling", async () => {
+test("an accepted update waits for the held pre-acceptance poll before polling again", async () => {
   const f = world();
   const mine = f.addRunner("Build box", "personal", "alice");
   const other = f.addRunner("Already updating", "personal", "alice");
@@ -685,7 +685,7 @@ test("a pre-acceptance roster reply cannot erase the accepted update or stop aut
   // The existing pending row causes a production roster poll. Its old answer
   // knows neither row as pending: the unrelated update has already finished.
   f.state.runnerRelease.set(other.id, fixtureRelease("managed", "none", { available: false }));
-  const held = f.answerLate("/v1/runners", TOKENS.alice!, 3500);
+  const held = f.answerLate("/v1/runners", TOKENS.alice!, 8000);
   await app.clock!.runFor(5100);
   expect(held.arrived()).toBe(1);
   f.answerLate("/v1/runners", TOKENS.alice!, 0);
@@ -695,18 +695,25 @@ test("a pre-acceptance roster reply cannot erase the accepted update or stop aut
   await app.press(`${id}:confirm`);
   await app.waitFor(pending);
 
-  await app.clock!.runFor(3700); // Release the old answer before the next poll.
-  expect(app.shows(pending)).toBe(true);
-  expect(app.shows(id)).toBe(false);
-
   const completed = fixtureRelease("managed", "none", { available: false });
   completed.presence.version = "0.5.0";
   f.state.runnerRelease.set(mine.id, completed);
   const authoritative = f.answerLate("/v1/runners", TOKENS.alice!, 6300);
-  await app.clock!.runFor(6500); // A second tick must not oust a slow fresh read.
+
+  await app.clock!.runFor(5600); // A tick passes with the old GET still held.
+  expect(authoritative.arrived()).toBe(0);
+  expect(app.shows(pending)).toBe(true);
+  expect(app.shows(id)).toBe(false);
+
+  await app.clock!.runFor(2800); // The old answer is released, but is stale.
+  expect(authoritative.arrived()).toBe(0);
+  expect(app.shows(pending)).toBe(true);
+  expect(app.shows(id)).toBe(false);
+
+  await app.clock!.runFor(6900); // A fresh poll starts; its next tick must not overlap.
   expect(authoritative.arrived()).toBe(1);
   expect(app.shows(pending)).toBe(true);
-  await app.clock!.runFor(1600);
+  await app.clock!.runFor(1700);
   await app.waitFor("text:v0.5.0 · Online");
   expect(app.shows(pending)).toBe(false);
   expect(app.shows(id)).toBe(false);
