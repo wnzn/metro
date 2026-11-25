@@ -990,9 +990,22 @@ impl Db {
     // ---- Rooms and events ----
 
     pub fn list_rooms(&self, space_id: &str) -> anyhow::Result<Vec<Room>> {
+        self.list_rooms_filtered(space_id, false)
+    }
+
+    pub(crate) fn list_rooms_filtered(
+        &self,
+        space_id: &str,
+        top_level_only: bool,
+    ) -> anyhow::Result<Vec<Room>> {
+        let filter = if top_level_only {
+            " AND parent_room_id IS NULL"
+        } else {
+            ""
+        };
         let conn = self.lock();
         let mut stmt = conn.prepare_cached(&format!(
-            "SELECT {ROOM_COLUMNS} FROM space_rooms WHERE space_id = ?1 ORDER BY created_at, rowid"
+            "SELECT {ROOM_COLUMNS} FROM space_rooms WHERE space_id = ?1{filter} ORDER BY created_at, rowid"
         ))?;
         let rows = stmt.query_map([space_id], row_room)?;
         Ok(rows.collect::<Result<_, _>>()?)
