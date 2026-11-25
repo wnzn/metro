@@ -1044,7 +1044,8 @@ async fn typed_use(
 /// Whether the typed call `u` prepared may still go ahead as prepared:
 /// the caller is still a member of its Space (when it has one), still has
 /// the grant they were admitted on, and the connection is still the same
-/// one (row, provider, model, revision, capability and approved endpoint).
+/// one (row, provider, model, revision, capability, credential and approved
+/// endpoint).
 /// Checked together, in one database call, immediately before the request
 /// is sent and again before its answer is returned, whatever the access
 /// (own, Space share, organization share). Lost access is
@@ -1052,7 +1053,10 @@ async fn typed_use(
 /// and is never silently retargeted; internal errors propagate.
 async fn still_current(state: &AppState, u: &TypedUse) -> Result<(), ProviderError> {
     let (caller, space, chosen) = (u.caller.clone(), u.space.clone(), u.chosen.clone());
-    let now = state
+    let prepared = u.row.clone();
+    let providers = state.providers.clone();
+    let entry = u.entry;
+    state
         .db
         .call(move |db| {
             let conn = db.lock();
@@ -1061,33 +1065,40 @@ async fn still_current(state: &AppState, u: &TypedUse) -> Result<(), ProviderErr
             {
                 return Ok(Err(UseError::Revoked));
             }
-            Ok(
-                match sharing::authorize(&conn, &caller, space.as_deref(), &chosen) {
-                    Err(UseError::NotFound) => Err(UseError::Revoked),
-                    other => other,
-                },
-            )
+            let now = match sharing::authorize(&conn, &caller, space.as_deref(), &chosen) {
+                Ok(now) => now.row,
+                Err(UseError::NotFound) => return Ok(Err(UseError::Revoked)),
+                Err(e) => return Ok(Err(e)),
+            };
+            let same = now.id == prepared.id
+                && now.user_id == prepared.user_id
+                && now.provider_id == prepared.provider_id
+                && now.model == prepared.model
+                && now.config_rev == prepared.config_rev
+                && now.capability == prepared.capability
+                && now.base_url == prepared.base_url
+                // A typed key rotation does not bump the search index revision.
+                && now.sealed_key == prepared.sealed_key
+                && match entry.execution {
+                    Execution::Device => true,
+                    Execution::Server => providers
+                        .effective_base_url(entry, now.base_url.as_deref())
+                        .is_ok(),
+                };
+            Ok(same.then_some(()).ok_or(UseError::TurnChanged))
         })
         .await
         .map_err(read_error)??;
-    let same = now.row.id == u.row.id
-        && now.row.user_id == u.row.user_id
-        && now.row.provider_id == u.row.provider_id
-        && now.row.model == u.row.model
-        && now.row.config_rev == u.row.config_rev
-        && now.row.capability == u.row.capability
-        && now.row.base_url == u.row.base_url
-        && match u.entry.execution {
-            Execution::Device => true,
-            Execution::Server => state
-                .providers
-                .effective_base_url(u.entry, now.row.base_url.as_deref())
-                .is_ok(),
-        };
-    if same {
-        Ok(())
-    } else {
-        Err(UseError::TurnChanged.into())
+    Ok(())
+}
+
+/// Withhold an in-flight answer if its grant or connection changed.
+/// Unlike a refusal before sending, this is a revocation of the answer
+/// already computed. Internal errors keep their status.
+async fn recheck_typed_answer(state: &AppState, u: &TypedUse) -> Result<(), ProviderError> {
+    match still_current(state, u).await {
+        Err(ProviderError::Use(UseError::TurnChanged)) => Err(UseError::Revoked.into()),
+        result => result,
     }
 }
 
@@ -1157,7 +1168,7 @@ async fn decide_with(
             .map_err(ProviderError::from),
     }
     .inspect_err(|e| log_typed_failure(&u, e))?;
-    still_current(state, &u).await?;
+    recheck_typed_answer(state, &u).await?;
     Ok(answer)
 }
 
@@ -1188,7 +1199,7 @@ pub async fn embed(
             "the model endpoint returned an invalid embeddings response".into(),
         ));
     }
-    still_current(state, &u).await?;
+    recheck_typed_answer(state, &u).await?;
     Ok(vectors)
 }
 
@@ -1242,7 +1253,7 @@ pub async fn media_embed(
             .map_err(ProviderError::from),
     }
     .inspect_err(|e| log_typed_failure(&u, e))?;
-    still_current(state, &u).await?;
+    recheck_typed_answer(state, &u).await?;
     Ok(answer)
 }
 
@@ -1472,26 +1483,27 @@ async fn counting_systemone() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
 }
 
 #[cfg(test)]
+async fn ask_typed_fixture(
+    state: &AppState,
+    u: TypedUse,
+) -> Result<serde_json::Value, ProviderError> {
+    decide_with(
+        state,
+        u,
+        serde_json::json!({"value": true}),
+        serde_json::json!({"check": {"type": "noul", "instructions": "Is value true?"}}),
+    )
+    .await
+}
+
+#[cfg(test)]
 #[tokio::test]
-async fn a_typed_call_goes_out_only_as_it_was_prepared() {
+async fn a_prepared_typed_call_does_not_follow_an_endpoint_rotation() {
     use std::sync::atomic::Ordering::SeqCst;
 
     let ((a, to_a), (b, to_b)) = (counting_systemone().await, counting_systemone().await);
     let state = api::probe_state(vec![a.clone(), b.clone()]).await;
     let sid = state.db.create_space("user", "typed", 10).unwrap().id;
-    state.db.add_member(&sid, "bob", 100).unwrap();
-    let ask = |state: &AppState, u: TypedUse| {
-        let state = state.clone();
-        async move {
-            decide_with(
-                &state,
-                u,
-                serde_json::json!({"value": true}),
-                serde_json::json!({"check": {"type": "noul", "instructions": "Is value true?"}}),
-            )
-            .await
-        }
-    };
 
     // The endpoint is rotated between preparation and dispatch.
     let row = api::probe_row(&state, catalog::CUSTOM_SYSTEMONE, &a);
@@ -1506,13 +1518,24 @@ async fn a_typed_call_goes_out_only_as_it_was_prepared() {
         store::patch(&mut state.db.lock(), "user", &row.id, &rotate, Some(&row)).unwrap(),
         store::Patched::Saved(_)
     ));
-    let r = ask(&state, u).await;
+    let r = ask_typed_fixture(&state, u).await;
     assert_eq!(r, Err(ProviderError::Use(UseError::TurnChanged)));
     assert_eq!(
         (to_a.load(SeqCst), to_b.load(SeqCst)),
         (0, 0),
         "nothing was sent"
     );
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn a_prepared_typed_call_is_not_sent_after_its_share_is_revoked() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let (a, to_a) = counting_systemone().await;
+    let state = api::probe_state(vec![a.clone()]).await;
+    let sid = state.db.create_space("user", "typed", 10).unwrap().id;
+    state.db.add_member(&sid, "bob", 100).unwrap();
 
     // A Space share is revoked between preparation and dispatch.
     let shared = api::probe_row(&state, catalog::CUSTOM_SYSTEMONE, &a);
@@ -1529,7 +1552,7 @@ async fn a_typed_call_goes_out_only_as_it_was_prepared() {
         space_ids: vec![],
     };
     assert!(store::set_share(&mut state.db.lock(), "user", &shared.id, &personal).unwrap());
-    let r = ask(&state, u).await;
+    let r = ask_typed_fixture(&state, u).await;
     assert_eq!(r, Err(ProviderError::Use(UseError::Revoked)));
     assert_eq!(to_a.load(SeqCst), 0, "the old endpoint got nothing");
 
@@ -1543,8 +1566,42 @@ async fn a_typed_call_goes_out_only_as_it_was_prepared() {
     )
     .await
     .unwrap();
-    assert!(ask(&state, u).await.is_ok());
+    assert!(ask_typed_fixture(&state, u).await.is_ok());
     assert_eq!(to_a.load(SeqCst), 1);
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn a_prepared_typed_call_does_not_use_a_retired_key() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let (a, to_a) = counting_systemone().await;
+    let state = api::probe_state(vec![a.clone()]).await;
+    let row = api::probe_row(&state, catalog::CUSTOM_SYSTEMONE, &a);
+
+    // A typed credential change alone does not bump the index revision.
+    let u = typed_use(&state, "user", None, &row.id, Capability::SystemOne)
+        .await
+        .unwrap();
+    let rotate_key = store::Patch {
+        sealed_key: Some(Some(vec![1; 40])),
+        ..store::Patch::default()
+    };
+    let store::Patched::Saved(rotated) =
+        store::patch(&mut state.db.lock(), "user", &row.id, &rotate_key, None).unwrap()
+    else {
+        panic!("typed key rotation did not save");
+    };
+    assert_eq!(rotated.config_rev, row.config_rev);
+    assert_eq!(
+        ask_typed_fixture(&state, u).await,
+        Err(ProviderError::Use(UseError::TurnChanged))
+    );
+    assert_eq!(
+        to_a.load(SeqCst),
+        0,
+        "no request used the retired credential"
+    );
 }
 
 #[cfg(test)]
@@ -1581,6 +1638,10 @@ async fn a_lost_membership_is_revoked_and_internal_errors_propagate() {
         .lock()
         .execute_batch("ALTER TABLE space_members RENAME TO space_members_gone")
         .unwrap();
+    assert_eq!(
+        recheck_typed_answer(&state, &u).await,
+        Err(ProviderError::Use(UseError::Internal))
+    );
     let (p, q) = question();
     assert_eq!(
         decide_with(&state, u, p, q).await,
