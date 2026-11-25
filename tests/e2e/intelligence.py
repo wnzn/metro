@@ -498,8 +498,7 @@ def configure_routing(run, user, **options):
             "routing preferences were not persisted")
 
 
-def exercise_routing(run, space, classifier, default, routed):
-    room = room_path(space)
+def exercise_chat(run, classifier, default, routed):
     current = run.call("alice", "GET", ROUTING, read_json=True)
     require(current["enabled"] is False and current["infer_addressing"] is False,
             "routing or the legacy settings default changed")
@@ -512,9 +511,6 @@ def exercise_routing(run, space, classifier, default, routed):
             and route["addressed_by"] == "explicit" and len(run.systemone.posts()) == before[0],
             "Chat did not send directly without System One")
 
-    before = run.post_counts()
-    event = run.post("alice", room, "Please analyze the causal chain. ROUTING_OPT_OUT")
-    run.expect_no_run("alice", room, event, before, "unaddressed while opted out")
     configure_routing(
         run, "alice", enabled=True, infer_addressing=True, classifier_id=classifier,
         default_chat_id=default, min_directedness=0.85, min_route_probability=0.65,
@@ -525,6 +521,22 @@ def exercise_routing(run, space, classifier, default, routed):
              "description": "Answer a simple factual question.", "connection_id": default},
         ],
     )
+    before = run.post_counts()
+    event = run.post("alice", CHAT, ROUTED)
+    route = run.expect_reply("alice", CHAT, event, run.routed, ROUTED)
+    require(route["addressed_by"] == "explicit" and route.get("case_key") == "causal_review",
+            "Chat did not preserve its direct attribution and separate use-case routing")
+    assert_questions(run.systemone, before[0], ROUTED, (("use_case", "choice"),))
+    before = run.post_counts()
+    event = run.post("alice", CHAT, "Remember this without asking.", invoke_agent=False)
+    run.expect_no_run("alice", CHAT, event, before, "explicit personal note")
+
+
+def exercise_space_routing(run, space, default, routed):
+    room = room_path(space)
+    before = run.post_counts()
+    event = run.post("alice", room, "Please analyze the causal chain. ROUTING_OPT_OUT")
+    run.expect_no_run("alice", room, event, before, "unaddressed while opted out")
     # In a Space, the opt-in is per Space and asks one Choice over its agents.
     run.call("alice", "PUT", f"/v1/spaces/{space}/prefs",
              body={"classify_unaddressed": True}, expect=(200,), read_json=True)
@@ -535,16 +547,6 @@ def exercise_routing(run, space, classifier, default, routed):
     def change_counts(counts, vendor):
         index = run.vendors.index(vendor)
         return counts[:index] + (counts[index] + 1,) + counts[index + 1:]
-
-    before = run.post_counts()
-    event = run.post("alice", CHAT, ROUTED)
-    route = run.expect_reply("alice", CHAT, event, run.routed, ROUTED)
-    require(route["addressed_by"] == "explicit" and route.get("case_key") == "causal_review",
-            "Chat did not preserve its direct attribution and separate use-case routing")
-    assert_questions(run.systemone, before[0], ROUTED, use_case)
-    before = run.post_counts()
-    event = run.post("alice", CHAT, "Remember this without asking.", invoke_agent=False)
-    run.expect_no_run("alice", CHAT, event, before, "explicit personal note")
 
     before = run.post_counts()
     event = run.post("alice", room, HUMAN)
@@ -732,6 +734,9 @@ def intelligence(server, connector, timeout):
         run.call("bob", "POST", f"{provider_path(embedding)}/device-token", body={}, expect=(404,),
                  read_json=True, label="borrowing a typed device does not grant its credential")
         configure_routing(run, "bob", embedding_id=embedding, classifier_id=bob_classifier)
+        # Run Chat first. The private note the search exercise seeds is
+        # deliberately forbidden in its vendor ledger, even as history.
+        exercise_chat(run, classifier, default, routed)
         exercise_search(run, space, stranger)
         share(run, embedding, "personal", capability="embeddings")
         before = run.post_counts()
@@ -740,7 +745,7 @@ def intelligence(server, connector, timeout):
         other = create_space(run.call, "bob", "Outside sharing fixture")
         exercise_sharing(run, shared, space, other)
         exercise_subscription_preset(run)
-        exercise_routing(run, space, classifier, default, routed)
+        exercise_space_routing(run, space, default, routed)
         run.finish()
     print("PASS: capability discovery, borrowed endpoint, direct Chat and Space classification, "
           "use-case routing, device embeddings, semantic rerank and privacy.")
