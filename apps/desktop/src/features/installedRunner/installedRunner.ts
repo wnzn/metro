@@ -184,7 +184,10 @@ onSpaceRunnerObserved((sid, runner, allowFolderAdd) => {
   const id = ownedInstalledRunner()?.id;
   if (!id || installedRunner()?.runner?.id !== id || !SPACE_ID_RE.test(sid)) return;
   const space = spaces().find((s) => s.id === sid && s.role === "owner");
-  if (!space || runner?.kind !== "registered" || runner.id !== id || runner.visibility !== "personal") {
+  // The list's cached role is not proof. Only this exact reply can supply
+  // an owner-only revision; a member or an old server can still report status.
+  if (!space || runner?.kind !== "registered" || runner.id !== id || runner.visibility !== "personal" ||
+      !runner.assignmentRevision) {
     removeFolder(sid);
   } else if (allowFolderAdd && !runnerSpaces().some((s) => s.id === sid)) {
     runnerSpaces.set([...runnerSpaces(), { id: sid, name: space.name }]);

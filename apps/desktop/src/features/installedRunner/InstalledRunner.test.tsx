@@ -99,6 +99,55 @@ const text = (app: App) => app.texts().join(" | ");
 const posts = (t: ReturnType<typeof bridgeWithRunner>) => t.log.filter((l) => l.method === "POST");
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+for (const variant of ["member", "unversioned"] as const) {
+  test(`a fresh ${variant} assignment cannot certify an installed folder`, async () => {
+    const f = world();
+    const mine = f.addRunner("This PC", "personal", "alice");
+    f.addSpace("target", "Target", "alice");
+    f.addSpace("valid", "Valid sibling", "alice");
+    f.addSpace("partial", "Unreadable sibling", "alice");
+    f.state.attached.set("target", mine.id);
+    const target = f.state.spaces.get("target")!;
+    const original = f.network[`GET ${BASE}/v1/*`]!;
+    let unproven = false;
+    let partial = false;
+    f.network[`GET ${BASE}/v1/*`] = (req) => {
+      const path = new URL(req.url).pathname;
+      const reply = original(req) as { status: number; body: Record<string, unknown> };
+      if (partial && path === "/v1/spaces/partial/runner") return { status: 503, body: {} };
+      if (unproven && path === "/v1/spaces/target/runner") {
+        if (variant === "member") return reply; // Generated while the caller is actually a member.
+        const { assignment_revision: _revision, ...body } = reply.body;
+        return { ...reply, body };
+      }
+      return reply;
+    };
+    const t = bridgeWithRunner(f, mine.id, "This PC");
+    const app = await openWith(f, t, true);
+    await signInToRunners(app, "alice");
+    await app.waitFor("id:installed-runner-space:target");
+    await app.press("id:settings-close");
+    if (variant === "member") target.owner = "bob"; // The local Space list still says owner.
+    unproven = true;
+    partial = true;
+    f.state.attached.set("valid", mine.id);
+    await openRunners(app);
+    await app.waitFor("id:installed-runner-space:valid");
+    expect(app.shows("id:installed-runner-space:target")).toBe(false);
+    expect(app.shows("id:installed-runner-folder:target")).toBe(false);
+    expect(app.shows("id:installed-runner-space:partial")).toBe(false);
+
+    // When owner proof returns the target is admitted, even though another
+    // row of that same folder snapshot still fails.
+    await app.press("id:settings-close");
+    unproven = false;
+    target.owner = "alice";
+    await openRunners(app);
+    await app.waitFor("id:installed-runner-space:target");
+    expect(app.shows("id:installed-runner-space:valid")).toBe(true);
+  });
+}
+
 test("shows the installer's runner, read-only tools and how to attach; opening only reads", async () => {
   const f = world();
   f.addSpace("solo", "Solo", "alice");
