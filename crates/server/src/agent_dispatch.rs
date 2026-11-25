@@ -141,8 +141,11 @@ pub async fn plan(
                         {
                             Ok(t) => push(&mut plan.targets, t),
                             Err(why) => {
-                                // Keep the existing room error without revealing
-                                // changes to the sender's access or connection.
+                                // The room reads one category; the sender
+                                // alone gets the reason.
+                                if plan.addressing_note.is_none() {
+                                    plan.addressing_note = Some(why.into());
+                                }
                                 let why = why.shared();
                                 plan.errors.push(format!(
                                     "Your classifier could not choose an agent for this message: \

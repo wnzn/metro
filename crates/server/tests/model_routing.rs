@@ -288,6 +288,7 @@ impl RoutingBackend for Backend {
                     api_key: String::new(),
                 }),
                 max_tokens: None,
+                config_rev: None,
             })
         })
     }
@@ -1765,15 +1766,29 @@ async fn the_classifier_picks_among_agents_only_for_the_sender_who_opted_in() {
         .await;
     assert_eq!(started["agent"]["handle"], "agent");
     assert!(started["pick"].as_str().unwrap().contains("unsure"));
-    // A failed or malformed decision runs nothing for @agent, visibly.
-    for (text, reason) in [
-        ("@agent [err] x", "the System One call failed"),
-        ("@agent [busy] x", "the System One call failed"),
-        ("@agent [ghost] x", "System One's answer was malformed"),
+    // A failed or malformed decision runs nothing for @agent, visibly. The
+    // room reads one category; only the sender learns which failure.
+    let mut seen_by_bob = Vec::new();
+    for (text, private) in [
+        ("@agent [err] x", "unreachable"),
+        ("@agent [busy] x", "unreachable"),
+        ("@agent [ghost] x", "invalid_answer"),
+        ("@agent [bad] x", "invalid_answer"),
+        ("@agent [timeout] x", "timeout"),
     ] {
+        let reason = "the System One call failed";
         let calls = h.model_calls().len();
         let e = h.say("alice", Some(&sid), json!({"text": text})).await;
-        assert_eq!(e.get("addressing_note"), Some(&Value::Null));
+        assert_eq!(
+            e["addressing_note"],
+            json!({"kind": "classification_failed", "reason": private}),
+            "{text}"
+        );
+        seen_by_bob.push(
+            h.answer_after("bob", Some(&sid), e["id"].as_i64().unwrap())
+                .await["text"]
+                .clone(),
+        );
         let a = h
             .answer_after("alice", Some(&sid), e["id"].as_i64().unwrap())
             .await;
@@ -1799,6 +1814,10 @@ async fn the_classifier_picks_among_agents_only_for_the_sender_who_opted_in() {
                 .all(|e| e.get("addressing_note").is_none())
         );
     }
+    assert!(
+        seen_by_bob.iter().all(|t| t == &seen_by_bob[0]),
+        "{seen_by_bob:?}"
+    );
     // A specific handle skips classification.
     let before = h.fake.calls();
     let e = h
@@ -1875,11 +1894,17 @@ async fn the_classifier_picks_among_agents_only_for_the_sender_who_opted_in() {
             json!({"text": "@agent access changed"}),
         )
         .await;
-    assert_eq!(e.get("addressing_note"), Some(&Value::Null));
+    assert_eq!(
+        e["addressing_note"],
+        json!({"kind": "classification_failed", "reason": "not_allowed"})
+    );
     let err = h
         .answer_after("bob", Some(&sid), e["id"].as_i64().unwrap())
         .await;
     assert_eq!(err["kind"], "error");
+    // Revocation reads exactly like an upstream failure, a timeout or a
+    // malformed answer.
+    assert_eq!(err["text"], seen_by_bob[0]);
     assert!(
         err["text"]
             .as_str()

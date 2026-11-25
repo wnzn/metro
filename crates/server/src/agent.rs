@@ -133,6 +133,8 @@ struct RunModel {
     model: DynModel<Completion>,
     max_tokens: Option<u64>,
     params: Option<serde_json::Value>,
+    /// The connection's `config_rev` the model was built from.
+    config_rev: Option<i64>,
 }
 
 impl RunModel {
@@ -191,6 +193,7 @@ async fn route_model(
                         model: selected.model,
                         max_tokens: selected.max_tokens,
                         params: selection.and_then(|s| s.params(&selected.provider_id)),
+                        config_rev: selected.config_rev,
                     })
                 }
                 Err(e) => Err(route.refused(space, &e)),
@@ -205,6 +208,7 @@ async fn route_model(
                     model: selected.model,
                     max_tokens: selected.max_tokens,
                     params: None,
+                    config_rev: selected.config_rev,
                 })
             }
             Ok(None) => match &state.config.model {
@@ -218,6 +222,7 @@ async fn route_model(
                         model: model(config).into(),
                         max_tokens: None,
                         params: None,
+                        config_rev: None,
                     })
                 }
                 None => Err(Refusal::shown(NO_MODEL)),
@@ -321,23 +326,87 @@ async fn cancelled(mut cancel: watch::Receiver<bool>) {
 
 enum Outcome {
     Completed(String),
-    /// The full text, the allowlisted monitoring code, and whether the model
-    /// or its connection failed (see [`model_failure`]).
-    Failed(String, Code, bool),
+    /// The run ended for its own reasons (its limits, a tool, its history):
+    /// the text, and the allowlisted monitoring code.
+    Failed(String, Code),
+    /// The model or the connection serving it failed.
+    ModelFailed(ModelFailure),
     Cancelled,
 }
 
-/// Whether a run failed because of its model or the connection serving it:
-/// a provider error, a transport error, or a refused request (a revoked
-/// share, a lost membership, a device's withdrawn access), as Rig reports
-/// them, typed or relayed. Their text can name the initiator's endpoint,
-/// provider, account or access, so a Space room never shows it. A tool's own
-/// failure and the run's limits are not about the connection.
-fn model_failure(e: &PromptError) -> bool {
-    match e {
-        PromptError::Provider(_) => true,
-        PromptError::Report(report) => !matches!(report.kind, rig_core::ErrorKind::Tool(_)),
-        _ => false,
+/// A run that failed because of its model or the connection serving it: a
+/// provider error, a transport error, or a request Metro refused (a revoked
+/// share, a lost membership, a changed connection), typed or relayed. The
+/// provider's own text is never kept: it can name an endpoint, an account
+/// or echo a credential, whoever owns the connection (the person, someone
+/// who shared it, or the operator). Only its allowlisted category and HTTP
+/// status are.
+#[derive(Clone, Copy, Debug)]
+struct ModelFailure {
+    code: Code,
+    status: Option<u16>,
+}
+
+impl ModelFailure {
+    /// `None` when `e` is not about the model or its connection (a tool's
+    /// own failure, the run's limits).
+    fn of(e: &PromptError) -> Option<Self> {
+        let status = match e {
+            PromptError::Provider(p) => rig_core::ErrorReport::from(p).http_status,
+            PromptError::Report(r) if !matches!(r.kind, rig_core::ErrorKind::Tool(_)) => {
+                r.http_status
+            }
+            _ => return None,
+        };
+        Some(Self {
+            code: failure_code(e),
+            status,
+        })
+    }
+
+    /// The failure's category and status. Never the provider's text.
+    fn text(&self) -> String {
+        match self.status {
+            Some(status) => format!("The agent failed. {} (HTTP {status})", self.code.summary()),
+            None => format!("The agent failed. {}", self.code.summary()),
+        }
+    }
+}
+
+/// Why the person whose run failed can no longer use its model as it was
+/// built, if that is why: rechecked as a new turn would be (Rig reports
+/// Metro's own refusal of a request only as text, so the reason is never
+/// parsed from it). A grant that is gone, or a connection whose endpoint,
+/// credential or model changed since the model was built (`built_rev`).
+/// `(reason, message)` for the person alone.
+async fn refusal_after(
+    state: &AppState,
+    user_id: &str,
+    space: Option<&str>,
+    route: &Route,
+    built_rev: Option<i64>,
+) -> Option<(String, String)> {
+    use crate::model_routing::AddressingNote;
+    let mut recheck = route.clone();
+    match route_model(state, user_id, space, &mut recheck).await {
+        Err(Refusal {
+            note:
+                Some(AddressingNote::ModelUnavailable {
+                    reason, message, ..
+                }),
+            ..
+        }) => Some((reason.to_owned(), format!("The agent stopped. {message}"))),
+        Err(refusal) => Some((
+            "not_allowed".to_owned(),
+            format!("The agent stopped. {}", refusal.private()),
+        )),
+        Ok(now) if built_rev.is_some() && now.config_rev != built_rev => Some((
+            "connection_changed".to_owned(),
+            "The agent stopped: its model connection changed during this run (its endpoint, \
+             key or model). Ask again to use the connection as it is now."
+                .to_owned(),
+        )),
+        Ok(_) => None,
     }
 }
 
@@ -410,6 +479,7 @@ async fn drive(
     prompt: Message,
     history: Vec<Message>,
     cancel: Option<watch::Receiver<bool>>,
+    connection: Option<&str>,
 ) -> Outcome {
     let limits = &state.config.limits;
     let run = agent
@@ -425,18 +495,26 @@ async fn drive(
     tokio::select! {
         result = tokio::time::timeout(limits.agent_timeout, run) => match result {
             Ok(Ok(response)) => Outcome::Completed(response.output()),
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "agent run failed");
-                Outcome::Failed(
-                    truncate(&format!("The agent failed: {e}"), 2_000),
-                    failure_code(&e),
-                    model_failure(&e),
-                )
-            }
+            // Logged as allowlisted fields only, never the error's text.
+            Ok(Err(e)) => match ModelFailure::of(&e) {
+                Some(failure) => {
+                    tracing::warn!(
+                        code = failure.code.code(),
+                        status = ?failure.status,
+                        connection = ?connection,
+                        "agent run failed: model"
+                    );
+                    Outcome::ModelFailed(failure)
+                }
+                None => {
+                    let code = failure_code(&e);
+                    tracing::warn!(code = code.code(), connection = ?connection, "agent run failed");
+                    Outcome::Failed(truncate(&format!("The agent failed: {e}"), 2_000), code)
+                }
+            },
             Err(_) => Outcome::Failed(
                 "The agent took too long and was stopped.".to_owned(),
                 Code::AgentTimedOut,
-                false,
             ),
         },
         () = cancel => Outcome::Cancelled,
@@ -631,50 +709,17 @@ pub async fn start_room_run(
     Ok(info)
 }
 
-/// The text of a model failure for the person whose run it was. On a
-/// connection someone shared with them, the provider's own text can name
-/// the owner's endpoint, account or key, which a borrower must never see:
-/// they get the failure's fixed category instead.
-async fn model_error_text(
-    state: &AppState,
-    user_id: &str,
-    route: &Route,
-    text: String,
-    code: Code,
-) -> String {
-    let Some(id) = route.note.connection_id.clone() else {
-        // The person's own default, or the operator's model.
-        return text;
-    };
-    let user = user_id.to_owned();
-    let owned = state
-        .db
-        .call(move |db| Ok(crate::providers::store::get(&db.lock(), &user, &id)?.is_some()))
-        .await
-        .unwrap_or(false);
-    if owned {
-        text
-    } else {
-        format!(
-            "The agent failed: {} The model connection is shared with you, so its provider's \
-             details aren't shown.",
-            code.summary()
-        )
-    }
-}
-
 /// Why `initiator`'s run in `space_id` on `route` failed, for them alone:
-/// rechecked as a new turn would be (membership, then the route's
-/// connection), so a lost grant says what to fix; otherwise the model's own
-/// error, `text`.
+/// their lost membership, a refusal or change of the connection, or the
+/// failure's category.
 async fn private_failure(
     state: &AppState,
     space_id: &str,
     initiator: &Author,
     route: &Route,
-    text: String,
+    built_rev: Option<i64>,
+    failure: ModelFailure,
 ) -> crate::orchestration::RunFailure {
-    use crate::model_routing::AddressingNote;
     use crate::orchestration::RunFailure;
     if ensure_member(state, space_id, initiator).await.is_err() {
         return RunFailure {
@@ -683,25 +728,11 @@ async fn private_failure(
         };
     }
     let user_id = initiator.id.clone().unwrap_or_default();
-    let mut recheck = route.clone();
-    match route_model(state, &user_id, Some(space_id), &mut recheck).await {
-        Err(Refusal {
-            note:
-                Some(AddressingNote::ModelUnavailable {
-                    reason, message, ..
-                }),
-            ..
-        }) => RunFailure {
-            reason: reason.to_owned(),
-            message: format!("The agent stopped. {message}"),
-        },
-        Err(refusal) => RunFailure {
-            reason: "not_allowed".to_owned(),
-            message: format!("The agent stopped. {}", refusal.private()),
-        },
-        Ok(_) => RunFailure {
+    match refusal_after(state, &user_id, Some(space_id), route, built_rev).await {
+        Some((reason, message)) => RunFailure { reason, message },
+        None => RunFailure {
             reason: "model_error".to_owned(),
-            message: text,
+            message: failure.text(),
         },
     }
 }
@@ -720,6 +751,7 @@ async fn execute_room_run(
     cancel: watch::Receiver<bool>,
     agent: &SpaceAgent,
 ) {
+    let built_rev = model.config_rev;
     let limits = state.config.limits.clone();
     let loaded = {
         let (space, room_id, before, n) = (
@@ -745,7 +777,6 @@ async fn execute_room_run(
             Outcome::Failed(
                 "The agent could not read the room history.".to_owned(),
                 Code::AgentHistoryUnavailable,
-                false,
             )
         }
         Ok((earlier, paired)) => {
@@ -818,6 +849,7 @@ async fn execute_room_run(
                 prompt,
                 history(&earlier, &key),
                 Some(cancel),
+                route.note.connection_id.as_deref(),
             )
             .await
         }
@@ -829,6 +861,7 @@ async fn execute_room_run(
         .get(run_id)
         .is_some_and(|r| r.status == RunStatus::Cancelled);
     let outcome = if stopped { Outcome::Cancelled } else { outcome };
+    let mut failure = None;
     let (status, posted) = match outcome {
         Outcome::Completed(text) => match final_reply(text, reacted.load(Ordering::SeqCst)) {
             Reply::Text(text) => (
@@ -837,26 +870,31 @@ async fn execute_room_run(
             ),
             Reply::ReactionOnly => (RunStatus::Completed, None),
         },
-        Outcome::Failed(text, code, false) => {
+        Outcome::Failed(text, code) => {
             // Space-scoped, owner-readable; the room keeps the full text.
             state.monitor_space(space_id, code).await;
             (RunStatus::Failed, Some((kind::ERROR, text)))
         }
-        Outcome::Failed(text, code, true) => {
-            state.monitor_space(space_id, code).await;
-            let user_id = initiator.id.clone().unwrap_or_default();
-            let text = model_error_text(state, &user_id, route, text, code).await;
-            let failure = private_failure(state, space_id, initiator, route, text).await;
-            state.runs.set_failure(run_id, failure);
+        // One public category for every model failure, in the room and in
+        // the Space owner's monitoring: neither can tell a revoked share
+        // from an upstream failure. The initiator gets the reason.
+        Outcome::ModelFailed(model) => {
+            state.monitor_space(space_id, Code::ProviderFailed).await;
+            failure =
+                Some(private_failure(state, space_id, initiator, route, built_rev, model).await);
             (
                 RunStatus::Failed,
                 Some((kind::ERROR, MODEL_STOPPED_IN_ROOM.to_owned())),
             )
         }
-        Outcome::Cancelled => (
-            RunStatus::Cancelled,
-            Some((kind::STATUS, format!("Agent run {run_id} was cancelled."))),
-        ),
+        Outcome::Cancelled => (RunStatus::Cancelled, None),
+    };
+    // The status and its private failure are committed together; a stop
+    // that won in the meantime keeps the run cancelled, with no failure.
+    let status = state.runs.finish_with(run_id, status, failure);
+    let posted = match status {
+        RunStatus::Cancelled => Some((kind::STATUS, format!("Agent run {run_id} was cancelled."))),
+        _ => posted,
     };
     if let Some((event_kind, text)) = &posted {
         state
@@ -885,7 +923,6 @@ async fn execute_room_run(
             Some(&turn.at(phase)),
         )
         .await;
-    state.runs.finish(run_id, status);
     let text = posted
         .map(|(_, text)| text)
         .unwrap_or_else(|| "(reacted to the task without a reply)".to_owned());
@@ -1366,6 +1403,7 @@ async fn execute_personal_run(
     model: RunModel,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
+    let built_rev = model.config_rev;
     let limits = state.config.limits.clone();
     let agent_author = Author::server(actor::AGENT);
     let turn = Activity::chat();
@@ -1454,6 +1492,7 @@ async fn execute_personal_run(
         prompt,
         history(&earlier, &key),
         None,
+        route.note.connection_id.as_deref(),
     )
     .await
     {
@@ -1464,11 +1503,16 @@ async fn execute_personal_run(
             activity::COMPLETED
         }
         // Only the person whose Chat this is can read it, and only the code.
-        Outcome::Failed(text, code, model) => {
+        Outcome::Failed(text, code) => {
             state.monitor_personal(&user_id, code).await;
-            let text = match model {
-                true => model_error_text(&state, &user_id, &route, text, code).await,
-                false => text,
+            tagged(kind::ERROR, text).await;
+            activity::FAILED
+        }
+        Outcome::ModelFailed(failure) => {
+            state.monitor_personal(&user_id, failure.code).await;
+            let text = match refusal_after(&state, &user_id, None, &route, built_rev).await {
+                Some((_, message)) => message,
+                None => failure.text(),
             };
             tagged(kind::ERROR, text).await;
             activity::FAILED

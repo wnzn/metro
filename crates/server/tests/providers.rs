@@ -1451,3 +1451,279 @@ async fn an_explicitly_chosen_connection_must_be_the_senders_own() {
     );
     assert_eq!(bob_model.chats()[0].body["model"], "second-model");
 }
+
+/// A chat endpoint that lists one model and answers a run's first request
+/// with a tool call, held until the test opens its gate.
+struct GatedModel {
+    base_url: String,
+    requests: Arc<Mutex<Vec<Value>>>,
+    gate: Arc<tokio::sync::RwLock<()>>,
+}
+
+impl GatedModel {
+    async fn start() -> Self {
+        let requests: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let gate = Arc::new(tokio::sync::RwLock::new(()));
+        let (seen, held) = (requests.clone(), gate.clone());
+        let app = axum::Router::new()
+            .route(
+                "/v1/models",
+                axum::routing::get(|| async {
+                    Json(json!({"object": "list", "data": [
+                        {"id": "am", "object": "model", "created": 0, "owned_by": "x"}]}))
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(move |Json(body): Json<Value>| {
+                    let (seen, held) = (seen.clone(), held.clone());
+                    async move {
+                        seen.lock().unwrap().push(body.clone());
+                        let replied = body["messages"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|m| m["role"] == "tool");
+                        let message = if replied {
+                            json!({"role": "assistant", "content": "done"})
+                        } else {
+                            let _open = held.read().await;
+                            json!({"role": "assistant", "content": null, "tool_calls": [{
+                                "id": "call_1", "type": "function",
+                                "function": {"name": body["tools"][0]["function"]["name"],
+                                             "arguments": "{}"}}]})
+                        };
+                        let finish = if replied { "stop" } else { "tool_calls" };
+                        Json(json!({
+                            "id": "c", "object": "chat.completion", "created": 0, "model": "am",
+                            "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Self {
+            base_url,
+            requests,
+            gate,
+        }
+    }
+
+    fn chat_requests(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+}
+
+#[tokio::test]
+async fn a_run_stops_at_its_next_request_after_its_endpoint_changes() {
+    let (a, b) = (GatedModel::start().await, GatedModel::start().await);
+    let s = Server::start(
+        None,
+        Db::open_in_memory().unwrap(),
+        Some(master(5)),
+        vec![a.base_url.clone(), b.base_url.clone()],
+    )
+    .await;
+    let c = s
+        .connect(
+            ALICE,
+            json!({"name": "a", "provider_id": "custom", "base_url": a.base_url,
+                   "api_key": "sk-alice-rotating", "model": "am"}),
+        )
+        .await;
+    let held = a.gate.write().await;
+    let (status, body) = s
+        .post(
+            ALICE,
+            "/v1/chat/messages",
+            json!({"text": "two turns", "invoke_agent": true}),
+        )
+        .await;
+    assert!(status.is_success(), "{body}");
+    wait_until(|| a.chat_requests() == 1).await;
+    // Between the run's two model requests, the owner moves the connection.
+    let (status, moved) = s
+        .patch(
+            ALICE,
+            &format!("/v1/providers/{}", c["id"].as_str().unwrap()),
+            json!({"base_url": b.base_url}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{moved}");
+    drop(held);
+    let mut answer = Value::Null;
+    for _ in 0..400 {
+        let (_, events) = s.get(ALICE, "/v1/chat/events").await;
+        if let Some(e) = events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| ["agent", "error"].contains(&e["kind"].as_str().unwrap_or("")))
+        {
+            answer = e.clone();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(answer["kind"], "error", "{answer}");
+    assert!(
+        answer["text"]
+            .as_str()
+            .unwrap()
+            .contains("model connection changed during this run"),
+        "{answer}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        a.chat_requests(),
+        1,
+        "the retired endpoint got no second request"
+    );
+    assert_eq!(
+        b.chat_requests(),
+        0,
+        "the run never switched endpoints mid-run"
+    );
+}
+
+/// Text only a provider's own error carries.
+const SENTINEL: &str = "SENTINEL-provider-body-51c0de";
+
+/// A chat endpoint that always fails with a body carrying [`SENTINEL`] and
+/// the credential it was sent, as some providers echo it.
+async fn failing_endpoint() -> String {
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        post(|headers: HeaderMap| async move {
+            let echoed = headers
+                .get("authorization")
+                .map(|v| v.to_str().unwrap().to_owned())
+                .unwrap_or_default();
+            (
+                AxumStatus::UNAUTHORIZED,
+                Json(json!({"error": {"message": format!("{SENTINEL}: bad key {echoed}")}})),
+            )
+                .into_response()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    base_url
+}
+
+/// Everything Metro logs while it is alive, on this thread.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn provider_error_text_reaches_no_run_detail_chat_or_log() {
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(tracing_subscriber::EnvFilter::new("metro_server=trace"))
+        .with_writer(move || writer.clone())
+        .finish();
+    // A current-thread runtime: every task, the server's included, logs here.
+    let _logs = tracing::subscriber::set_default(subscriber);
+
+    let failing = failing_endpoint().await;
+    let operator_key = "sk-operator-secret-key-42";
+    let own_key = "sk-alice-own-secret-key-42";
+    let s = Server::start(
+        Some(ModelConfig {
+            base_url: failing.clone(),
+            model: "env-model".into(),
+            api_key: operator_key.into(),
+        }),
+        Db::open_in_memory().unwrap(),
+        Some(master(5)),
+        vec![failing.clone()],
+    )
+    .await;
+    // Alice uses her own connection; Bob, who has none, the operator's model.
+    s.connect(
+        ALICE,
+        json!({"name": "own", "provider_id": "custom", "base_url": failing,
+               "api_key": own_key, "model": "own-model"}),
+    )
+    .await;
+    let (status, space) = s.post(ALICE, "/v1/spaces", json!({"name": "logs"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{space}");
+    let sid = space["id"].as_str().unwrap().to_owned();
+    let (status, _) = s
+        .post(
+            ALICE,
+            &format!("/v1/spaces/{sid}/members"),
+            json!({"user_id": "bob"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let leaks = [SENTINEL, operator_key, own_key, failing.as_str()];
+    for token in [ALICE, BOB] {
+        // Personal Chat: the persisted error.
+        let error = s.chat_and_wait(token, &format!("{token} asks")).await;
+        assert_eq!(error["kind"], "error", "{error}");
+        let text = error["text"].as_str().unwrap();
+        assert!(text.contains("HTTP 401"), "{text}");
+        for leak in leaks {
+            assert!(!text.contains(leak), "{token} chat: {text}");
+        }
+        // A Space run: the initiator's private failure.
+        let (status, sent) = s
+            .post(
+                token,
+                &format!("/v1/spaces/{sid}/rooms/lobby/messages"),
+                json!({"text": format!("@agent {token} in space")}),
+            )
+            .await;
+        assert!(status.is_success(), "{sent}");
+        let mut failure = Value::Null;
+        for _ in 0..400 {
+            let (_, runs) = s.get(token, "/v1/runs").await;
+            if let Some(run) =
+                runs["runs"].as_array().unwrap().iter().find(|r| {
+                    r["actor"] == token.trim_end_matches("-token") && r["status"] == "failed"
+                })
+            {
+                failure = run["failure"].clone();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(failure["reason"], "model_error", "{failure}");
+        let message = failure["message"].as_str().unwrap();
+        assert!(
+            message.contains("rejected the connection's credentials"),
+            "{message}"
+        );
+        for leak in leaks {
+            assert!(!message.contains(leak), "{token} run: {message}");
+        }
+    }
+
+    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("agent run failed"),
+        "the failures were logged"
+    );
+    assert!(logs.contains("auth_rejected"), "{logs}");
+    for leak in leaks {
+        assert!(!logs.contains(leak), "a log line carries {leak}:\n{logs}");
+    }
+}

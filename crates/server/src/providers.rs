@@ -542,6 +542,9 @@ pub struct SelectedModel {
     /// An output cap the run must set: Anthropic's Messages API requires
     /// `max_tokens`, and Rig knows the limit only for catalogued models.
     pub max_tokens: Option<u64>,
+    /// The connection's `config_rev` this model was built from (its
+    /// endpoint, credential and model), when Metro tracks one.
+    pub config_rev: Option<i64>,
 }
 
 impl std::fmt::Debug for SelectedModel {
@@ -700,6 +703,7 @@ fn grant_for(state: &AppState, caller: &str, space: Option<&str>, a: &Authorized
         target: a.row.id.clone(),
         turn_check: None,
         slots,
+        config_rev: None,
     })
 }
 
@@ -737,6 +741,7 @@ fn build_model_for_turn(
             target: authorized.row.id.clone(),
             turn_check: None,
             slots: None,
+            config_rev: None,
         });
         grant.turn_check = Some(guard::TurnCheck {
             state: state.clone(),
@@ -757,12 +762,24 @@ fn build_model_for_turn(
         }
         _ => None,
     };
-    let http = || match &grant {
-        None => state.providers.http(),
-        Some(grant) => DynHttpClient::new(GuardedHttp {
+    // Every server request, the owner's own included, is checked against
+    // the connection as it was when this model was built.
+    let http = || {
+        let mut grant = grant.clone().unwrap_or_else(|| Grant {
+            db: state.db.clone(),
+            caller: caller.to_owned(),
+            space: space.map(str::to_owned),
+            chosen: chosen.clone(),
+            target: row.id.clone(),
+            turn_check: None,
+            slots: None,
+            config_rev: None,
+        });
+        grant.config_rev = Some(row.config_rev);
+        DynHttpClient::new(GuardedHttp {
             inner: state.providers.http(),
-            grant: grant.clone(),
-        }),
+            grant,
+        })
     };
     let model = match entry.adapter {
         // Recheck an explicit model or preset before each relay request and
@@ -824,6 +841,7 @@ fn build_model_for_turn(
         model_id: row.model,
         model,
         max_tokens,
+        config_rev: Some(row.config_rev),
     })
 }
 

@@ -777,7 +777,7 @@ impl From<String> for Refusal {
 }
 
 /// A coarse, stable code for why a connection can't be used.
-fn use_reason(error: &UseError) -> &'static str {
+pub(crate) fn use_reason(error: &UseError) -> &'static str {
     match error {
         UseError::NotFound
         | UseError::Revoked
@@ -836,14 +836,13 @@ impl std::fmt::Display for DecisionFailure {
 }
 
 impl DecisionFailure {
-    /// The failure as other members of a Space room may see it: a lost
-    /// grant, a missing connection or a full queue reads like any other
-    /// failed call, so the room never learns about the sender's access.
+    /// The failure as other members of a Space room may see it: one public
+    /// category for every failure of this stage. A lost grant, a missing
+    /// connection, a full queue, a timeout and a malformed answer all read
+    /// alike, so the room never learns about the sender's access; the
+    /// sender's own note carries the distinction.
     pub fn shared(self) -> Self {
-        match self {
-            Self::NotAllowed | Self::Busy | Self::Unreachable => Self::Unreachable,
-            other => other,
-        }
+        Self::Unreachable
     }
 
     fn upstream(error: &anyhow::Error) -> Self {

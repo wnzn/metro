@@ -29,6 +29,9 @@ const ALICE: &str = "alice-token";
 const BOB: &str = "bob-token";
 const CAROL: &str = "carol-token";
 const ALICE_KEY: &str = "sk-alice-very-secret-0123456789";
+/// Text only a provider's own error carries: it must never reach a room, a
+/// run's private failure, a personal Chat or a log line.
+const SENTINEL: &str = "SENTINEL-provider-text-7f3a91";
 
 struct FakeAuth(HashMap<String, UserIdentity>);
 
@@ -183,15 +186,23 @@ impl Fixture {
                             }))
                             .into_response();
                         }
-                        // An upstream failure whose text names the owner's
-                        // account and endpoint.
-                        if asked.contains("[fail]") && !asked.contains("[tool]") {
+                        // An upstream failure whose text names the account
+                        // and echoes the credential it was sent.
+                        if asked.contains("[fail]") && !asked.contains("[tool]") && !asked.contains("[garbage]") {
+                            let echoed = h
+                                .get("authorization")
+                                .map(|v| v.to_str().unwrap().to_owned())
+                                .unwrap_or_default();
                             return (
                                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                                 Json(json!({"error": {"message":
-                                    "quota exceeded for org-alice-billing"}})),
+                                    format!("{SENTINEL}: quota exceeded; you sent {echoed}")}})),
                             )
                                 .into_response();
+                        }
+                        // A malformed reply.
+                        if asked.contains("[garbage]") && !asked.contains("[tool]") {
+                            return format!("not json {SENTINEL}").into_response();
                         }
                         Json(json!({
                             "id": "chatcmpl-1", "object": "chat.completion", "created": 0,
@@ -1466,6 +1477,11 @@ async fn a_share_revoked_mid_run_reads_like_an_upstream_failure_to_the_room() {
         .await;
     assert!(status.is_success(), "{failed}");
     let upstream = error_after(&s, CAROL, &sid, failed["id"].as_i64().unwrap()).await;
+    let (status, garbled) = s
+        .post(BOB, &lobby, json!({"text": "@agent [garbage] third"}))
+        .await;
+    assert!(status.is_success(), "{garbled}");
+    let malformed = error_after(&s, CAROL, &sid, garbled["id"].as_i64().unwrap()).await;
 
     // The share ends between the run's two model requests.
     let held = s.fixture.gate.write().await;
@@ -1495,8 +1511,11 @@ async fn a_share_revoked_mid_run_reads_like_an_upstream_failure_to_the_room() {
         .count();
     assert_eq!(requests, 1, "the request after the revoke was never sent");
 
-    // Carol (and Alice, the Space owner) can't tell the two apart.
-    assert_eq!(upstream["text"], revoked["text"]);
+    // Carol (and Alice, the Space owner) can't tell the three apart: every
+    // error event and its fields read the same.
+    let fields = |e: &Value| (e["kind"].clone(), e["actor"].clone(), e["text"].clone());
+    assert_eq!(fields(&upstream), fields(&revoked));
+    assert_eq!(fields(&upstream), fields(&malformed));
     assert_eq!(
         upstream["text"],
         "The agent stopped: the sender's model failed or is no longer available to this run."
@@ -1505,12 +1524,22 @@ async fn a_share_revoked_mid_run_reads_like_an_upstream_failure_to_the_room() {
         let (_, events) = s
             .get(token, &format!("/v1/spaces/{sid}/rooms/lobby/events"))
             .await;
+        let errors: Vec<&Value> = events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == "error")
+            .collect();
+        assert_eq!(errors.len(), 3, "{token}");
+        assert!(
+            errors.iter().all(|e| e["text"] == upstream["text"]),
+            "{token}"
+        );
         let transcript = events.to_string();
         for leak in [
             "has ended",
-            "org-alice-billing",
-            "The agent failed",
-            "500",
+            SENTINEL,
+            ALICE_KEY,
             s.fixture.base_url.as_str(),
             "not_allowed",
             "model_error",
@@ -1518,7 +1547,7 @@ async fn a_share_revoked_mid_run_reads_like_an_upstream_failure_to_the_room() {
             assert!(!transcript.contains(leak), "{token}: {leak}");
         }
         // Their run views carry no reason.
-        for task in ["[fail] first", "[tool] second"] {
+        for task in ["[fail] first", "[tool] second", "[garbage] third"] {
             let run = run_for(&s, token, task).await;
             assert_eq!(run["status"], "failed", "{run}");
             assert!(run.get("failure").is_none(), "{token}: {run}");
@@ -1530,19 +1559,39 @@ async fn a_share_revoked_mid_run_reads_like_an_upstream_failure_to_the_room() {
         }
     }
 
-    // Bob, who started both runs, learns each reason privately.
-    // The provider's own text is the owner's: a borrower gets its category.
-    let run = run_for(&s, BOB, "[fail] first").await;
-    assert_eq!(run["failure"]["reason"], "model_error", "{run}");
-    let message = run["failure"]["message"].as_str().unwrap();
-    assert!(
-        message.contains("server error") && message.contains("shared with you"),
-        "{message}"
-    );
-    assert!(
-        !message.contains("org-alice-billing") && !message.contains(&s.fixture.base_url),
-        "{message}"
-    );
+    // Alice owns the Space but started none of these runs: her monitoring
+    // view has one public code for all three.
+    let (status, monitoring) = s
+        .get(ALICE, &format!("/v1/monitoring/events?space_id={sid}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{monitoring}");
+    let codes: Vec<(String, String)> = monitoring["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["component"].as_str().unwrap().to_owned(),
+                e["code"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(codes, vec![("provider".to_owned(), "failed".to_owned()); 3]);
+
+    // Bob, who started the runs, learns each reason privately: Metro's own
+    // refusal, or the provider failure's category, never its text.
+    for (task, category) in [
+        ("[fail] first", "server error"),
+        ("[garbage] third", "reply"),
+    ] {
+        let run = run_for(&s, BOB, task).await;
+        assert_eq!(run["failure"]["reason"], "model_error", "{run}");
+        let message = run["failure"]["message"].as_str().unwrap();
+        assert!(message.contains(category), "{message}");
+        for leak in [SENTINEL, ALICE_KEY, s.fixture.base_url.as_str()] {
+            assert!(!message.contains(leak), "{message}");
+        }
+    }
     let run = run_for(&s, BOB, "[tool] second").await;
     assert_eq!(run["failure"]["reason"], "not_allowed", "{run}");
     let message = run["failure"]["message"].as_str().unwrap();
@@ -1605,14 +1654,13 @@ async fn a_borrowers_chat_never_shows_the_owners_provider_text() {
             panic!("no error");
         }
     };
+    // Neither the borrower's nor the owner's own Chat shows the provider's
+    // text (which echoes the key): its category and status only.
     let carol = ask(CAROL).await;
-    assert!(
-        carol.contains("server error") && carol.contains("shared with you"),
-        "{carol}"
+    assert_eq!(
+        carol,
+        "The agent failed. The model service reported a server error. (HTTP 500)"
     );
-    assert!(!carol.contains("org-alice-billing"), "{carol}");
-    assert!(!carol.contains(&s.fixture.base_url), "{carol}");
-    // The owner's own Chat keeps the provider's text.
     let (status, body) = s
         .put(
             ALICE,
@@ -1622,5 +1670,10 @@ async fn a_borrowers_chat_never_shows_the_owners_provider_text() {
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let alice = ask(ALICE).await;
-    assert!(alice.contains("org-alice-billing"), "{alice}");
+    assert_eq!(alice, carol);
+    for text in [&carol, &alice] {
+        for leak in [SENTINEL, ALICE_KEY, s.fixture.base_url.as_str()] {
+            assert!(!text.contains(leak), "{text}");
+        }
+    }
 }

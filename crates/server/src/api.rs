@@ -1118,10 +1118,10 @@ pub async fn list_runs(
     let spaces = db(&state, move |db| db.list_spaces(&user)).await?;
     let runs: Vec<_> = state
         .runs
-        .list()
+        .list_with_failures()
         .into_iter()
-        .filter(|r| spaces.iter().any(|s| s.id == r.space_id))
-        .map(|r| run_view(&state, &who, r))
+        .filter(|(r, _)| spaces.iter().any(|s| s.id == r.space_id))
+        .map(|(r, failure)| run_view(&who, r, failure))
         .collect::<ApiResult<_>>()?;
     Ok(Json(json!({"runs": runs})))
 }
@@ -1133,24 +1133,22 @@ pub async fn get_run(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let not_found = || ApiError::not_found("no such run");
-    let run = state.runs.get(&id).ok_or_else(not_found)?;
+    let (run, failure) = state.runs.get_with_failure(&id).ok_or_else(not_found)?;
     member_of(&state, &run.space_id, &who)
         .await
         .map_err(|_| not_found())?;
-    Ok(Json(run_view(&state, &who, run)?))
+    Ok(Json(run_view(&who, run, failure)?))
 }
 
 /// A run as `who` sees it: with `failure`, the full reason it failed, only
 /// when `who` started it (the room showed a generic error); never for
 /// other members, including the Space owner.
 fn run_view(
-    state: &AppState,
     who: &Human,
     run: crate::orchestration::RunInfo,
+    failure: Option<crate::orchestration::RunFailure>,
 ) -> ApiResult<serde_json::Value> {
-    let failure = (run.actor == who.id)
-        .then(|| state.runs.failure(&run.id))
-        .flatten();
+    let failure = failure.filter(|_| run.actor == who.id);
     let mut view = serde_json::to_value(&run).map_err(|e| ApiError::internal(e.into()))?;
     if let Some(failure) = failure {
         view["failure"] =

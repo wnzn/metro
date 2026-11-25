@@ -55,6 +55,10 @@ pub struct Grant {
     pub(super) turn_check: Option<TurnCheck>,
     /// The in-flight cap of a borrowed connection; `None` for a preset.
     pub(crate) slots: Option<Arc<Semaphore>>,
+    /// The target's `config_rev` when the model was built: its endpoint,
+    /// credential and model. A request after any of them changed is
+    /// refused, so a run never keeps using a retired endpoint or key.
+    pub(crate) config_rev: Option<i64>,
 }
 
 /// Additional checks for a client-selected model, including owned connections.
@@ -116,12 +120,13 @@ impl Grant {
                 }
             }
         };
-        let (caller, space, chosen, target, turn_check) = (
+        let (caller, space, chosen, target, turn_check, config_rev) = (
             self.caller.clone(),
             self.space.clone(),
             self.chosen.clone(),
             self.target.clone(),
             self.turn_check.clone(),
+            self.config_rev,
         );
         let still = self
             .db
@@ -137,6 +142,9 @@ impl Grant {
                     .and_then(|a| {
                         if a.row.id != target {
                             return Ok(false);
+                        }
+                        if config_rev.is_some_and(|rev| rev != a.row.config_rev) {
+                            return Err(UseError::TurnChanged);
                         }
                         if let Some(check) = turn_check {
                             check.selection.recheck(&check.state, &conn, &a)?;
@@ -158,21 +166,21 @@ impl Grant {
     }
 }
 
-/// A refused request, as the HTTP layer reports it. Carries only the
-/// [`UseError`] text.
+/// A refused request, as the HTTP layer reports it: the [`UseError`],
+/// shown as its text.
 #[derive(Debug)]
-struct Refused(String);
+struct Refused(UseError);
 
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        self.0.fmt(f)
     }
 }
 
 impl std::error::Error for Refused {}
 
 fn refused(e: UseError) -> http_client::Error {
-    http_client::Error::Permanent(Box::new(Refused(e.to_string())))
+    http_client::Error::Permanent(Box::new(Refused(e)))
 }
 
 /// The no-redirect provider client with a grant check before each request.
