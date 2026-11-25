@@ -181,8 +181,11 @@ host_problems() { # $1 = runner binary (optional); prints one problem per line
 #   the network unencrypted.
 # Numbers must be a canonical dotted quad: resolvers read 100.077.0.1 as
 # octal, 0x64 as hex and 100.64.1 as shorthand, so those are refused.
-# http_class URL sets url_class (loopback, tailscale or other) and url_host
-# (as written, IPv6 in brackets); it fails on a malformed or ambiguous host.
+# Its own variables all start with _hc_ (POSIX sh has no locals).
+# http_class URL sets url_class (loopback, tailscale or other), url_host (as
+# written, IPv6 in brackets) and url_port (empty when absent); it fails on a
+# malformed or ambiguous authority. After an IPv6 literal's `]` only an
+# optional `:<digits>` may follow.
 is_label() {
     case "$1" in ''|-*|*-|*[!A-Za-z0-9-]*) return 1 ;; esac
     [ ${#1} -le 63 ]
@@ -195,94 +198,108 @@ v6_part() { # colon-separated groups of 1-4 hex digits (or nothing): prints them
         IFS=:
         # shellcheck disable=SC2086 # split on colons on purpose
         set -- $1
-        for g in "$@"; do
-            case "$g" in ''|?????*) exit 1 ;; esac
-            printf '%04x ' "0x$g"
+        for _hc_g in "$@"; do
+            case "$_hc_g" in ''|?????*) exit 1 ;; esac
+            printf '%04x ' "0x$_hc_g"
         done
     )
 }
 
 ipv6_groups() { # prints the 8 groups, lowercase and padded, or fails
-    t=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
-    case "$t" in ''|*[!0-9a-f:]*|*::*::*) return 1 ;; esac
-    case "$t" in
-        *::*) head=${t%%::*}; tail=${t#*::}; compress=1 ;;
-        *) head=$t; tail=''; compress=0 ;;
+    _hc_t=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    case "$_hc_t" in ''|*[!0-9a-f:]*|*::*::*) return 1 ;; esac
+    case "$_hc_t" in
+        *::*) _hc_head=${_hc_t%%::*}; _hc_tail=${_hc_t#*::}; _hc_compress=1 ;;
+        *) _hc_head=$_hc_t; _hc_tail=''; _hc_compress=0 ;;
     esac
-    hg=$(v6_part "$head") || return 1
-    tg=$(v6_part "$tail") || return 1
+    _hc_hg=$(v6_part "$_hc_head") || return 1
+    _hc_tg=$(v6_part "$_hc_tail") || return 1
     # shellcheck disable=SC2086
-    n=$(( $(set -- $hg; echo $#) + $(set -- $tg; echo $#) ))
-    if [ "$compress" = 1 ]; then [ "$n" -le 7 ] || return 1; else [ "$n" -eq 8 ] || return 1; fi
-    zeros=''; i=$n
-    while [ "$i" -lt 8 ]; do zeros="$zeros 0000"; i=$((i + 1)); done
+    _hc_n=$(( $(set -- $_hc_hg; echo $#) + $(set -- $_hc_tg; echo $#) ))
+    if [ "$_hc_compress" = 1 ]; then [ "$_hc_n" -le 7 ] || return 1; else [ "$_hc_n" -eq 8 ] || return 1; fi
+    _hc_zeros=''; _hc_i=$_hc_n
+    while [ "$_hc_i" -lt 8 ]; do _hc_zeros="$_hc_zeros 0000"; _hc_i=$((_hc_i + 1)); done
     # shellcheck disable=SC2086
-    echo $hg $zeros $tg
+    echo $_hc_hg $_hc_zeros $_hc_tg
 }
 
 http_class() {
-    rest=${1#http://}; auth=${rest%%/*}; port='' has_port=0 url_class='' url_host=''
-    case "$auth" in
-        \[*\]:*) url_host=${auth%%\]:*}']'; port=${auth##*\]:}; has_port=1 ;;
-        \[*\]) url_host=$auth ;;
-        *:*:*) return 1 ;;
-        *:*) url_host=${auth%:*}; port=${auth##*:}; has_port=1 ;;
-        *) url_host=$auth ;;
+    _hc_rest=${1#http://}; _hc_auth=${_hc_rest%%/*}; _hc_port='' _hc_has_port=0 url_class='' url_host='' url_port=''
+    case "$_hc_auth" in
+        \[*)
+            _hc_inner=${_hc_auth#\[}
+            case "$_hc_inner" in *\]*) ;; *) return 1 ;; esac
+            _hc_after=${_hc_inner#*\]}; _hc_inner=${_hc_inner%%\]*}
+            url_host="[$_hc_inner]"
+            case "$_hc_after" in
+                '') ;;
+                :*) _hc_port=${_hc_after#:}; _hc_has_port=1 ;;
+                *) return 1 ;;
+            esac ;;
+        *\[*|*\]*|*:*:*) return 1 ;;
+        *:*) url_host=${_hc_auth%:*}; _hc_port=${_hc_auth##*:}; _hc_has_port=1 ;;
+        *) url_host=$_hc_auth ;;
     esac
-    if [ "$has_port" = 1 ]; then
-        case "$port" in ''|*[!0-9]*) return 1 ;; esac
-        [ ${#port} -le 5 ] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
+    if [ "$_hc_has_port" = 1 ]; then
+        case "$_hc_port" in ''|*[!0-9]*) return 1 ;; esac
+        [ ${#_hc_port} -le 5 ] && [ "$_hc_port" -ge 1 ] && [ "$_hc_port" -le 65535 ] || return 1
+        # shellcheck disable=SC2034 # read by the container script's probe
+        url_port=$_hc_port
     fi
     case "$url_host" in
         \[*\])
-            inner=${url_host#\[}; inner=${inner%\]}
-            groups=$(ipv6_groups "$inner") || return 1
+            _hc_inner=${url_host#\[}; _hc_inner=${_hc_inner%\]}
+            _hc_groups=$(ipv6_groups "$_hc_inner") || return 1
             # shellcheck disable=SC2086
-            set -- $groups
+            set -- $_hc_groups
             case "$*" in
                 "0000 0000 0000 0000 0000 0000 0000 0000") return 1 ;;
                 "0000 0000 0000 0000 0000 0000 0000 0001")
-                    [ "$url_host" = '[::1]' ] && [ "$has_port" = 1 ] || return 1
+                    [ "$url_host" = '[::1]' ] && [ "$_hc_has_port" = 1 ] || return 1
                     url_class=loopback; return 0 ;;
                 "0000 0000 0000 0000 0000 ffff "*) return 1 ;;
                 "fd7a 115c a1e0 "*) url_class=tailscale; return 0 ;;
             esac
             url_class=other; return 0 ;;
     esac
-    name=$url_host; dotted=0
-    case "$name" in *.) name=${name%.}; dotted=1 ;; esac
-    [ -n "$name" ] && [ ${#name} -le 253 ] || return 1
-    case "$name" in .*|*..*) return 1 ;; esac
-    labels=$(printf '%s' "$name" | tr '.' ' ')
-    count=0 last=''
-    for l in $labels; do is_label "$l" || return 1; count=$((count + 1)); last=$l; done
-    case "$last" in
-        *[!0-9]*) case "$last" in 0[xX]*) numeric=1 ;; *) numeric=0 ;; esac ;;
-        *) numeric=1 ;;
+    _hc_name=$url_host; _hc_dotted=0
+    case "$_hc_name" in *.) _hc_name=${_hc_name%.}; _hc_dotted=1 ;; esac
+    [ -n "$_hc_name" ] && [ ${#_hc_name} -le 253 ] || return 1
+    # DNS characters only, checked before any splitting (no glob characters
+    # can reach the shell), and no empty label: box.. is refused.
+    case "$_hc_name" in *[!A-Za-z0-9.-]*|.*|*..*|*.) return 1 ;; esac
+    _hc_labels=$(printf '%s' "$_hc_name" | tr '.' ' ')
+    _hc_count=0 _hc_last=''
+    set -f
+    for _hc_l in $_hc_labels; do is_label "$_hc_l" || { set +f; return 1; }; _hc_count=$((_hc_count + 1)); _hc_last=$_hc_l; done
+    set +f
+    case "$_hc_last" in
+        *[!0-9]*) case "$_hc_last" in 0[xX]*) _hc_numeric=1 ;; *) _hc_numeric=0 ;; esac ;;
+        *) _hc_numeric=1 ;;
     esac
-    if [ "$numeric" = 1 ]; then
-        [ "$dotted" = 0 ] && [ "$count" = 4 ] || return 1
-        for o in $labels; do
-            case "$o" in 0|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;; *) return 1 ;; esac
-            [ "$o" -le 255 ] || return 1
+    if [ "$_hc_numeric" = 1 ]; then
+        [ "$_hc_dotted" = 0 ] && [ "$_hc_count" = 4 ] || return 1
+        for _hc_o in $_hc_labels; do
+            case "$_hc_o" in 0|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;; *) return 1 ;; esac
+            [ "$_hc_o" -le 255 ] || return 1
         done
         # shellcheck disable=SC2086 # four validated numeric labels
-        set -- $labels
+        set -- $_hc_labels
         if [ "$1" = 127 ]; then
-            [ "$name" = 127.0.0.1 ] && [ "$has_port" = 1 ] || return 1
+            [ "$_hc_name" = 127.0.0.1 ] && [ "$_hc_has_port" = 1 ] || return 1
             url_class=loopback; return 0
         fi
-        [ "$name" != 0.0.0.0 ] || return 1
+        [ "$_hc_name" != 0.0.0.0 ] || return 1
         if [ "$1" = 100 ] && [ "$2" -ge 64 ] && [ "$2" -le 127 ]; then url_class=tailscale; return 0; fi
         url_class=other; return 0
     fi
-    lower=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
-    if [ "$lower" = localhost ] && [ "$dotted" = 0 ]; then
-        [ "$url_host" = localhost ] && [ "$has_port" = 1 ] || return 1
+    _hc_lower=$(printf '%s' "$_hc_name" | tr '[:upper:]' '[:lower:]')
+    if [ "$_hc_lower" = localhost ] && [ "$_hc_dotted" = 0 ]; then
+        [ "$url_host" = localhost ] && [ "$_hc_has_port" = 1 ] || return 1
         url_class=loopback; return 0
     fi
-    case "$lower" in
-        *.ts.net) [ "$count" -ge 3 ] && url_class=tailscale && return 0 ;;
+    case "$_hc_lower" in
+        *.ts.net) [ "$_hc_count" -ge 3 ] && url_class=tailscale && return 0 ;;
     esac
     url_class=other
 }
@@ -295,10 +312,10 @@ http_class() {
 # written (IPv6 in brackets). Prints the person's NO_PROXY (or no_proxy) with
 # this server's host added; other destinations keep their proxy settings.
 direct_no_proxy() { # $1 = url_host
-    base=${NO_PROXY-${no_proxy-}}
-    extra=$1
-    case "$1" in \[*\]) extra="$1,${1#\[}"; extra=${extra%\]} ;; esac
-    printf '%s' "${base:+$base,}$extra"
+    _dnp_base=${NO_PROXY-${no_proxy-}}
+    _dnp_extra=$1
+    case "$1" in \[*\]) _dnp_extra="$1,${1#\[}"; _dnp_extra=${_dnp_extra%\]} ;; esac
+    printf '%s' "${_dnp_base:+$_dnp_base,}$_dnp_extra"
 }
 
 plain_http_warning() { # $1 = host; never mentions the token's value

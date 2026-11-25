@@ -87,8 +87,11 @@ done
 #   the network unencrypted.
 # Numbers must be a canonical dotted quad: resolvers read 100.077.0.1 as
 # octal, 0x64 as hex and 100.64.1 as shorthand, so those are refused.
-# http_class URL sets url_class (loopback, tailscale or other) and url_host
-# (as written, IPv6 in brackets); it fails on a malformed or ambiguous host.
+# Its own variables all start with _hc_ (POSIX sh has no locals).
+# http_class URL sets url_class (loopback, tailscale or other), url_host (as
+# written, IPv6 in brackets) and url_port (empty when absent); it fails on a
+# malformed or ambiguous authority. After an IPv6 literal's `]` only an
+# optional `:<digits>` may follow.
 is_label() {
     case "$1" in ''|-*|*-|*[!A-Za-z0-9-]*) return 1 ;; esac
     [ ${#1} -le 63 ]
@@ -101,94 +104,108 @@ v6_part() { # colon-separated groups of 1-4 hex digits (or nothing): prints them
         IFS=:
         # shellcheck disable=SC2086 # split on colons on purpose
         set -- $1
-        for g in "$@"; do
-            case "$g" in ''|?????*) exit 1 ;; esac
-            printf '%04x ' "0x$g"
+        for _hc_g in "$@"; do
+            case "$_hc_g" in ''|?????*) exit 1 ;; esac
+            printf '%04x ' "0x$_hc_g"
         done
     )
 }
 
 ipv6_groups() { # prints the 8 groups, lowercase and padded, or fails
-    t=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
-    case "$t" in ''|*[!0-9a-f:]*|*::*::*) return 1 ;; esac
-    case "$t" in
-        *::*) head=${t%%::*}; tail=${t#*::}; compress=1 ;;
-        *) head=$t; tail=''; compress=0 ;;
+    _hc_t=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    case "$_hc_t" in ''|*[!0-9a-f:]*|*::*::*) return 1 ;; esac
+    case "$_hc_t" in
+        *::*) _hc_head=${_hc_t%%::*}; _hc_tail=${_hc_t#*::}; _hc_compress=1 ;;
+        *) _hc_head=$_hc_t; _hc_tail=''; _hc_compress=0 ;;
     esac
-    hg=$(v6_part "$head") || return 1
-    tg=$(v6_part "$tail") || return 1
+    _hc_hg=$(v6_part "$_hc_head") || return 1
+    _hc_tg=$(v6_part "$_hc_tail") || return 1
     # shellcheck disable=SC2086
-    n=$(( $(set -- $hg; echo $#) + $(set -- $tg; echo $#) ))
-    if [ "$compress" = 1 ]; then [ "$n" -le 7 ] || return 1; else [ "$n" -eq 8 ] || return 1; fi
-    zeros=''; i=$n
-    while [ "$i" -lt 8 ]; do zeros="$zeros 0000"; i=$((i + 1)); done
+    _hc_n=$(( $(set -- $_hc_hg; echo $#) + $(set -- $_hc_tg; echo $#) ))
+    if [ "$_hc_compress" = 1 ]; then [ "$_hc_n" -le 7 ] || return 1; else [ "$_hc_n" -eq 8 ] || return 1; fi
+    _hc_zeros=''; _hc_i=$_hc_n
+    while [ "$_hc_i" -lt 8 ]; do _hc_zeros="$_hc_zeros 0000"; _hc_i=$((_hc_i + 1)); done
     # shellcheck disable=SC2086
-    echo $hg $zeros $tg
+    echo $_hc_hg $_hc_zeros $_hc_tg
 }
 
 http_class() {
-    rest=${1#http://}; auth=${rest%%/*}; port='' has_port=0 url_class='' url_host=''
-    case "$auth" in
-        \[*\]:*) url_host=${auth%%\]:*}']'; port=${auth##*\]:}; has_port=1 ;;
-        \[*\]) url_host=$auth ;;
-        *:*:*) return 1 ;;
-        *:*) url_host=${auth%:*}; port=${auth##*:}; has_port=1 ;;
-        *) url_host=$auth ;;
+    _hc_rest=${1#http://}; _hc_auth=${_hc_rest%%/*}; _hc_port='' _hc_has_port=0 url_class='' url_host='' url_port=''
+    case "$_hc_auth" in
+        \[*)
+            _hc_inner=${_hc_auth#\[}
+            case "$_hc_inner" in *\]*) ;; *) return 1 ;; esac
+            _hc_after=${_hc_inner#*\]}; _hc_inner=${_hc_inner%%\]*}
+            url_host="[$_hc_inner]"
+            case "$_hc_after" in
+                '') ;;
+                :*) _hc_port=${_hc_after#:}; _hc_has_port=1 ;;
+                *) return 1 ;;
+            esac ;;
+        *\[*|*\]*|*:*:*) return 1 ;;
+        *:*) url_host=${_hc_auth%:*}; _hc_port=${_hc_auth##*:}; _hc_has_port=1 ;;
+        *) url_host=$_hc_auth ;;
     esac
-    if [ "$has_port" = 1 ]; then
-        case "$port" in ''|*[!0-9]*) return 1 ;; esac
-        [ ${#port} -le 5 ] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
+    if [ "$_hc_has_port" = 1 ]; then
+        case "$_hc_port" in ''|*[!0-9]*) return 1 ;; esac
+        [ ${#_hc_port} -le 5 ] && [ "$_hc_port" -ge 1 ] && [ "$_hc_port" -le 65535 ] || return 1
+        # shellcheck disable=SC2034 # read by the container script's probe
+        url_port=$_hc_port
     fi
     case "$url_host" in
         \[*\])
-            inner=${url_host#\[}; inner=${inner%\]}
-            groups=$(ipv6_groups "$inner") || return 1
+            _hc_inner=${url_host#\[}; _hc_inner=${_hc_inner%\]}
+            _hc_groups=$(ipv6_groups "$_hc_inner") || return 1
             # shellcheck disable=SC2086
-            set -- $groups
+            set -- $_hc_groups
             case "$*" in
                 "0000 0000 0000 0000 0000 0000 0000 0000") return 1 ;;
                 "0000 0000 0000 0000 0000 0000 0000 0001")
-                    [ "$url_host" = '[::1]' ] && [ "$has_port" = 1 ] || return 1
+                    [ "$url_host" = '[::1]' ] && [ "$_hc_has_port" = 1 ] || return 1
                     url_class=loopback; return 0 ;;
                 "0000 0000 0000 0000 0000 ffff "*) return 1 ;;
                 "fd7a 115c a1e0 "*) url_class=tailscale; return 0 ;;
             esac
             url_class=other; return 0 ;;
     esac
-    name=$url_host; dotted=0
-    case "$name" in *.) name=${name%.}; dotted=1 ;; esac
-    [ -n "$name" ] && [ ${#name} -le 253 ] || return 1
-    case "$name" in .*|*..*) return 1 ;; esac
-    labels=$(printf '%s' "$name" | tr '.' ' ')
-    count=0 last=''
-    for l in $labels; do is_label "$l" || return 1; count=$((count + 1)); last=$l; done
-    case "$last" in
-        *[!0-9]*) case "$last" in 0[xX]*) numeric=1 ;; *) numeric=0 ;; esac ;;
-        *) numeric=1 ;;
+    _hc_name=$url_host; _hc_dotted=0
+    case "$_hc_name" in *.) _hc_name=${_hc_name%.}; _hc_dotted=1 ;; esac
+    [ -n "$_hc_name" ] && [ ${#_hc_name} -le 253 ] || return 1
+    # DNS characters only, checked before any splitting (no glob characters
+    # can reach the shell), and no empty label: box.. is refused.
+    case "$_hc_name" in *[!A-Za-z0-9.-]*|.*|*..*|*.) return 1 ;; esac
+    _hc_labels=$(printf '%s' "$_hc_name" | tr '.' ' ')
+    _hc_count=0 _hc_last=''
+    set -f
+    for _hc_l in $_hc_labels; do is_label "$_hc_l" || { set +f; return 1; }; _hc_count=$((_hc_count + 1)); _hc_last=$_hc_l; done
+    set +f
+    case "$_hc_last" in
+        *[!0-9]*) case "$_hc_last" in 0[xX]*) _hc_numeric=1 ;; *) _hc_numeric=0 ;; esac ;;
+        *) _hc_numeric=1 ;;
     esac
-    if [ "$numeric" = 1 ]; then
-        [ "$dotted" = 0 ] && [ "$count" = 4 ] || return 1
-        for o in $labels; do
-            case "$o" in 0|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;; *) return 1 ;; esac
-            [ "$o" -le 255 ] || return 1
+    if [ "$_hc_numeric" = 1 ]; then
+        [ "$_hc_dotted" = 0 ] && [ "$_hc_count" = 4 ] || return 1
+        for _hc_o in $_hc_labels; do
+            case "$_hc_o" in 0|[1-9]|[1-9][0-9]|[1-9][0-9][0-9]) ;; *) return 1 ;; esac
+            [ "$_hc_o" -le 255 ] || return 1
         done
         # shellcheck disable=SC2086 # four validated numeric labels
-        set -- $labels
+        set -- $_hc_labels
         if [ "$1" = 127 ]; then
-            [ "$name" = 127.0.0.1 ] && [ "$has_port" = 1 ] || return 1
+            [ "$_hc_name" = 127.0.0.1 ] && [ "$_hc_has_port" = 1 ] || return 1
             url_class=loopback; return 0
         fi
-        [ "$name" != 0.0.0.0 ] || return 1
+        [ "$_hc_name" != 0.0.0.0 ] || return 1
         if [ "$1" = 100 ] && [ "$2" -ge 64 ] && [ "$2" -le 127 ]; then url_class=tailscale; return 0; fi
         url_class=other; return 0
     fi
-    lower=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
-    if [ "$lower" = localhost ] && [ "$dotted" = 0 ]; then
-        [ "$url_host" = localhost ] && [ "$has_port" = 1 ] || return 1
+    _hc_lower=$(printf '%s' "$_hc_name" | tr '[:upper:]' '[:lower:]')
+    if [ "$_hc_lower" = localhost ] && [ "$_hc_dotted" = 0 ]; then
+        [ "$url_host" = localhost ] && [ "$_hc_has_port" = 1 ] || return 1
         url_class=loopback; return 0
     fi
-    case "$lower" in
-        *.ts.net) [ "$count" -ge 3 ] && url_class=tailscale && return 0 ;;
+    case "$_hc_lower" in
+        *.ts.net) [ "$_hc_count" -ge 3 ] && url_class=tailscale && return 0 ;;
     esac
     url_class=other
 }
@@ -201,10 +218,10 @@ http_class() {
 # written (IPv6 in brackets). Prints the person's NO_PROXY (or no_proxy) with
 # this server's host added; other destinations keep their proxy settings.
 direct_no_proxy() { # $1 = url_host
-    base=${NO_PROXY-${no_proxy-}}
-    extra=$1
-    case "$1" in \[*\]) extra="$1,${1#\[}"; extra=${extra%\]} ;; esac
-    printf '%s' "${base:+$base,}$extra"
+    _dnp_base=${NO_PROXY-${no_proxy-}}
+    _dnp_extra=$1
+    case "$1" in \[*\]) _dnp_extra="$1,${1#\[}"; _dnp_extra=${_dnp_extra%\]} ;; esac
+    printf '%s' "${_dnp_base:+$_dnp_base,}$_dnp_extra"
 }
 
 plain_http_warning() { # $1 = host; never mentions the token's value
@@ -294,13 +311,29 @@ ensure_image() {
 }
 
 # Runs a command in the runner image with the same mounts as the real container.
-probe() { # $@ = shell command
+# $1 = a FIXED shell command (never built from settings); any further
+# arguments reach it as $1, $2, ... inside the container, as data.
+probe() {
+    _probe_cmd=$1; shift
     # shellcheck disable=SC2046
     "$engine" run --rm --pull=never $(network_flag) --read-only --cap-drop ALL \
         --security-opt no-new-privileges:true \
         --mount "type=bind,source=$token_file,target=$SECRET,readonly" \
-        --entrypoint /bin/bash "$image" -c "$1" >/dev/null 2>&1
+        --entrypoint /bin/bash "$image" -c "$_probe_cmd" metro-probe "$@" >/dev/null 2>&1
 }
+
+# Can the container open a TCP connection to host $1, port $2?
+# shellcheck disable=SC2016 # expanded by the container shell, from its arguments
+PROBE_TCP='exec 3<>"/dev/tcp/$1/$2"'
+
+# The runner container's entry: adds the validated Metro host
+# (METRO_DIRECT_NO_PROXY, loopback or Tailscale only) to the container's own
+# NO_PROXY, keeping exclusions the engine injected, then reads the token from
+# the read-only mount and starts the runner. Fixed text: settings reach it
+# only as environment values. Same text as $RunnerEntry in
+# metro-runner-container.ps1.
+# shellcheck disable=SC2016 # expanded by the container shell
+RUNNER_ENTRY='if [ -n "${METRO_DIRECT_NO_PROXY:-}" ]; then NO_PROXY="${NO_PROXY:-${no_proxy:-}}"; NO_PROXY="${NO_PROXY:+$NO_PROXY,}$METRO_DIRECT_NO_PROXY"; no_proxy="$NO_PROXY"; export NO_PROXY no_proxy; fi; unset METRO_DIRECT_NO_PROXY; IFS= read -r METRO_RUNNER_TOKEN < /run/secrets/metro_runner_token || [ -n "$METRO_RUNNER_TOKEN" ]; export METRO_RUNNER_TOKEN; exec /usr/local/bin/metro-runner'
 
 # Runner images up to 0.4.0 refuse plain http beyond loopback without this
 # opt-in; newer ones accept it, ignore it and print their own warning.
@@ -310,14 +343,15 @@ insecure_flag() {
     esac
 }
 
-# A loopback or Tailscale server is always reached directly: proxies the
-# engine injects (Docker's "proxies" client setting) are skipped for exactly
-# that host. Other destinations keep the engine's settings.
+# A loopback or Tailscale server is always reached directly: the entry script
+# adds exactly that host to the container's NO_PROXY, after any exclusions
+# the engine injected (Docker's "proxies" client setting), which are kept.
+# Other destinations keep the engine's settings as they are.
 direct_flag() {
     case "$url_class" in
         loopback|tailscale)
             direct=$(unset NO_PROXY no_proxy; direct_no_proxy "$url_host")
-            printf -- '--env NO_PROXY=%s --env no_proxy=%s' "$direct" "$direct" ;;
+            printf -- '--env METRO_DIRECT_NO_PROXY=%s' "$direct" ;;
     esac
 }
 
@@ -348,13 +382,14 @@ setup() {
     ensure_image
     "$engine" volume inspect "$volume" >/dev/null 2>&1 || "$engine" volume create "$volume" >/dev/null ||
         die "cannot create volume $volume"
-    probe "test -r $SECRET && test -s $SECRET" ||
+    # shellcheck disable=SC2016 # expanded by the container shell, from its argument
+    probe 'test -r "$1" && test -s "$1"' "$SECRET" ||
         die "the container cannot read $token_file. Share its folder with $engine (Docker Desktop: Settings > Resources > File sharing); on Linux the file must be readable by the image's runner user (uid 1000), or use the native Linux runner."
     if [ "$network" = host ]; then
-        hostport=${server_url#http://}; hostport=${hostport%%/*}
-        h=${hostport%:*}; p=${hostport##*:}  # both validated by http_class (loopback)
-        case "$h" in localhost) h=127.0.0.1 ;; \[::1\]) h=::1 ;; esac
-        if ! probe "exec 3<>/dev/tcp/$h/$p"; then
+        # url_host and url_port come from http_class (loopback: an exact
+        # literal and a numeric port); they reach the probe as arguments.
+        case "$url_host" in \[::1\]) h=::1 ;; *) h=127.0.0.1 ;; esac
+        if ! probe "$PROBE_TCP" "$h" "$url_port"; then
             say "warning: the container cannot reach $server_url right now. Make sure Metro is running on that port."
             say "         On Docker Desktop, enable Settings > Resources > Network > Enable host networking (4.34+)."
         fi
@@ -387,7 +422,7 @@ start() {
         --env "METRO_SERVER_URL=$server_url" $(insecure_flag) $(direct_flag) \
         --label dev.metro.managed-by=$PROG \
         --entrypoint /bin/sh "$image" \
-        -c 'IFS= read -r METRO_RUNNER_TOKEN < '"$SECRET"' || [ -n "$METRO_RUNNER_TOKEN" ]; export METRO_RUNNER_TOKEN; exec /usr/local/bin/metro-runner' \
+        -c "$RUNNER_ENTRY" \
         >/dev/null || { set +f; die "could not start the runner container"; }
     set +f
     say "Started $name ($image). See its log with: $0 logs"

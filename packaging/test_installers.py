@@ -54,7 +54,9 @@ BAD_HTTP = ("http://1.2.3.999", "http://.metro.example", "http://a..b", "http://
             "http://[fd7a:115c:a1e0:::]:8787", "http://[fd7a:115c:a1e0::1::2]",
             # Numeric spellings resolvers read differently (octal, hex, shorthand).
             "http://100.077.0.1", "http://100.00077.0.1:8787", "http://0x64.64.0.1", "http://100.64.1",
-            "http://1681915905:8787")
+            "http://1681915905:8787",
+            # Strict authorities and DNS characters.
+            "http://[::1]:99]:8787", "http://[::1]x:8787", "http://*.ts.net:8787", "http://box..:8787")
 VECTORS = HERE.parent / "crates/url-policy/testdata/host_vectors.json"
 HOST_MUTATORS = {"docker", "podman", "sudo", "doas", "pkexec", "su", "systemctl", "apt", "apt-get", "dpkg",
                  "pacman", "dnf", "yum", "rpm", "zypper", "flatpak", "snap"}
@@ -532,7 +534,8 @@ class ContainerScriptTests(unittest.TestCase):
         calls = self.docker_calls()
         self.assertIn("docker pull ghcr.io/wnzn/metro-runner:v0.3.0", calls)
         self.assertIn("docker volume create metro-runner-workspace", calls)
-        self.assertTrue(any(c.startswith("docker run --rm") and "test -r /run/secrets/metro_runner_token" in c
+        self.assertTrue(any(c.startswith("docker run --rm") and 'test -r "$1" && test -s "$1" metro-probe '
+                            "/run/secrets/metro_runner_token" in c
                             for c in calls))
         self.box.run(CONTAINER, "start", check=True)
         run = next(c for c in self.docker_calls() if c.startswith("docker run -d"))
@@ -566,7 +569,12 @@ class ContainerScriptTests(unittest.TestCase):
         self.assertNotIn("--network=host", run)
         self.assertIn("METRO_SERVER_URL=http://192.168.1.10:8787", run)
         self.assertIn("--env METRO_ALLOW_INSECURE_HTTP=1", run)  # for runner images up to 0.4.0
-        self.assertNotIn("NO_PROXY", run)  # an ordinary host keeps the engine's proxy settings
+        # An ordinary host keeps the engine's proxy settings.
+        self.assertNotIn("--env NO_PROXY", run)
+        self.assertNotIn("--env METRO_DIRECT_NO_PROXY", run)
+        # Checking the URL never touches the script's own settings.
+        self.assertIn("--name metro-runner ", run)
+        self.assertIn("NAME=metro-runner\n", self.config.read_text())
         self.assertFalse(any("/dev/tcp/" in c for c in self.docker_calls()))
         self.box.run(CONTAINER, "remove", check=True)
 
@@ -581,7 +589,8 @@ class ContainerScriptTests(unittest.TestCase):
         self.box.run(CONTAINER, "start", check=True)
         run = [c for c in self.docker_calls() if c.startswith("docker run -d")][-1]
         entries = "[fd7a:115c:a1e0::1],fd7a:115c:a1e0::1"
-        self.assertIn(f"--env NO_PROXY={entries} --env no_proxy={entries}", run)
+        self.assertIn(f"--env METRO_DIRECT_NO_PROXY={entries} ", run)
+        self.assertNotIn("--env NO_PROXY", run)  # the container's own exclusions are kept (entry script)
         self.box.run(CONTAINER, "remove", check=True)
         for url in BAD_HTTP:
             r = self.box.run(CONTAINER, "setup", "--server-url", url, "--token-file", self.token, "--image", "m:ci")
@@ -590,12 +599,14 @@ class ContainerScriptTests(unittest.TestCase):
     def test_loopback_uses_host_network(self):
         self.box.run(CONTAINER, "setup", "--server-url", "http://127.0.0.1:41234", "--token-file", self.token,
                      "--image", "metro-runner:ci", check=True)
-        self.assertTrue(any("--network=host" in c and "/dev/tcp/127.0.0.1/41234" in c for c in self.docker_calls()))
+        # The probe is fixed text; the host and port reach it as arguments.
+        self.assertTrue(any("--network=host" in c and 'exec 3<>"/dev/tcp/$1/$2" metro-probe 127.0.0.1 41234' in c
+                            for c in self.docker_calls()))
         self.box.run(CONTAINER, "start", check=True)
         run = next(c for c in self.docker_calls() if c.startswith("docker run -d"))
         self.assertIn("--network=host", run)
         self.assertNotIn("METRO_ALLOW_INSECURE_HTTP", run)
-        self.assertIn("--env NO_PROXY=127.0.0.1 --env no_proxy=127.0.0.1", run)
+        self.assertIn("--env METRO_DIRECT_NO_PROXY=127.0.0.1 ", run)
 
     def test_loopback_urls_are_exact_literals_with_a_port(self):
         for url in BAD_LOOPBACK:
@@ -606,7 +617,7 @@ class ContainerScriptTests(unittest.TestCase):
             self.box.run(CONTAINER, "setup", "--server-url", url, "--token-file", self.token, "--image", "m:ci",
                          check=True)
             self.assertIn("NETWORK=host", self.config.read_text())
-        self.assertTrue(any("/dev/tcp/::1/65535" in c for c in self.docker_calls()))
+        self.assertTrue(any('"/dev/tcp/$1/$2" metro-probe ::1 65535' in c for c in self.docker_calls()))
 
     def test_token_file_checks_and_foreign_container(self):
         self.token.chmod(0o640)
@@ -652,16 +663,23 @@ class UrlRuleVectorTests(unittest.TestCase):
         self.assertEqual(wrong, [])
 
     def test_shell_scripts(self):
+        """Under every POSIX-ish shell present (sh, dash, bash), from a directory
+        holding a file, so a stray pathname expansion would show (*.ts.net)."""
         cases = vector_cases()
+        shells = [sh for sh in ("sh", "dash", "bash") if shutil.which(sh)]
+        self.assertIn("sh", shells)
         for script in (RUNNER, CONTAINER):
-            with self.subTest(script=script.name), tempfile.TemporaryDirectory() as d:
-                harness = Path(d) / "rule.sh"
-                harness.write_text("PROG=t\n" + url_rule_block(script, "#") +
-                                   'for u in "$@"; do if http_class "$u"; then echo "$url_class"; '
-                                   'else echo refused; fi; done\n')
-                r = subprocess.run(["sh", harness, *[u for u, _ in cases]], text=True, capture_output=True,
-                                   check=True)
-                self.check(r.stdout.splitlines(), cases)
+            for sh in shells:
+                with self.subTest(script=script.name, shell=sh), tempfile.TemporaryDirectory() as d, \
+                        tempfile.TemporaryDirectory() as cwd:
+                    (Path(cwd) / "sample").write_text("")
+                    harness = Path(d) / "rule.sh"
+                    harness.write_text("PROG=t\n" + url_rule_block(script, "#") +
+                                       'for u in "$@"; do if http_class "$u"; then echo "$url_class"; '
+                                       'else echo refused; fi; done\n')
+                    r = subprocess.run([sh, harness, *[u for u, _ in cases]], text=True, capture_output=True,
+                                       check=True, cwd=cwd)
+                    self.check(r.stdout.splitlines(), cases)
 
     @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 (pwsh) is not installed")
     def test_powershell_script(self):
@@ -687,11 +705,48 @@ class UrlRuleVectorTests(unittest.TestCase):
             r = subprocess.run(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", harness, *urls],
                                text=True, capture_output=True, timeout=120, check=True)
             self.assertEqual(r.stdout.splitlines(), [
-                "--env NO_PROXY=100.101.102.103 --env no_proxy=100.101.102.103",
-                "--env NO_PROXY=[fd7a:115c:a1e0::1],fd7a:115c:a1e0::1 --env no_proxy=[fd7a:115c:a1e0::1],fd7a:115c:a1e0::1",
-                "--env NO_PROXY=127.0.0.1 --env no_proxy=127.0.0.1",
+                "--env METRO_DIRECT_NO_PROXY=100.101.102.103",
+                "--env METRO_DIRECT_NO_PROXY=[fd7a:115c:a1e0::1],fd7a:115c:a1e0::1",
+                "--env METRO_DIRECT_NO_PROXY=127.0.0.1",
                 "", "",
             ])
+
+
+def runner_entry(script):
+    """The container entry text of metro-runner-container.sh / .ps1."""
+    text = script.read_text()
+    if script.suffix == ".ps1":
+        return text.split("$RunnerEntry = '", 1)[1].split("'\n", 1)[0]
+    return text.split("RUNNER_ENTRY='", 1)[1].split("'\n", 1)[0]
+
+
+class ContainerEntryTests(unittest.TestCase):
+    """The runner container's fixed entry script, run here with sh."""
+
+    def run_entry(self, env):
+        entry = runner_entry(CONTAINER)
+        self.assertEqual(entry, runner_entry(CONTAINER_PS1), "the .sh and .ps1 entries must be the same text")
+        with tempfile.TemporaryDirectory() as d:
+            token = Path(d) / "token"
+            token.write_text("metro_rt_v2_secret-value\n")
+            # Only the secret's path and the final exec are swapped for the test.
+            local = entry.replace("/run/secrets/metro_runner_token", str(token)).replace(
+                "exec /usr/local/bin/metro-runner", 'printf "NO_PROXY=%s|no_proxy=%s|direct=%s\\n" '
+                '"${NO_PROXY-unset}" "${no_proxy-unset}" "${METRO_DIRECT_NO_PROXY-unset}"')
+            return subprocess.run(["sh", "-c", local], text=True, capture_output=True, check=True,
+                                  env={"PATH": os.environ["PATH"], **env}).stdout.strip()
+
+    def test_metro_host_is_appended_and_engine_exclusions_survive(self):
+        self.assertEqual(self.run_entry({"NO_PROXY": "corp.internal,.svc", "METRO_DIRECT_NO_PROXY": "100.101.102.103"}),
+                         "NO_PROXY=corp.internal,.svc,100.101.102.103|no_proxy=corp.internal,.svc,100.101.102.103|direct=unset")
+        # Docker may inject only the lowercase form.
+        self.assertEqual(self.run_entry({"no_proxy": "corp.internal", "METRO_DIRECT_NO_PROXY": "[fd7a::1],fd7a::1"}),
+                         "NO_PROXY=corp.internal,[fd7a::1],fd7a::1|no_proxy=corp.internal,[fd7a::1],fd7a::1|direct=unset")
+        self.assertEqual(self.run_entry({"METRO_DIRECT_NO_PROXY": "127.0.0.1"}),
+                         "NO_PROXY=127.0.0.1|no_proxy=127.0.0.1|direct=unset")
+        # An ordinary destination: the engine's settings stay exactly as they were.
+        self.assertEqual(self.run_entry({"NO_PROXY": "corp.internal"}),
+                         "NO_PROXY=corp.internal|no_proxy=unset|direct=unset")
 
 
 class MacosInstallerTests(unittest.TestCase):

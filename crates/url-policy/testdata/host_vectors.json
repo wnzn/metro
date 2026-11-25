@@ -11,7 +11,8 @@
     "0x64 as hex and 100.64.1 as shorthand, so classifiers never call those Tailscale; installers refuse them.",
     "no_proxy: how ureq 3 (NSH fetch, runners up to 0.4.0) matches a NO_PROXY value against a URI host.",
     "direct_uri_hosts: canonical URI hosts that metro_url_policy::direct_no_proxy_entries() must exempt from proxies.",
-    "launcher_no_proxy_entries: exactly metro_url_policy::direct_no_proxy_entries(), which the desktop launcher adds to the UI's NO_PROXY."
+    "launcher_no_proxy_entries: exactly metro_url_policy::direct_no_proxy_entries(), which the desktop launcher adds to the UI's NO_PROXY.",
+    "Authorities: after an IPv6 literal's ] only :<digits> may follow ([::1]:99] is refused), and names are checked for DNS characters before any shell splitting (*.ts.net, box.. are refused)."
   ],
   "hosts": [
     {
@@ -330,6 +331,31 @@
     },
     {
       "host": "100.64.0.256",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "[::1]:99]",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "[::1]x",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "*.ts.net",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "box..",
+      "class": "other",
+      "installer": "refused"
+    },
+    {
+      "host": "box.ts.net..",
       "class": "other",
       "installer": "refused"
     }

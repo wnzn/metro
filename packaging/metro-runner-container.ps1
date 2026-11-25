@@ -45,6 +45,12 @@ Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
 $Prog = 'metro-runner-container'
 $Secret = '/run/secrets/metro_runner_token'
+# Fixed shell text for the container; settings reach it only as arguments or
+# environment values, never inside the text. Same as RUNNER_ENTRY and
+# PROBE_TCP in metro-runner-container.sh.
+$RunnerEntry = 'if [ -n "${METRO_DIRECT_NO_PROXY:-}" ]; then NO_PROXY="${NO_PROXY:-${no_proxy:-}}"; NO_PROXY="${NO_PROXY:+$NO_PROXY,}$METRO_DIRECT_NO_PROXY"; no_proxy="$NO_PROXY"; export NO_PROXY no_proxy; fi; unset METRO_DIRECT_NO_PROXY; IFS= read -r METRO_RUNNER_TOKEN < /run/secrets/metro_runner_token || [ -n "$METRO_RUNNER_TOKEN" ]; export METRO_RUNNER_TOKEN; exec /usr/local/bin/metro-runner'
+$ProbeTcp = 'exec 3<>"/dev/tcp/$1/$2"'
+$ProbeToken = 'test -r "$1" && test -s "$1"'
 $DefaultRepo = 'ghcr.io/wnzn/metro-runner'
 $OnWindows = [System.Environment]::OSVersion.Platform -eq 'Win32NT'
 if ($env:METRO_RUNNER_CONFIG_DIR) { $ConfigDir = $env:METRO_RUNNER_CONFIG_DIR }
@@ -185,7 +191,7 @@ function Get-DirectArgs($c) {
     if ((Test-Url $c.ServerUrl) -notin 'loopback', 'tailscale') { return @() }
     $h = $script:UrlHost
     $entries = if ($h.StartsWith('[')) { "$h,$($h.Substring(1, $h.Length - 2))" } else { $h }
-    return @('--env', "NO_PROXY=$entries", '--env', "no_proxy=$entries")
+    return @('--env', "METRO_DIRECT_NO_PROXY=$entries")
 }
 
 # url-rule:end
@@ -276,9 +282,10 @@ function Confirm-Image([string] $Ref) {
     }
 }
 
-function Invoke-Probe($c, [string] $Command) {
+# $Command is one of the fixed texts above; $Arguments reach it as $1, $2, ...
+function Invoke-Probe($c, [string] $Command, [string[]] $Arguments = @()) {
     $a = @('run', '--rm', '--pull=never') + (Get-NetworkArgs $c) + @('--read-only', '--cap-drop', 'ALL',
-        '--security-opt', 'no-new-privileges:true', '--mount', (Get-TokenMount $c), '--entrypoint', '/bin/bash', $c.Image, '-c', $Command)
+        '--security-opt', 'no-new-privileges:true', '--mount', (Get-TokenMount $c), '--entrypoint', '/bin/bash', $c.Image, '-c', $Command, 'metro-probe') + $Arguments
     Invoke-Engine @a | Out-Null
     return $EngineExit -eq 0
 }
@@ -299,7 +306,7 @@ function Start-Runner($c) {
         Write-Host "Started $($c.Name)."; return
     }
     Confirm-Image $c.Image
-    $script = 'IFS= read -r METRO_RUNNER_TOKEN < ' + $Secret + ' || [ -n "$METRO_RUNNER_TOKEN" ]; export METRO_RUNNER_TOKEN; exec /usr/local/bin/metro-runner'
+    $script = $RunnerEntry
     $a = @('run', '-d', '--name', $c.Name, '--restart', 'unless-stopped', '--pull=never') + (Get-NetworkArgs $c) + @(
         '--read-only', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=64m',
         '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--pids-limit', '256',
@@ -347,13 +354,13 @@ try {
             Confirm-Image $c.Image
             Invoke-Engine volume inspect $c.Volume | Out-Null
             if ($EngineExit -ne 0) { Invoke-Engine volume create $c.Volume | Out-Null; if ($EngineExit -ne 0) { Fail "cannot create volume $($c.Volume)" } }
-            if (-not (Invoke-Probe $c "test -r $Secret && test -s $Secret")) {
+            if (-not (Invoke-Probe $c $ProbeToken @($Secret))) {
                 Fail "the container cannot read $tokenPath. Make sure Docker Desktop can share that folder (Settings > Resources > File sharing)."
             }
             if ($c.Network -eq 'host') {
                 $u = [Uri] $url
                 $h = if ($u.Host -eq '[::1]') { '::1' } else { '127.0.0.1' }
-                if (-not (Invoke-Probe $c "exec 3<>/dev/tcp/$h/$($u.Port)")) {
+                if (-not (Invoke-Probe $c $ProbeTcp @($h, [string] $u.Port))) {
                     Write-Warning "the container cannot reach $url right now. Make sure Metro is running on that port, and enable Docker Desktop's Settings > Resources > Network > Enable host networking (4.34+)."
                 }
             }
