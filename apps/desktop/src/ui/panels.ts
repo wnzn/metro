@@ -65,4 +65,5 @@ function panel(name: string, size: PanelSize = { initial: 0, min: 0, max: 0 }) {
 
 export const navigationPanel = panel("navigation", { initial: 256, min: 200, max: 400 });
 export const runsPanel = panel("runs", { initial: 340, min: 260, max: 520 });
+export const threadPanel = panel("thread", { initial: 380, min: 320, max: 520 });
 export const settingsPanel = panel("settings-sections", { initial: 228, min: 180, max: 320 });

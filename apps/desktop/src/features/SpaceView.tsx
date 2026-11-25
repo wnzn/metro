@@ -22,10 +22,13 @@ import type { Bounds, ViewRef } from "nsh";
 import {
   actionError,
   activeRoom,
+  activeLoaded,
   activeSpace,
   activeSpaceId,
   addMention,
   beginMentionVisit,
+  chooseReplyTarget,
+  closeReplyPane,
   composerScope,
   draft,
   inSpaceComposer,
@@ -36,12 +39,16 @@ import {
   mentionDraft,
   mentionVisitKey,
   mentions,
+  muteReplyAgent,
   openManage,
+  openReplyThread,
   removeMention,
   previewMentionDraft,
   previewMentionMatches,
   rooms,
   roomsLoaded,
+  replyPane,
+  replyTarget,
   selectRoom,
   setDraft,
   status,
@@ -59,21 +66,27 @@ import {
   ComposerHint,
   InlineLink,
   Label,
+  Modal,
   PopoverNote,
   RecipientBar,
   RecipientChip,
+  ResizeHandle,
   Row,
   SuggestionList,
   SuggestionOption,
   Surface,
   ToolbarIconButton,
+  modalOpen,
+  threadPanel,
 } from "../ui";
+import { sidePanelFits } from "../ui/activity";
 import type { AskAgentChoice } from "../ui";
 import type { SpaceAgent } from "../api/spaces";
 import { RESERVED_HANDLE } from "../api/spaces";
-import { Composer, ConnectionBanner, fillDraft, focusComposer, Transcript } from "./Conversation";
+import { Composer, ConnectionBanner, fillDraft, focusComposer, messageAuthorName, replyExcerpt, Transcript } from "./Conversation";
 import { NewSpaceRunnerFeedback } from "./CreateSpaceForm";
 import type { DraftIdea } from "./Conversation";
+import type { RoomEvent } from "../store";
 import { PersonAvatar } from "./profile/PersonAvatar";
 import { ensureMentionPerson } from "./profile/profileState";
 import { agentById, agentMentionOptions, defaultAgent, spaceAgents } from "./space/agents";
@@ -84,6 +97,7 @@ import { mentionIdentityKey, scanMentionDraft } from "./mentions/draft";
 import type { MentionDirectory, MentionRecipient } from "./mentions/draft";
 import { beginMentionAgentVisit, refreshMentionAgents, spaceMentionDirectory, verifiedMembers } from "./mentions/roster";
 import { mentionSuggestion } from "./mentions/suggestions";
+import { ThreadPane } from "./replies/ThreadPane";
 
 /** Suggestions of an empty room: they fill the draft (and its recipients), never send. */
 const ROOM_IDEAS: DraftIdea[] = [
@@ -106,6 +120,33 @@ export function SpaceView() {
   // Its header (breadcrumb, runner, Manage, Space settings) is the Shell's one
   // header row: RoomHeaderTitle and RoomHeaderActions below.
   let announcedFor: string | null = null;
+  let opener: ViewRef | undefined;
+  const closeThread = () => {
+    const button = opener;
+    opener = undefined;
+    closeReplyPane();
+    if (button) void button.measure().then(layout => {
+      if (layout && !replyPane()) button.focus();
+    });
+  };
+  const reply = (event: RoomEvent, button?: ViewRef) => {
+    if (activeRoom()?.parentRoomId) {
+      chooseReplyTarget(event);
+      focusComposer();
+    } else void openReplyThread(event).then(ok => {
+      if (!ok) return;
+      opener = button;
+      queueMicrotask(() => focusComposer());
+    });
+  };
+  const pickThreadReply = (event: RoomEvent) => {
+    chooseReplyTarget(event);
+    focusComposer();
+  };
+  effect(() => {
+    if (!replyPane() || !sidePanelFits() || modalOpen()) return;
+    return keymap.bind("escape", closeThread, { when: "always" });
+  });
   effect(() => {
     const pending = roomsPending() ? activeSpace() : null;
     if (pending && pending.id !== announcedFor) announce(`Loading rooms in ${pending.name}.`);
@@ -131,8 +172,24 @@ export function SpaceView() {
           </Column>
         </If>
       }>
-        <Transcript emptyTitle="Start the conversation" emptyText="Messages here are seen by this Space's members." ideas={ROOM_IDEAS} />
-        <RoomComposer />
+        <Row grow>
+          <Column grow>
+            <Transcript roomId={activeRoom()?.id} onReply={reply} emptyTitle="Start the conversation"
+              emptyText="Messages here are seen by this Space's members." ideas={replyPane() ? [] : ROOM_IDEAS} />
+            <If when={!replyPane()}><RoomComposer /></If>
+          </Column>
+          <If when={replyPane() && sidePanelFits()}>
+            <ResizeHandle panel={threadPanel} edge="start" name="thread" testID="resize-thread" />
+            <Surface variant="aside" testID="thread-aside" width={threadPanel.width()}>
+              <ThreadPane onReply={pickThreadReply} onClose={closeThread} composer={<RoomComposer thread />} />
+            </Surface>
+          </If>
+        </Row>
+        <Modal testID="thread-dialog" title="Thread" size="full-height" open={!!replyPane() && !sidePanelFits()} onClose={closeThread}>
+          <If when={replyPane() && !sidePanelFits()}>
+            <ThreadPane onReply={pickThreadReply} onClose={closeThread} composer={<RoomComposer thread />} />
+          </If>
+        </Modal>
       </If>
     </Surface>
   );
@@ -261,7 +318,7 @@ export function mentionOptions(
   return out;
 }
 
-function RoomComposer() {
+function RoomComposer(props: { thread?: boolean }) {
   /** Opened with the @ button (not by typing). */
   const explicit = signal(false);
   /** The draft the user closed the suggestions at: typing on opens them again. */
@@ -281,6 +338,14 @@ function RoomComposer() {
     : activeSpaceId() ? spaceMentionDirectory(activeSpaceId()!) : null;
   const unresolved = () => matches().find(d => d.kind === "unresolved");
   const chips = computed(() => mentions().filter(a => !matches().some(m => m.kind === "ambiguous" && m.start === a.start)));
+  const replyAgent = () => {
+    const target = replyTarget();
+    if (!target || target.event.kind !== "agent" || target.muted) return null;
+    const saved = target.event.activity?.agent;
+    const sid = activeSpaceId();
+    return saved ? { id: saved.id, name: agentById(sid, saved.id)?.name ?? saved.name } :
+      defaultAgent(sid) ?? { id: undefined, name: "the agent" };
+  };
   const unresolvedHint = () => {
     const m = unresolved();
     if (!m) return "";
@@ -445,17 +510,18 @@ function RoomComposer() {
 
   return (
     <Composer
-      placeholder={activeRoom() ? `Message #${activeRoom()!.name}` : "Select a room"}
+      placeholder={props.thread ? "Reply in thread…" : activeRoom() ? `Message #${activeRoom()!.name}` : "Select a room"}
       agentHint={
         hasAgentChoice(activeSpaceId())
           ? "Return sends · Shift+Return adds a line · @agent asks the default agent, @handle a named one, Ask agent the one you chose; @name only notifies them."
           : "Return sends · Shift+Return adds a line · @agent or Ask agent asks this Space's agent; @name only notifies them."
       }
       askAgentId={askAgentId(activeSpaceId())}
+      replyAgentId={replyAgent()?.id}
       askLabel={askLabel()}
       askPicture={askPicture()}
       askChooser={askChooser()}
-      disabled={!activeRoom()}
+      disabled={!activeRoom() || (props.thread && !activeLoaded())}
       onSubmitIntercept={intercept}
       onCaretMove={(e) => caret.set(e.pageBounds)}
       onSelectionChange={selection.set}
@@ -474,6 +540,18 @@ function RoomComposer() {
       }
       above={
         <>
+          <If when={replyTarget()}>
+            {target => <Column gap={1} testID="reply-context">
+              <Label variant="caption" color="muted" lines={2} testID="composer-reply-quote">
+                {messageAuthorName(target().event)} · {replyExcerpt(target().event)}
+              </Label>
+              <If when={replyAgent()}>
+                {agent => <RecipientBar><RecipientChip testID="reply-agent-chip" agent
+                  label={`Replying to ${agent().name}`} accessibilityLabel={`Don't ask ${agent().name} to reply`}
+                  onRemove={() => { muteReplyAgent(); focusComposer(); }} /></RecipientBar>}
+              </If>
+            </Column>}
+          </If>
           <If when={chips().length > 0}>
             <RecipientBar testID="mention-chips">
               <Each of={chips()} key={(a) => mentionIdentityKey(a.mention)}>

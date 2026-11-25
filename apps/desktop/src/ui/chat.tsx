@@ -6,7 +6,7 @@
 // A picture's `src` is a `blob:` URL the feature made from bytes it fetched
 // with the user's credential, never a remote URL.
 
-import { announce, computed, effect, Image, openUrl, signal, Text, View } from "nsh";
+import { announce, computed, effect, Image, keymap, openUrl, signal, Text, View } from "nsh";
 import { Button, TextView } from "nsh/base";
 import type { TextViewCustomNode } from "nsh/base";
 import type { JSX, ViewRef } from "nsh";
@@ -177,18 +177,28 @@ export function MessageFrame(
     /** Follows the previous entry by the same author: tighter spacing. */
     continued?: boolean;
     selectable?: boolean;
+    shortcuts?: Record<string, () => void>;
     children?: JSX.Element;
   },
 ) {
+  const focused = signal(false);
+  const hasShortcuts = () => Object.keys(props.shortcuts ?? {}).length > 0;
+  effect(() => {
+    if (focused() && hasShortcuts()) return keymap.bind(props.shortcuts!, { forFocus: true, when: "notEditing" });
+  });
   return (
     <View
       class={cx(
         "group/msg relative flex-row gap-(--space-3) rounded-(--radius-sm) px-(--space-2) hover:bg-muted/50 focus-within:bg-muted/50",
         props.continued ? "py-px" : "pt-(--space-2) pb-px",
         props.highlight && "bg-tone-warning/45 hover:bg-tone-warning/70",
+        hasShortcuts() && focusRingClass,
       )}
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel}
+      focusable={hasShortcuts()}
+      onFocus={() => focused.set(true)}
+      onBlur={() => focused.set(false)}
     >
       <If when={props.highlight}>
         <View class="absolute left-0 top-[3px] bottom-[3px] w-[3px] rounded-full bg-tone-warning-foreground" accessibilityElementsHidden />
@@ -235,9 +245,10 @@ export function AuthorName(props: Testable & { name: string; agent?: boolean; de
 }
 
 /** A quiet marker after an author's name ("you"): plain muted words, never a pill. */
-export function AuthorTag(props: Testable & { label: string; tone?: Tone }) {
+export function AuthorTag(props: Testable & { label: string; tone?: Tone; tooltip?: string }) {
   return (
-    <Text class="text-(length:--text-xs) text-muted-foreground" testID={props.testID} accessibilityLabel={props.accessibilityLabel}>
+    <Text class="text-(length:--text-xs) text-muted-foreground" testID={props.testID} accessibilityLabel={props.accessibilityLabel ?? props.tooltip}
+      tooltip={props.tooltip ? <Text class="rounded-(--radius-sm) bg-popover border border-border px-(--space-2) py-[3px] text-(length:--text-xs) text-popover-foreground">{props.tooltip}</Text> : undefined}>
       {props.label}
     </Text>
   );

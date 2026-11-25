@@ -6,7 +6,8 @@ type DecisionReason = typeof decisionReasons[number];
 
 export type AddressingNote =
   | { kind: "classification_failed"; reason: DecisionReason }
-  | { kind: "generic_agent_unavailable"; reason: DecisionReason; message: string };
+  | { kind: "generic_agent_unavailable"; reason: DecisionReason; message: string }
+  | { kind: "reply_agent_unavailable"; message: string };
 export type RoutingNote =
   | { kind: "routing_failed"; reason: DecisionReason; message: string }
   | { kind: "model_unavailable"; reason: typeof modelReasons[number]; source: typeof modelSources[number]; message: string };
@@ -19,11 +20,12 @@ export type SenderNoticeDetails = {
   routing: RoutingNote | null;
 };
 /** Echo evidence is held only while waiting for the poll to corroborate a POST. */
-export type PostedSenderNotes = SenderNoticeDetails & { text: string; recipientsKey: string };
+export type PostedSenderNotes = SenderNoticeDetails & { text: string; recipientsKey: string; replyTo?: number };
 
 type SendIntent =
   | { kind: "chat"; text: string }
   | { kind: "space"; text: string; invoke_agent?: boolean; agent_id?: string;
+      reply?: { eventId: number; askAgent: boolean; agentId?: string };
       mentions?: readonly ({ kind: "agent"; agent_id?: string } | { kind: "user"; id: string })[] };
 
 export function canonicalEventTime(value: unknown): string | undefined {
@@ -47,7 +49,8 @@ export function canonicalStableId(value: unknown): value is string {
     !/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/.test(value);
 }
 
-type Recipient = readonly ["user", string] | readonly ["agent", string | null, "classifier" | "schedule" | null];
+type AgentAddress = "classifier" | "schedule" | "reply" | "metro";
+type Recipient = readonly ["user", string] | readonly ["agent", string | null, AgentAddress | null];
 const identityOf = (r: Recipient) => JSON.stringify([r[0], r[1]]);
 const recipientsKey = (recipients: readonly Recipient[]) => JSON.stringify(recipients);
 
@@ -65,8 +68,8 @@ export function canonicalAddressing(audience: unknown, raw: unknown): Recipient[
       const id = "agent_id" in m ? m.agent_id : null;
       const by = "addressed_by" in m ? m.addressed_by : null;
       if (("agent_id" in m && !canonicalStableId(id)) ||
-        ("addressed_by" in m && (!(by === "classifier" || by === "schedule") || !canonicalStableId(id)))) return null;
-      r = ["agent", id as string | null, by as "classifier" | "schedule" | null];
+        ("addressed_by" in m && (!(by === "classifier" || by === "schedule" || by === "reply" || by === "metro") || !canonicalStableId(id)))) return null;
+      r = ["agent", id as string | null, by as AgentAddress | null];
     } else return null;
     const identity = identityOf(r);
     if (seen.has(identity)) return null;
@@ -79,7 +82,7 @@ export function canonicalAddressing(audience: unknown, raw: unknown): Recipient[
 }
 
 type RenderedRecipient = { kind: "user"; id: string } |
-  { kind: "agent"; agentId?: string; addressedBy?: "classifier" | "schedule" };
+  { kind: "agent"; agentId?: string; addressedBy?: AgentAddress };
 
 /** Only called for a row whose original wire fields passed canonicalAddressing. */
 export function renderedRecipientsKey(mentions: readonly RenderedRecipient[] = []): string {
@@ -104,7 +107,12 @@ function readMessage(value: unknown) {
 }
 
 function addressingNote(value: unknown): AddressingNote | null {
-  if (!isRecord(value) || !isOneOf(decisionReasons, value.reason)) return null;
+  if (!isRecord(value)) return null;
+  if (value.kind === "reply_agent_unavailable") {
+    const message = readMessage(value.message);
+    return message ? { kind: value.kind, message } : null;
+  }
+  if (!isOneOf(decisionReasons, value.reason)) return null;
   const { kind, reason } = value;
   if (kind === "classification_failed") return { kind, reason };
   if (kind !== "generic_agent_unavailable") return null;
@@ -125,7 +133,7 @@ function routingNote(value: unknown): RoutingNote | null {
 }
 
 export function addressingText(note: AddressingNote) {
-  if (note.kind === "generic_agent_unavailable") return note.message;
+  if (note.kind !== "classification_failed") return note.message;
   const reason: Record<DecisionReason, string> = {
     unreachable: "System One didn't answer",
     timeout: "it took too long",
@@ -162,6 +170,8 @@ export function readPostedNotes(data: unknown, sent: SendIntent): PostedSenderNo
   if ((!addressing && !routing) || (data.routing_note != null && !routing)) return null;
   const echoed = canonicalAddressing(data.audience, data.mentions);
   if (!echoed) return null;
+  const reply = sent.kind === "space" ? sent.reply : undefined;
+  if ((data.reply_to ?? undefined) !== reply?.eventId) return null;
   const expected = submittedRecipients(sent);
   const key = recipientsKey(echoed);
   const explicitMatch = recipientsKey(expected) === key;
@@ -169,15 +179,18 @@ export function readPostedNotes(data: unknown, sent: SendIntent): PostedSenderNo
     if (data.addressing_note != null && !addressing) return null;
     const unaddressed = expected.length === 0;
     const generic = expected.some(m => m[0] === "agent" && m[1] === null);
-    const named = expected.some(m => m[0] === "agent" && m[1] !== null);
+    const replyRecipient = echoed.filter(m => m[0] === "agent" && m[2] === "reply");
+    const replied = reply?.askAgent && replyRecipient.length === 1 &&
+      (!reply.agentId || replyRecipient[0]![1] === reply.agentId) &&
+      recipientsKey(echoed.filter(m => m[0] !== "agent" || m[2] !== "reply")) === recipientsKey(expected);
+    const named = expected.some(m => m[0] === "agent" && m[1] !== null) || replied;
+    if (addressing?.kind === "reply_agent_unavailable" && (!reply?.askAgent || !explicitMatch)) return null;
     if (addressing?.kind === "classification_failed" &&
       (!unaddressed || !text || routing || !explicitMatch)) return null;
     if (addressing?.kind === "generic_agent_unavailable" && (!generic || (routing && !named))) return null;
-    // Classification is the only valid rewrite of explicit no-recipient
-    // addressing. It must name a single agent picked by the classifier.
     const classified = unaddressed && !!text && echoed.length === 1 && echoed[0]?.[0] === "agent" && echoed[0][2] === "classifier";
-    if (!explicitMatch && !(routing && !addressing && classified)) return null;
+    if (!explicitMatch && !replied && !(routing && !addressing && classified)) return null;
     if (routing && !generic && !named && !classified) return null;
   } else if (!explicitMatch) return null;
-  return { eventId: id, senderId: actor_id, createdAt, text, recipientsKey: key, addressing, routing };
+  return { eventId: id, senderId: actor_id, createdAt, text, recipientsKey: key, addressing, routing, ...(reply ? { replyTo: reply.eventId } : {}) };
 }

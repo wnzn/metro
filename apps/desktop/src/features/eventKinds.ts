@@ -20,13 +20,15 @@ export function kindLabel(kind: string): string {
   return label || "event";
 }
 
-export type MentionLike = { kind: "agent"; addressedBy?: "classifier" | "schedule" } | { kind: "user"; id: string };
+export type MentionLike = { kind: "agent"; addressedBy?: "classifier" | "schedule" | "reply" | "metro" } | { kind: "user"; id: string };
 
 /** "@agent", "@you" for the signed-in user, else "@<user id>". */
 export function mentionText(m: MentionLike, myId: string | null): string {
   // Not typed by the sender, so never shown as an "@agent" they wrote.
   if (m.kind === "agent" && m.addressedBy === "classifier") return "agent · detected by System One";
   if (m.kind === "agent" && m.addressedBy === "schedule") return "agent · scheduled prompt";
+  if (m.kind === "agent" && m.addressedBy === "reply") return "agent · reply";
+  if (m.kind === "agent" && m.addressedBy === "metro") return "agent · via Metro";
   if (m.kind === "agent") return "@agent";
   return m.id === myId ? "@you" : `@${m.id}`;
 }
