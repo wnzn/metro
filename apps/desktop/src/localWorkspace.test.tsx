@@ -53,12 +53,18 @@ function atLocal(server: F) {
 
 const env = { process: { "default.env": { METRO_DESKTOP_BRIDGE_URL: BRIDGE, METRO_DESKTOP_BRIDGE_TOKEN: BRIDGE_TOKEN } } };
 
-async function launch(remote: F, local: F, bridge: ReturnType<typeof fakeLauncher> | null, storage: Record<string, string> = {}) {
+async function launch(remote: F, local: F, bridge: ReturnType<typeof fakeLauncher> | null, storage: Record<string, string> = {}, manualClock = false) {
   const network = { ...(remote.network as any), ...atLocal(local), ...(bridge ? bridge.network : {}) };
-  return open("../App.tsx", { network, platform: "linux", width: 1200, height: 800, storage, ...(bridge ? { modules: env as any } : {}) });
+  return open("../App.tsx", { network, platform: "linux", width: 1200, height: 800, storage, ...(bridge ? { modules: env as any } : {}), ...(manualClock ? { clock: {} } : {}) });
 }
 
 const text = (app: App) => app.texts().join(" | ");
+const lastLocalSpace = { "metro.lastSpace": JSON.stringify({ server: LOCAL, space: "solo" }) };
+const localRooms = "/v1/spaces/solo/rooms";
+const lobbyEvents = `${localRooms}/lobby/events`;
+const roomEventPaths = (server: F) => server.state.log
+  .map((r) => r.path)
+  .filter((path) => path.startsWith("/v1/spaces/") && path.includes("/events?"));
 
 function expectNoTokens(app: App) {
   const shown = text(app);
@@ -109,6 +115,101 @@ test("a new install opens local Chat without a click and leaves remote settings 
   expect(app.value("id:server-url")).toBe("https://metro.example.com");
   expect(bridge.opens()).toHaveLength(1);
   expectNoTokens(app);
+});
+
+test("a slow remembered room starts one initial transcript request before the normal poll", async () => {
+  const local = fakeServer();
+  local.addSpace("solo", "Solo", "carol");
+  const message = local.post("solo/lobby", { kind: "message", actor: "carol", text: "First local message" });
+  const rooms = local.answerLate(localRooms, LOCAL_TOKEN, 80);
+  local.answerLate(lobbyEvents, LOCAL_TOKEN, 300);
+  const app = await launch(world(), local, fakeLauncher(), lastLocalSpace, true);
+  await app.waitFor("id:workspace", { timeout: 50 });
+  expect(rooms.arrived()).toBe(1);
+  expect(roomEventPaths(local)).toEqual([]);
+
+  await app.waitUntil(() => roomEventPaths(local).length > 0, { timeout: 150 });
+  await app.clock!.runFor(150);
+  expect(roomEventPaths(local)).toEqual([`${lobbyEvents}?after=0`]);
+  expect(app.shows("text:First local message")).toBe(false);
+  await app.waitFor("text:First local message", { timeout: 300 });
+  await app.waitUntil(() => roomEventPaths(local).length >= 2, { timeout: 150 });
+  // The intentional catch-up page advances the cursor, never re-fetching page one.
+  expect(roomEventPaths(local)).toEqual([`${lobbyEvents}?after=0`, `${lobbyEvents}?after=${message.id}`]);
+});
+
+test("a remembered Space with no rooms makes no transcript request", async () => {
+  const local = fakeServer();
+  local.addSpace("solo", "Solo", "carol");
+  local.state.rooms.set("solo", []);
+  local.answerLate(localRooms, LOCAL_TOKEN, 80);
+  const app = await launch(world(), local, fakeLauncher(), lastLocalSpace, true);
+  await app.waitFor("id:workspace");
+  await app.clock!.runFor(1700);
+  expect(app.shows("id:space:solo")).toBe(true);
+  expect(app.shows("text:No room selected")).toBe(true);
+  expect(roomEventPaths(local)).toEqual([]);
+});
+
+test("membership refused by the rooms endpoint never starts that Space's transcript", async () => {
+  const local = fakeServer();
+  local.addSpace("solo", "Solo", "alice", ["carol"]);
+  const get = local.network[`GET ${BASE}/v1/*`]!;
+  local.network[`GET ${BASE}/v1/*`] = (req) => {
+    // Membership was present in /spaces but revoked by the next request.
+    if (new URL(req.url).pathname === localRooms) local.state.spaces.get("solo")!.members.delete("carol");
+    return get(req);
+  };
+  local.answerLate(localRooms, LOCAL_TOKEN, 80);
+  const app = await launch(world(), local, fakeLauncher(), lastLocalSpace, true);
+  await app.waitUntil(() => text(app).includes("Couldn't open Solo"), { timeout: 200 });
+  expect(app.shows("id:space:solo")).toBe(false);
+  expect(roomEventPaths(local)).toEqual([]);
+  await app.waitUntil(() => local.state.log.some((r) => r.path === "/v1/chat/events?after=0"), { timeout: 200 });
+});
+
+test("switching accounts during remembered room load cannot start the old transcript", async () => {
+  const local = fakeServer();
+  local.addSpace("solo", "Solo", "carol");
+  const oldRooms = local.answerLate(localRooms, LOCAL_TOKEN, 1000);
+  const remote = world();
+  const app = await launch(remote, local, fakeLauncher(), lastLocalSpace, true);
+  await app.waitUntil(() => oldRooms.arrived() === 1, { timeout: 200 });
+  await app.press("id:account-menu");
+  await app.press("id:add-server");
+  await app.type("id:add-server-url", BASE);
+  await app.type("id:add-server-token", TOKENS.alice!);
+  await app.press("id:add-server-submit");
+  await app.waitFor("id:space:acme", { timeout: 200 });
+  await app.press("id:space:acme");
+  await app.waitFor("text:hello from bob in acme", { timeout: 200 });
+  await app.clock!.runFor(1100);
+  expect(app.shows("text:hello from bob in acme")).toBe(true);
+  expect(app.shows("id:space:solo")).toBe(false);
+  expect(roomEventPaths(local)).toEqual([]);
+  expect(roomEventPaths(remote).filter((path) => path.endsWith("?after=0"))).toEqual([
+    "/v1/spaces/acme/rooms/lobby/events?after=0",
+  ]);
+});
+
+test("an in-session switch to a remembered empty transcript requests it only once before the next poll", async () => {
+  const remote = fakeServer();
+  remote.addSpace("target", "Target", "alice");
+  const rooms = remote.answerLate("/v1/spaces/target/rooms", TOKENS.alice!, 80);
+  const app = await launch(remote, fakeServer(), fakeLauncher(), {
+    "metro.lastSpace": JSON.stringify({ server: BASE, space: "target" }),
+  }, true);
+  await app.waitFor("id:workspace");
+  await app.press("id:account-menu");
+  await app.press("id:add-server");
+  await app.type("id:add-server-url", BASE);
+  await app.type("id:add-server-token", TOKENS.alice!);
+  await app.press("id:add-server-submit");
+  await app.waitUntil(() => rooms.arrived() === 1, { timeout: 200 });
+  expect(roomEventPaths(remote)).toEqual([]);
+  await app.waitUntil(() => roomEventPaths(remote).length > 0, { timeout: 150 });
+  await app.clock!.runFor(400);
+  expect(roomEventPaths(remote)).toEqual(["/v1/spaces/target/rooms/lobby/events?after=0"]);
 });
 
 test("legacy last-used markers never override the factory startup preference", async () => {

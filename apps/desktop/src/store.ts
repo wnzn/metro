@@ -289,7 +289,6 @@ function startOnline(baseUrl: string, token: string) {
   failures = 0;
   status.set({ phase: "online" });
   for (const fn of sessionStarters) fn({ baseUrl, token });
-  kick();
 }
 
 /** Consume a verified candidate synchronously. Subsequent requests have their own session lifetime. */
@@ -303,8 +302,17 @@ export function adoptConnection(prepared: PreparedConnection, opts: { remember?:
     connectError.set(null);
     publishIdentity(prepared.baseUrl, candidate.who, candidate.list, opts.remember);
     startOnline(prepared.baseUrl, candidate.token);
-    if (candidate.list.some((s) => s.id === candidate.remembered)) {
-      void enterSpace(candidate.remembered!, { place: "chat", spaceId: null });
+    const initial = candidate.list.find((s) => s.id === candidate.remembered);
+    if (initial) {
+      // Show the shell now, but start its first tick after room selection.
+      // A tick before the room list arrives has no transcript to poll.
+      const current = guard();
+      void enterSpace(initial.id, { place: "chat", spaceId: null }).then(() => {
+        // Navigation away may already have started the loop for another view.
+        if (current() && !ticking && (basePlace() === "space" || timer === undefined)) kick();
+      });
+    } else {
+      kick();
     }
   });
 }
@@ -339,6 +347,7 @@ export async function connect(urlInput: string, tokenInput: string, opts: { reme
     if (initial) await enterSpace(initial.id, { place: "chat", spaceId: null });
     if (sess !== session) return;
     startOnline(baseUrl, token);
+    kick();
   } catch (error) {
     if (sess !== session) return;
     endSession();
