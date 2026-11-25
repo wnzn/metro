@@ -103,6 +103,50 @@ anyone outside the release workflow; macOS (not built); real vendor
 accounts and sign-ins; pretrained `google/embeddinggemma-2` ranking.
 Windows files carry no Authenticode signature.
 
+## Source only: shared-workspace updater re-review (2026-11-25, local)
+
+Verified on `lane/updates-backend` at `d57420e`, after `b451766`. This is
+unreleased source; nothing was pushed, merged, or deployed.
+
+- The Linux watchdog keeps the original `instance.lock` through the
+  trial handoff and rollback. The trial launcher verifies the handoff
+  against its parent and the workspace journal. The bundled server
+  inherits both the instance lock and the local workspace lease.
+  A portable launcher was refused before opening a workspace on the
+  same data root. In a separate fixture the bundled server outlived the
+  trial launcher: an independent holder of the old lock protocol could
+  not become primary, and the watchdog preserved the database, backup,
+  and journals instead of restoring over the live writer.
+- The desktop's durable floor survived both expiry of its cached
+  verification lease and absence of the cached status. A lower signed
+  release was not offered; the pending stage was retained until it
+  could be revalidated. The admin notice used the runner's shared-floor
+  decision: a below-floor release remained history with no update link
+  or image instructions.
+- 71 focused locked Rust tests passed; one child-process helper was
+  ignored as a standalone test and invoked by its parent test. These
+  suites included the published Linux installer lock regressions.
+  Formatting, strict Clippy, and the admin browser suite (22/22) passed.
+  `tests/e2e/updates.py` passed with separate test-release binaries. A
+  damaged or unprotected runner journal was left unchanged and the
+  runner exited with status 75 before sending a claim.
+
+**Manual recovery and legacy limits.** If a trial loses its watchdog and
+continuous exclusion cannot be proved, Metro does not restore on restart.
+The `desktop-update.json` gate and backup are kept. Stop Metro and its
+bundled server, keep both database copies, and resolve the installation
+and data together before resuming. Old launchers honor `instance.lock`
+while it is held but do not read the durable gate after the lock is
+released; do not run them against a workspace pending manual recovery.
+A server already orphaned by an older launcher did not inherit the new
+guards; older launchers and servers must be stopped before updating.
+Earlier installer migration restrictions still apply.
+
+Windows remains manual-only. The connector and launcher checked for
+`x86_64-pc-windows-gnu`, with pre-existing connector warnings. Native
+Windows MSI and helper-death tests remain deferred. No live update or
+TUF refresh was run.
+
 ## Source only: updater re-review (2026-11-25, local)
 
 Verified locally on `lane/updates-backend` at `92979ca`, after `916f8da`.
