@@ -1249,7 +1249,7 @@ impl DeviceRelay {
                 },
             );
         }
-        tracing::debug!(job = %id, ?operation, borrowed, "device job queued");
+        tracing::debug!(job = %id, %connection, ?operation, borrowed, "device job queued");
         let _abandon = Abandon {
             relay: self,
             id: id.clone(),

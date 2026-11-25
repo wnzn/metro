@@ -1689,11 +1689,14 @@ async fn a_borrowers_chat_never_shows_the_owners_provider_text() {
 
 /// Everything Metro logs, in this test binary.
 #[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
+struct Captured {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    written: Arc<tokio::sync::Notify>,
+}
 
 /// The process-wide capture of Metro's logs, installed once. A process-wide
 /// subscriber (not a thread's) sees every callsite whichever thread first
-/// reached it; only one test per binary reads it, for its own sentinel.
+/// reached it.
 fn captured_logs() -> Captured {
     static CAPTURED: std::sync::OnceLock<Captured> = std::sync::OnceLock::new();
     CAPTURED
@@ -1713,11 +1716,33 @@ fn captured_logs() -> Captured {
 
 impl std::io::Write for Captured {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
+        self.bytes.lock().unwrap().extend_from_slice(buf);
+        self.written.notify_waiters();
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+impl Captured {
+    async fn wait_for_enqueue(&self, connection: &str) {
+        let field = format!("connection={connection}");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                // Register the notification before looking at the buffer.
+                let next_write = self.written.notified();
+                let logged = String::from_utf8_lossy(&self.bytes.lock().unwrap())
+                    .lines()
+                    .any(|line| line.contains("device job queued") && line.contains(&field));
+                if logged {
+                    return;
+                }
+                next_write.await;
+            }
+        })
+        .await
+        .expect("the device job was enqueued");
     }
 }
 
@@ -1797,7 +1822,7 @@ async fn a_device_classifiers_own_text_reaches_no_log_response_or_room() {
             .await;
         assert!(!events.to_string().contains(SENTINEL), "{events}");
     }
-    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let logs = String::from_utf8(captured.bytes.lock().unwrap().clone()).unwrap();
     assert!(logs.contains("typed model call failed"), "{logs}");
     assert!(logs.contains("device_error"), "{logs}");
     assert!(
@@ -2022,6 +2047,7 @@ async fn online_device(s: &Server, token: &str) -> (String, String) {
 
 #[tokio::test]
 async fn space_work_queued_for_a_device_is_withheld_after_the_caller_leaves() {
+    let captured = captured_logs();
     let s = Arc::new(Server::start().await);
     // Bob's own device, and Alice's shared with the whole organization.
     let (own, own_device) = online_device(&s, BOB).await;
@@ -2036,8 +2062,8 @@ async fn space_work_queued_for_a_device_is_withheld_after_the_caller_leaves() {
             let (s, sid, id) = (s.clone(), sid.clone(), id.clone());
             tokio::spawn(async move { s.decide("bob", Some(&sid), &id).await })
         };
-        // Queued (admitted while Bob was a member), not yet claimed.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // The relay logged this specific job after inserting it in the queue.
+        captured.wait_for_enqueue(&id).await;
         assert!(
             !pending.is_finished(),
             "{label}: still waiting for the device"
@@ -2049,7 +2075,13 @@ async fn space_work_queued_for_a_device_is_withheld_after_the_caller_leaves() {
             "{label}: released after removal"
         );
         let r = pending.await.unwrap();
-        assert!(r.is_err(), "{label}: {r:?}");
+        assert_eq!(
+            r,
+            Err(ProviderError::Device(
+                metro_server::device_relay::DeviceError::AccessRevoked
+            )),
+            "{label}"
+        );
     }
 }
 
