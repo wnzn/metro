@@ -4,7 +4,7 @@ import { isPageStatus, pageFailure } from "../../api/pages";
 import { goPages, hasSpace, pageGuard, pages, pagesError, pagesLoading, pagesProblem, recentPageDrafts, refreshPages, scopeVisible, spaceGrants, watchPageScope } from "../../pagesState";
 import type { PagesRoute } from "../../pagesState";
 import { apiClient, sessionGuard, spaces } from "../../store";
-import { Action, ActionBar, Badge, Column, compactWidth, Label, Modal, PageHeader, PageLayout, Picker, Row, SettingsGroup, Surface } from "../../ui";
+import { Action, ActionBar, Badge, Banner, Column, compactWidth, Label, Modal, PageHeader, PageLayout, Picker, Row, SettingsGroup, Surface } from "../../ui";
 import { profileName } from "../profile/profileState";
 import { Diagnostics, DraftPrompt, PagesError, scopeName, showDraft, showPage } from "./controls";
 import { cell } from "./renderPlan";
@@ -24,6 +24,10 @@ export function PagesHome(props: { route: Home }) {
         <Action testID="new-page" label="New page" variant="primary" onPress={() => creating.set(true)} />
       </PageHeader>
     </Column>
+    <If when={props.route.afterDelete}>
+      <Banner tone="success" variant="inline" message="Page deleted. You can restore it for 30 days."
+        action={<Action compact label="Recently deleted" testID="page-deleted-recovery" onPress={() => deleted.set(true)} />} />
+    </If>
     <Row gap={2} wrap>
       <Action compact testID="pages-reload" label="Refresh list" onPress={() => void refreshPages()} />
       <Action compact testID="pages-deleted" label="Recently deleted" variant="ghost" onPress={() => deleted.set(true)} />
@@ -144,7 +148,7 @@ function NewPageSheet(props: { route: Home; close: () => void }) {
       </Column>}>
         <DraftPrompt spaceId={scope()} busy={!!busy()} onSubmit={(prompt, choice) => void create(async (client, dest, current) => {
           const draft = await client.createPageDraft(dest, prompt, choice);
-          if (current() && sameTarget(dest, draft)) showDraft(draft);
+          if (current() && sameTarget(dest, draft)) showDraft(draft, choice);
         })} />
       </If>
       <Diagnostics items={diagnostics() ?? []} />
@@ -210,12 +214,20 @@ function DeletedPages(props: { route: Home; close: () => void }) {
         <Column gap={2}>
           <Each of={rows()} key={entry => entry.page.id}>
             {entry => <Row align="center" gap={2} justify="between" wrap>
-              <Label>{entry().page.title} · {scopeName(entry().page.space_id)}</Label>
-              <Action compact label="Undelete" testID={`undelete-page:${entry().page.id}`} disabled={!!busy()} busy={busy()?.pageId === entry().page.id} onPress={() => void restore(entry())} />
+              <Column gap={1}>
+                <Label>{entry().page.title} · {scopeName(entry().page.space_id)}</Label>
+                <Label variant="meta">{restoreTime(entry().page.deleted_at)}</Label>
+              </Column>
+              <Action compact label="Restore page" accessibilityLabel={`Restore ${entry().page.title}`} testID={`undelete-page:${entry().page.id}`} disabled={!!busy()} busy={busy()?.pageId === entry().page.id} onPress={() => void restore(entry())} />
             </Row>}
           </Each>
         </Column>
       </If>
     </PageLayout>
   </Modal>;
+}
+
+function restoreTime(deletedAt: string | null) {
+  const days = Math.ceil((Date.parse(deletedAt ?? "") + 30 * 86_400_000 - Date.now()) / 86_400_000);
+  return !Number.isFinite(days) ? "" : days <= 0 ? "Restore window ended" : days === 1 ? "Less than a day left to restore" : `${Math.min(days, 30)} days left to restore`;
 }

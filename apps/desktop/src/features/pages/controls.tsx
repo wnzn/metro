@@ -1,7 +1,8 @@
 import { cleanup, signal } from "nsh";
+import type { InputRef } from "nsh";
 import type { TurnModelChoice } from "../../api/client";
 import type { Draft, PageDiagnostic } from "../../api/pages";
-import { hasSpace, goPages, refreshPages, watchPageScope } from "../../pagesState";
+import { hasSpace, goPages, refreshPages, rememberPageDraftModel, watchPageScope } from "../../pagesState";
 import { apiClient, sessionGuard, spaces } from "../../store";
 import { Action, Banner, Column, Field, Label, Row } from "../../ui";
 import { ComposerModelTrigger, ModelOptionPicker, ThinkingChoice } from "../../ui/composerModelTrigger";
@@ -16,14 +17,15 @@ export function showPage(page: { id: string; space_id: string | null }) {
   void refreshPages();
 }
 
-export function showDraft(draft: Draft) {
+export function showDraft(draft: Draft, choice?: TurnModelChoice) {
+  rememberPageDraftModel(draft.id, choice);
   goPages({ kind: "draft", id: draft.id, spaceId: draft.space_id ?? undefined, returnPage: draft.page_id ?? undefined });
 }
 
-export function PagesError(props: { message: string; onRetry?: () => void; testID?: string }) {
+export function PagesError(props: { message: string; onRetry?: () => void; retryLabel?: string; testID?: string }) {
   return <If when={props.message}>
     <Banner testID={props.testID ?? "pages-error"} variant="inline" tone="danger" message={props.message}
-      action={props.onRetry ? <Action compact label="Try again" onPress={() => props.onRetry?.()} /> : undefined} />
+      action={props.onRetry ? <Action compact label={props.retryLabel ?? "Try again"} onPress={() => props.onRetry?.()} /> : undefined} />
   </If>;
 }
 
@@ -40,12 +42,12 @@ export function Diagnostics(props: { items: PageDiagnostic[] }) {
 
 /** Same model options, provider grouping and thinking controls as the chat
  * composer, but with a separate per-form catalog and an explicit page scope. */
-function createPageModel(scopeId: () => string | null) {
+function createPageModel(scopeId: () => string | null, initial?: TurnModelChoice) {
   const catalog = createComposerCatalog();
   const open = signal(false);
   // Explicit intent lives outside the fetchable catalogue. A refresh, failed
   // request, or lost share can remove options but can't choose Default.
-  const intent = signal<{ scope: string | null; choice: TurnModelChoice } | null>(null);
+  const intent = signal<{ scope: string | null; choice: TurnModelChoice } | null>(initial ? { scope: scopeId(), choice: initial } : null);
   const pin = () => intent()?.scope === scopeId() ? intent()?.choice : undefined;
   const current = () => catalog.current(scopeId());
   const selected = () => {
@@ -61,9 +63,11 @@ function createPageModel(scopeId: () => string | null) {
       () => client.availableCatalog(scope).then(result => result.models),
       () => client.providerCatalog().then(result => result.providers.map(({ id, name }) => ({ id, name }))));
   };
+  let initialized = false;
   watchPageScope(scopeId, (_, visible, switched) => {
     catalog.clear();
-    if (switched) { intent.set(null); open.set(false); }
+    if (initialized && switched) { intent.set(null); open.set(false); }
+    initialized = true;
     if (visible && (open() || pin())) void load();
   });
   cleanup(() => { alive = false; catalog.clear(); });
@@ -89,9 +93,10 @@ function createPageModel(scopeId: () => string | null) {
 function PageModel(props: { model: ReturnType<typeof createPageModel>; disabled?: boolean }) {
   const { open, current, selected, pin, pick, load } = props.model;
   return <Column gap={2}>
-    <Row><ComposerModelTrigger model={selected()?.model ?? (pin() ? "Check selection" : null)}
+    <Label variant="strong">Model for this draft</Label>
+    <Row><ComposerModelTrigger model={selected()?.model ?? (pin()?.modelId || (pin() ? "Check selection" : null))}
       thinking={pin()?.reasoningEffort ?? "Provider default"} mark={selected()?.provider.mark ?? null}
-      accessibilityLabel="Model for building this page" onPress={() => {
+      accessibilityLabel="Model for this draft" onPress={() => {
         if (props.disabled) return;
         open.set(!open());
         if (open()) void load();
@@ -119,14 +124,15 @@ function PageModel(props: { model: ReturnType<typeof createPageModel>; disabled?
 
 type DraftSend = (prompt: string, choice?: TurnModelChoice) => void;
 export function DraftPrompt(props: {
-  spaceId: string | null; initial?: string; label?: string; busy?: boolean;
+  spaceId: string | null; initial?: string; initialModel?: TurnModelChoice; label?: string; busy?: boolean; blocked?: boolean;
+  focus?: boolean; inputRef?: (node: InputRef) => void; onCancel?: () => void;
 } & ({ onSubmit: DraftSend; prepareSubmit?: never } | { prepareSubmit: () => DraftSend; onSubmit?: never })) {
   const prompt = signal(props.initial ?? "");
   const checking = signal(false);
-  const model = createPageModel(() => props.spaceId);
+  const model = createPageModel(() => props.spaceId, props.initialModel);
   const submit = async () => {
     const text = prompt().trim(), choice = model.pin(), sid = props.spaceId;
-    if (props.busy || checking() || !text || model.error()) return;
+    if (props.busy || props.blocked || checking() || !text || model.error()) return;
     const send = props.prepareSubmit?.() ?? props.onSubmit;
     if (!send) return;
     if (!choice) { send(text); return; }
@@ -141,10 +147,12 @@ export function DraftPrompt(props: {
   };
   return <Column gap={2}>
     <Field testID="page-prompt" accessibilityLabel={props.label ?? "Describe the page you want"} multiline value={prompt()}
-      placeholder={props.label ?? "Describe the page you want"} onChange={prompt.set} maxLength={4000} disabled={props.busy || checking()} />
+      placeholder={props.label ?? "Describe the page you want"} onChange={prompt.set} maxLength={4000} disabled={props.busy || checking()}
+      autoFocus={props.focus} inputRef={props.inputRef} onCancel={props.onCancel} />
     <PageModel model={model} disabled={props.busy || checking()} />
     <If when={model.error()}>{message => <Label color="warning">{message()}</Label>}</If>
-    <Row justify="end"><Action testID="page-generate" label="Generate draft" busyLabel="Starting…" variant="primary"
-      disabled={!prompt().trim() || !!model.error()} busy={props.busy || checking()} onPress={() => void submit()} /></Row>
+    <Label variant="caption" color="muted">Only you can review this draft until you apply it.</Label>
+    <Row justify="end"><Action testID="page-generate" label="Generate draft" busyLabel={checking() ? "Checking model…" : "Building draft…"} variant="primary"
+      disabled={props.blocked || !prompt().trim() || !!model.error()} busy={props.busy || checking()} onPress={() => void submit()} /></Row>
   </Column>;
 }

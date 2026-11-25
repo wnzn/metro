@@ -1,9 +1,10 @@
 import { batch, computed, effect, signal, untracked } from "nsh";
 import type { PageMeta } from "./api/pages";
+import type { TurnModelChoice } from "./api/client";
 import { ApiError, apiClient, describe, disconnect, isAborted, mainPlace, onSessionEnd, openPlace, sessionGuard, spaces } from "./store";
 
 export type PagesRoute =
-  | { kind: "home"; spaceId?: string }
+  | { kind: "home"; spaceId?: string; afterDelete?: boolean }
   | { kind: "page"; id: string; spaceId?: string }
   | { kind: "draft"; id: string; spaceId?: string; returnPage?: string; returnRoom?: string };
 
@@ -13,6 +14,13 @@ export const pagesRouteMount = signal(0);
 const entries = signal<{ page: PageMeta; valid?: () => boolean }[]>([]);
 type DraftRoute = Extract<PagesRoute, { kind: "draft" }>;
 const draftLinks = signal<{ route: DraftRoute; valid: () => boolean }[]>([]);
+const unavailableDrafts = signal<ReadonlySet<string>>(new Set());
+const draftModels = new Map<string, TurnModelChoice>();
+export const pageDraftUnavailable = (id: string) => unavailableDrafts().has(id);
+export const pageDraftModel = (id: string) => draftModels.get(id);
+export function rememberPageDraftModel(id: string, choice?: TurnModelChoice) {
+  if (choice) draftModels.set(id, choice);
+}
 export const pagesRoute = computed(route);
 export const pages = computed(() => entries().filter(e => scopeVisible(e.page) && (e.valid?.() ?? true)).map(e => e.page));
 /** Session-only handles; no draft source, prompt, or preview is cached here. */
@@ -54,7 +62,10 @@ export function scopeVisible(page: { scope: string; space_id: string | null }) {
 export function goPages(next: PagesRoute = { kind: "home" }) {
   if (!apiClient() || !hasSpace(next.spaceId)) return;
   batch(() => {
-    if (next.kind === "draft") draftLinks.set([{ route: { ...next }, valid: sessionGuard(next.spaceId) }, ...draftLinks().filter(entry => entry.route.id !== next.id && entry.valid())].slice(0, 20));
+    if (next.kind === "draft" && !pageDraftUnavailable(next.id)) {
+      const links = [{ route: { ...next }, valid: sessionGuard(next.spaceId) }, ...draftLinks().filter(entry => entry.route.id !== next.id && entry.valid())].slice(0, 20);
+      draftLinks.set(links);
+    }
     route.set(next);
     pagesRouteMount.set(pagesRouteMount() + 1);
     // Keep mutation navigation guards in step even for Page A → B → A.
@@ -63,6 +74,8 @@ export function goPages(next: PagesRoute = { kind: "home" }) {
 }
 
 export function forgetPageDraft(id: string) {
+  unavailableDrafts.set(new Set(unavailableDrafts()).add(id));
+  draftModels.delete(id);
   draftLinks.set(draftLinks().filter(entry => entry.route.id !== id));
 }
 
@@ -108,6 +121,8 @@ onSessionEnd(() => {
   listRequest++;
   entries.set([]);
   draftLinks.set([]);
+  unavailableDrafts.set(new Set());
+  draftModels.clear();
   pagesError.set("");
   pagesLoading.set(false);
   route.set({ kind: "home" });

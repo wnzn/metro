@@ -1,8 +1,9 @@
-import { cleanup, effect, lifecycle, signal, untracked } from "nsh";
+import { announce, cleanup, effect, lifecycle, signal, untracked } from "nsh";
+import type { ViewRef } from "nsh";
 import type { TurnModelChoice } from "../../api/client";
 import type { Draft, Page, PageDiagnostic, PageValues } from "../../api/pages";
 import { isPageStatus, pageFailure, targetOf } from "../../api/pages";
-import { forgetPageDraft, goPages, pageGuard, pagesProblem, sameSpaceGrants, scopeVisible, spaceGrants } from "../../pagesState";
+import { forgetPageDraft, goPages, pageDraftModel, pageDraftUnavailable, pageGuard, pagesProblem, rememberPageDraftModel, sameSpaceGrants, scopeVisible, spaceGrants } from "../../pagesState";
 import type { PagesRoute } from "../../pagesState";
 import { apiClient, openExactRoom, sessionGuard } from "../../store";
 import { Action, ActionBar, Badge, Banner, Column, Label, modalOpen, PageHeader, Row, ScrollArea, SegmentedControl } from "../../ui";
@@ -22,12 +23,16 @@ export function DraftView(props: { route: DraftRoute }) {
   const currentHead = signal<Page | null>(null), stale = signal(false);
   const tab = signal<Tab>("preview"), error = signal("");
   const outside = signal<string[]>([]), confirmOutside = signal(false), retry = signal(false), discard = signal(false);
-  const busy = signal(false), loading = signal(true), previewing = signal(false), unavailable = signal(false);
+  const busy = signal(false), loading = signal(true), previewing = signal(false), unavailable = signal(pageDraftUnavailable(route.id));
+  const previewError = signal("");
+  let retryControl: ViewRef | undefined;
+  function closeRetry() { if (!busy()) { retry.set(false); retryControl?.focus(); } }
   const applyAccess = signal<"allowed" | "checking" | "denied">("allowed");
   const checkError = signal("");
   const conflict = signal<{ pageId: string; version: number } | null>(null), readingHead = signal(false), headError = signal("");
   const draftReads = pageReadLane<string>(), previewReads = pageReadLane<Draft>(), headReads = pageReadLane<string>();
   let alive = true, grant = sessionGuard(route.spaceId);
+  let draftStatus: Draft["status"] | undefined;
   cleanup(() => { alive = false; });
   const valid = () => alive && guard() && grant() && (!draft() || scopeVisible(draft()!));
   const visible = () => valid() && !modalOpen() && lifecycle() === "active";
@@ -40,7 +45,7 @@ export function DraftView(props: { route: DraftRoute }) {
     checkError.set("");
     applyAccess.set("denied");
     error.set("This draft is no longer available. It may have been applied, discarded, expired, or you may no longer have access.");
-    loading.set(false); previewing.set(false); readingHead.set(false);
+    loading.set(false); previewing.set(false); readingHead.set(false); previewError.set("");
     data.set(null); draft.set(null); currentHead.set(null); diagnostics.set([]); outside.set([]);
   }
   function problem(e: unknown) {
@@ -62,7 +67,12 @@ export function DraftView(props: { route: DraftRoute }) {
         draft.set(next);
         diagnostics.set(next.diagnostics);
         outside.set(next.outside_selection);
-        error.set(next.error ?? "");
+        error.set("");
+        if (next.status !== draftStatus) {
+          if (next.status === "failed") announce(next.error || "Draft generation failed.");
+          else if (next.status === "ready" && draftStatus === "generating") announce("Draft ready for review.");
+          draftStatus = next.status;
+        }
         if (recheck) applyAccess.set("denied");
       } catch (e) {
         if (allowed()) {
@@ -74,6 +84,7 @@ export function DraftView(props: { route: DraftRoute }) {
       finally { if (allowed()) loading.set(false); }
     });
   }
+  if (unavailable()) missing();
   const generating = () => !draft() || draft()?.status === "generating";
   visiblePolling(() => visible() && available() && generating() && applyAccess() !== "checking", () => 1_500, () => void load());
   function preview(review: Draft) {
@@ -82,11 +93,16 @@ export function DraftView(props: { route: DraftRoute }) {
     return previewReads.run(review, async (signal, current) => {
       const allowed = () => current() && visible() && available() && tab() === "preview" && draft() === review && [...grants.values()].every(ok => ok());
       if (!allowed()) return;
-      previewing.set(true);
+      previewing.set(true); previewError.set("");
       try {
         const values = await client.pageDraftData(route.id, signal);
         if (allowed()) data.set(values);
-      } catch (e) { if (allowed()) problem(e); }
+      } catch (e) {
+        if (allowed()) {
+          if (isPageStatus(e, 404) || isPageStatus(e, 403)) missing();
+          else previewError.set(pagesProblem(e));
+        }
+      }
       finally { if (allowed()) previewing.set(false); }
     });
   }
@@ -124,7 +140,7 @@ export function DraftView(props: { route: DraftRoute }) {
       if (!shown || changed) draftReads.cancel();
       if (shown && checkingAccess) void load(true);
       else if ((show || changed) && shown && generating()) void load();
-      if (previewChanged || !shown) { previewReads.cancel(); data.set(null); previewing.set(false); }
+      if (previewChanged || !shown) { previewReads.cancel(); data.set(null); previewing.set(false); previewError.set(""); }
       if (toPreview && previewChanged) void preview(toPreview);
       if (!toCompare || changed) { headReads.cancel(); readingHead.set(false); }
       if (toCompare) void loadConflictHead();
@@ -195,8 +211,10 @@ export function DraftView(props: { route: DraftRoute }) {
       // if that fails it remains private and expires on the server.
       void client.discardPageDraft(review.id).catch(() => {});
       forgetPageDraft(review.id);
-      if (route.returnRoom) goPages({ ...route, id: next.id });
-      else showDraft(next);
+      if (route.returnRoom) {
+        rememberPageDraftModel(next.id, choice);
+        goPages({ ...route, id: next.id });
+      } else showDraft(next, choice);
     } catch (e) {
       // A missing selected block or newly revoked edit grant must never
       // quietly widen a selected edit to the whole document.
@@ -219,7 +237,7 @@ export function DraftView(props: { route: DraftRoute }) {
           variant="ghost" disabled={busy()} onPress={back} />
         <If when={route.returnRoom || route.returnPage}><Action compact variant="ghost" label="All pages" onPress={() => goPages()} /></If>
       </Row>
-      <PageHeader title={title()} subtitle="Review the draft before it changes a page.">
+      <PageHeader title={title()} subtitle="Review the draft before it changes a page." focusTitle testID="page-draft-heading">
         <Badge label={scopeName(route.spaceId)} tone="system" />
       </PageHeader>
     </Column>
@@ -233,7 +251,12 @@ export function DraftView(props: { route: DraftRoute }) {
       <If when={applyAccess() === "denied"}>
         <Banner tone="warning" variant="inline" message="You can still review or discard this draft, but you no longer have permission to apply it." />
       </If>
-      <If when={review().status === "generating"}><Label testID="page-draft-generating">Building your draft… You can leave this view while it runs.</Label></If>
+      <If when={review().status === "generating"}><Label testID="page-draft-generating">Building draft… You can leave and resume under Pages → Continue reviewing.</Label></If>
+      <If when={review().status === "failed"}>
+        <Banner tone="danger" variant="inline" message={review().error || "Couldn’t build this draft."}
+          action={applyAccess() === "allowed" ? <Action compact testID="page-retry-failed" label={retry() ? "Close prompt" : "Edit prompt and retry"} disabled={busy()}
+            viewRef={node => { retryControl = node; }} onPress={() => { if (retry()) closeRetry(); else retry.set(true); }} /> : undefined} />
+      </If>
       <If when={review().status !== "generating"}>
         <Row gap={2} wrap align="center">
           <SegmentedControl testID="page-draft-tab" accessibilityLabel="Draft review tab" value={tab()} onChange={tab.set}
@@ -242,6 +265,7 @@ export function DraftView(props: { route: DraftRoute }) {
         </Row>
         <If when={tab() === "preview"}>
           <ScrollArea gap={2}>
+            <PagesError message={previewError()} retryLabel="Retry preview" onRetry={() => void preview(review())} />
             <If when={review().spec} else={<Label color="muted">No preview is available. Review the diagnostics or edit the prompt and retry.</Label>}>
               {spec => <PageRenderer spec={spec()} data={data()} pending={previewing()} changed={changed()} readOnly />}
             </If>
@@ -257,7 +281,8 @@ export function DraftView(props: { route: DraftRoute }) {
             <If when={readingHead()}><Label color="muted">Loading current source…</Label></If>
             <PagesError message={headError()} onRetry={() => void loadConflictHead()} />
           </Column>}>
-            <PageDiff before={currentHead()?.source ?? review().base_source ?? ""} after={review().source ?? ""} />
+            <PageDiff before={currentHead()?.source ?? review().base_source ?? ""} after={review().source ?? ""}
+              accessibilityLabel={`${currentHead() ? `Current version ${currentHead()!.head_version}` : review().base_version ? `Published version ${review().base_version}` : "Empty page"} to draft source`} />
           </If>
         </If>
         <If when={tab() === "source"}><PageCode value={review().source ?? ""} readOnly /></If>
@@ -272,7 +297,8 @@ export function DraftView(props: { route: DraftRoute }) {
         <If when={retry() && applyAccess() === "allowed"}>
           <ScrollArea gap={2}>
             <Label variant="strong">{review().block_key ? `Retry edit to block ${review().block_key}` : "Edit prompt and retry"}</Label>
-            <DraftPrompt spaceId={review().space_id} initial={review().prompt} label="Revise the prompt" busy={busy()} onSubmit={(prompt, choice) => void regenerate(prompt, choice)} />
+            <DraftPrompt spaceId={review().space_id} initial={review().prompt} initialModel={pageDraftModel(review().id)}
+              label="Revise the prompt" busy={busy()} focus onCancel={closeRetry} onSubmit={(prompt, choice) => void regenerate(prompt, choice)} />
           </ScrollArea>
         </If>
       </If>
@@ -283,8 +309,9 @@ export function DraftView(props: { route: DraftRoute }) {
       </If>
       <ActionBar>
         <Action label="Discard…" testID="page-discard" variant="destructive" disabled={busy() || discard()} onPress={() => discard.set(true)} />
-        <If when={review().status !== "generating"}>
-          <Action testID="page-draft-retry" label={retry() ? "Close prompt" : "Edit prompt and retry"} variant="ghost" disabled={busy() || applyAccess() === "denied"} onPress={() => retry.set(!retry())} />
+        <If when={review().status === "ready"}>
+          <Action testID="page-draft-retry" label={retry() ? "Close prompt" : "Edit prompt and retry"} variant="ghost" disabled={busy() || applyAccess() === "denied"}
+            viewRef={node => { retryControl = node; }} onPress={() => { if (retry()) closeRetry(); else retry.set(true); }} />
         </If>
         <Action testID="page-apply" label="Apply" variant="primary" disabled={applyAccess() !== "allowed" || stale() || review().status !== "ready" || confirmOutside() || discard()} busy={busy()} onPress={() => void apply()} />
       </ActionBar>
