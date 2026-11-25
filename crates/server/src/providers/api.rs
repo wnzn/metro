@@ -416,15 +416,22 @@ pub async fn create(
                     }
                 }
                 if explicit == Some(false) && row.is_default {
-                    row.is_default = false;
-                    let r = row.clone();
-                    if let Some(rev) = state
+                    // Only the flag: anything else changed since the listing
+                    // keeps its committed value.
+                    let (user, cid) = (row.user_id.clone(), row.id.clone());
+                    let unset = store::Patch {
+                        is_default: Some(false),
+                        ..store::Patch::default()
+                    };
+                    if let store::Patched::Saved(saved) = state
                         .db
-                        .call(move |db| Ok(store::update(&mut db.lock(), &r)?))
+                        .call(move |db| {
+                            Ok(store::patch(&mut db.lock(), &user, &cid, &unset, None)?)
+                        })
                         .await
                         .map_err(ApiError::internal)?
                     {
-                        row.config_rev = rev;
+                        row = saved;
                     }
                 }
             }
@@ -497,23 +504,26 @@ pub async fn update(
     Path(id): Path<String>,
     body: Result<Json<UpdateBody>, JsonRejection>,
 ) -> ApiResult<Json<ConnectionView>> {
-    let mut row = load(&state, &who, &id).await?;
+    let previous = load(&state, &who, &id).await?;
     let Json(body) = body?;
-    let previous = row.clone();
-    let entry = catalog::find(&row.provider_id)
+    let entry = catalog::find(&previous.provider_id)
         .ok_or_else(|| conflict("this connection's provider is no longer supported"))?;
+    let mut patch = store::Patch::default();
     if let Some(url) = body.base_url {
         if entry.is_device() {
             return Err(device_has_no_key());
         }
         let url = url.ok_or_else(|| bad_request("base_url must be an approved URL, not null"))?;
-        row.base_url = Some(approved_base_url(&state, &url)?);
+        let url = approved_base_url(&state, &url)?;
+        if previous.base_url.as_deref() != Some(url.as_str()) {
+            patch.base_url = Some(url);
+        }
     }
     if let Some(name) = &body.name {
-        row.name = check_name(name)?;
+        patch.name = Some(check_name(name)?);
     }
     if let Some(model) = &body.model {
-        row.model = check_model(model.as_deref().unwrap_or(""))?;
+        patch.model = Some(check_model(model.as_deref().unwrap_or(""))?);
     }
     match &body.api_key {
         None => {}
@@ -523,62 +533,85 @@ pub async fn update(
                 "this provider needs an api_key; it cannot be removed",
             ));
         }
-        Some(None) => row.sealed_key = None,
+        Some(None) => patch.sealed_key = Some(None),
         Some(Some(key)) => {
             let key = check_key(key)?;
             let master = state.providers.master().ok_or_else(no_master_key)?;
-            row.sealed_key = Some(
+            patch.sealed_key = Some(Some(
                 master
-                    .seal(&row.user_id, &row.id, &key)
+                    .seal(&previous.user_id, &previous.id, &key)
                     .map_err(ApiError::internal)?,
-            );
-        }
-    }
-    if let Some(flag) = body.is_default {
-        row.is_default = flag;
-    }
-    if row.is_default && row.model.is_empty() {
-        return Err(conflict(
-            "a default connection needs a model; choose one first",
-        ));
-    }
-    let changing_endpoint = row.base_url != previous.base_url;
-    let saved = save_update(&state, entry, row, previous).await?;
-    let Some(row) = saved else {
-        if changing_endpoint {
-            load(&state, &who, &id).await?;
-            return Err(conflict(
-                "the connection changed while testing the endpoint; try again",
             ));
         }
-        return Err(not_found());
-    };
-    Ok(Json(view_of(&state, row).await?))
+    }
+    patch.is_default = body.is_default;
+    match save_update(&state, entry, patch, previous).await? {
+        store::Patched::Saved(row) => Ok(Json(view_of(&state, row).await?)),
+        store::Patched::Missing => Err(not_found()),
+        store::Patched::DefaultNeedsModel => Err(default_needs_model()),
+        store::Patched::Changed => {
+            load(&state, &who, &id).await?;
+            Err(conflict(
+                "the connection changed while testing the endpoint; try again",
+            ))
+        }
+    }
 }
 
+fn default_needs_model() -> ApiError {
+    conflict("a default connection needs a model; choose one first")
+}
+
+/// The connection as `patch` would leave `previous`.
+fn patched(previous: &Row, patch: &store::Patch) -> Row {
+    let mut row = previous.clone();
+    if let Some(name) = &patch.name {
+        row.name = name.clone();
+    }
+    if let Some(model) = &patch.model {
+        row.model = model.clone();
+    }
+    if let Some(flag) = patch.is_default {
+        row.is_default = flag;
+    }
+    if let Some(key) = &patch.sealed_key {
+        row.sealed_key = key.clone();
+    }
+    if let Some(url) = &patch.base_url {
+        row.base_url = Some(url.clone());
+    }
+    row
+}
+
+/// Save `patch`. Fields it doesn't set keep their committed values. A new
+/// endpoint is first tested with the connection as `previous` plus the
+/// patch, then saved only while the connection still equals `previous`.
 async fn save_update(
     state: &AppState,
     entry: &Entry,
-    row: Row,
+    patch: store::Patch,
     previous: Row,
-) -> ApiResult<Option<Row>> {
-    let changing_endpoint = row.base_url != previous.base_url;
-    if changing_endpoint {
-        test_endpoint(state, entry, &row).await?;
-    }
+) -> ApiResult<store::Patched> {
+    let expected = if patch.base_url.is_some() {
+        let candidate = patched(&previous, &patch);
+        if candidate.is_default && candidate.model.is_empty() {
+            return Err(default_needs_model());
+        }
+        test_endpoint(state, entry, &candidate).await?;
+        Some(previous.clone())
+    } else {
+        None
+    };
     state
         .db
         .call(move |db| {
-            let mut conn = db.lock();
-            let revision = if changing_endpoint {
-                store::update_if_current(&mut conn, &row, &previous)?
-            } else {
-                store::update(&mut conn, &row)?
-            };
-            if revision.is_none() {
-                return Ok(None);
-            }
-            Ok(store::get(&conn, &row.user_id, &row.id)?)
+            Ok(store::patch(
+                &mut db.lock(),
+                &previous.user_id,
+                &previous.id,
+                &patch,
+                expected.as_ref(),
+            )?)
         })
         .await
         .map_err(ApiError::internal)
@@ -771,8 +804,10 @@ async fn endpoint_changes_probe_capabilities_and_keep_the_old_url_on_failure() {
         };
         assert!(store::insert(&mut state.db.lock(), &previous, 20).unwrap());
 
-        let mut row = previous.clone();
-        row.base_url = Some(failing.clone());
+        let to = |url: &str| store::Patch {
+            base_url: Some(url.to_owned()),
+            ..store::Patch::default()
+        };
         let permit = state
             .providers
             .inner
@@ -781,7 +816,7 @@ async fn endpoint_changes_probe_capabilities_and_keep_the_old_url_on_failure() {
             .unwrap();
         for lists_models in [true, false] {
             entry.lists_models = lists_models;
-            let err = save_update(&state, &entry, row.clone(), previous.clone())
+            let err = save_update(&state, &entry, to(&failing), previous.clone())
                 .await
                 .unwrap_err();
             assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -791,17 +826,19 @@ async fn endpoint_changes_probe_capabilities_and_keep_the_old_url_on_failure() {
 
         // Listing errors local to Metro must keep their status and message.
         entry.lists_models = true;
-        row.sealed_key = Some(vec![0]);
-        let err = save_update(&state, &entry, row.clone(), previous.clone())
+        let keyed = store::Patch {
+            sealed_key: Some(Some(vec![0])),
+            ..to(&failing)
+        };
+        let err = save_update(&state, &entry, keyed, previous.clone())
             .await
             .unwrap_err();
         assert_eq!(err.status(), StatusCode::CONFLICT);
         assert_eq!(err.message(), UseError::NoMasterKey.to_string());
-        row.sealed_key = None;
 
         // Exercise the minimal wire even when today's catalog lists models.
         entry.lists_models = false;
-        let err = save_update(&state, &entry, row.clone(), previous.clone())
+        let err = save_update(&state, &entry, to(&failing), previous.clone())
             .await
             .unwrap_err();
         assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
@@ -812,23 +849,51 @@ async fn endpoint_changes_probe_capabilities_and_keep_the_old_url_on_failure() {
         let saved = store::get(&state.db.lock(), &previous.user_id, &previous.id).unwrap();
         assert_eq!(saved.as_ref(), Some(&previous));
 
-        row.base_url = Some(base.clone());
-        let saved = save_update(&state, &entry, row, previous.clone())
+        let store::Patched::Saved(saved) = save_update(&state, &entry, to(&base), previous.clone())
             .await
             .unwrap()
-            .unwrap();
+        else {
+            panic!("the tested endpoint was not saved");
+        };
         assert_eq!(saved.base_url.as_deref(), Some(base.as_str()));
 
-        // A regular PATCH from a stale snapshot still wins without a second
-        // probe, and must not write the old endpoint back.
-        let mut rename = previous.clone();
-        rename.name = "Renamed".into();
-        let saved = save_update(&state, &entry, rename, previous)
+        // A rename read `saved`; before it writes, an endpoint, key and model
+        // rotation commits. The rename must keep all three.
+        let rotation = store::Patch {
+            model: Some("rotated-model".into()),
+            sealed_key: Some(Some(vec![7; 40])),
+            ..to(&original)
+        };
+        let store::Patched::Saved(rotated) = store::patch(
+            &mut state.db.lock(),
+            &saved.user_id,
+            &saved.id,
+            &rotation,
+            Some(&saved),
+        )
+        .unwrap() else {
+            panic!("the rotation was not saved");
+        };
+        let rename = store::Patch {
+            name: Some("Renamed".into()),
+            ..store::Patch::default()
+        };
+        let store::Patched::Saved(renamed) =
+            save_update(&state, &entry, rename, saved).await.unwrap()
+        else {
+            panic!("the rename was not saved");
+        };
+        assert_eq!(renamed.name, "Renamed");
+        assert_eq!(renamed.base_url.as_deref(), Some(original.as_str()));
+        assert_eq!(renamed.sealed_key, Some(vec![7; 40]));
+        assert_eq!(renamed.model, "rotated-model");
+        assert_eq!(renamed.config_rev, rotated.config_rev);
+
+        // An endpoint change tested from a stale snapshot is not saved.
+        let stale = save_update(&state, &entry, to(&base), previous.clone())
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(saved.name, "Renamed");
-        assert_eq!(saved.base_url.as_deref(), Some(base.as_str()));
+        assert!(matches!(stale, store::Patched::Changed));
     }
 }
 
