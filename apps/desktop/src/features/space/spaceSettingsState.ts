@@ -308,8 +308,13 @@ export async function loadMembers(): Promise<void> {
     });
   } catch (error) {
     if (!live() || isAborted(error)) return;
-    const accepted = read.fail(error);
-    if (!lost(error, sid) && accepted) rosterError.set(reason(error, "Couldn't load members"));
+    // Auth failure ends the current session, but an older roster failure
+    // must not close the page or supersede a newer accepted roster.
+    if (error instanceof ApiError && error.kind === "auth") {
+      lost(error, sid);
+      return;
+    }
+    if (read.fail(error) && !lost(error, sid)) rosterError.set(reason(error, "Couldn't load members"));
   }
 }
 
