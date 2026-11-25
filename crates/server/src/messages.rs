@@ -243,7 +243,7 @@ pub async fn post_room_message(
     let meta = MessageMeta {
         reply_to: msg.reply_to,
         via: msg.via,
-        forwarded: None,
+        ..MessageMeta::default()
     };
     let (writer, ids) = (author.clone(), msg.asset_ids);
     // Include targets derived from classification, @agent or a reply as

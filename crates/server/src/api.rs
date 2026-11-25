@@ -1119,7 +1119,7 @@ pub async fn list_runs(
         .list_with_failures()
         .into_iter()
         .filter(|(r, _)| spaces.iter().any(|s| s.id == r.space_id))
-        .map(|(r, failure)| run_view(&who, r, failure))
+        .map(|(r, failure)| run_view(&state.compaction, &who, r, failure))
         .collect::<ApiResult<_>>()?;
     Ok(Json(json!({"runs": runs})))
 }
@@ -1146,19 +1146,24 @@ pub async fn get_run(
     member_of(&state, &run.space_id, &who)
         .await
         .map_err(|e| run_not_found(e, not_found))?;
-    Ok(Json(run_view(&who, run, failure)?))
+    Ok(Json(run_view(&state.compaction, &who, run, failure)?))
 }
 
 /// A run as `who` sees it: with `failure`, the full reason it failed, only
 /// when `who` started it (the room showed a generic error); never for
 /// other members, including the Space owner.
 fn run_view(
+    compaction: &crate::compaction::Compaction,
     who: &Human,
     run: crate::orchestration::RunInfo,
     failure: Option<crate::orchestration::RunFailure>,
 ) -> ApiResult<serde_json::Value> {
     let failure = failure.filter(|_| run.actor == who.id);
+    let note = compaction.note_for(&run.id, &who.id);
     let mut view = serde_json::to_value(&run).map_err(|e| ApiError::internal(e.into()))?;
+    if let Some(message) = note {
+        view["compaction_failure"] = json!({"message": message});
+    }
     if let Some(failure) = failure {
         view["failure"] =
             serde_json::to_value(failure).map_err(|e| ApiError::internal(e.into()))?;
