@@ -223,6 +223,8 @@ def updates(server, runner, timeout):
         rid, token = created["runner"]["id"], created["token"]
         root = state / "metro-runner"
         (root / "versions" / OLD).mkdir(parents=True)
+        for path in (root, root / "versions", root / "versions" / OLD):
+            path.chmod(0o700)
         shutil.copy2(runner, root / "versions" / OLD / "metro-runner")
         (root / ".metro-runner-install").write_text("managed\n")
         shutil.copy2(ROOT / "packaging/install-metro-runner-linux.sh", root / "install-metro-runner-linux.sh")

@@ -61,6 +61,27 @@ config_dir=$config_home/metro-runner
 config=$config_dir/runner.env
 unit_file=$config_home/systemd/user/$UNIT
 
+# Same open-directory flock as metro-runner. Closing fd 9 releases only
+# this invocation's lock; there is no stale lock file to delete.
+lock_install() {
+    [ -d "$root" ] && [ ! -L "$root" ] || die "install directory is not a plain directory"
+    [ "$(stat -c '%u' -- "$root")" = "$(id -u)" ] || die "install directory is not owned by you"
+    mode=$(stat -c '%a' -- "$root")
+    [ "$((0$mode & 022))" -eq 0 ] || die "install directory is writable by others"
+    exec 9<"$root"
+    flock -n -x 9 || die "another install is running"
+    [ ! -L "$root" ] && [ "$root" -ef /proc/self/fd/9 ] || die "the install directory changed"
+    if [ -e "$root/.lock" ] || [ -L "$root/.lock" ]; then
+        die "another install holds the legacy lock at $root/.lock"
+    fi
+}
+
+no_pending_update() {
+    if [ -e "$root/.update-pending.json" ] || [ -L "$root/.update-pending.json" ]; then
+        die "a runner update journal is present; finish recovery before changing the install"
+    fi
+}
+
 action=${1:-}
 [ $# -gt 0 ] && shift
 archive='' sha='' checksum_file='' server_url='' workspace='' token_file='' purge=0 self_update=
@@ -258,6 +279,10 @@ configure() {
     fi
     [ "$(stat -c '%u' -- "$workspace")" = "$(id -u)" ] || die "workspace must be owned by you: $workspace"
     check_token_file "$token_file"
+    if [ -d "$root" ] || [ -L "$root" ]; then
+        lock_install
+        no_pending_update
+    fi
     # Self-update: explicit choice; else keep the earlier one; else on for a
     # new configuration and off for one made before this option existed.
     if [ -z "$self_update" ]; then
@@ -327,20 +352,37 @@ install_runner() {
     esac
     printf '%s' "$version" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9][A-Za-z0-9.-]{0,40})?$' ||
         die "unexpected version in archive name: $version"
-    [ "$action" != update ] || [ -L "$root/current" ] || die "the runner is not installed in $root; use install"
     problems=$(host_problems)
     [ -z "$problems" ] || die "this host cannot run the native runner: $problems"
-    verify_archive_checksum "$archive"
-    mkdir -p -- "$root"
+    mkdir -p -m 700 -- "$root"
+    lock_install
+    no_pending_update
+    [ "$action" != update ] || [ -L "$root/current" ] || die "the runner is not installed in $root; use install"
     if [ -n "$(ls -A -- "$root")" ] && [ ! -f "$root/$MARK" ]; then
         die "$root exists but was not created by this installer; refusing to change it"
     fi
-    mkdir -- "$root/.lock" 2>/dev/null || die "another install is running (or crashed: remove $root/.lock)"
     stage=
-    trap 'rm -rf -- "$root/.lock" ${stage:+"$stage"}' EXIT
+    old=
+    installed=0
+    trap 'if [ "$root" -ef /proc/self/fd/9 ]; then
+        if [ "$installed" = 0 ] && [ -n "$old" ] && [ ! -e "$root/versions/$version" ] && [ -e "$old/$version" ]; then
+            mv -- "$old/$version" "$root/versions/$version"
+        fi
+        [ -z "$stage" ] || rm -rf -- "$stage"
+    fi' EXIT
     trap 'exit 130' INT TERM
-    echo "Metro runner per-user install (managed by $PROG)." >"$root/$MARK"
     stage=$(mktemp -d -- "$root/.stage.XXXXXX")
+    # Verify the same private copy that tar will read.
+    source_archive=$archive
+    cp -- "$source_archive" "$stage/$name"
+    if [ -z "$sha" ] && [ -z "$checksum_file" ]; then
+        if [ -f "$source_archive.sha256" ]; then checksum_file=$source_archive.sha256
+        elif [ -f "${source_archive%/*}/SHA256SUMS" ]; then checksum_file=${source_archive%/*}/SHA256SUMS
+        else die "no checksum for $name: pass --sha256 HEX or --checksum-file FILE"
+        fi
+    fi
+    archive=$stage/$name
+    verify_archive_checksum "$archive"
     extract_verified "$archive" "$stage" "$top"
     app=$stage/$top
     if [ "$(json_field "$app/RELEASE.json" kind)" != runner ] ||
@@ -353,18 +395,20 @@ install_runner() {
     fi
     problems=$(host_problems "$app/metro-runner")
     [ -z "$problems" ] || die "this host cannot run this runner: $problems"
+    if [ ! -e "$root/$MARK" ]; then
+        (set -C; echo "Metro runner per-user install (managed by $PROG)." >"$root/$MARK")
+    fi
+    [ ! -L "$root/versions" ] || die "versions directory is a symlink"
     mkdir -p -- "$root/versions"
-    old=
     if [ -e "$root/versions/$version" ]; then
         old=$(mktemp -d -- "$root/.old.XXXXXX"); mv -- "$root/versions/$version" "$old/"
     fi
     mv -- "$app" "$root/versions/$version"
     ln -sfn -- "versions/$version" "$root/.current.new"
     mv -fT -- "$root/.current.new" "$root/current"
-    for other in "$root"/versions/* "$root"/.old.*; do
-        [ -e "$other" ] || continue
-        [ "$other" = "$root/versions/$version" ] || rm -rf -- "$other"
-    done
+    installed=1
+    # Don't prune previously working copies as part of a manual switch.
+    [ -z "$old" ] || rm -rf -- "$old"
     # Keep a copy of this script beside the install for `run` and the unit.
     keep_script_copy
     say "Metro runner $version is installed in $root/versions/$version"
@@ -379,6 +423,8 @@ install_runner() {
 }
 
 install_service() {
+    lock_install
+    no_pending_update
     [ -x "$root/$PROG.sh" ] || die "install the runner first"
     load_config
     check_plain_value "install directory" "$root"
@@ -431,6 +477,13 @@ doctor() {
 }
 
 uninstall_runner() {
+    locked=
+    if [ -d "$root" ] || [ -L "$root" ]; then
+        lock_install
+        no_pending_update
+        [ -f "$root/$MARK" ] || die "$root was not created by this installer; refusing to remove it"
+        locked=1
+    fi
     if [ -f "$unit_file" ] && grep -qxF "$UNIT_TAG" "$unit_file"; then
         if command -v systemctl >/dev/null 2>&1; then
             systemctl --user disable --now "$UNIT" >/dev/null 2>&1 || true
@@ -441,16 +494,16 @@ uninstall_runner() {
         fi
         say "Removed $unit_file"
     fi
-    if [ -d "$root" ]; then
-        [ -f "$root/$MARK" ] || die "$root was not created by this installer; refusing to remove it"
-        rm -rf -- "$root"
-        say "Removed $root"
-    fi
     if [ "$purge" = 1 ]; then
         rm -f -- "$config"; rmdir -- "$config_dir" 2>/dev/null || true
         say "Removed $config"
     elif [ -f "$config" ]; then
         say "Settings kept in $config (use --purge-config to remove them)."
+    fi
+    if [ -n "$locked" ]; then
+        [ "$root" -ef /proc/self/fd/9 ] || die "the install directory changed"
+        rm -rf -- "$root"
+        say "Removed $root"
     fi
     say "Your workspace and token file were not changed. Revoke the runner's token in Metro if you no longer use it."
 }

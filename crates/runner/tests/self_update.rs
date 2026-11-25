@@ -7,6 +7,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -99,6 +100,13 @@ fn managed_root() -> Root {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("metro-runner");
     fs::create_dir_all(path.join("versions").join(OLD)).unwrap();
+    for d in [
+        path.clone(),
+        path.join("versions"),
+        path.join("versions").join(OLD),
+    ] {
+        fs::set_permissions(d, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     fs::write(
         path.join("versions").join(OLD).join("metro-runner"),
         stub(0),
@@ -141,7 +149,10 @@ fn leftovers(root: &Path) -> Vec<String> {
         .unwrap()
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
         .filter(|n| {
-            n.starts_with(".stage.") || n.starts_with(".old.") || n == ".lock" || n == ".update-dl"
+            n.starts_with(".stage.")
+                || n.starts_with(".old.")
+                || n == ".lock"
+                || n.starts_with(".update-dl")
         })
         .collect()
 }
@@ -160,10 +171,13 @@ fn happy_path_stages_verifies_and_execs_the_new_version() {
     assert_eq!(fs::read(root.path.join(update::SCRIPT)).unwrap(), SCRIPT);
     assert_eq!(current(&root.path), Path::new("versions/0.9.0"));
     // The prepared switch still holds the installers' lock...
-    assert_eq!(leftovers(&root.path), [".lock"]);
-    assert!(root.path.join(".lock/owner").is_file());
+    assert_eq!(
+        update::Lock::take(&root.path).err().unwrap().code,
+        "installer_busy"
+    );
     // ...and a dropped (abandoned) switch lets go of it.
     drop(switch);
+    assert!(update::Lock::take(&root.path).is_ok());
     assert!(
         leftovers(&root.path).is_empty(),
         "{:?}",
@@ -179,11 +193,12 @@ fn happy_path_stages_verifies_and_execs_the_new_version() {
         NEW,
         OLD,
         Some(&PendingFile {
+            version: 1,
             from: OLD.into(),
             to: NEW.into(),
             attempts: 0,
+            rolling_back: false,
         }),
-        false,
         (
             vec![OsString::from("metro-runner"), OsString::from("arg1")],
             vec![
@@ -197,7 +212,7 @@ fn happy_path_stages_verifies_and_execs_the_new_version() {
                 ),
             ],
         ),
-        Some(&update::Lock::take(&root.path).unwrap().into_path()),
+        update::Lock::take(&root.path).unwrap(),
     )
     .unwrap();
     // SAFETY: the child only runs Switch::exec (libc calls on prepared
@@ -208,6 +223,8 @@ fn happy_path_stages_verifies_and_execs_the_new_version() {
         let _ = switch.exec();
         unsafe { libc::_exit(99) };
     }
+    // Drop the parent's reference; only the exec'ing child holds the lock.
+    drop(switch);
     let mut status = 0;
     unsafe { libc::waitpid(pid, &mut status, 0) };
     assert!(
@@ -217,7 +234,7 @@ fn happy_path_stages_verifies_and_execs_the_new_version() {
     let line = fs::read_to_string(&marker).unwrap();
     assert!(line.ends_with("|arg1|kept-env\n"), "{line}");
     assert!(
-        !root.path.join(".lock").exists(),
+        update::Lock::take(&root.path).is_ok(),
         "the lock is released at the exec"
     );
     assert_eq!(current(&root.path), Path::new("versions/0.9.1"));
@@ -226,9 +243,11 @@ fn happy_path_stages_verifies_and_execs_the_new_version() {
     assert_eq!(
         pending,
         PendingFile {
+            version: 1,
             from: OLD.into(),
             to: NEW.into(),
-            attempts: 0
+            attempts: 0,
+            rolling_back: false,
         }
     );
     // The new version's first start counts, then a good claim confirms.
@@ -248,29 +267,72 @@ fn happy_path_stages_verifies_and_execs_the_new_version() {
 #[test]
 fn a_failed_exec_points_current_back() {
     let root = managed_root();
-    fs::create_dir_all(root.path.join("versions").join(NEW)).unwrap(); // no binary
+    let dest = root.path.join("versions").join(NEW);
+    fs::create_dir_all(&dest).unwrap();
+    fs::set_permissions(&dest, fs::Permissions::from_mode(0o700)).unwrap();
+    let exe = dest.join(update::BINARY);
+    fs::write(&exe, b"#!/no-such-interpreter\n").unwrap();
+    set_exec(&exe);
     let switch = Switch::new(
         &root.path,
         NEW,
         OLD,
         Some(&PendingFile {
+            version: 1,
             from: OLD.into(),
             to: NEW.into(),
             attempts: 0,
+            rolling_back: false,
         }),
-        false,
         (vec![OsString::from("x")], vec![]),
-        Some(&update::Lock::take(&root.path).unwrap().into_path()),
+        update::Lock::take(&root.path).unwrap(),
     )
     .unwrap();
     let e = switch.exec();
     assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
     assert!(
-        !root.path.join(".lock").exists(),
+        update::Lock::take(&root.path).is_ok(),
         "a failed exec releases the lock"
     );
     assert_eq!(current(&root.path), Path::new("versions/0.9.0"));
     assert!(!root.path.join(update::PENDING).exists());
+}
+
+#[test]
+fn failed_rollback_exec_keeps_retry_intent_and_the_previous_copy() {
+    let root = managed_root();
+    let old = root.path.join("versions").join(OLD).join(update::BINARY);
+    fs::write(&old, b"#!/no-such-interpreter\n").unwrap();
+    let new = root.path.join("versions").join(NEW);
+    fs::create_dir_all(&new).unwrap();
+    fs::set_permissions(&new, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(new.join(update::BINARY), stub(0)).unwrap();
+    set_exec(&new.join(update::BINARY));
+    update::point_current(&root.path, &Path::new("versions").join(NEW)).unwrap();
+    let pending = PendingFile {
+        version: 1,
+        from: OLD.into(),
+        to: NEW.into(),
+        attempts: update::MAX_STARTS,
+        rolling_back: false,
+    };
+    let journal = root.path.join(update::PENDING);
+    fs::write(&journal, serde_json::to_vec(&pending).unwrap()).unwrap();
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+    let version = Version::parse(NEW).unwrap();
+    let update::StartAction::RollBack(switch) = update::on_start(&root.path, &version).unwrap()
+    else {
+        panic!("expected rollback");
+    };
+    assert_eq!(switch.exec().kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(current(&root.path), Path::new("versions/0.9.1"));
+    assert!(old.is_file());
+    let after: PendingFile = serde_json::from_slice(&fs::read(journal).unwrap()).unwrap();
+    assert!(after.rolling_back);
+    assert!(matches!(
+        update::on_start(&root.path, &version).unwrap(),
+        update::StartAction::RollBack(_)
+    ));
 }
 
 #[test]

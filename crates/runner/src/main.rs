@@ -148,6 +148,12 @@ fn main() -> ExitCode {
     {
         match update::on_start(root, &own) {
             Ok(StartAction::Continue) => {}
+            Ok(StartAction::Busy) => {
+                eprintln!(
+                    "metro-runner: another installer holds the update lock for {own}; exiting to retry"
+                );
+                return ExitCode::from(75);
+            }
             Ok(StartAction::RollBack(switch)) => {
                 eprintln!(
                     "metro-runner: {own} failed to start {} times after an update; going back to the previous version",
@@ -155,6 +161,7 @@ fn main() -> ExitCode {
                 );
                 let e = switch.exec();
                 eprintln!("metro-runner: could not start the previous version: {e}");
+                return ExitCode::from(75);
             }
             Err(e) => eprintln!(
                 "metro-runner: warning: update bookkeeping failed: {}",
