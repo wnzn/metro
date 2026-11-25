@@ -759,3 +759,40 @@ async fn move_to_personal_chat_clears_room() {
     assert_eq!(task.target, None);
     assert_eq!(task.view()["room_id"], serde_json::Value::Null);
 }
+
+#[tokio::test]
+async fn run_now_at_the_due_instant_never_swallows_the_occurrence() {
+    let st = state().await;
+    let fake = Fake::new(Mode::Ok);
+    let now = t(NOW);
+    let task = create(&st, "alice", body(once("2026-11-22T10:00:06+08:00")), now).unwrap();
+    let due = task.next_run_at.unwrap();
+    // "Run now" at exactly the instant the occurrence is due.
+    let claim = claim_now(&st.db, "alice", &task.id, due).unwrap();
+    finish(
+        &st.db,
+        &claim,
+        status::DISPATCHING,
+        status::DISPATCHED,
+        "ok",
+        due,
+    )
+    .unwrap();
+    // The scheduled occurrence is still claimed and dispatched, once.
+    let r = tick(&st, due, &fake).await;
+    assert_eq!(r.dispatched, 1, "{r:?}");
+    assert_eq!(
+        tick(&st, due + Duration::seconds(1), &fake).await,
+        TickReport::default()
+    );
+    assert_eq!(fake.calls().len(), 1);
+    let h = runs(&st, "alice", &task.id);
+    assert_eq!(h.len(), 2, "{h:?}");
+    assert!(h.iter().all(|r| r.due_at == "2026-11-22T02:00:06Z"));
+    assert_eq!(h.iter().filter(|r| r.run_now).count(), 1);
+    assert_eq!(h.iter().filter(|r| !r.run_now).count(), 1);
+    // Two run-nows in the same millisecond get distinct rows too.
+    let a = claim_now(&st.db, "alice", &task.id, due).unwrap();
+    let b = claim_now(&st.db, "alice", &task.id, due).unwrap();
+    assert_ne!(a.run_id, b.run_id);
+}

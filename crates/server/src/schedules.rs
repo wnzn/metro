@@ -270,7 +270,10 @@ impl Task {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct RunView {
     pub id: i64,
+    /// When it was due; for a run now, when it was asked for.
     pub due_at: String,
+    /// Started with "Run now" rather than by the schedule.
+    pub run_now: bool,
     pub status: String,
     pub detail: Option<String>,
     pub claimed_at: String,
@@ -827,7 +830,8 @@ pub fn task_history(db: &Db, owner: &str, id: &str) -> Result<Vec<RunView>, Sche
     let rows = stmt.query_map(params![id, owner, HISTORY_PER_TASK as i64], |r| {
         Ok(RunView {
             id: r.get(0)?,
-            due_at: rfc3339(from_ms(r.get(1)?)),
+            due_at: rfc3339(from_ms(r.get::<_, i64>(1)?.abs())),
+            run_now: r.get::<_, i64>(1)? < 0,
             status: r.get(2)?,
             detail: r.get(3)?,
             claimed_at: rfc3339(from_ms(r.get(4)?)),
@@ -989,7 +993,8 @@ pub fn recover_interrupted(db: &Db, now: DateTime<Utc>) -> anyhow::Result<usize>
                   not have been posted, and it is not retried";
     tx.execute(
         "UPDATE schedules SET last_status = ?1, last_detail = ?2 WHERE last_status = ?3 AND id IN \
-         (SELECT task_id FROM schedule_runs WHERE status = ?3 AND due_at = schedules.last_run_at)",
+         (SELECT task_id FROM schedule_runs WHERE status = ?3 \
+         AND ABS(due_at) = schedules.last_run_at)",
         params![status::INTERRUPTED, detail, status::DISPATCHING],
     )?;
     let n = tx.execute(
@@ -1276,18 +1281,23 @@ fn claim_now(db: &Db, owner: &str, id: &str, now: DateTime<Utc>) -> Result<Claim
     let mut conn = db.lock();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let task = get_owned(&tx, owner, id)?;
-    let mut due = ms(now);
+    // Run-now rows live in their own namespace: `due_at` is the negated
+    // time, and a scheduled occurrence's `due_at` is never negative, so a
+    // run now can never take the unique (task, due_at) slot of a real
+    // occurrence (which `claim_due` inserts with INSERT OR IGNORE).
+    let mut key = -ms(now).max(1);
     let run_id = loop {
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO schedule_runs \
              (task_id, owner_id, due_at, status, claimed_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![task.id, task.owner_id, due, status::DISPATCHING, ms(now)],
+            params![task.id, task.owner_id, key, status::DISPATCHING, ms(now)],
         )?;
         if inserted == 1 {
             break tx.last_insert_rowid();
         }
-        due += 1;
+        key -= 1;
     };
+    let due = ms(now);
     tx.execute(
         "UPDATE schedules SET last_status = ?2, last_run_at = ?3, last_detail = NULL WHERE id = ?1",
         params![task.id, status::DISPATCHING, due],
@@ -1312,7 +1322,8 @@ fn run_view(db: &Db, run_id: i64) -> anyhow::Result<Option<RunView>> {
             |r| {
                 Ok(RunView {
                     id: r.get(0)?,
-                    due_at: rfc3339(from_ms(r.get(1)?)),
+                    due_at: rfc3339(from_ms(r.get::<_, i64>(1)?.abs())),
+                    run_now: r.get::<_, i64>(1)? < 0,
                     status: r.get(2)?,
                     detail: r.get(3)?,
                     claimed_at: rfc3339(from_ms(r.get(4)?)),
