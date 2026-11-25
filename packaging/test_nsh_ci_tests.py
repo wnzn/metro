@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import subprocess
 import sys
@@ -20,6 +21,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 import xml.etree.ElementTree as ET
 
 if sys.argv[1:] == ["--version"]:
@@ -43,6 +45,12 @@ assert (Path.cwd() / "target" / "fixture").read_text() == "fixture"
 (audit / file.replace("/", "_")).write_text(json.dumps(
     state | {"app": str(Path.cwd()), "work": str(work), "report": str(output)}))
 mode = Path(path).read_text()
+if mode == "timeout":
+    child = os.fork()
+    if child == 0:
+        (audit / "timeout-child").write_text(str(os.getpid()))
+    time.sleep(15)
+    sys.exit(0)
 if mode == "missing":
     sys.exit(0)
 if mode == "malformed":
@@ -54,13 +62,17 @@ if mode.startswith("empty"):
     ET.ElementTree(root).write(output)
     sys.exit(7 if mode == "empty-nonzero" else 0)
 attrs = {"tests": "4" if mode != "bad-count" else "3",
-         "failures": str(int(mode == "failure")), "errors": str(int(mode == "error")), "skipped": "2"}
+         "failures": str(int(mode in ("failure", "two-failures"))),
+         "errors": str(int(mode in ("error", "two-failures"))), "skipped": "2"}
 root = ET.Element("testsuites", name="nsh test", **attrs)
 suite = ET.SubElement(root, "testsuite", name=file if mode != "wrong-suite" else "Other.test.ts", **attrs)
 for name in ("passed", "second", "skip", "todo"):
-    case = ET.SubElement(suite, "testcase", name=name, classname=file)
+    label = "third\n::error::not a workflow command ##[error]" if mode == "two-failures" and name == "passed" else name
+    case = ET.SubElement(suite, "testcase", name=label, classname=file)
     if name == "second" and mode in ("failure", "error"):
         ET.SubElement(case, mode).text = "test assertion body must not leak"
+    if mode == "two-failures" and name in ("passed", "second"):
+        ET.SubElement(case, "error" if name == "passed" else "failure").text = "test assertion body must not leak"
     if name == "skip":
         ET.SubElement(case, "skipped")
     if name == "todo":
@@ -156,7 +168,7 @@ class ShardTests(unittest.TestCase):
 
     def test_failed_and_unverifiable_shards_never_fall_back(self):
         for mode in ("missing", "malformed", "bad-count", "failure", "error", "nonzero", "wrong-suite",
-                     "empty-invalid", "empty-nonzero"):
+                     "empty-invalid", "empty-nonzero", "two-failures"):
             with self.subTest(mode=mode):
                 self.write("a.test.ts", mode)
                 result = self.run_helper()
@@ -164,8 +176,38 @@ class ShardTests(unittest.TestCase):
                 self.assertIn("2/2 files, 1 unsuccessful", result.stdout)
                 self.assertIn("'a.test.ts':", result.stderr)
                 self.assertIn("NSH exited 7" if mode.endswith("nonzero") else "JUnit", result.stderr)
+                if mode in ("failure", "error", "two-failures"):
+                    self.assertIn("NSH: 'a.test.ts' › 'second': failure", result.stderr.splitlines())
+                if mode == "two-failures":
+                    self.assertIn(
+                        r"NSH: 'a.test.ts' › 'third\n::error::not a workflow command \x23#[error]': failure",
+                        result.stderr.splitlines(),
+                    )
+                    self.assertTrue(all(line.startswith("NSH: ") for line in result.stderr.splitlines()))
+                    self.assertNotIn("##[", result.stderr)
                 self.assertNotIn("must not leak", result.stdout + result.stderr)
                 self.assertFalse((self.audit / "unfiltered").exists())
+
+    def test_timed_out_file_kills_its_process_group_and_never_falls_back(self):
+        self.write("a.test.ts", "timeout")
+        # Exercise the real Popen timeout path without waiting ten minutes.
+        code = (f"import sys; sys.path.insert(0, {str(Path(policy.__file__).parent)!r}); "
+                "import nsh_ci_tests as policy; policy.FILE_TIMEOUT_SECONDS = 1; sys.exit(policy.main())")
+        result = subprocess.run([sys.executable, "-B", "-c", code], cwd=self.app,
+                                env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("'a.test.ts': NSH timed out", result.stderr)
+        self.assertIn("2/2 files, 1 unsuccessful; 2 passed", result.stdout)
+        self.assertFalse((self.audit / "unfiltered").exists())
+        child = int((self.audit / "timeout-child").read_text())
+        try:
+            fd = os.pidfd_open(child)
+        except ProcessLookupError:
+            return  # The descendant is already gone.
+        try:
+            self.assertEqual(select.select([fd], [], [], 2)[0], [fd], "timed-out descendant still running")
+        finally:
+            os.close(fd)
 
     def test_empty_but_successful_test_file_matches_plain_nsh(self):
         self.write("a.test.ts", "empty")

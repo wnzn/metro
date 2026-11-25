@@ -9,6 +9,7 @@ from pathlib import Path
 from queue import Empty, Queue
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -21,11 +22,11 @@ import xml.etree.ElementTree as ET
 SLOW_FILES = {
     "App.test.tsx": 54,
     "src/features/QuickSearch.test.tsx": 42,
-    "src/features/Monitoring.test.tsx": 39,
     "src/device/Device.test.tsx": 37,
     "src/features/library/Library.test.tsx": 26,
 }
 RESULTS = ("passed", "failed", "errors", "skipped", "todo")
+FILE_TIMEOUT_SECONDS = 600
 
 
 class CannotShard(Exception):
@@ -139,6 +140,7 @@ def prepare(app, scratch, nsh, env):
 def report_counts(report, file):
     root = ET.parse(report).getroot()
     counts = dict.fromkeys(RESULTS, 0)
+    failed_cases = []
     if root.tag != "testsuites" or root.get("name") != "nsh test" or len(root) > 1:
         raise ValueError("expected at most one NSH JUnit suite")
     if not len(root):
@@ -146,7 +148,7 @@ def report_counts(report, file):
         # entirely. This is only success with all-zero counts and exit 0.
         if any(root.get(key) != "0" for key in ("tests", "failures", "errors", "skipped")):
             raise ValueError("inconsistent empty JUnit report")
-        return counts
+        return counts, failed_cases
     suite = root[0]
     if suite.tag != "testsuite" or suite.get("name") != file or not len(suite):
         raise ValueError("missing or wrong per-file JUnit suite")
@@ -161,36 +163,54 @@ def report_counts(report, file):
             counts["todo" if case[0].get("message") == "todo" else "skipped"] += 1
         elif case[0].tag in ("failure", "error"):
             counts["failed" if case[0].tag == "failure" else "errors"] += 1
+            failed_cases.append(case.attrib["name"])
         else:
             raise ValueError("unknown JUnit test result")
     expected = {"tests": sum(counts.values()), "failures": counts["failed"],
                 "errors": counts["errors"], "skipped": counts["skipped"] + counts["todo"]}
     if any(element.get(key) != str(value) for element in (root, suite) for key, value in expected.items()):
         raise ValueError("inconsistent JUnit test counts")
-    return counts
+    return counts, failed_cases
 
 
 def run_file(nsh, file, report, app, env, export):
     counts = dict.fromkeys(RESULTS, 0)
     problems = []
+    failed_cases = []
     try:
-        result = subprocess.run([nsh, "test", str(app / file), "--junit", str(report)],
-                                cwd=app, env=env, stdin=subprocess.DEVNULL,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if result.returncode:
-            problems.append(f"NSH exited {result.returncode}")
+        with subprocess.Popen([nsh, "test", str(app / file), "--junit", str(report)],
+                              cwd=app, env=env, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              start_new_session=True) as process:
+            try:
+                status = process.wait(timeout=FILE_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                problems.append(f"NSH timed out after {FILE_TIMEOUT_SECONDS} seconds")
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # The process group exited as the timeout fired.
+            else:
+                if status:
+                    problems.append(f"NSH exited {status}")
     except OSError:
-        problems.append("could not start NSH")
+        problems.append("could not run NSH")
     try:
-        counts = report_counts(report, file.as_posix())
-        if counts["failed"] or counts["errors"]:
+        counts, failed_cases = report_counts(report, file.as_posix())
+        if failed_cases:
             problems.append("JUnit recorded failures")
         if export is not None:
             shutil.copyfile(report, export / report.name)
     except (ET.ParseError, OSError, ValueError):
         problems.append("missing, invalid or unwritable JUnit report")
     # Do not emit raw NSH output or JUnit failure text (screens/assertions).
-    return file, counts, problems
+    return file, counts, problems, failed_cases
+
+
+def log_label(value):
+    # Repr escapes line breaks. The NSH prefix blocks `::` commands, but the
+    # runner also recognizes legacy `##[` commands anywhere on a line.
+    return repr(str(value)).replace("##[", r"\x23#[")
 
 
 def run_shards(nsh, files, contexts, export):
@@ -215,13 +235,15 @@ def run_shards(nsh, files, contexts, export):
     with ThreadPoolExecutor(max_workers=len(contexts)) as pool:
         futures = [pool.submit(worker, *ctx, job) for ctx, job in zip(contexts, jobs)]
         results = [result for future in futures for result in future.result()]
-    for file, counts, problems in sorted(results):
+    for file, counts, problems, failed_cases in sorted(results):
         for key, value in counts.items():
             totals[key] += value
         if problems:
             failures += 1
-            # repr escapes control characters; the prefix is not a CI command.
-            print(f"NSH: {str(file)!r}: {', '.join(problems)}", file=sys.stderr)
+            label = log_label(file)
+            print(f"NSH: {label}: {', '.join(problems)}", file=sys.stderr)
+            for name in failed_cases:
+                print(f"NSH: {label} › {log_label(name)}: failure", file=sys.stderr)
     print(f"NSH: {len(results)}/{len(files)} files, {failures} unsuccessful; " +
           ", ".join(f"{value} {key}" for key, value in totals.items()))
     return int(bool(failures) or len(results) != len(files))

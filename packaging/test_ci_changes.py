@@ -66,6 +66,11 @@ class GitFixture(unittest.TestCase):
 
 
 class SegmentTests(GitFixture):
+    def test_packaging_readme_with_trailing_newline_is_not_exempt(self):
+        for push in (False, True):
+            with self.subTest(push=push):
+                self.assertEqual(self.classify("packaging/README.md\n", push=push), EVERYTHING)
+
     def test_documentation_only_runs_nothing(self):
         for paths in (["README.md"], ["docs/acceptance.md"], ["README.md", "AGENTS.md"], ["docs/screenshots/new.png"],
                       ["docs/deploy.md", "docs/diagrams/flow.svg", "docs/a.jpg", "docs/b.jpeg", "docs/c.gif",

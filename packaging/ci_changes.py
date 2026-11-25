@@ -71,7 +71,7 @@ RULES = tuple((re.compile(pattern.encode()), frozenset(segments)) for pattern, s
     # test_image_release.py reads compose.yaml and compose.prebuilt.yaml.
     (r"compose(?:\.[a-z0-9-]+)?\.yaml", {"containers", "packaging"}),
     # The packaging tests read every workflow; release.yml and its calls build the previews.
-    (r"packaging/(?!README\.md$).+|\.github/.+", {"packaging", "previews"}),
+    (r"packaging/(?!README\.md\Z).+|\.github/.+", {"packaging", "previews"}),
     (r"packaging/metro-runner-container\.(?:sh|ps1)", {"containers"}),
 ))
 

@@ -94,6 +94,7 @@ jobs:
       && (needs.workflows.outputs.desktop != 'false' || needs.release-policy.outputs.release == 'true') }}
     # Choose a queue, not a fallback if the selected runner is offline.
     runs-on: ${{ needs.workflows.outputs.desktop_runner == 'metro-ci-linux-x64' && needs.release-policy.outputs.release != 'true' && 'metro-ci-linux-x64' || 'ubuntu-24.04' }}
+    timeout-minutes: 45
     env:
       NSH_VERSION: v0.6.1
       NSH_ARCHIVE_SHA256: 9a7ac692f1c229df476be8ff83a3c5912d271453b644e313f02cb19d18696070

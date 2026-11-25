@@ -356,4 +356,5 @@ test("an older helper is unsupported; a refused bridge bearer is an error; a lat
   await app.waitFor("text:Acme runner went offline", BEFORE_REPLY);
   await app.clock!.runFor(LATE_REPLY);
   expect(text(app)).not.toContain("Late local event");
+  expect(text(app)).toContain("Acme runner went offline");
 });
