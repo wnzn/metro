@@ -359,7 +359,7 @@ export async function attachMany(spaceIds: readonly string[]) {
           failures.push(`${s.name}: You no longer own this Space.`);
           continue;
         }
-        if (s.runnerPaired || current !== null) {
+        if (s.runnerPaired !== false || current !== null) {
           failures.push(`${s.name}: Already has a runner.`);
           continue;
         }

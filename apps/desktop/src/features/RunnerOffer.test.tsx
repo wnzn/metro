@@ -23,6 +23,7 @@ function fixture(f: Server, runnerId: string | null, state = "online") {
   const gate = {
     create: 0, attach: 0, badConfirmation: false, reconnect: 0,
     attachSpace: null as string | null,
+    runnerReadError: null as string | null,
     runnerRead: null as { sid: string; delay: number; parked: boolean } | null,
     detach: null as { sid: string; beforeCommit: boolean; delay: number; commit: (() => void) | null } | null,
   };
@@ -52,13 +53,16 @@ function fixture(f: Server, runnerId: string | null, state = "online") {
   // The server handles the request before these gates hold or spoil its reply.
   const serverGet = network[`GET ${BASE}/v1/*`]!;
   network[`GET ${BASE}/v1/*`] = (req) => {
+    const path = new URL(req.url).pathname;
     const reply = serverGet(req);
+    const result = gate.runnerReadError && path === `/v1/spaces/${gate.runnerReadError}/runner`
+      ? { status: 503, body: {} } : reply;
     const read = gate.runnerRead;
-    if (read && !read.parked && new URL(req.url).pathname === `/v1/spaces/${read.sid}/runner`) {
+    if (read && !read.parked && path === `/v1/spaces/${read.sid}/runner`) {
       read.parked = true;
-      return { ...(reply as object), delay: read.delay };
+      return { ...(result as object), delay: read.delay };
     }
-    return reply;
+    return result;
   };
   const serverPost = network[`POST ${BASE}/v1/*`]!;
   network[`POST ${BASE}/v1/*`] = (req) => {
@@ -139,6 +143,47 @@ async function openWithHeldFolderStatus(app: App, t: ReturnType<typeof fixture>,
   await openRunnerSettings(app);
   await app.waitUntil(() => t.status.reads > before);
   t.status.delay = 0;
+}
+
+for (const exactFails of [false, true]) {
+  test(`an older Space list cannot restore empty after attach with ${exactFails ? "a failed" : "a successful"} exact read`, async () => {
+    const f = world();
+    const r = f.addRunner("This PC", "personal", "alice");
+    f.addSpace("solo", "Solo", "alice");
+    const t = fixture(f, r.id);
+    const app = await launch(t, { manual: true });
+    await signIn(app);
+    await app.press("id:space:solo");
+    await openSpaceRunner(app);
+    await app.waitFor(`id:space-runner-attach:${r.id}`);
+    const staleList = f.answerLate("/v1/spaces", TOKENS.alice!, 3000);
+    await app.clock!.runFor(11_000);
+    await app.waitUntil(() => staleList.arrived() === 1);
+
+    const held = { sid: "solo", delay: 700, parked: false };
+    t.gate.runnerRead = held;
+    if (exactFails) t.gate.runnerReadError = "solo";
+    await app.press(`id:space-runner-attach:${r.id}`);
+    await app.waitUntil(() => held.parked);
+    expect(f.state.attached.get("solo")).toBe(r.id);
+    await app.waitFor("id:runner-state >> text:Runner not confirmed");
+    expect(app.shows("id:attached-runner")).toBe(false);
+    expect(app.shows(`id:space-runner-attach:${r.id}`)).toBe(false);
+    expect(app.shows("id:runner-state >> text:No runner")).toBe(false);
+
+    await app.clock!.runFor(700);
+    await app.waitFor(exactFails ? "id:manage-error" : "id:attached-runner");
+    await app.clock!.runFor(3000);
+    await app.waitFor(exactFails ? "id:runner-state >> text:Runner not confirmed" : "id:runner-state >> text:Runner attached");
+    await app.press("id:space-settings-close");
+    await openRunnerSettings(app);
+    expect(app.shows("id:runner-attach-pick:solo")).toBe(false);
+    expect(app.shows("id:runner-state >> text:No runner")).toBe(false);
+    if (exactFails) {
+      await app.waitFor("text:Some runner assignments haven’t been confirmed yet.");
+      expect(app.shows("text:Every Space you own has a runner.")).toBe(false);
+    }
+  });
 }
 
 test("sidebar requires submit consent, supports keyboard, and starts each new form checked", async () => {

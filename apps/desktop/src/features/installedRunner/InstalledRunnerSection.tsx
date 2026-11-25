@@ -7,6 +7,7 @@ import { Clipboard, signal } from "nsh";
 import type { JSX } from "nsh";
 import { runnerBusy, runners } from "../../settings";
 import { attachMany, eligibleSpaces, installedFolderRefreshExhausted, installedRunnerChoice, retryInstalledFolderRefresh, runnerAttachBusy, runnerSessionKey } from "../../runnersState";
+import { spaces } from "../../store";
 import { Action, Badge, Banner, Checkbox, Column, ConfirmInline, Label, Row, SettingRow, SettingsGroup } from "../../ui";
 import type { Tone } from "../../ui";
 import {
@@ -190,7 +191,8 @@ function AttachPicks() {
     if (!installedFolderRefreshExhausted() && checkingInstalledScope() && !installedRunnerChoice()) return "Checking this computer's runner…";
     if (ownedInstalledRunner()?.attachIfEmpty === false) return "This server doesn't support attaching only to Spaces without a runner.";
     if (!installedRunnerChoice()) return "This computer's runner isn't available to attach for this account.";
-    if (eligibleSpaces().length === 0) return "Every Space you own has a runner.";
+    if (eligibleSpaces().length === 0) return spaces().some((s) => s.role === "owner" && s.runnerPaired === null)
+      ? "Some runner assignments haven’t been confirmed yet." : "Every Space you own has a runner.";
     return "Agents in the Spaces you choose can list and read files in their own folders on this computer.";
   };
   return (

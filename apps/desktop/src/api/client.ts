@@ -101,8 +101,8 @@ export type EventAttachment = AttachedFile | { removed: true };
 /** Most files one message may carry (the server's limit too). */
 export const MAX_MESSAGE_ATTACHMENTS = 10;
 export type SpaceRole = "owner" | "member";
-/** `runnerPaired`: a runner token is issued for the space. It says nothing about the runner being online. */
-export type Space = { id: string; name: string; role: SpaceRole; runnerPaired: boolean };
+/** `runnerPaired` says nothing about liveness; null is local, awaiting exact post-write proof. */
+export type Space = { id: string; name: string; role: SpaceRole; runnerPaired: boolean | null };
 export type Member = { userId: string; role: SpaceRole };
 /** An agent run in a Space the user belongs to (GET /v1/runs, newest first). */
 export type Run = { id: string; spaceId: string; roomId: string; status: string; actor: string; task: string };

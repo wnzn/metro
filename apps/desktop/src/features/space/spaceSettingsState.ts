@@ -29,6 +29,7 @@ import type { AgentPatch, ModelSelection, SpaceAgent, SpaceDetails, SpacePrefs, 
 import { apiClient, closeSettings, describe, disconnect, isAborted, me, onManageOpen, onSessionEnd, onTransientClear, rememberMembers, sessionGuard, spaceGone, spaceRenamed, spaces } from "../../store";
 import { beginSpaceRunnerWrite, dismissReveal, revealDedicatedToken, revealed, spaceRunners } from "../../settings";
 import { beginSpaceRunnerObservation, forgetDisprovedSpaceRunner } from "../../spaceRunnerObservations";
+import { spaceRunnerExactPending } from "../../spaceRunnerOrder";
 import { dismissRunnerOffer, installedRunnerChoice, snapshotInstalledRunner } from "../../runnersState";
 import { clearLocalToolsMessages, localToolsBusy } from "../localtools/localTools";
 import { noteClassifierPrefs } from "./askAgent";
@@ -360,6 +361,7 @@ async function readRunner(api: Client, sid: string): Promise<RunnerSnapshot> {
     // fallback from the Space record; a revoked membership also returns 404.
     const space = (await api.listSpaces()).find((s) => s.id === sid);
     if (!space) throw error;
+    if (spaceRunnerExactPending(sid)) throw new ApiError("protocol", "The current runner assignment could not be confirmed.");
     return { runner: space.runnerPaired ? dedicatedRunner : null, legacy: true, guardedTokenChanges: false };
   }
 }

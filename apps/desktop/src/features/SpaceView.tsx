@@ -134,10 +134,11 @@ export function RoomHeaderTitle() {
 
 /** Room actions: runner status, an owner's Members shortcut, and Space settings. */
 export function RoomHeaderActions() {
-  const paired = () => !!activeSpace()?.runnerPaired;
+  const paired = () => activeSpace()?.runnerPaired;
   return (
     <>
-      <Badge testID="runner-state" tone={paired() ? "runner" : "neutral"} label={paired() ? "Runner attached" : "No runner"} />
+      <Badge testID="runner-state" tone={paired() ? "runner" : "neutral"}
+        label={paired() === true ? "Runner attached" : paired() === false ? "No runner" : "Runner not confirmed"} />
       <If when={activeSpace()?.role === "owner"}>
         <Action testID="manage-space" label="Members" onPress={() => openManage()} />
       </If>
