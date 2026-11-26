@@ -402,7 +402,6 @@ export function ComposerField(
 ) {
   // Grows with its text (one empty line's height while empty), then scrolls.
   const height = signal(FIELD_MIN);
-  const focused = signal(false);
   return (
     <>
       <Input
@@ -416,19 +415,14 @@ export function ComposerField(
         multiline
         placeholder={props.placeholder}
         disabled={props.disabled}
-        onFocus={() => { focused.set(true); props.onFocusChange?.(true); }}
-        onBlur={() => { focused.set(false); props.onFocusChange?.(false); }}
+        onFocus={() => props.onFocusChange?.(true)}
+        onBlur={() => props.onFocusChange?.(false)}
         onCaretMove={props.onCaretMove}
         onSelectionChange={props.onSelectionChange}
         onContentSizeChange={({ size }) => height.set(Math.max(FIELD_MIN, Math.min(FIELD_MAX, Math.ceil(size.height))))}
         testID={props.testID}
         accessibilityLabel={props.accessibilityLabel ?? props.placeholder}
       />
-      <If when={focused()}>
-        <Text class="px-(--space-3) pb-(--space-1) text-(length:--text-xs) text-muted-foreground" testID="composer-markdown-hint">
-          Markdown supported
-        </Text>
-      </If>
     </>
   );
 }

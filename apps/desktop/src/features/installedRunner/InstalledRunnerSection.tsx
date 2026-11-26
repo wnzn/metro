@@ -27,11 +27,11 @@ import type { InstalledRunner } from "./installedRunner";
 export function installedRunnerBadge(r: InstalledRunner): { tone: Tone; label: string } {
   switch (r.state) {
     case "online":
-      return { tone: "success", label: "Online" };
+      return { tone: "success", label: "Connected" };
     case "starting":
       return { tone: "neutral", label: "Starting…" };
     case "offline":
-      return { tone: "warning", label: "Can't reach the local server" };
+      return { tone: "warning", label: "Disconnected" };
     case "revoked":
       return { tone: "danger", label: "Token no longer accepted" };
     case "deleted":
@@ -45,6 +45,11 @@ export function installedRunnerBadge(r: InstalledRunner): { tone: Tone; label: s
     default:
       return { tone: "neutral", label: "Stopped" };
   }
+}
+
+/** What a "Disconnected" badge doesn't say: the local server isn't answering. */
+export function installedRunnerNote(r: InstalledRunner): string {
+  return r.state === "offline" ? "Can't reach the local server. " : "";
 }
 
 export function reconnectImpact(r: InstalledRunner): string {
@@ -87,7 +92,7 @@ function Section(props: { r: InstalledRunner; management?: JSX.Element; picks: A
     >
       <SettingRow
         label={r().runner?.name ?? (r().unconfirmedName ? `Not confirmed (asked for “${r().unconfirmedName}”)` : "Not registered yet")}
-        description={`${version() ? `v${version()}` : "Version unknown until it connects"}. Updates with Metro. Read-only: ${r().tools.join(", ") || "workspace.list, workspace.read"}. It never changes files, runs commands or MCP servers.`}
+        description={`${installedRunnerNote(r())}${version() ? `v${version()}` : "Version unknown until it connects"}. Updates with Metro. Read-only: ${r().tools.join(", ") || "workspace.list, workspace.read"}. It never changes files, runs commands or MCP servers.`}
       >
         <Badge testID="installed-runner-state" tone={badge().tone} label={badge().label} />
       </SettingRow>
