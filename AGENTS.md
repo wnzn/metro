@@ -247,9 +247,10 @@ see [New in Metro 0.5.0](docs/released-0.5.0.md); for later changes, see
   the notice, with per-Space exclusions and live access checks. Space
   content read goes to the model answering Chat, visible to a shared
   connection's owner. Posts go directly as the user, marked `via Metro`,
-  only to a Space named in the user's own text. Address the default
-  agent unless one is named; normal reply targeting also applies if a
-  post replies in a thread. Don't infer recipients from text. The
+  only to a Space named in the user's own text. Address exactly one
+  agent: the named one, else the agent whose message the post replies
+  to, else the default agent. Don't infer recipients from text. A
+  schedule Metro creates may name only Spaces the user named. The
   receipt is Chat-only, never indexed or model history. Metro doesn't
   change settings or apply Page drafts. Chat stop doesn't stop delegated
   runs; only their initiators can retry eligible failed or cancelled

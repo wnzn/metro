@@ -32,11 +32,12 @@ thread, and which agent if not the default. Metro posts directly, without
 a separate confirmation, under your name with a **via Metro** label.
 The Space name or ID must appear in your current prompt or a recent
 message of your own in Chat (up to five available earlier messages).
-Names found in tool results don't count. Metro addresses the named
-agent, or the Space's default agent, by ID without classification.
-Typing `@` into the post doesn't add a recipient by itself. If Metro
-posts as a reply to another agent in a thread, the normal reply
-addressing also applies. Your usual Space model choices apply. Metro
+Names found in tool results don't count, and a scheduled prompt Metro
+creates for you may name only Spaces you named. Metro addresses exactly
+one agent by ID, without classification: the agent you named, else the
+agent whose message it replies to in a thread, else the Space's default
+agent. Typing `@` into the post doesn't add a recipient by itself. Your
+usual Space model choices apply. Metro
 can wait up to two minutes and summarize the answer; it may return
 sooner if the run is still going or no wait slot is available.
 
