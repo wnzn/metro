@@ -1391,10 +1391,17 @@ pub async fn submit_scheduled(
     if text.is_empty() || text.chars().count() > max {
         anyhow::bail!("the scheduled prompt must be 1..={max} characters");
     }
-    let author = Author {
-        id: Some(owner_id.to_owned()),
-        name: owner_id.to_owned(),
-    };
+    let uid = owner_id.to_owned();
+    let author = state
+        .db
+        .call(move |db| {
+            let profile = db.profile(&uid)?;
+            Ok(Author {
+                id: Some(uid),
+                name: profile.display_name,
+            })
+        })
+        .await?;
     let settings = preferences(state, owner_id).await?;
     match space {
         None => {

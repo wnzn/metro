@@ -152,6 +152,7 @@ struct H {
     base: String,
     http: reqwest::Client,
     mock: Arc<Mock>,
+    state: AppState,
 }
 
 impl H {
@@ -199,6 +200,7 @@ impl H {
             base,
             http: reqwest::Client::new(),
             mock,
+            state,
         }
     }
 
@@ -1000,6 +1002,36 @@ async fn runs_are_listed_and_cancelled_with_the_room_rules() {
 }
 
 // ---- Schedules ----
+
+#[tokio::test]
+async fn a_scheduled_chat_post_uses_the_owners_profile_name() {
+    let h = H::start().await;
+    let s = h.space("Design").await;
+    h.notice("bob").await;
+    let (status, profile) = h
+        .req(
+            Method::PATCH,
+            "bob",
+            "/v1/me/profile",
+            Some(json!({"display_name": "Bob Rivera"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{profile}");
+    metro_server::model_routing::submit_scheduled(
+        &h.state,
+        "bob",
+        None,
+        &plan(
+            "Ask Design for a status update",
+            json!([["space_send", {"space_id": s.id, "room_id": "lobby", "text": "What's the status?"}]]),
+        ),
+    )
+    .await
+    .unwrap();
+    let posted = h.wait_room(&s.id, |e| e["via"] == "metro").await;
+    assert_eq!(posted["actor"], "Bob Rivera");
+    assert_eq!(posted["actor_id"], "bob");
+}
 
 #[tokio::test]
 async fn schedules_are_scoped_and_paused_by_revision() {
