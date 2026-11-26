@@ -7,15 +7,29 @@
 //! use-case routing. A personal Chat message likewise returns before its
 //! turn is routed and started.
 //!
-//! **Durable.** Such a message gets a `pending_decisions` row in the same
-//! transaction that stores it. The decision itself is never stored on the
-//! message, so it can be made again: at startup, [`resume`] makes every
-//! decision still pending, in message order. The row goes in the same
-//! transaction that registers the run it starts (a Space run's acceptance,
-//! or a Chat turn's `started` marker), which also checks that the message
-//! still exists, so a run starts at most once and never for a deleted
-//! message. A decision that starts nothing removes its row when it ends,
-//! and deleting the message removes it too.
+//! **Durable, and claimed.** Such a message gets a `pending_decisions`
+//! row in the same transaction that stores it, claimed by this process
+//! ([`Pending::epoch`]). The decision is never stored on the message, so it
+//! can be made again. Once made, one transaction replaces the row with one
+//! `pending_targets` row per agent run it starts, plus the room errors it
+//! posts. Each run's row is claimed (deleted) in the transaction that
+//! registers the run and writes its `started` marker, which also checks
+//! that the message still exists: a run starts at most once, never for a
+//! deleted message, and a crash after that leaves a `started` marker that
+//! the next startup closes as `interrupted`, visibly. A Chat turn's row is
+//! settled with its `started` marker the same way.
+//!
+//! **Recovery.** At startup, before the listener accepts anything,
+//! [`resume`] claims every row another process left (in one transaction:
+//! `UPDATE ... RETURNING`) and enqueues it, in message order; a Chat turn
+//! gets its place in its sender's line then. Only a row's claimant ever
+//! dispatches it, so nothing runs twice. Work is reloaded from the live
+//! message after every wait and before every System One call; a message
+//! deleted meanwhile goes no further and reaches no model.
+//!
+//! **Stop.** A Chat message's POST returns its `turn_id`. Stopping it before
+//! it starts (`POST /v1/chat/turns/{id}/stop`) is saved in its pending row
+//! before the call answers, so neither this process nor the next starts it.
 //!
 //! **Bounded.** At most [`AT_ONCE`] decisions run at once on the server,
 //! and [`PER_USER`] per person; more wait their turn, none is dropped. A
@@ -39,7 +53,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
 
@@ -92,8 +106,42 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
              payload    TEXT NOT NULL,
              created_at INTEGER NOT NULL,
              PRIMARY KEY (scope, event_id)
+         );
+         -- The decision for a Space message was made: one row per agent run
+         -- still to start, settled with that run's `started` marker.
+         CREATE TABLE IF NOT EXISTS pending_targets (
+             event_id     INTEGER NOT NULL,
+             agent_id     TEXT NOT NULL,
+             position     INTEGER NOT NULL,
+             space_id     TEXT NOT NULL,
+             room_id      TEXT NOT NULL,
+             user_id      TEXT NOT NULL,
+             pick         TEXT,
+             addressed_by TEXT NOT NULL,
+             choice       TEXT,
+             claimed_by   TEXT,
+             created_at   INTEGER NOT NULL,
+             PRIMARY KEY (event_id, agent_id)
          );",
-    )
+    )?;
+    // Additive, for databases from builds before claims and Stop.
+    for (column, decl) in [
+        ("claimed_by", "TEXT"),
+        ("cancelled", "INTEGER NOT NULL DEFAULT 0"),
+        ("turn_id", "TEXT"),
+    ] {
+        let has: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('pending_decisions') WHERE name = ?1)",
+            [column],
+            |r| r.get(0),
+        )?;
+        if !has {
+            conn.execute_batch(&format!(
+                "ALTER TABLE pending_decisions ADD COLUMN {column} {decl}"
+            ))?;
+        }
+    }
+    Ok(())
 }
 
 /// A decision to make for a message about to be stored.
@@ -106,6 +154,10 @@ pub struct NewPending {
     /// What the decision needs beyond the stored message: see
     /// [`crate::messages`] and [`crate::api`].
     pub payload: serde_json::Value,
+    /// The process that makes it ([`Pending::epoch`]): whoever stores it.
+    pub claimed_by: String,
+    /// A Chat turn's id, known to its sender before it starts (for Stop).
+    pub turn_id: Option<String>,
 }
 
 /// Write `p` for event `event_id`, inside the transaction that stores it.
@@ -115,8 +167,9 @@ pub fn insert_in(conn: &Connection, p: &NewPending, event_id: i64) -> rusqlite::
         None => (None, None),
     };
     conn.execute(
-        "INSERT INTO pending_decisions (scope, event_id, user_id, space_id, room_id, payload, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO pending_decisions
+             (scope, event_id, user_id, space_id, room_id, payload, created_at, claimed_by, turn_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             p.scope.as_str(),
             event_id,
@@ -124,7 +177,9 @@ pub fn insert_in(conn: &Connection, p: &NewPending, event_id: i64) -> rusqlite::
             space,
             room,
             p.payload.to_string(),
-            crate::db::now_ms()
+            crate::db::now_ms(),
+            p.claimed_by,
+            p.turn_id,
         ],
     )?;
     Ok(())
@@ -135,20 +190,28 @@ pub fn insert(db: &crate::db::Db, p: &NewPending, event_id: i64) -> anyhow::Resu
     Ok(insert_in(&db.lock(), p, event_id)?)
 }
 
-/// How many decisions are pending.
+/// How many decisions and planned runs are pending.
 pub fn count(db: &crate::db::Db) -> anyhow::Result<i64> {
-    Ok(db
-        .lock()
-        .query_row("SELECT COUNT(*) FROM pending_decisions", [], |r| r.get(0))?)
+    Ok(db.lock().query_row(
+        "SELECT (SELECT COUNT(*) FROM pending_decisions) + (SELECT COUNT(*) FROM pending_targets)",
+        [],
+        |r| r.get(0),
+    )?)
 }
 
-/// Drop the pending decision of event `event_id`, if any, inside the
-/// caller's transaction.
+/// Drop everything pending for event `event_id` (its decision, or the runs
+/// it planned), inside the caller's transaction.
 pub fn forget_in(conn: &Connection, scope: Scope, event_id: i64) -> rusqlite::Result<()> {
     conn.execute(
         "DELETE FROM pending_decisions WHERE scope = ?1 AND event_id = ?2",
         params![scope.as_str(), event_id],
     )?;
+    if scope == Scope::Space {
+        conn.execute(
+            "DELETE FROM pending_targets WHERE event_id = ?1",
+            [event_id],
+        )?;
+    }
     Ok(())
 }
 
@@ -163,6 +226,155 @@ pub async fn forget(state: &AppState, scope: Scope, event_id: i64) {
     }
 }
 
+/// Drop one planned run that won't start (refused, or its agent gone).
+pub async fn forget_target(state: &AppState, event_id: i64, agent_id: &str) {
+    let agent = agent_id.to_owned();
+    if let Err(e) = state
+        .db
+        .call(move |db| {
+            db.lock().execute(
+                "DELETE FROM pending_targets WHERE event_id = ?1 AND agent_id = ?2",
+                params![event_id, agent],
+            )?;
+            Ok(())
+        })
+        .await
+    {
+        tracing::error!(error = %format!("{e:#}"), "clearing a planned run");
+    }
+}
+
+/// One run a Space decision planned, as stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedTarget {
+    pub agent_id: String,
+    pub pick: Option<String>,
+    pub addressed_by: crate::model_routing::AddressedBy,
+}
+
+/// Turn the claimed decision of Space message `event_id` into its planned
+/// runs, with the room errors the decision posts, in one transaction. False
+/// (nothing written) when this process no longer holds the claim or the
+/// message is gone.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_in(
+    db: &crate::db::Db,
+    epoch: &str,
+    space: &str,
+    room: &str,
+    user: &str,
+    event_id: i64,
+    targets: &[PlannedTarget],
+    choice: Option<&serde_json::Value>,
+    errors: &[String],
+) -> anyhow::Result<bool> {
+    let mut conn = db.lock();
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let held = tx.execute(
+        "DELETE FROM pending_decisions WHERE scope = 'space' AND event_id = ?1 AND claimed_by = ?2",
+        params![event_id, epoch],
+    )? == 1;
+    let present = crate::replies::event_in(&tx, space, room, event_id)?
+        .is_some_and(|e| e.kind == crate::db::kind::MESSAGE);
+    if !held || !present {
+        return Ok(false);
+    }
+    let now = crate::db::now_ms();
+    for (position, t) in targets.iter().enumerate() {
+        tx.execute(
+            "INSERT OR IGNORE INTO pending_targets (event_id, agent_id, position, space_id, room_id,
+                 user_id, pick, addressed_by, choice, claimed_by, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                event_id,
+                t.agent_id,
+                position as i64,
+                space,
+                room,
+                user,
+                t.pick,
+                serde_json::to_value(t.addressed_by)?.as_str(),
+                choice.map(|c| c.to_string()),
+                epoch,
+                now
+            ],
+        )?;
+    }
+    for reason in errors {
+        crate::db::Db::append_event_in(
+            &tx,
+            space,
+            room,
+            crate::db::kind::ERROR,
+            &crate::db::Author::server(crate::db::actor::SYSTEM),
+            reason,
+            &crate::db::Addressed::room(),
+            None,
+        )?;
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Claim one planned run inside the transaction that registers it and
+/// writes its `started` marker: true only for the claimant.
+pub fn claim_target_in(
+    conn: &Connection,
+    epoch: &str,
+    event_id: i64,
+    agent_id: &str,
+) -> rusqlite::Result<bool> {
+    Ok(conn.execute(
+        "DELETE FROM pending_targets WHERE event_id = ?1 AND agent_id = ?2 AND claimed_by = ?3",
+        params![event_id, agent_id, epoch],
+    )? == 1)
+}
+
+/// Inside the transaction that writes a Chat turn's `started` marker:
+/// settle its pending decision. False when another process holds it or the
+/// sender stopped it (then it's dropped); true when there was none.
+pub fn settle_chat_in(conn: &Connection, epoch: &str, event_id: i64) -> rusqlite::Result<bool> {
+    let row: Option<(Option<String>, i64)> = conn
+        .query_row(
+            "SELECT claimed_by, cancelled FROM pending_decisions WHERE scope = 'personal' AND event_id = ?1",
+            [event_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(match row {
+        None => true,
+        // Someone else's to settle.
+        Some((claimed, 0)) if claimed.as_deref() != Some(epoch) => false,
+        Some((_, cancelled)) => {
+            forget_in(conn, Scope::Personal, event_id)?;
+            cancelled == 0
+        }
+    })
+}
+
+/// The sender stopped Chat turn `turn_id` before it started: remembered
+/// with its pending decision, so a restart doesn't start it either.
+pub fn cancel_turn(db: &crate::db::Db, user: &str, turn_id: &str) -> anyhow::Result<bool> {
+    Ok(db.lock().execute(
+        "UPDATE pending_decisions SET cancelled = 1
+         WHERE scope = 'personal' AND user_id = ?1 AND turn_id = ?2",
+        params![user, turn_id],
+    )? == 1)
+}
+
+/// Whether Chat message `event_id`'s turn was stopped before it started.
+pub fn cancelled(db: &crate::db::Db, event_id: i64) -> anyhow::Result<bool> {
+    Ok(db
+        .lock()
+        .query_row(
+            "SELECT cancelled FROM pending_decisions WHERE scope = 'personal' AND event_id = ?1",
+            [event_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+        == Some(1))
+}
+
 /// One pending decision as stored.
 #[derive(Clone, Debug)]
 pub struct Stored {
@@ -172,44 +384,131 @@ pub struct Stored {
     pub space_id: Option<String>,
     pub room_id: Option<String>,
     pub payload: serde_json::Value,
+    pub turn_id: Option<String>,
 }
 
-fn pending_rows(conn: &Connection) -> rusqlite::Result<Vec<Stored>> {
-    let mut stmt = conn.prepare(
-        "SELECT scope, event_id, user_id, space_id, room_id, payload FROM pending_decisions
-         ORDER BY created_at, event_id",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        let scope: String = r.get(0)?;
-        let payload: String = r.get(5)?;
-        Ok(Stored {
-            scope: if scope == "space" {
-                Scope::Space
-            } else {
-                Scope::Personal
-            },
-            event_id: r.get(1)?,
-            user_id: r.get(2)?,
-            space_id: r.get(3)?,
-            room_id: r.get(4)?,
-            payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
-        })
-    })?;
-    rows.collect()
+/// Planned runs of one Space message, as stored.
+#[derive(Clone, Debug)]
+pub struct StoredTargets {
+    pub event_id: i64,
+    pub space_id: String,
+    pub room_id: String,
+    pub user_id: String,
+    pub choice: Option<serde_json::Value>,
+    pub targets: Vec<PlannedTarget>,
 }
 
-/// Make every decision left pending by an earlier run of the server, in
-/// the order their messages were stored. Call once at startup.
+/// Everything left pending by another process, claimed for this one
+/// (`epoch`) in one transaction. Cancelled Chat turns are dropped.
+fn claim_all(
+    conn: &mut Connection,
+    epoch: &str,
+) -> rusqlite::Result<(Vec<Stored>, Vec<StoredTargets>)> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute("DELETE FROM pending_decisions WHERE cancelled = 1", [])?;
+    let decisions = {
+        let mut stmt = tx.prepare(
+            "UPDATE pending_decisions SET claimed_by = ?1
+             WHERE claimed_by IS NULL OR claimed_by <> ?1
+             RETURNING scope, event_id, user_id, space_id, room_id, payload, turn_id, created_at",
+        )?;
+        let mut rows = stmt
+            .query_map([epoch], |r| {
+                let scope: String = r.get(0)?;
+                let payload: String = r.get(5)?;
+                Ok((
+                    r.get::<_, i64>(7)?,
+                    Stored {
+                        scope: if scope == "space" {
+                            Scope::Space
+                        } else {
+                            Scope::Personal
+                        },
+                        event_id: r.get(1)?,
+                        user_id: r.get(2)?,
+                        space_id: r.get(3)?,
+                        room_id: r.get(4)?,
+                        payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+                        turn_id: r.get(6)?,
+                    },
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.sort_by_key(|(at, s)| (*at, s.event_id));
+        rows.into_iter().map(|(_, s)| s).collect::<Vec<_>>()
+    };
+    let targets = {
+        let mut stmt = tx.prepare(
+            "UPDATE pending_targets SET claimed_by = ?1
+             WHERE claimed_by IS NULL OR claimed_by <> ?1
+             RETURNING event_id, space_id, room_id, user_id, choice, agent_id, pick, addressed_by, position",
+        )?;
+        let mut rows = stmt
+            .query_map([epoch], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, i64>(8)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.sort_by_key(|r| (r.0, r.8));
+        let mut grouped: Vec<StoredTargets> = Vec::new();
+        for (event_id, space_id, room_id, user_id, choice, agent_id, pick, by, _) in rows {
+            let addressed_by = serde_json::from_value(serde_json::Value::String(by))
+                .unwrap_or(crate::model_routing::AddressedBy::Explicit);
+            let target = PlannedTarget {
+                agent_id,
+                pick,
+                addressed_by,
+            };
+            match grouped.last_mut() {
+                Some(g) if g.event_id == event_id => g.targets.push(target),
+                _ => grouped.push(StoredTargets {
+                    event_id,
+                    space_id,
+                    room_id,
+                    user_id,
+                    choice: choice.and_then(|c| serde_json::from_str(&c).ok()),
+                    targets: vec![target],
+                }),
+            }
+        }
+        grouped
+    };
+    tx.commit()?;
+    Ok((decisions, targets))
+}
+
+/// Claim and enqueue every decision and planned run left pending by an
+/// earlier run of the server, in the order their messages were stored.
+/// Call once at startup, before accepting requests: every claim is made
+/// (and every Chat turn has its place in line) before any new message can
+/// be stored, and only the claimant ever dispatches.
 pub async fn resume(state: AppState) -> anyhow::Result<usize> {
-    let rows = state.db.call(|db| Ok(pending_rows(&db.lock())?)).await?;
-    let n = rows.len();
+    let epoch = state.decisions.epoch().to_owned();
+    let (decisions, targets) = state
+        .db
+        .call(move |db| Ok(claim_all(&mut db.lock(), &epoch)?))
+        .await?;
+    let n = decisions.len() + targets.len();
     if n > 0 {
         tracing::info!(
             pending = n,
             "resuming System One decisions pending at shutdown"
         );
     }
-    for row in rows {
+    for planned in targets {
+        let state = state.clone();
+        tokio::spawn(async move { crate::messages::resume_targets(state, planned).await });
+    }
+    for row in decisions {
         let state = state.clone();
         match row.scope {
             Scope::Space => {
@@ -368,6 +667,11 @@ type Entries = HashMap<Key, Entry>;
 /// Deferred outcomes by [`Key`], plus the decision slots and Chat lines.
 /// Memory only.
 pub struct Pending {
+    /// This process's claim on pending decisions.
+    epoch: String,
+    /// Held while a Chat message is stored and given its place in line, so
+    /// line order is storage order.
+    chat_insert: Mutex<()>,
     entries: Arc<Mutex<Entries>>,
     all: Arc<Semaphore>,
     users: Mutex<HashMap<String, Arc<Semaphore>>>,
@@ -377,6 +681,8 @@ pub struct Pending {
 impl Default for Pending {
     fn default() -> Self {
         Self {
+            epoch: format!("epoch_{}", uuid::Uuid::new_v4().simple()),
+            chat_insert: Mutex::default(),
             entries: Arc::default(),
             all: Arc::new(Semaphore::new(AT_ONCE)),
             users: Mutex::default(),
@@ -496,6 +802,19 @@ impl Pending {
             _all: all,
             _mine: mine,
         }
+    }
+
+    /// This process's claim token.
+    pub fn epoch(&self) -> &str {
+        &self.epoch
+    }
+
+    /// Store a Chat message with `store` and give it the next place in
+    /// `user`'s line, both under one lock: line order is storage order.
+    pub fn in_chat_order<T>(&self, user: &str, store: impl FnOnce() -> T) -> (T, Ticket) {
+        let _held = self.chat_insert.lock().unwrap_or_else(|e| e.into_inner());
+        let ticket = self.chat_ticket(user);
+        (store(), ticket)
     }
 
     /// The next place in `user`'s line of Chat turns.
@@ -688,6 +1007,111 @@ mod tests {
         // Finishers of evicted entries are harmless.
         drop(held);
         assert_eq!(pending.len(), 0);
+    }
+
+    #[test]
+    fn only_the_claimant_starts_a_planned_run_and_recovery_claims_once() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let space = db.create_space("alice", "S", 10).unwrap();
+        let author = crate::db::Author {
+            id: Some("alice".into()),
+            name: "alice".into(),
+        };
+        let msg = db
+            .append_event(
+                &space.id,
+                "lobby",
+                kind::MESSAGE,
+                &author,
+                "hi",
+                &Addressed::room(),
+            )
+            .unwrap();
+        let pending = NewPending {
+            scope: Scope::Space,
+            user_id: "alice".into(),
+            place: Some((space.id.clone(), "lobby".into())),
+            payload: serde_json::json!({}),
+            claimed_by: "old".into(),
+            turn_id: None,
+        };
+        insert(&db, &pending, msg.id).unwrap();
+        let targets = [PlannedTarget {
+            agent_id: "ag".into(),
+            pick: None,
+            addressed_by: crate::model_routing::AddressedBy::Explicit,
+        }];
+        // Another process can't make a decision it doesn't hold.
+        assert!(
+            !plan_in(
+                &db,
+                "new",
+                &space.id,
+                "lobby",
+                "alice",
+                msg.id,
+                &targets,
+                None,
+                &[]
+            )
+            .unwrap()
+        );
+        assert!(
+            plan_in(
+                &db,
+                "old",
+                &space.id,
+                "lobby",
+                "alice",
+                msg.id,
+                &targets,
+                None,
+                &[]
+            )
+            .unwrap()
+        );
+        // Recovery claims what "old" left, once.
+        let (d, t) = claim_all(&mut db.lock(), "new").unwrap();
+        assert!(d.is_empty());
+        assert_eq!(t.len(), 1);
+        assert!(claim_all(&mut db.lock(), "new").unwrap().1.is_empty());
+        assert!(
+            !claim_target_in(&db.lock(), "old", msg.id, "ag").unwrap(),
+            "the old claimant lost it"
+        );
+        assert!(claim_target_in(&db.lock(), "new", msg.id, "ag").unwrap());
+        assert!(
+            !claim_target_in(&db.lock(), "new", msg.id, "ag").unwrap(),
+            "started once"
+        );
+        assert_eq!(count(&db).unwrap(), 0);
+    }
+
+    #[test]
+    fn an_earlier_pending_table_gains_claims_and_stop() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pending_decisions (
+                 scope TEXT NOT NULL, event_id INTEGER NOT NULL, user_id TEXT NOT NULL,
+                 space_id TEXT, room_id TEXT, payload TEXT NOT NULL, created_at INTEGER NOT NULL,
+                 PRIMARY KEY (scope, event_id));
+             INSERT INTO pending_decisions VALUES ('personal', 7, 'alice', NULL, NULL, '{}', 1);",
+        )
+        .unwrap();
+        init(&conn).unwrap();
+        init(&conn).unwrap();
+        let (claimed, cancelled): (Option<String>, i64) = conn
+            .query_row(
+                "SELECT claimed_by, cancelled FROM pending_decisions",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (claimed, cancelled),
+            (None, 0),
+            "kept, and claimable at startup"
+        );
     }
 
     #[tokio::test]

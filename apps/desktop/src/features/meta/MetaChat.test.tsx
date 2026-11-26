@@ -278,3 +278,23 @@ test("older servers leave Chat usable with no notice and no Stop for legacy turn
   expect(app.shows("id:chat-stop")).toBe(false);
   expect(app.shows("id:send")).toBe(true);
 });
+
+test("Stop works on a turn that hasn't started yet, by the id its POST returned", async () => {
+  const f = setup({ notice_shown: true });
+  const base = f.network[`POST ${BASE}/v1/*`]!;
+  f.network[`POST ${BASE}/v1/*`] = req => {
+    if (new URL(req.url).pathname !== "/v1/chat/messages") return base(req);
+    const body = JSON.parse(req.body!);
+    // Stored; the turn waits (routing or an earlier turn), no marker yet.
+    const ev = f.addChat({ kind: "message", actor: "alice", actor_id: "alice", text: body.text, audience: "agent" } as any);
+    return ok({ ...ev, actor_id: "alice", turn_id: liveId }, 202);
+  };
+  const app = await launch(f);
+  await app.type("id:composer", "wait for it");
+  await app.press("id:send");
+  await app.waitFor("id:chat-stop");
+  await app.press("id:chat-stop");
+  await app.waitUntil(() => f.stopped.length === 1);
+  await app.waitFor("id:chat-stop", { state: "gone" });
+  expect(app.shows("id:send")).toBe(true);
+});

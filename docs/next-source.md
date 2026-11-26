@@ -16,13 +16,14 @@ for release records.
   `@agent` pick and use-case routing in the background. In local tests
   with a scripted System One that takes 1,000 ms, the message was visible
   to another member 1–2 ms after the POST instead of about 1,022 ms.
-  Private notices still reach only the sender. Pending decisions are
-  saved with the message, so a restart still makes them, once; a message
-  deleted meanwhile starts nothing. A classifier's pick is no longer added
+  Private notices still reach only the sender. Pending decisions, and the
+  runs a decision planned, are saved and claimed, so a restart still
+  makes and starts them, once; a message deleted meanwhile reaches no
+  model and starts nothing. A turn with a chosen model defers too. A classifier's pick is no longer added
   to the message's recipients or labelled *Picked by classifier* or
   *detected by System One*; the run shows as that agent's. Personal Chat
   now routes and starts its turn after the message is stored too, in send
-  order, and **Stop** works while it waits.
+  order, and **Stop** works while it waits, across a restart.
   See [classification](system-one.md#decisions-after-posting).
 - **Quieter transcript.** The composer no longer shows *Markdown
   supported*. A run that ends without an agent message shows nothing in
@@ -58,9 +59,13 @@ Use the signed-in person's bearer token.
 | `POST /v1/spaces/{sid}/rooms/{rid}/messages` with `defer_decisions: true` | Returns the stored message at once, with `decisions_pending: true` when a System One decision follows. |
 | `POST /v1/spaces/{sid}/rooms/{rid}/messages/{eid}/decisions` with `{}` | Sender only. `200` with the event and any `addressing_note` or `routing_note`, once; `202 {decisions_pending: true}` if still deciding after 90 seconds; `404` otherwise. See [decisions after posting](system-one.md#decisions-after-posting). |
 | `GET /v1/dms/{id}/events?after=&deletions=1` | Also returns `message_deleted` events. |
+| `POST /v1/chat/messages` | The response adds `turn_id` when the message starts a turn. |
+| `POST /v1/chat/turns/{turn_id}/stop` | Also stops a turn that hasn't started yet; the stop is saved first. |
+| Space message POST responses | `classified: true` when the classifier picked an agent; its pick is never in `mentions`. |
 
 Events can also be `kind: "message_deleted"` (JSON `text`
 `{target_event_id, tombstone}`) and `kind: "deleted"` (a tombstone with
 no text, recipients or metadata that anchors a reply thread). Room run
 completion activity still carries `outcome: "no_reply"`; the desktop
-shows nothing for it.
+shows nothing for it. A run whose message was deleted keeps its status
+in `/v1/runs` with an empty `task`.

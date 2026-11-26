@@ -107,6 +107,9 @@ pub struct Posted {
     /// the notes and runs above are empty, and the sender collects the notes
     /// from `POST .../messages/{eid}/decisions`.
     pub decisions_pending: bool,
+    /// The classifier chose an agent for this unaddressed message (it is
+    /// never added to the stored recipients).
+    pub classified: bool,
 }
 
 /// Post `msg` as `who` in room or thread `rid` of Space `sid` and start
@@ -195,6 +198,14 @@ pub async fn post_room_message(
         a => a,
     };
     agent_needs_text(&text, addressing)?;
+    // An explicit model for this turn, as a pending decision stores it.
+    let choice = msg.provider_connection_id.as_ref().map(|id| {
+        serde_json::json!({
+            "provider_connection_id": id,
+            "model_id": msg.model_id,
+            "reasoning_effort": msg.reasoning_effort,
+        })
+    });
     let chosen = check_choice(
         state,
         who,
@@ -240,17 +251,14 @@ pub async fn post_room_message(
             &prefs,
             &agents,
             reply_agent.as_ref(),
+            None,
         )
         .await
     };
-    // Only an unaddressed message can acquire a recipient here. Explicit
-    // spans keep their canonical indices even if @agent's target is picked
-    // by the classifier (that choice is run activity, not an edit to To:).
-    // A deferred decision never edits the stored message.
-    let mut addressed = plan
-        .classified
-        .clone()
-        .unwrap_or_else(|| stored(&resolved, reply_agent.as_ref(), msg.via));
+    // The classifier's output is never stored in a message's recipients, in
+    // any path: its pick is run activity only. Explicit spans keep their
+    // canonical indices.
+    let mut addressed = stored(&resolved, reply_agent.as_ref(), msg.via);
     if !msg.infer_text_mentions || !spans.is_empty() {
         addressed.spans = Some(spans);
     }
@@ -273,7 +281,10 @@ pub async fn post_room_message(
         payload: serde_json::json!({
             "resolved": resolved,
             "reply_agent": reply_agent.as_ref().map(|a| a.id.clone()),
+            "choice": choice,
         }),
+        claimed_by: state.decisions.epoch().to_owned(),
+        turn_id: None,
     });
     // Include targets derived from classification, @agent or a reply as
     // well as stored explicit recipients. A refusal reveals no classifier
@@ -322,6 +333,8 @@ pub async fn post_room_message(
             settings,
             prefs,
             reply_agent: reply_agent.map(|a| a.id),
+            chosen: chosen.map(Box::new),
+            choice,
         };
         tokio::spawn(async move {
             let outcome = job.run().await;
@@ -334,6 +347,7 @@ pub async fn post_room_message(
             routing_note: None,
             runs: Vec::new(),
             decisions_pending: true,
+            classified: false,
         });
     }
     let started = finish(
@@ -346,6 +360,7 @@ pub async fn post_room_message(
         routing_note: started.routing_note,
         runs: started.runs,
         decisions_pending: false,
+        classified: started.classified,
     })
 }
 
@@ -361,11 +376,6 @@ fn needs_system_one(
     agents: &[SpaceAgent],
     chosen: &Option<crate::model_routing::Route>,
 ) -> bool {
-    // A model chosen for this turn isn't stored with a pending decision, so
-    // such a message decides before it returns, as before.
-    if chosen.is_some() {
-        return false;
-    }
     match addressing {
         Addressing::PeopleOnly => false,
         Addressing::Unaddressed => !text.is_empty() && prefs.classify_unaddressed,
@@ -374,7 +384,10 @@ fn needs_system_one(
                 && prefs.classify_unaddressed
                 && settings.classifier_id.is_some()
                 && agents.len() >= 2;
-            let routes = settings.enabled && prefs.routing && prefs.default_model.is_none();
+            let routes = chosen.is_none()
+                && settings.enabled
+                && prefs.routing
+                && prefs.default_model.is_none();
             picks || routes
         }
     }
@@ -453,6 +466,52 @@ struct Deferred {
     prefs: crate::space_prefs::SpacePrefs,
     /// The id of the agent whose reply this message answers.
     reply_agent: Option<String>,
+    /// The model chosen for the turn, checked (`None` after a restart:
+    /// rechecked from `choice`).
+    chosen: Option<Box<crate::model_routing::Route>>,
+    choice: Option<serde_json::Value>,
+}
+
+/// The live trigger: the message as stored now, `None` once deleted.
+async fn live_message(state: &AppState, space: &str, room: &str, id: i64) -> Option<Event> {
+    let (s, r) = (space.to_owned(), room.to_owned());
+    match state
+        .db
+        .call(move |db| Ok(crate::replies::event_in(&db.lock(), &s, &r, id)?))
+        .await
+    {
+        Ok(event) => event.filter(|e| e.kind == kind::MESSAGE),
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "reading a pending decision's message");
+            None
+        }
+    }
+}
+
+/// The model chosen for a turn, checked again (after a restart).
+async fn recheck_choice(
+    state: &AppState,
+    user: &str,
+    name: &str,
+    space: &str,
+    choice: &serde_json::Value,
+) -> Result<Option<crate::model_routing::Route>, String> {
+    let who = Human {
+        id: user.to_owned(),
+        name: name.to_owned(),
+    };
+    let text = |k: &str| choice.get(k).and_then(|v| v.as_str()).map(str::to_owned);
+    check_choice(
+        state,
+        &who,
+        Some(space),
+        text("provider_connection_id"),
+        text("model_id"),
+        text("reasoning_effort"),
+        Addressing::Agent,
+    )
+    .await
+    .map_err(|e| e.message().to_owned())
 }
 
 impl Deferred {
@@ -463,25 +522,20 @@ impl Deferred {
             runs: Vec::new(),
             classified: false,
         };
-        // The Space's agents as they are now: one deleted since the post is
-        // never picked or started. A message deleted meanwhile starts nothing.
-        let (space, room, eid) = (self.space.clone(), self.room.id.clone(), self.event.id);
-        let agents = match self
-            .state
-            .db
-            .call(move |db| {
-                let present = crate::replies::event_in(&db.lock(), &space, &room, eid)?
-                    .is_some_and(|e| e.kind == kind::MESSAGE);
-                present.then(|| db.space_agents(&space)).transpose()
-            })
-            .await
-        {
-            Ok(Some(agents)) => agents,
-            Ok(None) => {
-                let id = self.event.id;
-                crate::decisions::forget(&self.state, crate::decisions::Scope::Space, id).await;
-                return nothing();
-            }
+        // System One calls wait for a slot; none is dropped.
+        let _slot = self.state.decisions.slot(&self.user).await;
+        // The message as it is now, after the wait: one deleted meanwhile
+        // goes to no model. And the Space's agents as they are now.
+        let Some(event) =
+            live_message(&self.state, &self.space, &self.room.id, self.event.id).await
+        else {
+            crate::decisions::forget(&self.state, crate::decisions::Scope::Space, self.event.id)
+                .await;
+            return nothing();
+        };
+        let space = self.space.clone();
+        let agents = match self.state.db.call(move |db| db.space_agents(&space)).await {
+            Ok(agents) => agents,
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "loading agents for a deferred decision");
                 return nothing();
@@ -491,37 +545,235 @@ impl Deferred {
             .reply_agent
             .as_ref()
             .and_then(|r| agents.iter().find(|a| a.id == *r).cloned());
-        // System One calls wait for a slot; none is dropped.
-        let _slot = self.state.decisions.slot(&self.user).await;
         let plan = crate::agent_dispatch::plan(
             &self.state,
             &self.user,
             &self.space,
             &self.room.id,
-            &self.event.text,
+            &event.text,
             &self.resolved,
             self.addressing,
             &self.settings,
             &self.prefs,
             &agents,
             reply_agent.as_ref(),
+            Some(event.id),
         )
         .await;
-        let finished = finish(
+        let classified = plan.classified.is_some();
+        let addressing_note = plan.addressing_note.clone().map(SenderNote::Addressing);
+        // The decision is made: its planned runs replace it, durably, with
+        // the room errors it posts. Lost claim or deleted message: stop.
+        let planned: Vec<_> = plan
+            .targets
+            .iter()
+            .map(|t| crate::decisions::PlannedTarget {
+                agent_id: t.agent.id.clone(),
+                pick: t.pick.clone(),
+                addressed_by: t.addressed_by,
+            })
+            .collect();
+        let (epoch, sid, rid, user, eid, choice, errors) = (
+            self.state.decisions.epoch().to_owned(),
+            self.space.clone(),
+            self.room.id.clone(),
+            self.user.clone(),
+            event.id,
+            self.choice.clone(),
+            plan.errors.clone(),
+        );
+        let persisted = self
+            .state
+            .db
+            .call(move |db| {
+                crate::decisions::plan_in(
+                    db,
+                    &epoch,
+                    &sid,
+                    &rid,
+                    &user,
+                    eid,
+                    &planned,
+                    choice.as_ref(),
+                    &errors,
+                )
+            })
+            .await;
+        match persisted {
+            Ok(true) => {}
+            Ok(false) => return nothing(),
+            Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), "storing a decision's runs");
+                return nothing();
+            }
+        }
+        let chosen = self.chosen.map(|r| *r);
+        let started = dispatch_planned(
             &self.state,
             &self.space,
             &self.room,
             &self.author,
-            &self.event,
-            plan,
-            None,
+            event.id,
+            plan.targets,
+            chosen,
             &self.settings,
             &self.prefs,
         )
         .await;
-        // Settled already if a run was accepted; otherwise nothing started.
-        crate::decisions::forget(&self.state, crate::decisions::Scope::Space, self.event.id).await;
-        finished
+        Finished {
+            addressing_note,
+            routing_note: started.note,
+            runs: started.runs,
+            classified,
+        }
+    }
+}
+
+/// Start each planned run of message `event_id` in order. Before each one
+/// (its use-case routing is a System One call) the message is read again:
+/// once it's deleted, the rest are dropped. Each run is claimed, registered
+/// and marked `started` in one transaction ([`crate::agent::start_room_run_claimed`]);
+/// a run that can't start says why in the room and is dropped.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_planned(
+    state: &AppState,
+    space: &str,
+    room: &crate::db::Room,
+    author: &Author,
+    event_id: i64,
+    targets: Vec<crate::agent_dispatch::Target>,
+    chosen: Option<crate::model_routing::Route>,
+    settings: &RoutingSettings,
+    prefs: &crate::space_prefs::SpacePrefs,
+) -> crate::agent_dispatch::Started {
+    let user = author.id.clone().unwrap_or_default();
+    let mut started = crate::agent_dispatch::Started::default();
+    for t in targets {
+        let Some(event) = live_message(state, space, &room.id, event_id).await else {
+            crate::decisions::forget(state, crate::decisions::Scope::Space, event_id).await;
+            break;
+        };
+        let route = match &chosen {
+            Some(route) => route.clone(),
+            None => {
+                let _slot = state.decisions.slot(&user).await;
+                crate::space_prefs::route_for(
+                    state,
+                    &user,
+                    space,
+                    prefs,
+                    settings,
+                    &t.agent.id,
+                    &event.text,
+                    t.addressed_by,
+                )
+                .await
+            }
+        };
+        match crate::agent::start_room_run_claimed(
+            state, space, room, author, &event, route, &t.agent, t.pick, true,
+        )
+        .await
+        {
+            Ok(run) => started.runs.push(run),
+            Err(refusal) => {
+                crate::decisions::forget_target(state, event_id, &t.agent.id).await;
+                if refusal.shown.is_empty() {
+                    continue;
+                }
+                state
+                    .append(
+                        space,
+                        &room.id,
+                        kind::ERROR,
+                        &Author::server(actor::SYSTEM),
+                        &refusal.shown,
+                    )
+                    .await;
+                started.failures.push(refusal.private().to_owned());
+                if started.note.is_none() {
+                    started.note = refusal.note;
+                }
+            }
+        }
+    }
+    started
+}
+
+/// The sender's current settings for a Space, for work resumed at startup.
+async fn current_settings(
+    state: &AppState,
+    user: &str,
+    space: &str,
+) -> Option<(RoutingSettings, crate::space_prefs::SpacePrefs)> {
+    match (
+        routing::preferences(state, user).await,
+        crate::space_prefs::load(state, space, user).await,
+    ) {
+        (Ok(s), Ok(p)) => Some((s, p)),
+        _ => {
+            tracing::error!("loading settings for pending work");
+            None
+        }
+    }
+}
+
+/// The room of a pending Space message and the message, if both remain.
+async fn pending_place(
+    state: &AppState,
+    space: &str,
+    room: &str,
+    event_id: i64,
+) -> Option<(crate::db::Room, Event)> {
+    let (sid, rid) = (space.to_owned(), room.to_owned());
+    let found = state
+        .db
+        .call(move |db| {
+            let conn = db.lock();
+            let room = crate::db::Db::room_in(&conn, &sid, &rid)?;
+            let event = crate::replies::event_in(&conn, &sid, &rid, event_id)?;
+            Ok(room.zip(event))
+        })
+        .await;
+    match found {
+        Ok(Some((room, event))) if event.kind == kind::MESSAGE => Some((room, event)),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "resuming pending work");
+            None
+        }
+    }
+}
+
+/// The model chosen for resumed work, or the visible reason it can't be used.
+async fn resumed_choice(
+    state: &AppState,
+    user: &str,
+    space: &str,
+    room: &str,
+    event: &Event,
+    choice: Option<&serde_json::Value>,
+) -> Result<Option<crate::model_routing::Route>, ()> {
+    let Some(choice) = choice.filter(|c| !c.is_null()) else {
+        return Ok(None);
+    };
+    match recheck_choice(state, user, &event.actor, space, choice).await {
+        Ok(route) => Ok(route),
+        Err(why) => {
+            state
+                .append(
+                    space,
+                    room,
+                    kind::ERROR,
+                    &Author::server(actor::SYSTEM),
+                    &format!(
+                        "Metro restarted before this message's agent run started, and the model \
+                         chosen for it can't be used now: {why} No agent ran."
+                    ),
+                )
+                .await;
+            Err(())
+        }
     }
 }
 
@@ -532,23 +784,8 @@ pub(crate) async fn resume_space(state: AppState, row: crate::decisions::Stored)
     let (Some(space), Some(room)) = (row.space_id.clone(), row.room_id.clone()) else {
         return forget(&state, Scope::Space, row.event_id).await;
     };
-    let (sid, rid, eid) = (space.clone(), room.clone(), row.event_id);
-    let found = state
-        .db
-        .call(move |db| {
-            let conn = db.lock();
-            let room = crate::db::Db::room_in(&conn, &sid, &rid)?;
-            let event = crate::replies::event_in(&conn, &sid, &rid, eid)?;
-            Ok(room.zip(event))
-        })
-        .await;
-    let (room, event) = match found {
-        Ok(Some((room, event))) if event.kind == kind::MESSAGE => (room, event),
-        Ok(_) => return forget(&state, Scope::Space, row.event_id).await,
-        Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "resuming a pending decision");
-            return;
-        }
+    let Some((room, event)) = pending_place(&state, &space, &room, row.event_id).await else {
+        return forget(&state, Scope::Space, row.event_id).await;
     };
     let resolved: Vec<Mention> =
         serde_json::from_value(row.payload["resolved"].clone()).unwrap_or_default();
@@ -558,11 +795,21 @@ pub(crate) async fn resume_space(state: AppState, row: crate::decisions::Stored)
     } else {
         Addressing::of(&resolved)
     };
-    let settings = routing::preferences(&state, &row.user_id).await;
-    let prefs = crate::space_prefs::load(&state, &space, &row.user_id).await;
-    let (Ok(settings), Ok(prefs)) = (settings, prefs) else {
-        tracing::error!("loading settings for a pending decision");
+    let Some((settings, prefs)) = current_settings(&state, &row.user_id, &space).await else {
         return;
+    };
+    let choice = row.payload.get("choice").filter(|c| !c.is_null()).cloned();
+    let Ok(chosen) = resumed_choice(
+        &state,
+        &row.user_id,
+        &space,
+        &room.id,
+        &event,
+        choice.as_ref(),
+    )
+    .await
+    else {
+        return forget(&state, Scope::Space, row.event_id).await;
     };
     let author = Author {
         id: Some(row.user_id.clone()),
@@ -580,9 +827,74 @@ pub(crate) async fn resume_space(state: AppState, row: crate::decisions::Stored)
         settings,
         prefs,
         reply_agent,
+        chosen: chosen.map(Box::new),
+        choice,
     };
     // Its sender's notes went with the old process: nobody collects them.
     let _ = job.run().await;
+}
+
+/// Start the runs a decision planned before a restart, in their order.
+pub(crate) async fn resume_targets(state: AppState, planned: crate::decisions::StoredTargets) {
+    use crate::decisions::{Scope, forget};
+    let eid = planned.event_id;
+    let Some((room, event)) = pending_place(&state, &planned.space_id, &planned.room_id, eid).await
+    else {
+        return forget(&state, Scope::Space, eid).await;
+    };
+    let Some((settings, prefs)) =
+        current_settings(&state, &planned.user_id, &planned.space_id).await
+    else {
+        return;
+    };
+    let Ok(chosen) = resumed_choice(
+        &state,
+        &planned.user_id,
+        &planned.space_id,
+        &room.id,
+        &event,
+        planned.choice.as_ref(),
+    )
+    .await
+    else {
+        return forget(&state, Scope::Space, eid).await;
+    };
+    let space = planned.space_id.clone();
+    let agents = match state.db.call(move |db| db.space_agents(&space)).await {
+        Ok(agents) => agents,
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "loading agents for planned runs");
+            return;
+        }
+    };
+    let mut targets = Vec::new();
+    for t in planned.targets {
+        match agents.iter().find(|a| a.id == t.agent_id) {
+            Some(agent) => targets.push(crate::agent_dispatch::Target {
+                agent: agent.clone(),
+                pick: t.pick,
+                addressed_by: t.addressed_by,
+            }),
+            // Deleted since: it isn't replaced.
+            None => crate::decisions::forget_target(&state, eid, &t.agent_id).await,
+        }
+    }
+    let author = Author {
+        id: Some(planned.user_id.clone()),
+        name: event.actor.clone(),
+    };
+    dispatch_planned(
+        &state,
+        &planned.space_id,
+        &room,
+        &author,
+        eid,
+        targets,
+        chosen,
+        &settings,
+        &prefs,
+    )
+    .await;
 }
 
 /// The stored recipients: `resolved`, then the replied agent unless it was

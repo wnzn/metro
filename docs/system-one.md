@@ -150,20 +150,24 @@ usable in that Space. It is off by default. The rules below are for
   one agent: the same `choice`, without *No agent*. A pick at or above
   `min_route_probability` runs that agent; a weaker one runs the default
   agent. A failed decision posts an error in the room and runs nothing for
-  `@agent`.
+  `@agent`. In the source, not released, the room's marker for a weak pick
+  says only *Default agent*, without the guessed agent or its score.
 
 For these decisions:
 
 - Only that one new message, never the room's history, ids or the agents'
   instructions, goes to the sender's System One connection (`classifier_id`),
-  cut to 4,000 characters.
+  cut to 4,000 characters. (For unaddressed text, the room context below
+  is only messages from before it, even when the decision is made later.)
 - The run belongs to the sender and uses the sender's connections.
 - An unaddressed message that started a run this way is stored with
   `addressed_by: "classifier"`, which no client can send. The run's activity
   shows how its agent was chosen, for example *Picked by classifier: Coder*.
-  In the source, not released, the run shows only as the picked agent's
-  run: [deferred decisions](#decisions-after-posting) don't store the pick
-  on the message, and the server no longer writes that label.
+  In the source, not released, the classifier's output is never stored in
+  a message's recipients, whether the decision is
+  [deferred](#decisions-after-posting) or not: the POST says
+  `classified: true`, and the run shows only as the picked agent's run,
+  with no label.
 - It never sees a people-only message, which never starts an agent.
 - It never sees a message to a named agent (`@coder`, or Ask agent with an
   agent chosen).
@@ -211,20 +215,30 @@ returns the message at once. If it would otherwise wait on System One
 or use-case routing), the response has `decisions_pending: true`; the
 server then makes those decisions and starts the runs they choose,
 whether or not anyone collects the result. People-only messages and
-messages to a named agent are still never classified. A message whose
-POST chooses a model for the turn (`provider_connection_id`) still
-decides before the POST returns.
+messages to a named agent are still never classified. A model chosen for
+the turn (`provider_connection_id`) is saved with the decision, so such a
+message defers too; after a restart the choice is checked again, and one
+that can no longer be used says so in the room and runs nothing.
 
 - **It survives a restart.** The pending decision is saved in the same
-  transaction as the message. At startup the server makes every decision
-  still pending, in message order, with the sender's current settings.
-  Registering the run it starts (or finding that nothing starts) settles
-  it in the same transaction that checks the message still exists, so a
-  message starts its runs at most once.
-- **A deleted message starts nothing.** Deleting the message drops its
-  pending decision, and a run is never registered for a message deleted
-  while System One was deciding, so no model is called for it. An agent
-  deleted meanwhile isn't picked either.
+  transaction as the message, claimed by the server process that stores
+  it. When the decision is made, one transaction replaces it with one
+  saved entry per agent run it starts, plus any room error it posts. Each
+  run's entry is claimed in the same transaction that registers the run,
+  writes its `started` marker and checks the message still exists, so a
+  run starts at most once. If the server stops after that, the next start
+  closes the run as `interrupted`, in the room; if it stops before, the
+  next start begins it. Runs a decision planned start one by one, so a
+  restart between them starts the rest.
+- **Recovery comes first.** At startup, before accepting any request, the
+  server claims every decision and planned run the previous process left,
+  in one transaction, and queues them in message order. Only the claimant
+  dispatches, so nothing runs twice.
+- **A deleted message reaches no model.** The message is read again after
+  every wait and before every System One call (the classification, and
+  each run's use-case routing). Once it's deleted, nothing more is sent
+  or started, and deleting it drops what's pending for it. An agent
+  deleted meanwhile isn't picked or started either.
 - **Bounded.** At most 8 deferred decisions call System One at once on a
   server, and 2 per person; more wait their turn and none is dropped.
 - The decision never edits the stored message: a classifier's pick isn't
@@ -244,14 +258,16 @@ decides before the POST returns.
   still runs). If the decisions are still running after 90 seconds, the
   call returns `202 {decisions_pending: true}`; ask again.
 - Without `defer_decisions`, the POST waits for the decisions as before.
-- **Personal Chat** returns the message first too, then routes and starts
-  the turn, saved the same way so a restart still starts it. A person's
-  Chat turns start in the order they were sent. Each turn is registered
-  while it waits and routes, so **Stop** and the "reply running" check see
-  it; a turn stopped before it started, or whose message was deleted,
-  never starts. A turn that can't start says why in the Chat; after a
-  restart, a turn whose chosen model can no longer be used says so and
-  doesn't run.
+- **Personal Chat** returns the message first too, with the `turn_id` of
+  the turn it starts, then routes and starts the turn, saved and claimed
+  the same way so a restart still starts it. A person's Chat turns start
+  in the order their messages were stored. **Stop**
+  (`POST /v1/chat/turns/{turn_id}/stop`) works before the turn starts:
+  the desktop offers it as soon as the message is sent, and the stop is
+  saved before the call answers, so the turn doesn't start, not even
+  after a restart. A turn whose message was deleted never starts. A turn
+  that can't start says why in the Chat; after a restart, a turn whose
+  chosen model can no longer be used says so and doesn't run.
 
 In a local test with a scripted System One taking 1,000 ms, the message
 was visible to another member 1–2 ms after the POST, against about

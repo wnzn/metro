@@ -156,6 +156,8 @@ const activeScope = computed(() => {
 });
 export const activeEvents = computed(() => eventsByScope()[activeScope()] ?? EMPTY_EVENTS);
 export const chatEvents = computed(() => eventsByScope()[CHAT] ?? EMPTY_EVENTS);
+/** Chat turns this session started, by id and their message, before their `started` marker arrives. */
+export const pendingChatTurns = signal<readonly { id: string; eventId: number }[]>([]);
 export const activeLoaded = computed(() => !!loadedScopes()[activeScope()]);
 const reactionsByScope = signal<Record<string, Reactions>>({});
 export const activeReactions = computed(() => reactionsByScope()[activeScope()] ?? EMPTY_REACTIONS);
@@ -1730,7 +1732,11 @@ async function sendDraft(intent: DraftSend): Promise<void> {
       if (saveNote) {
         await c.saveChatNote(text, ids);
         origin.acknowledge(null);
-      } else origin.acknowledge(await c.sendChatMessage(text, ids, selected.choice));
+      } else {
+        const sent = await c.sendChatMessage(text, ids, selected.choice);
+        origin.acknowledge(sent.notes);
+        if (sent.turn && sameSession()) pendingChatTurns.set([...pendingChatTurns(), sent.turn].slice(-20));
+      }
     } else {
       if (!mayPost()) {
         if (here()) actionError.set("The draft or destination changed. Nothing was sent; review the draft and send again.");
