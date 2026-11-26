@@ -158,6 +158,11 @@ export const activeEvents = computed(() => eventsByScope()[activeScope()] ?? EMP
 export const chatEvents = computed(() => eventsByScope()[CHAT] ?? EMPTY_EVENTS);
 /** Chat turns this session started, by id and their message, before their `started` marker arrives. */
 export const pendingChatTurns = signal<readonly { id: string; eventId: number }[]>([]);
+/** A pending turn nobody ever settles (the server dropped it) stops offering Stop after this long. */
+export const PENDING_TURN_MS = 120_000;
+function dropPendingTurn(id: string) {
+  if (pendingChatTurns().some((p) => p.id === id)) pendingChatTurns.set(pendingChatTurns().filter((p) => p.id !== id));
+}
 export const activeLoaded = computed(() => !!loadedScopes()[activeScope()]);
 const reactionsByScope = signal<Record<string, Reactions>>({});
 export const activeReactions = computed(() => reactionsByScope()[activeScope()] ?? EMPTY_REACTIONS);
@@ -1745,7 +1750,12 @@ async function sendDraft(intent: DraftSend): Promise<void> {
       } else {
         const sent = await c.sendChatMessage(text, ids, selected.choice);
         origin.acknowledge(sent.notes);
-        if (sent.turn && sameSession()) pendingChatTurns.set([...pendingChatTurns(), sent.turn].slice(-20));
+        if (sent.turn && sameSession()) {
+          const turn = sent.turn;
+          pendingChatTurns.set([...pendingChatTurns().filter((p) => p.id !== turn.id), turn].slice(-20));
+          const sess = session;
+          setTimeout(() => { if (sess === session) dropPendingTurn(turn.id); }, PENDING_TURN_MS);
+        }
       }
     } else {
       if (!mayPost()) {
@@ -2585,6 +2595,21 @@ function clearTransient(keepReply = false) {
 const stashedDrafts = signal<Record<string, { text: string; mention: MentionDraft; directory: MentionDirectory | null }>>({});
 /** Some place other than the active one has a draft not sent yet. */
 export const stashedDraftPending = computed(() => Object.values(stashedDrafts()).some((d) => d.text.trim().length > 0));
+// A pending Chat turn is settled once its `started` marker arrived, or the
+// Chat refused it (an error row after its message), or its message is gone.
+effect(() => {
+  const pending = pendingChatTurns();
+  if (!pending.length) return;
+  const events = chatEvents();
+  if (!events.length) return;
+  const started = new Set<string>();
+  for (const e of events) if (e.kind === "activity" && e.activity?.id) started.add(e.activity.id);
+  const settled = pending.filter((p) => {
+    const at = events.findIndex((e) => e.id === p.eventId);
+    return started.has(p.id) || (at >= 0 && events.slice(at + 1).some((e) => e.kind === "error" && !e.activity));
+  });
+  if (settled.length) untracked(() => pendingChatTurns.set(pending.filter((p) => !settled.includes(p))));
+});
 let mentionScope = "";
 effect(() => {
   const scope = activeScope();
@@ -2612,6 +2637,7 @@ effect(() => {
 
 function endSession() {
   replySelections.set({});
+  pendingChatTurns.set([]);
   session++;
   abort?.abort();
   abort = null;

@@ -138,10 +138,18 @@ test("route attribution: a compact badge, and the full sentence in words, never 
   expect(routeBadge(route({ source: "default", caseLabel: null, addressedBy: "schedule" }))).toBe("Scheduled");
   expect(routeBadge(route({ source: "default", caseLabel: null, addressedBy: "explicit" }))).toBe(null);
 
-  const sentence = routeText(route({ reason: 'System One matched the use case "Code review" (p 0.91).' }));
-  expect(sentence).toBe("Use case “Code review” answered."); // no System One or classifier attribution, even in stored text
-  expect(routeText(route({ source: "default", caseLabel: null, reason: "Default agent (the classifier was unsure: best Coder at 0.41)" }))).not.toMatch(/classifier|System One/i);
-  expect(routeText(route({ source: "default", caseLabel: null, reason: "Picked by classifier: Coder" }))).not.toMatch(/classifier|System One/i);
+  // Use-case routing's own explanation and failures stay visible.
+  expect(routeText(route({ reason: 'System One matched the use case "Code review" (p 0.91).' })))
+    .toBe('Use case “Code review” answered: System One matched the use case "Code review" with 91% probability.');
+  expect(routeText(route({ source: "routing_default", caseLabel: null, addressedBy: "explicit", reason: "System One found no matching use case; using your default" })))
+    .toBe("The routing fallback model answered: System One found no matching use case; using your default.");
+  expect(routeText(route({ source: "routing_default", caseLabel: null, addressedBy: "explicit", reason: "routing failed: System One took too long" })))
+    .toContain("routing failed: System One took too long");
+  // Only classifier attribution is hidden, even in text an older server stored.
+  for (const reason of ["Picked by classifier: Coder", "detected by System One", "System One judged that the message asked the agent", "Started by System One",
+    "Default agent (the classifier was unsure: best Coder at 0.41)"]) {
+    expect(routeText(route({ source: "default", caseLabel: null, reason }))).toBe("The default chat model of the person who asked answered.");
+  }
   // An out-of-range probability is dropped, not shown.
   expect(routeConfidence(route({ reason: "matched (p 7.5)" }))).toBe(null);
   expect(routeText(route({ reason: "matched (p 7.5)" }))).not.toContain("p 7.5");
