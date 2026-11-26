@@ -155,10 +155,27 @@ impl Drop for AbortOnDrop {
 /// Run `make(rx)` until it returns (asked to stop, or stopped for good,
 /// such as a revoked token). If it panics, `crashed(delay)` records why,
 /// and it runs again after `delay`, doubling up to a minute, until asked
-/// to stop. Shared by the per-Space workers and this computer's runner.
+/// to stop. A run that lasted longer than that minute was healthy: the
+/// next crash starts again at `first`. Shared by the per-Space workers and
+/// this computer's runner.
 pub(super) async fn supervise<F, Fut>(
+    rx: watch::Receiver<bool>,
+    first: Duration,
+    crashed: impl Fn(Duration),
+    make: F,
+) where
+    F: FnMut(watch::Receiver<bool>) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    supervise_up_to(rx, first, MAX_RESTART, crashed, make).await
+}
+
+/// [`supervise`] with `max` as both the longest delay and the run length
+/// after which the delay starts over.
+async fn supervise_up_to<F, Fut>(
     mut rx: watch::Receiver<bool>,
     first: Duration,
+    max: Duration,
     crashed: impl Fn(Duration),
     mut make: F,
 ) where
@@ -167,6 +184,7 @@ pub(super) async fn supervise<F, Fut>(
 {
     let mut delay = first;
     loop {
+        let started = tokio::time::Instant::now();
         let mut run = AbortOnDrop(tokio::spawn(make(rx.clone())));
         match (&mut run.0).await {
             Err(e) if e.is_panic() => {}
@@ -176,11 +194,14 @@ pub(super) async fn supervise<F, Fut>(
         if *rx.borrow() {
             return;
         }
+        if started.elapsed() > max {
+            delay = first;
+        }
         crashed(delay);
         if !pause(&mut rx, delay).await {
             return;
         }
-        delay = (delay * 2).min(MAX_RESTART);
+        delay = (delay * 2).min(max);
     }
 }
 
@@ -428,6 +449,38 @@ mod tests {
             *crashes.lock().unwrap(),
             [Duration::from_millis(5), Duration::from_millis(10)]
         );
+    }
+
+    #[tokio::test]
+    async fn a_healthy_run_resets_the_backoff() {
+        let (_tx, rx) = watch::channel(false);
+        let runs = Arc::new(AtomicU32::new(0));
+        let crashes = Arc::new(Mutex::new(Vec::new()));
+        let (r, c) = (runs.clone(), crashes.clone());
+        let ms = Duration::from_millis;
+        supervise_up_to(
+            rx,
+            ms(5),
+            ms(40),
+            move |delay| c.lock().unwrap().push(delay),
+            move |_rx| {
+                let n = r.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    match n {
+                        0 | 1 => panic!("simulated worker crash"),
+                        // Ran longer than the longest delay before crashing.
+                        2 => {
+                            tokio::time::sleep(ms(80)).await;
+                            panic!("simulated worker crash");
+                        }
+                        _ => {}
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(runs.load(Ordering::SeqCst), 4);
+        assert_eq!(*crashes.lock().unwrap(), [ms(5), ms(10), ms(5)]);
     }
 
     #[tokio::test]

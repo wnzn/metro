@@ -30,9 +30,20 @@ for release records.
   new server test drives the desktop's **Use locally** paths end to end
   (per-Space local tools and an installed runner answering **Test
   runner**, before and after a restart); it passed on Linux and as a
-  Windows build under Wine. The release workflow now also runs it on
-  native Windows. A reported Windows **Test runner** timeout hasn't been
-  reproduced, and this doesn't claim to fix it.
+  Windows build under Wine. It is added to the release workflow's
+  Windows job but hasn't yet run on native Windows. A reported Windows
+  **Test runner** timeout hasn't been reproduced, and this doesn't claim
+  to fix it.
+- **Local runner failures say why.** If the desktop's local tools or
+  this computer's runner can't start (for example, its folder can't be
+  opened or a pairing can't be read), Space settings shows the reason
+  instead of nothing, and Metro tries again at the next sign-in. A
+  worker that stops unexpectedly restarts after 1 second, doubling up to
+  a minute.
+- **"Not picked up" says why.** When no runner takes a job, the room
+  says whether the Space has no runner, its runner isn't connected (with
+  when it last checked in), or it's connected but didn't take the job in
+  time.
 
 ## New API routes and fields
 

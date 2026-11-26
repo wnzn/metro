@@ -707,6 +707,19 @@ pub(super) fn start_failed(slot: &mut Slot, marker: &Marker, reason: &str) {
     }
 }
 
+/// The start failure `reason` no longer applies (nothing was started
+/// since): back to not started, unless something else was recorded.
+pub(super) fn clear_start_failed(slot: &mut Slot, reason: &str) {
+    if slot.worker.is_none()
+        && slot
+            .last
+            .as_ref()
+            .is_some_and(|n| n.state == RunnerState::Failed && n.detail.as_deref() == Some(reason))
+    {
+        slot.last = None;
+    }
+}
+
 fn fs_failed(slot: &mut Slot, what: &str) {
     slot.set(note(
         RunnerState::Failed,

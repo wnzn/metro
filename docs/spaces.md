@@ -417,7 +417,11 @@ sharing logs. A read names exactly one scope; nothing combines them.
   one Space: failed, timed-out or refused agent runs, problems with the
   model connection a run used (unreachable, credentials rejected, rate
   limited, server error, unusable reply), and runner problems (queue full,
-  no runner picked up the job, no result in time, runner changed). Only the
+  no runner picked up the job, no result in time, runner changed). When
+  no runner picks up a job, the room says which case it is: the Space
+  has no runner; its runner isn't connected (it hasn't checked in since
+  the server started, or last checked in some minutes ago); or the
+  runner is connected but didn't pick up the job in time. Only the
   Space's **current owner** may read it. Members get 403, and outsiders and
   unknown ids get 404, checked on every request.
 - `GET /v1/monitoring/events` with no `space_id` returns the server's own

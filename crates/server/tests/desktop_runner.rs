@@ -776,3 +776,31 @@ async fn a_folder_that_cannot_open_is_reported_and_retried_on_the_next_bind() {
     assert!(all["problem"].is_null(), "{all}");
     t.stop_all().await;
 }
+
+/// A folder problem seen by a status read goes away once a later read can
+/// open the folder, in both statuses, without waiting for a session bind.
+#[tokio::test]
+async fn a_folder_problem_clears_when_a_later_status_read_opens_it() {
+    let s = Server::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("local-tools");
+    std::fs::write(&root, b"not a folder").unwrap();
+    let t = tools(&root, Marker::Accepted);
+    let alice = s.hosted(ALICE, "alice");
+    let (_, all) = t
+        .handle("GET", "/v1/local-tools", b"", Some(alice.clone()))
+        .await;
+    assert!(all["problem"].is_string(), "{all}");
+    assert_eq!(runner_status(&t, Some(&alice)).await["state"], "failed");
+
+    std::fs::remove_file(&root).unwrap();
+    let (st, all) = t
+        .handle("GET", "/v1/local-tools", b"", Some(alice.clone()))
+        .await;
+    assert_eq!(st, 200, "{all}");
+    assert!(all["problem"].is_null(), "{all}");
+    let v = runner_status(&t, Some(&alice)).await;
+    assert_ne!(v["state"], "failed", "{v}");
+    assert!(v["detail"].is_null(), "{v}");
+    t.stop_all().await;
+}
