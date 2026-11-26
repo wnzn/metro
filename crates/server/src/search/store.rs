@@ -262,13 +262,25 @@ pub fn store_batch(
     )?;
     let room = max_vectors.saturating_sub(existing as usize);
     let mut stored = 0;
+    // The first vector left out because the source is full.
+    let mut full_at = None;
     {
         let mut insert = tx.prepare_cached(
             "INSERT OR REPLACE INTO search_vectors
                  (user_id, source, event_id, fingerprint, room_id, text_hash, vector)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
-        for v in vectors.iter().take(room) {
+        for (i, v) in vectors.iter().enumerate() {
+            // An event deleted (or changed) since the batch was read is
+            // skipped, so its vector never comes back; the cursor still
+            // moves past it.
+            if !unchanged(&tx, user, source, v)? {
+                continue;
+            }
+            if stored >= room {
+                full_at = Some(i);
+                break;
+            }
             insert.execute(params![
                 user,
                 key,
@@ -283,10 +295,9 @@ pub fn store_batch(
     }
     // Stop the cursor at the last stored event when the source is full, so
     // the rest is still counted as waiting rather than silently dropped.
-    let to = if stored < vectors.len() {
-        vectors[stored].event_id - 1
-    } else {
-        to
+    let to = match full_at {
+        Some(i) => vectors[i].event_id - 1,
+        None => to,
     };
     tx.execute(
         "UPDATE search_sources SET cursor = ?3, dims = COALESCE(dims, ?4)
@@ -295,6 +306,35 @@ pub fn store_batch(
     )?;
     tx.commit()?;
     Ok((StoreOutcome::Stored, stored))
+}
+
+/// Does `v`'s event still exist in `source`, of an indexed kind, in the same
+/// room and with the text that was embedded?
+fn unchanged(
+    conn: &Connection,
+    user: &str,
+    source: &Source,
+    v: &NewVector,
+) -> rusqlite::Result<bool> {
+    let row: Option<(Option<String>, String)> = match source {
+        Source::Chat => conn
+            .prepare_cached(&format!(
+                "SELECT NULL, text FROM personal_events
+                 WHERE user_id = ?1 AND id = ?2 AND kind IN {INDEXED_KINDS}"
+            ))?
+            .query_row(params![user, v.event_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?,
+        Source::Space(sid) => conn
+            .prepare_cached(&format!(
+                "SELECT room_id, text FROM space_events
+                 WHERE space_id = ?1 AND id = ?2 AND kind IN {INDEXED_KINDS}"
+            ))?
+            .query_row(params![sid, v.event_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?,
+    };
+    Ok(row.is_some_and(|(room, text)| {
+        room == v.room_id && text_hash(&super::embed_text(&text)) == v.text_hash
+    }))
 }
 
 pub fn vector_count(conn: &Connection, user: &str, source: &Source) -> rusqlite::Result<usize> {
@@ -417,4 +457,146 @@ pub fn purge_revoked(conn: &mut Connection, user: &str) -> rusqlite::Result<usiz
     )?;
     tx.commit()?;
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::Human;
+    use crate::db::{Addressed, Author, Db, kind};
+
+    fn vector(event_id: i64, room_id: Option<&str>, text: &str) -> NewVector {
+        NewVector {
+            event_id,
+            room_id: room_id.map(str::to_owned),
+            text_hash: text_hash(&super::super::embed_text(text)),
+            vector: vec![0; 8],
+        }
+    }
+
+    fn ids(db: &Db, user: &str, source: &Source) -> Vec<i64> {
+        db.lock()
+            .prepare("SELECT event_id FROM search_vectors WHERE user_id = ?1 AND source = ?2 ORDER BY event_id")
+            .unwrap()
+            .query_map(params![user, source.key()], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn cursor(db: &Db, user: &str, source: &Source) -> i64 {
+        db.lock()
+            .query_row(
+                "SELECT cursor FROM search_sources WHERE user_id = ?1 AND source = ?2",
+                params![user, source.key()],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// A batch read before a deletion and stored after it never brings the
+    /// deleted event's vector back, and the cursor still moves past it.
+    #[test]
+    fn a_batch_read_before_a_deletion_skips_the_deleted_event() {
+        let db = Db::open_in_memory().unwrap();
+        let space = db.create_space("alice", "S", 10).unwrap();
+        let alice = Author {
+            id: Some("alice".into()),
+            name: "alice".into(),
+        };
+        let post = |text: &str| {
+            db.append_event(
+                &space.id,
+                "lobby",
+                kind::MESSAGE,
+                &alice,
+                text,
+                &Addressed::room(),
+            )
+            .unwrap()
+            .id
+        };
+        let (a, gone, c) = (post("first"), post("gone"), post("third"));
+        let source = Source::Space(space.id.clone());
+        // Read the batch.
+        let rows = {
+            let mut conn = db.lock();
+            let state = ensure_source(&mut conn, "alice", &source, "fp").unwrap();
+            events_after(&conn, "alice", &source, state.cursor, 10).unwrap()
+        };
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), [a, gone, c]);
+        let vectors: Vec<NewVector> = rows
+            .iter()
+            .map(|r| vector(r.id, r.room_id.as_deref(), &r.text))
+            .collect();
+        // Delete one event while the batch is being embedded.
+        let who = Human {
+            id: "alice".into(),
+            name: "alice".into(),
+        };
+        crate::deletion::delete_in_space(&db, &space.id, "lobby", gone, &who)
+            .unwrap()
+            .unwrap();
+        let (outcome, stored) = store_batch(
+            &mut db.lock(),
+            "alice",
+            &source,
+            "fp",
+            0,
+            c,
+            Some(8),
+            &vectors,
+            100,
+        )
+        .unwrap();
+        assert_eq!((outcome, stored), (StoreOutcome::Stored, 2));
+        assert_eq!(ids(&db, "alice", &source), [a, c]);
+        assert_eq!(cursor(&db, "alice", &source), c, "the cursor moves past it");
+    }
+
+    /// Changed text, another room or a non-indexed kind is skipped too, and a
+    /// full source still stops the cursor before the first event left out.
+    #[test]
+    fn changed_or_moved_events_are_skipped_and_fullness_still_stops_the_cursor() {
+        let db = Db::open_in_memory().unwrap();
+        let alice = Author {
+            id: Some("alice".into()),
+            name: "alice".into(),
+        };
+        let chat = |text: &str| {
+            db.append_personal("alice", kind::MESSAGE, &alice, text, &Addressed::room())
+                .unwrap()
+                .id
+        };
+        let (a, b, c, d) = (chat("one"), chat("two"), chat("three"), chat("four"));
+        let source = Source::Chat;
+        ensure_source(&mut db.lock(), "alice", &source, "fp").unwrap();
+        db.lock()
+            .execute(
+                "UPDATE personal_events SET kind = 'deleted' WHERE id = ?1",
+                [b],
+            )
+            .unwrap();
+        let vectors = [
+            vector(a, None, "edited"),
+            vector(b, None, "two"),
+            vector(c, None, "three"),
+            vector(d, None, "four"),
+        ];
+        let (outcome, stored) = store_batch(
+            &mut db.lock(),
+            "alice",
+            &source,
+            "fp",
+            0,
+            d,
+            Some(8),
+            &vectors,
+            1,
+        )
+        .unwrap();
+        assert_eq!((outcome, stored), (StoreOutcome::Stored, 1));
+        assert_eq!(ids(&db, "alice", &source), [c]);
+        assert_eq!(cursor(&db, "alice", &source), d - 1, "d is still waiting");
+    }
 }
