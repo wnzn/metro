@@ -25,8 +25,8 @@ native desktop check by a person or a publication gate.
   `threads.py` and `settings.py` passed. Install-lock flakes went from
   3/60 lib runs and 12/40 `self_update` runs to 0/150 and 0/60. The new
   `tests/desktop_local_runner.rs` passed on Linux and as an
-  `x86_64-pc-windows-gnu` build under Wine 10; its native Windows step in
-  `release.yml` hasn't run yet. The reported Windows **Test runner**
+  `x86_64-pc-windows-gnu` build under Wine 10. It is added to the
+  release workflow's Windows job; it hasn't yet run on native Windows. The reported Windows **Test runner**
   timeout wasn't reproduced.
 
 **Merged-branch final gate: pending.**

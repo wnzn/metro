@@ -210,6 +210,9 @@ struct Inner {
     /// Why the last start didn't serve every pairing (`None`: it did).
     /// Shown in the status; the next session bind tries again.
     problem: Option<String>,
+    /// `problem` is only that the folder couldn't be opened: a later
+    /// successful open clears it.
+    problem_is_root: bool,
 }
 
 /// The desktop's local tools manager. One per launcher; `Send + Sync`.
@@ -231,6 +234,7 @@ impl DesktopTools {
                 workers: HashMap::new(),
                 runner: runner::Slot::default(),
                 problem: None,
+                problem_is_root: false,
             }),
             store_lock: Arc::new(Mutex::new(())),
             marker: runner::Marker::Absent,
@@ -255,12 +259,14 @@ impl DesktopTools {
         Ok(f)
     }
 
-    /// The root, or the person-facing reason it can't be opened.
+    /// The root, or the person-facing reason it can't be opened (then
+    /// also recorded as the problem, for this computer's runner too). A
+    /// successful open clears a problem that was only this.
     fn root_or_problem(&self, inner: &mut Inner) -> Result<Arc<File>, String> {
         if let Some(r) = &inner.root {
             return Ok(r.clone());
         }
-        let f = store::open_root(&self.root_path).map_err(|e| {
+        let opened = store::open_root(&self.root_path).map_err(|e| {
             crate::secret::clean_line(
                 &format!(
                     "Metro couldn't open its local tools folder {}: {e}",
@@ -268,9 +274,23 @@ impl DesktopTools {
                 ),
                 300,
             )
-        })?;
-        let f = Arc::new(f);
+        });
+        let f = match opened {
+            Ok(f) => Arc::new(f),
+            Err(why) => {
+                runner::start_failed(&mut inner.runner, &self.marker, &why);
+                inner.problem = Some(why.clone());
+                inner.problem_is_root = true;
+                return Err(why);
+            }
+        };
         inner.root = Some(f.clone());
+        if inner.problem_is_root {
+            if let Some(why) = inner.problem.take() {
+                runner::clear_start_failed(&mut inner.runner, &why);
+            }
+            inner.problem_is_root = false;
+        }
         Ok(f)
     }
 
@@ -284,6 +304,7 @@ impl DesktopTools {
             inner.runner.stop().await;
             inner.bound = key;
             inner.problem = None;
+            inner.problem_is_root = false;
         }
     }
 
@@ -438,12 +459,10 @@ impl DesktopTools {
             }
             let mut inner = self.inner.lock().await;
             Self::rebind(&mut inner, hosted.as_ref()).await;
-            if hosted.is_some()
-                && let Err(why) = self.root_or_problem(&mut inner)
-            {
-                // Say why instead of failing the status read.
-                runner::start_failed(&mut inner.runner, &self.marker, &why);
-                inner.problem = Some(why);
+            if hosted.is_some() {
+                // On failure the reason is recorded: say why instead of
+                // failing the status read.
+                let _ = self.root_or_problem(&mut inner);
             }
             return Ok(self.runner_status(&inner, hosted.as_ref()));
         }
@@ -515,9 +534,7 @@ impl DesktopTools {
         };
         let root = match self.root_or_problem(&mut inner) {
             Ok(r) => r,
-            Err(why) => {
-                runner::start_failed(&mut inner.runner, &self.marker, &why);
-                inner.problem = Some(why);
+            Err(_) => {
                 return Ok(json!({
                     "available": true,
                     "reason": null,
@@ -753,6 +770,11 @@ impl DesktopTools {
         if let Some(why) = &problem {
             eprintln!("metro-desktop: local tools didn't fully start: {why}");
             runner::start_failed(&mut inner.runner, &self.marker, why);
+        }
+        // Still only the folder (set by `root_or_problem`), or something else.
+        inner.problem_is_root &= problem.is_some();
+        if problem.as_ref() != inner.problem.as_ref() {
+            inner.problem_is_root = false;
         }
         inner.problem = problem;
     }
