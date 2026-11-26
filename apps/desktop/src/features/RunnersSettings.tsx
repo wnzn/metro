@@ -166,7 +166,7 @@ export function runnerStatus(r: RegisteredRunner, now = Date.now()): string {
   const p = r.presence;
   const version = p?.version ? `v${p.version}` : p?.seenAt != null ? "Version not reported" : "Version unknown until it connects";
   if (p?.online) return `${version} · Connected`;
-  return p?.seenAt != null ? `${version} · Last seen ${relativeTime(Math.min(p.seenAt, now), now)}` : version;
+  return p?.seenAt != null ? `${version} · Disconnected · last seen ${relativeTime(Math.min(p.seenAt, now), now)}` : `${version} · Disconnected`;
 }
 
 const registrationScope = (r: RegisteredRunner) => JSON.stringify([runnerSessionKey(), r.id, r.visibility, r.canManage]);

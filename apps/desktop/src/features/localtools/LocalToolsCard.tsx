@@ -26,7 +26,7 @@ export function localToolsBadge(e: LocalToolsSpace | null): { tone: Tone; label:
     case "online":
       return { tone: "success", label: "On" };
     case "offline":
-      return { tone: "warning", label: "Can't reach the local server" };
+      return { tone: "warning", label: "Disconnected" };
     case "starting":
       return { tone: "neutral", label: "Starting…" };
     case "failed":
@@ -109,7 +109,7 @@ export function LocalToolsCard(props: { spaceId: string | null; runner: SpaceRun
     <If when={localTools()?.available}>
       <SettingsGroup title="Local tools on this computer" testID="local-tools-card"
         description="Older single-Space pairing for this computer. Prefer this computer's runner above.">
-        <SettingRow label="Local pairing" description="Lets agents list and read files in one private folder while Metro is open. No file changes or commands.">
+        <SettingRow label="Local pairing" description={`${entry()?.worker === "offline" ? "Can't reach the local server. " : ""}Lets agents list and read files in one private folder while Metro is open. No file changes or commands.`}>
           <Badge testID="local-tools-state" tone={badge().tone} label={badge().label} />
         </SettingRow>
         <If when={problem()}>

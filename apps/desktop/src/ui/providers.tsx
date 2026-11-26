@@ -189,7 +189,7 @@ export function ConnectionItem(props: {
   );
 }
 
-/** A coloured dot and one short line of status ("Online · this computer"). */
+/** A coloured dot and one short line of status ("Connected · this computer"). */
 export function StatusLine(props: { tone: Tone; text: string; testID?: string }) {
   return (
     <View class="flex-row items-center gap-(--space-2)" testID={props.testID}>

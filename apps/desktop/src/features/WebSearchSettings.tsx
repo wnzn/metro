@@ -110,7 +110,7 @@ function WorkerBadge(props: { state: LocalWebSearch }) {
     if (!s.enabled) return "Off";
     if (s.worker === "starting") return "Starting";
     if (s.worker === "online" && s.paired) return "Ready";
-    if (s.worker === "offline") return "Offline";
+    if (s.worker === "offline") return "Disconnected";
     return "Unavailable";
   };
   return <Badge testID="websearch-worker" label={label()} tone={label() === "Ready" ? "success" : label() === "Off" || label() === "Starting" ? "neutral" : "warning"} />;

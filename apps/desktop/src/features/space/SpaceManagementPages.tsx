@@ -117,7 +117,7 @@ export function RunnerPage() {
           <SettingsGroup title="Status" testID="runner-card">
             <SettingRow label="Runner" testID="runner-status-row" description={
               runnerError() ? "Metro couldn't confirm the assignment." : runner() === undefined ? "Checking this Space's runner." :
-                runner() ? "This Space sends jobs to this runner. The assignment doesn't mean it's online." :
+                runner() ? "This Space sends jobs to this runner. The assignment doesn't mean it's connected." :
                   "Agents can still answer, but without runner workspace tools."
             }>
               <Badge testID="space-runner-status" tone={badge().tone} label={badge().label} />
