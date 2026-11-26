@@ -1095,7 +1095,8 @@ pub async fn chat_message(
     // the message is already stored and shown.
     if let (Some(how), Some(turn)) = (how, turn_id.clone()) {
         let (state, user, event) = (state.clone(), who.id.clone(), event.clone());
-        tokio::spawn(chat_turn(state, user, event, how, ticket, turn));
+        let watch = crate::decisions::Watch::chat(&state, &user, event.id);
+        tokio::spawn(chat_turn(state, user, event, how, ticket, turn, watch));
     }
     Ok((
         StatusCode::ACCEPTED,
@@ -1130,6 +1131,7 @@ pub(crate) async fn chat_turn(
     how: ChatRoute,
     ticket: crate::decisions::Ticket,
     turn_id: String,
+    watch: crate::decisions::Watch,
 ) {
     use crate::decisions::{Scope, forget};
     let turn = crate::db::Activity::agent(turn_id, crate::db::Activity::AGENT_NAME);
@@ -1139,7 +1141,7 @@ pub(crate) async fn chat_turn(
         ChatRoute::Chosen(route) => *route,
         ChatRoute::Routing(settings) => {
             // Only use-case routing calls System One.
-            let _slot = match settings.enabled {
+            let _slot = match settings.wants_case_routing() {
                 true => Some(state.decisions.slot(&user).await),
                 false => None,
             };
@@ -1147,7 +1149,10 @@ pub(crate) async fn chat_turn(
             // stopped meanwhile goes to no model.
             match live_chat_message(&state, &user, event.id).await {
                 Some(_) if !stopped(&state, &cancel, event.id).await => {}
-                _ => return forget(&state, Scope::Personal, event.id).await,
+                _ => {
+                    watch.done();
+                    return forget(&state, Scope::Personal, event.id).await;
+                }
             }
             routing::route_turn(
                 &state,
@@ -1162,6 +1167,7 @@ pub(crate) async fn chat_turn(
         }
     };
     if stopped(&state, &cancel, event.id).await {
+        watch.done();
         return forget(&state, Scope::Personal, event.id).await;
     }
     let (started, written) = tokio::sync::oneshot::channel();
@@ -1176,11 +1182,13 @@ pub(crate) async fn chat_turn(
         .await
         .is_err()
     {
+        watch.done();
         return forget(&state, Scope::Personal, event.id).await;
     }
     // Hold the line until this turn's `started` marker is written (or it
-    // found its message deleted).
+    // found its message deleted, or the turn stopped first).
     let _ = written.await;
+    watch.done();
 }
 
 /// Whether the sender stopped this turn: live, or remembered with its
@@ -1234,6 +1242,8 @@ pub(crate) async fn resume_chat_turn(
         .turn_id
         .clone()
         .unwrap_or_else(|| crate::db::Activity::chat().id);
+    // From here every early return drops the turn and says so in the Chat.
+    let watch = crate::decisions::Watch::chat(&state, &row.user_id, row.event_id);
     let how = match row.payload["choice"].as_object() {
         Some(choice) => {
             let who = Human {
@@ -1253,7 +1263,7 @@ pub(crate) async fn resume_chat_turn(
             .await
             {
                 Ok(Some(route)) => ChatRoute::Chosen(Box::new(route)),
-                Ok(None) => return forget(&state, Scope::Personal, row.event_id).await,
+                Ok(None) => return,
                 Err(e) => {
                     let message = format!(
                         "Metro restarted before this turn started, and its chosen model can't be \
@@ -1273,6 +1283,7 @@ pub(crate) async fn resume_chat_turn(
                             )
                         })
                         .await;
+                    watch.done();
                     return forget(&state, Scope::Personal, row.event_id).await;
                 }
             }
@@ -1285,7 +1296,7 @@ pub(crate) async fn resume_chat_turn(
             }
         },
     };
-    chat_turn(state, row.user_id, event, how, ticket, turn_id).await;
+    chat_turn(state, row.user_id, event, how, ticket, turn_id, watch).await;
 }
 
 #[cfg(test)]
