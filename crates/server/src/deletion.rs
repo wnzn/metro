@@ -328,10 +328,14 @@ async fn delete_space(
     // 404 for a Space or room the caller can't see, before anything else.
     let space = crate::api::member_of(&state, &sid, &who).await?;
     let room = crate::api::room_of(&state, &space, &rid).await?;
+    let (space_id, room_id) = (space.id.clone(), room.id.clone());
     let events = db(&state, move |db| {
         delete_in_space(db, &space.id, &room.id, eid, &who)
     })
     .await??;
+    // Runs answering it keep their status but not its text; readers also
+    // check the trigger as they read ([`crate::orchestration::trigger_live`]).
+    state.runs.redact_trigger(&space_id, &room_id, eid);
     Ok(answer(events))
 }
 

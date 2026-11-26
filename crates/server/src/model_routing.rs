@@ -1141,18 +1141,18 @@ pub async fn pick_agent(
     settings: &RoutingSettings,
     text: &str,
     agents: &[(String, String)],
-    unaddressed_room: Option<&str>,
+    unaddressed_room: Option<(&str, i64)>,
 ) -> Decision<AgentAnswer> {
     let with_none = unaddressed_room.is_some();
     let mut payload = message_payload(text, true);
-    if let Some(room) = unaddressed_room {
+    if let Some((room, before)) = unaddressed_room {
         if settings.classifier_id.is_none() {
             return Decision::Failed(DecisionFailure::NoClassifier);
         }
         let (user, space, room) = (user.to_owned(), space.to_owned(), room.to_owned());
         match state
             .db
-            .call(move |db| classifier_context(&db.lock(), &user, &space, &room))
+            .call(move |db| classifier_context(&db.lock(), &user, &space, &room, before))
             .await
         {
             Ok(Some(context)) => {
@@ -1220,11 +1220,15 @@ pub async fn pick_agent(
     Decision::Answered(answer)
 }
 
+/// The room context of a classification: up to three messages or agent
+/// replies before event `before` (the message being classified, which may
+/// be stored already), never it or anything after it.
 fn classifier_context(
     conn: &Connection,
     user: &str,
     space: &str,
     room: &str,
+    before: i64,
 ) -> anyhow::Result<Option<[(&'static str, Value); 3]>> {
     if !crate::db::Db::room_member_in(conn, space, room, user)? {
         return Ok(None);
@@ -1238,10 +1242,11 @@ fn classifier_context(
     let mut stmt = conn.prepare_cached(
         "SELECT kind, actor, substr(text, 1, 400), json_extract(activity, '$.agent.name')
          FROM space_events WHERE space_id = ?1 AND room_id = ?2 AND kind IN ('message', 'agent')
+           AND id < ?3
          ORDER BY id DESC LIMIT 3",
     )?;
     let mut previous = stmt
-        .query_map(params![space, room], |r| {
+        .query_map(params![space, room, before], |r| {
             let kind: String = r.get(0)?;
             let actor: String = r.get(1)?;
             let text: String = r.get(2)?;

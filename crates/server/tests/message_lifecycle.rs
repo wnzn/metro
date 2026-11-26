@@ -44,6 +44,8 @@ const CLASSIFIER: &str = "pc_11111111111111111111111111111111";
 struct Backend {
     calls: Mutex<usize>,
     delay_ms: AtomicU64,
+    /// Every state payload System One was sent.
+    seen: Mutex<Vec<Value>>,
 }
 
 impl RoutingBackend for Backend {
@@ -58,6 +60,7 @@ impl RoutingBackend for Backend {
     ) -> BoxFuture<'a, anyhow::Result<Value>> {
         Box::pin(async move {
             *self.calls.lock().unwrap() += 1;
+            self.seen.lock().unwrap().push(payload.clone());
             let delay = self.delay_ms.load(Ordering::SeqCst);
             if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
@@ -932,6 +935,9 @@ async fn a_restart_makes_a_pending_decision_once() {
                 user_id: "bob".into(),
                 place: None,
                 payload: json!({"choice": null}),
+                // Stored by the crashed process.
+                claimed_by: "epoch_before".into(),
+                turn_id: None,
             },
             eid,
         )
@@ -1151,4 +1157,267 @@ async fn a_tombstone_has_no_decisions_and_isnt_in_reply_thread_history() {
         !saw.contains("replying_to"),
         "a deleted anchor is still in the preamble"
     );
+}
+
+// ---- Second review: previews, planned runs, claims, live triggers, Stop ----
+
+#[tokio::test]
+async fn a_deleted_trigger_leaves_no_preview_in_the_run_list() {
+    let h = H::start().await;
+    let sid = h.space().await;
+    let room = format!("/v1/spaces/{sid}/rooms/lobby");
+    let ask = h
+        .sent(
+            "alice",
+            &sid,
+            "lobby",
+            json!({"text": "@agent the secret plan is tulips"}),
+        )
+        .await;
+    h.reply_after(&sid, "lobby", id(&ask)).await;
+    let (_, runs) = h.req(Method::GET, "bob", "/v1/runs", None).await;
+    let run = runs["runs"][0].clone();
+    assert!(run["task"].as_str().unwrap().contains("tulips"), "{run}");
+    let (s, _) = h
+        .delete("alice", &format!("{room}/events/{}", id(&ask)))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, runs) = h.req(Method::GET, "bob", "/v1/runs", None).await;
+    assert_eq!(runs["runs"][0]["id"], run["id"]);
+    assert_eq!(runs["runs"][0]["task"], "", "{runs}");
+    assert_eq!(runs["runs"][0]["status"], run["status"], "the status stays");
+    let (_, one) = h
+        .req(
+            Method::GET,
+            "bob",
+            &format!("/v1/runs/{}", run["id"].as_str().unwrap()),
+            None,
+        )
+        .await;
+    assert_eq!(one["task"], "");
+    assert!(!serde_json::to_string(&runs).unwrap().contains("tulips"));
+}
+
+#[tokio::test]
+async fn queued_work_never_sends_a_deleted_message_to_system_one() {
+    let h = H::start().await;
+    let sid = h.space().await;
+    h.classify(&sid).await;
+    let room = format!("/v1/spaces/{sid}/rooms/lobby");
+    // Alice's decision slots are busy: hers waits in line.
+    let a = h.state.decisions.slot("alice").await;
+    let b = h.state.decisions.slot("alice").await;
+    let posted = h
+        .sent(
+            "alice",
+            &sid,
+            "lobby",
+            json!({"text": "queued then deleted", "defer_decisions": true}),
+        )
+        .await;
+    let (s, _) = h
+        .delete("alice", &format!("{room}/events/{}", id(&posted)))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    drop((a, b));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        h.classifier_calls(),
+        0,
+        "a deleted message reached System One"
+    );
+    assert_eq!(h.pending(), 0);
+    assert!(h.model_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn deferred_classification_context_is_only_what_came_before() {
+    let h = H::start_with(None, 500).await;
+    let sid = h.space().await;
+    h.sent("bob", &sid, "lobby", json!({"text": "earlier words", "mentions": [{"kind": "user", "id": "alice"}], "infer_text_mentions": false}))
+        .await;
+    h.classify(&sid).await;
+    let posted = h
+        .sent(
+            "alice",
+            &sid,
+            "lobby",
+            json!({"text": "classify me", "defer_decisions": true}),
+        )
+        .await;
+    // Something written after it, while System One is being asked.
+    h.sent("bob", &sid, "lobby", json!({"text": "later words", "mentions": [{"kind": "user", "id": "alice"}], "infer_text_mentions": false}))
+        .await;
+    let (s, _) = h.decisions("alice", &sid, id(&posted)).await;
+    assert_eq!(s, StatusCode::OK);
+    let seen = h.backend.seen.lock().unwrap().clone();
+    let previous = &seen[0]["previous"];
+    let texts: Vec<&str> = previous
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(texts, ["earlier words"], "{seen:?}");
+}
+
+#[tokio::test]
+async fn planned_runs_survive_a_restart_one_by_one_and_start_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("metro.sqlite3");
+    let before = H::start_with(Some(&file), 0).await;
+    let sid = before.space().await;
+    let (s, coder) = before
+        .post(
+            "alice",
+            &format!("/v1/spaces/{sid}/agents"),
+            json!({"name": "Coder", "handle": "coder", "description": "Writes code."}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{coder}");
+    let (_, agents) = before
+        .req(
+            Method::GET,
+            "alice",
+            &format!("/v1/spaces/{sid}/agents"),
+            None,
+        )
+        .await;
+    let ids: Vec<String> = agents["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    // A message whose decision planned two runs; the process died before
+    // starting either (one could equally have started: its row would be gone).
+    let msg = before
+        .sent(
+            "alice",
+            &sid,
+            "lobby",
+            json!({"text": "for both of you", "mentions": [{"kind": "user", "id": "bob"}], "infer_text_mentions": false}),
+        )
+        .await;
+    metro_server::decisions::insert(
+        &before.state.db,
+        &metro_server::decisions::NewPending {
+            scope: metro_server::decisions::Scope::Space,
+            user_id: "alice".into(),
+            place: Some((sid.clone(), "lobby".into())),
+            payload: json!({}),
+            claimed_by: "epoch_before".into(),
+            turn_id: None,
+        },
+        id(&msg),
+    )
+    .unwrap();
+    let planned: Vec<_> = ids
+        .iter()
+        .map(|a| metro_server::decisions::PlannedTarget {
+            agent_id: a.clone(),
+            pick: Some("Addressed".into()),
+            addressed_by: metro_server::model_routing::AddressedBy::Explicit,
+        })
+        .collect();
+    assert!(
+        metro_server::decisions::plan_in(
+            &before.state.db,
+            "epoch_before",
+            &sid,
+            "lobby",
+            "alice",
+            id(&msg),
+            &planned,
+            None,
+            &[],
+        )
+        .unwrap()
+    );
+    assert_eq!(before.pending(), 2);
+    let after = H::start_with(Some(&file), 0).await;
+    assert_eq!(
+        metro_server::decisions::resume(after.state.clone())
+            .await
+            .unwrap(),
+        1
+    );
+    // Recovery claimed everything: nothing is left for anyone else.
+    assert_eq!(
+        metro_server::decisions::resume(after.state.clone())
+            .await
+            .unwrap(),
+        0
+    );
+    for _ in 0..400 {
+        let events = after.events("alice", &sid, "lobby").await;
+        if events
+            .iter()
+            .filter(|e| e["kind"] == "agent" && id(e) > id(&msg))
+            .count()
+            == 2
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let events = after.events("alice", &sid, "lobby").await;
+    let started: Vec<&Value> = events
+        .iter()
+        .filter(|e| {
+            id(e) > id(&msg) && e["kind"] == "activity" && e["activity"]["phase"] == "started"
+        })
+        .collect();
+    assert_eq!(started.len(), 2, "{events:?}");
+    let mut agents_started: Vec<String> = started
+        .iter()
+        .map(|e| e["activity"]["agent"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    agents_started.sort();
+    let mut want = ids.clone();
+    want.sort();
+    assert_eq!(agents_started, want);
+    assert_eq!(after.pending(), 0);
+}
+
+#[tokio::test]
+async fn stop_before_start_works_through_the_api_and_across_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("metro.sqlite3");
+    let before = H::start_with(Some(&file), 0).await;
+    // Alice's line is busy: her turn waits.
+    let held = before.state.decisions.chat_ticket("alice");
+    let (s, sent) = before
+        .post("alice", "/v1/chat/messages", json!({"text": "never mind"}))
+        .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{sent}");
+    let turn = sent["turn_id"].as_str().unwrap().to_owned();
+    assert!(turn.starts_with("chat_"));
+    // Only its sender can stop it.
+    let (s, _) = before
+        .post("bob", &format!("/v1/chat/turns/{turn}/stop"), json!({}))
+        .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, v) = before
+        .post("alice", &format!("/v1/chat/turns/{turn}/stop"), json!({}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    // The process "crashes" with the turn still queued; the next one
+    // remembers the Stop.
+    let after = H::start_with(Some(&file), 0).await;
+    assert_eq!(
+        metro_server::decisions::resume(after.state.clone())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(after.pending(), 0);
+    // And the old process, once its line moves, doesn't start it either.
+    drop(held);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(started_for(&after.chat("alice").await, 0), 0);
+    assert!(before.model_calls.lock().unwrap().is_empty());
+    assert!(after.model_calls.lock().unwrap().is_empty());
 }

@@ -122,6 +122,34 @@ pub struct RunOrigin {
     pub trigger_event_id: Option<i64>,
 }
 
+/// Whether run `run`'s task preview may still be shown: it copies the start
+/// of its trigger, so not once that message was deleted (or is a deleted
+/// thread anchor). Readers call this at read time, as the viewer.
+pub fn trigger_live(conn: &rusqlite::Connection, run: &RunInfo) -> rusqlite::Result<bool> {
+    use rusqlite::OptionalExtension;
+    let Some(id) = run.trigger_event_id else {
+        return Ok(true);
+    };
+    let kind: Option<String> = conn
+        .query_row(
+            "SELECT kind FROM space_events WHERE id = ?1 AND space_id = ?2 AND room_id = ?3",
+            rusqlite::params![id, run.space_id, run.room_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(kind.is_some_and(|k| k != crate::db::kind::DELETED))
+}
+
+/// `runs` with the task of each run whose trigger is gone emptied.
+pub fn live_tasks(conn: &rusqlite::Connection, runs: &mut [RunInfo]) -> rusqlite::Result<()> {
+    for run in runs.iter_mut() {
+        if !run.task.is_empty() && !trigger_live(conn, run)? {
+            run.task.clear();
+        }
+    }
+    Ok(())
+}
+
 fn rfc3339_ms<S: serde::Serializer>(ms: &i64, s: S) -> Result<S::Ok, S::Error> {
     match crate::db::rfc3339_utc(*ms) {
         Some(t) => s.serialize_str(&t),
@@ -373,6 +401,21 @@ impl RunRegistry {
             .rev()
             .map(|e| (e.info.clone(), e.failure.clone()))
             .collect()
+    }
+
+    /// Forget the task preview of runs answering event `event_id` of
+    /// `room_id` in `space_id` (the message was deleted). Status and the
+    /// rest stay.
+    pub fn redact_trigger(&self, space_id: &str, room_id: &str, event_id: i64) {
+        for e in self.lock().entries.iter_mut() {
+            let i = &mut e.info;
+            if i.space_id == space_id
+                && i.room_id == room_id
+                && i.trigger_event_id == Some(event_id)
+            {
+                i.task.clear();
+            }
+        }
     }
 
     /// Every run held, newest first. Unfiltered: see the module docs.

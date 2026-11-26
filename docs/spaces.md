@@ -153,7 +153,8 @@ always means "the default agent, or the one the classifier picks" (below).
   `started` marker also says how the agent was chosen (`activity.pick`, for
   example *Addressed: @coder*, *Default agent* or *Picked by classifier:
   Coder*). In the source, not released, a run the classifier picked has no
-  `activity.pick`: it shows only as that agent's run.
+  `activity.pick`: it shows only as that agent's run, and a weak pick that
+  fell back says only *Default agent*.
 - Threads an agent's run creates keep that agent.
 - [Scheduled prompts](schedules.md) in a Space use its default agent.
 

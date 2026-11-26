@@ -227,13 +227,20 @@ see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
   the sender only, not a room event. The selected run acts as the sender.
   With `defer_decisions` (what the desktop sends), the message is stored
   and shown first and the decision follows; the pick is run activity and
-  is never written into the stored recipients. Nothing labels it "Picked
-  by classifier" or "detected by System One". The pending decision is a
-  `pending_decisions` row written with the message and remade at startup;
-  it's settled in the transaction that registers its run, which also
-  checks the message still exists, so a run starts at most once and
-  never for a deleted message. Deferred System One calls are bounded per
-  server and per person and wait rather than drop. Never
+  is never written into the stored recipients (in no path: the POST says
+  `classified`). Nothing labels it "Picked by classifier" or "detected by
+  System One"; a weak pick's fallback marker names no guess or score. The
+  pending decision is a `pending_decisions` row written with the message
+  (with any explicit model choice) and claimed by the storing process;
+  once made it becomes one `pending_targets` row per run, each claimed in
+  the transaction that registers that run and writes its `started`
+  marker, which also checks the message still exists. Startup claims
+  everything left (`UPDATE ... RETURNING`) and enqueues it before
+  accepting requests; only the claimant dispatches. Work rereads the live
+  message after each wait and before each System One call, so a deleted
+  message reaches no model. Classification context is only events before
+  the message. Deferred System One calls are bounded per server and per
+  person and wait rather than drop. Never
   classify people-only or explicitly named recipients. With
   classification off (the default), unaddressed text is ordinary
   conversation.
@@ -255,9 +262,11 @@ see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
   remains accepted for compatibility and the existing one-time Space
   migration, but doesn't control Chat dispatch. Use-case routing remains
   separate and can choose the answering connection. The POST returns
-  first; the turn is saved as a pending decision, registered (so Stop
-  works) before it routes, started in send order, and never started if
-  stopped or its message was deleted meanwhile.
+  first, with the turn's `turn_id`; the turn is saved as a pending
+  decision, registered before it routes, started in storage order, and
+  never started if its message was deleted. Stop works before it starts:
+  it's saved in the pending row before it's acknowledged, so a restart
+  doesn't start it.
 - **Metro in Chat** can read and act as the user in their eligible
   Spaces. The per-account switch is on by default but gated on showing
   the notice, with per-Space exclusions and live access checks. Space
@@ -382,7 +391,9 @@ see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
   thread) stays as a `deleted` tombstone, kept out of model history and
   the thread preamble. A `message_deleted` event tells readers. Deleting
   never starts or cancels a started run; a run not yet registered for it
-  never starts.
+  never starts. Run task previews are resolved from the live trigger
+  when read (runs API, Pages, Metro in Chat): a deleted trigger shows no
+  text, status kept.
 - **Compaction** keeps the saved transcript intact. Chat, Space rooms
   and threads can use a model-written summary as untrusted history
   (never DMs or Page conversations). Auto is per initiator, on by default

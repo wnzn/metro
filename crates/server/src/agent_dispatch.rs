@@ -96,6 +96,7 @@ pub async fn plan(
     prefs: &SpacePrefs,
     agents: &[SpaceAgent],
     reply: Option<&SpaceAgent>,
+    before: Option<i64>,
 ) -> Plan {
     let mut plan = Plan::default();
     let Some(default) = agents.iter().find(|a| a.is_default).or(agents.first()) else {
@@ -116,7 +117,7 @@ pub async fn plan(
                 settings,
                 text,
                 &options(agents),
-                Some(room),
+                Some((room, before.unwrap_or(i64::MAX))),
             )
             .await;
             if let Decision::Failed(why) = answer {
@@ -228,10 +229,8 @@ async fn generic(
                 pick: None,
                 addressed_by: AddressedBy::Explicit,
             }),
-            Some(i) => Ok(default_target(format!(
-                "Default agent (the classifier was unsure: best {} at {:.2})",
-                agents[i].name, a.probability
-            ))),
+            // The room sees this marker: no names or scores of the guess.
+            Some(_) => Ok(default_target("Default agent".to_owned())),
             None => Ok(default_target("Default agent".to_owned())),
         },
         Decision::Failed(why) => Err(why),

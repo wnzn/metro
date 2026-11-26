@@ -69,7 +69,10 @@ thread, even an empty one, leaves a **Message deleted** line so the thread
 keeps its place; the deleted message is no longer part of that thread's
 agent history. Runs it already started keep going; a run that hadn't
 started yet (for example while System One was still deciding) never
-starts. Deleting never starts or stops agent work. Copies already
+starts. Deleting never starts or stops agent work. A run's task preview
+copies the start of its message, so once the message is deleted the run
+lists (**Agent runs**, `/v1/runs`, Pages and Metro in Chat) show the run
+with its status but without that text. Copies already
 forwarded, and anything already sent to a model, aren't affected.
 
 ## Direct messages and the directory

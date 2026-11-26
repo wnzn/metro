@@ -979,13 +979,16 @@ export function createClient(options: ClientOptions) {
       return events.filter(isEvent).map(toEvent);
     },
 
-    async sendChatMessage(text: string, assetIds?: readonly string[], choice?: TurnModelChoice): Promise<PostedSenderNotes | null> {
+    async sendChatMessage(text: string, assetIds?: readonly string[], choice?: TurnModelChoice): Promise<SentChatMessage> {
       // Text sends also ask the agent on servers that require the legacy flag.
       const body: Record<string, unknown> = { text, invoke_agent: true, ...turnModelBody(choice) };
       const ids = assetIdsBody(assetIds);
       if (ids) body.asset_ids = ids;
       const data = await request("POST", "/v1/chat/messages", body);
-      return readPostedNotes(data, { kind: "chat", text });
+      // The turn it starts, which can be stopped before it starts.
+      const turn = isObject(data) && typeof data.turn_id === "string" && /^chat_[A-Za-z0-9]{1,64}$/.test(data.turn_id) &&
+        isEventId(data.id) ? { id: data.turn_id, eventId: data.id } : null;
+      return { notes: readPostedNotes(data, { kind: "chat", text }), turn };
     },
 
     async saveChatNote(text: string, assetIds?: readonly string[]): Promise<void> {
@@ -1677,6 +1680,9 @@ async function safeSnippet(response: Response): Promise<string> {
     return "";
   }
 }
+
+/** What a Chat message POST returned: its sender notes, and the turn it starts (for Stop). */
+export type SentChatMessage = { notes: PostedSenderNotes | null; turn: { id: string; eventId: number } | null };
 
 /** What a Space message POST returned: its sender notes, and whether System One decides afterwards. */
 export type SentSpaceMessage = { notes: PostedSenderNotes | null; decisionsPending: number | null };

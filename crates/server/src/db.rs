@@ -1553,12 +1553,14 @@ impl Db {
     }
 
     /// [`Db::append_personal_with`], only while event `trigger` of the
-    /// same Chat is still a `message`, in one transaction that also drops
-    /// its pending decision ([`crate::decisions`]). `None` (nothing
-    /// written) once the message was deleted.
+    /// same Chat is still a `message`, in one transaction that also settles
+    /// its pending decision ([`crate::decisions::settle_chat_in`]). `None`
+    /// (nothing written) once the message was deleted, the turn was
+    /// stopped before it started, or process `epoch` doesn't hold it.
     #[allow(clippy::too_many_arguments)]
     pub fn append_personal_for_message(
         &self,
+        epoch: &str,
         user_id: &str,
         trigger: i64,
         kind: &str,
@@ -1573,8 +1575,8 @@ impl Db {
             params![trigger, user_id],
             |r| r.get(0),
         )?;
-        crate::decisions::forget_in(&tx, crate::decisions::Scope::Personal, trigger)?;
-        if !present {
+        let ours = crate::decisions::settle_chat_in(&tx, epoch, trigger)?;
+        if !present || !ours {
             tx.commit()?;
             return Ok(None);
         }
@@ -2536,6 +2538,8 @@ mod tests {
                     user_id: "alice".into(),
                     place: None,
                     payload: serde_json::json!({}),
+                    claimed_by: "epoch_a".into(),
+                    turn_id: None,
                 },
                 e.id,
             )
@@ -2547,8 +2551,16 @@ mod tests {
         let agent = Author::server(actor::AGENT);
         let turn = Activity::chat().at(activity::STARTED);
         let marker = |id| {
-            db.append_personal_for_message("alice", id, kind::ACTIVITY, &agent, "", Some(&turn))
-                .unwrap()
+            db.append_personal_for_message(
+                "epoch_a",
+                "alice",
+                id,
+                kind::ACTIVITY,
+                &agent,
+                "",
+                Some(&turn),
+            )
+            .unwrap()
         };
         assert!(
             marker(gone.id).is_none(),
@@ -2557,11 +2569,57 @@ mod tests {
         assert!(marker(kept.id).is_some());
         // Another person's Chat id is no trigger of alice's.
         assert!(
-            db.append_personal_for_message("bob", kept.id, kind::ACTIVITY, &agent, "", Some(&turn))
-                .unwrap()
-                .is_none()
+            db.append_personal_for_message(
+                "epoch_a",
+                "bob",
+                kept.id,
+                kind::ACTIVITY,
+                &agent,
+                "",
+                Some(&turn)
+            )
+            .unwrap()
+            .is_none()
         );
         assert_eq!(crate::decisions::count(&db).unwrap(), 0, "both settled");
+        // Held by another process, or stopped first: no marker.
+        let other = db
+            .append_personal("alice", kind::MESSAGE, &alice, "later", &Addressed::room())
+            .unwrap();
+        for (epoch, turn_id) in [("epoch_b", None), ("epoch_a", Some("chat_x"))] {
+            crate::decisions::insert(
+                &db,
+                &crate::decisions::NewPending {
+                    scope: crate::decisions::Scope::Personal,
+                    user_id: "alice".into(),
+                    place: None,
+                    payload: serde_json::json!({}),
+                    claimed_by: epoch.into(),
+                    turn_id: turn_id.map(str::to_owned),
+                },
+                other.id,
+            )
+            .unwrap();
+            if turn_id.is_some() {
+                assert!(crate::decisions::cancel_turn(&db, "alice", "chat_x").unwrap());
+            }
+            assert!(marker(other.id).is_none(), "{epoch}");
+            if turn_id.is_none() {
+                // Left for the process that holds it.
+                assert_eq!(crate::decisions::count(&db).unwrap(), 1);
+                crate::decisions::forget_in(
+                    &db.lock(),
+                    crate::decisions::Scope::Personal,
+                    other.id,
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(
+            crate::decisions::count(&db).unwrap(),
+            0,
+            "a stopped turn is dropped"
+        );
     }
 
     #[test]

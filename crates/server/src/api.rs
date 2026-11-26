@@ -724,6 +724,13 @@ pub struct PostedMessage {
     /// their notes from `POST .../messages/{eid}/decisions`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     decisions_pending: bool,
+    /// The classifier chose an agent for this unaddressed message.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    classified: bool,
+    /// Personal Chat: the turn this message starts, which its sender can
+    /// stop (`POST /v1/chat/turns/{id}/stop`) even before it starts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_id: Option<String>,
 }
 
 pub async fn post_message(
@@ -762,6 +769,8 @@ pub async fn post_message(
             addressing_note: posted.addressing_note,
             routing_note: posted.routing_note,
             decisions_pending: posted.decisions_pending,
+            classified: posted.classified,
+            turn_id: None,
         }),
     ))
 }
@@ -1035,8 +1044,10 @@ pub async fn chat_message(
         )),
         None => None,
     };
-    // A turn to start is durable with its message: a restart starts it.
-    let pending = how.as_ref().map(|_| crate::decisions::NewPending {
+    // A turn to start is durable with its message: a restart starts it. Its
+    // id is the sender's from now on, so they can Stop it before it starts.
+    let turn_id = how.as_ref().map(|_| crate::db::Activity::chat().id);
+    let pending = turn_id.as_ref().map(|turn| crate::decisions::NewPending {
         scope: crate::decisions::Scope::Personal,
         user_id: who.id.clone(),
         place: None,
@@ -1045,37 +1056,46 @@ pub async fn chat_message(
             "model_id": body.model_id,
             "reasoning_effort": body.reasoning_effort,
         }))}),
+        claimed_by: state.decisions.epoch().to_owned(),
+        turn_id: Some(turn.clone()),
     });
     let addressed = addressed(&resolved);
     let (uid, author, stored) = (who.id.clone(), who.author(), text.clone());
     let ids = body.asset_ids;
-    let place = Place::Personal { user_id: uid };
-    let event = match db(&state, move |db| {
-        attachments::append_message(
-            db,
-            &place,
-            &author,
-            &stored,
-            &addressed,
-            &ids,
-            &[],
-            &MessageMeta::default(),
-            pending.as_ref(),
-        )
+    let place = Place::Personal {
+        user_id: uid.clone(),
+    };
+    let order = state.decisions.clone();
+    // Stored and given its place in the sender's line under one lock, so
+    // turns start in the order their messages were stored.
+    let (appended, ticket) = db(&state, move |db| {
+        let (appended, ticket) = order.in_chat_order(&uid, || {
+            attachments::append_message(
+                db,
+                &place,
+                &author,
+                &stored,
+                &addressed,
+                &ids,
+                &[],
+                &MessageMeta::default(),
+                pending.as_ref(),
+            )
+        });
+        Ok((appended?, ticket))
     })
-    .await?
-    {
+    .await?;
+    let event = match appended {
         Append::Posted(event) => *event,
         Append::NoRoom | Append::NoAsset | Append::NoRecipient | Append::NoReplyTarget => {
             return Err(no_attachment());
         }
     };
     // Routing (a System One call) and the turn come after the response:
-    // the message is already stored and shown, in the order it was sent.
-    if let Some(how) = how {
-        let ticket = state.decisions.chat_ticket(&who.id);
+    // the message is already stored and shown.
+    if let (Some(how), Some(turn)) = (how, turn_id.clone()) {
         let (state, user, event) = (state.clone(), who.id.clone(), event.clone());
-        tokio::spawn(chat_turn(state, user, event, how, ticket));
+        tokio::spawn(chat_turn(state, user, event, how, ticket, turn));
     }
     Ok((
         StatusCode::ACCEPTED,
@@ -1084,6 +1104,8 @@ pub async fn chat_message(
             addressing_note: None,
             routing_note: None,
             decisions_pending: false,
+            classified: false,
+            turn_id,
         }),
     ))
 }
@@ -1107,9 +1129,10 @@ pub(crate) async fn chat_turn(
     event: Event,
     how: ChatRoute,
     ticket: crate::decisions::Ticket,
+    turn_id: String,
 ) {
     use crate::decisions::{Scope, forget};
-    let turn = crate::db::Activity::chat();
+    let turn = crate::db::Activity::agent(turn_id, crate::db::Activity::AGENT_NAME);
     let (cancel, guard) = state.chat_runs.register(&turn.id, &user);
     let _in_line = ticket.wait().await;
     let route = match how {
@@ -1120,6 +1143,12 @@ pub(crate) async fn chat_turn(
                 true => Some(state.decisions.slot(&user).await),
                 false => None,
             };
+            // The message as it is now, after the wait: one deleted or
+            // stopped meanwhile goes to no model.
+            match live_chat_message(&state, &user, event.id).await {
+                Some(_) if !stopped(&state, &cancel, event.id).await => {}
+                _ => return forget(&state, Scope::Personal, event.id).await,
+            }
             routing::route_turn(
                 &state,
                 &user,
@@ -1132,7 +1161,7 @@ pub(crate) async fn chat_turn(
             .await
         }
     };
-    if *cancel.borrow() {
+    if stopped(&state, &cancel, event.id).await {
         return forget(&state, Scope::Personal, event.id).await;
     }
     let (started, written) = tokio::sync::oneshot::channel();
@@ -1154,15 +1183,25 @@ pub(crate) async fn chat_turn(
     let _ = written.await;
 }
 
-/// Start a Chat turn left pending at shutdown ([`crate::decisions::resume`]).
-pub(crate) async fn resume_chat_turn(
-    state: AppState,
-    row: crate::decisions::Stored,
-    ticket: crate::decisions::Ticket,
-) {
-    use crate::decisions::{Scope, forget};
-    let (user, eid) = (row.user_id.clone(), row.event_id);
-    let found = state
+/// Whether the sender stopped this turn: live, or remembered with its
+/// pending decision (a Stop made before a restart).
+async fn stopped(
+    state: &AppState,
+    cancel: &tokio::sync::watch::Receiver<bool>,
+    event_id: i64,
+) -> bool {
+    *cancel.borrow()
+        || state
+            .db
+            .call(move |db| crate::decisions::cancelled(db, event_id))
+            .await
+            .unwrap_or(false)
+}
+
+/// Chat message `id` of `user` as stored now; `None` once deleted.
+async fn live_chat_message(state: &AppState, user: &str, id: i64) -> Option<Event> {
+    let user = user.to_owned();
+    state
         .db
         .call(move |db| {
             let conn = db.lock();
@@ -1171,18 +1210,30 @@ pub(crate) async fn resume_chat_turn(
                  FROM personal_events WHERE id = ?1 AND user_id = ?2 AND kind = 'message'",
             )?;
             Ok(stmt
-                .query_row(rusqlite::params![eid, user], crate::db::row_event)
+                .query_row(rusqlite::params![id, user], crate::db::row_event)
                 .ok())
         })
-        .await;
-    let event = match found {
-        Ok(Some(event)) => event,
-        Ok(None) => return forget(&state, Scope::Personal, row.event_id).await,
-        Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "resuming a pending Chat turn");
-            return;
-        }
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %format!("{e:#}"), "reading a Chat message");
+            None
+        })
+}
+
+/// Start a Chat turn left pending at shutdown ([`crate::decisions::resume`]).
+pub(crate) async fn resume_chat_turn(
+    state: AppState,
+    row: crate::decisions::Stored,
+    ticket: crate::decisions::Ticket,
+) {
+    use crate::decisions::{Scope, forget};
+    let Some(event) = live_chat_message(&state, &row.user_id, row.event_id).await else {
+        return forget(&state, Scope::Personal, row.event_id).await;
     };
+    let turn_id = row
+        .turn_id
+        .clone()
+        .unwrap_or_else(|| crate::db::Activity::chat().id);
     let how = match row.payload["choice"].as_object() {
         Some(choice) => {
             let who = Human {
@@ -1234,7 +1285,7 @@ pub(crate) async fn resume_chat_turn(
             }
         },
     };
-    chat_turn(state, row.user_id, event, how, ticket).await;
+    chat_turn(state, row.user_id, event, how, ticket, turn_id).await;
 }
 
 #[cfg(test)]
@@ -1262,12 +1313,20 @@ pub async fn list_runs(
     who: Human,
 ) -> ApiResult<Json<serde_json::Value>> {
     let user = who.id.clone();
-    let spaces = db(&state, move |db| db.list_spaces(&user)).await?;
-    let runs: Vec<_> = state
-        .runs
-        .list_with_failures()
+    let listed = state.runs.list_with_failures();
+    // Previews of deleted messages are dropped as the runs are read.
+    let listed = db(&state, move |db| {
+        let spaces = db.list_spaces(&user)?;
+        let (mut runs, failures): (Vec<_>, Vec<_>) = listed
+            .into_iter()
+            .filter(|(r, _)| spaces.iter().any(|s| s.id == r.space_id))
+            .unzip();
+        crate::orchestration::live_tasks(&db.lock(), &mut runs)?;
+        Ok(runs.into_iter().zip(failures).collect::<Vec<_>>())
+    })
+    .await?;
+    let runs: Vec<_> = listed
         .into_iter()
-        .filter(|(r, _)| spaces.iter().any(|s| s.id == r.space_id))
         .map(|(r, failure)| run_view(&state.compaction, &who, r, failure))
         .collect::<ApiResult<_>>()?;
     Ok(Json(json!({"runs": runs})))
@@ -1295,6 +1354,13 @@ pub async fn get_run(
     member_of(&state, &run.space_id, &who)
         .await
         .map_err(|e| run_not_found(e, not_found))?;
+    let run = db(&state, move |db| {
+        let mut runs = [run];
+        crate::orchestration::live_tasks(&db.lock(), &mut runs)?;
+        let [run] = runs;
+        Ok(run)
+    })
+    .await?;
     Ok(Json(run_view(&state.compaction, &who, run, failure)?))
 }
 

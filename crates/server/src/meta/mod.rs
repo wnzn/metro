@@ -265,7 +265,15 @@ async fn stop_turn(
     body: axum::body::Bytes,
 ) -> ApiResult<Json<Value>> {
     empty_object(&body)?;
-    if state.chat_runs.stop(&id, &who.id) {
+    // A turn that hasn't started yet: the Stop is saved with its pending
+    // decision before it's acknowledged, so a restart doesn't start it.
+    let (user, turn) = (who.id.clone(), id.clone());
+    let saved = crate::api::db(&state, move |db| {
+        crate::decisions::cancel_turn(db, &user, &turn)
+    })
+    .await?;
+    let live = state.chat_runs.stop(&id, &who.id);
+    if saved || live {
         Ok(Json(json!({"turn_id": id, "status": "cancelled"})))
     } else {
         Err(ApiError::not_found("no such running Chat turn"))
