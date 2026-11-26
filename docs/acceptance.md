@@ -3,6 +3,19 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Metro 0.5.1 publication record pending
+
+Reserved for the verified publication time, tag and commit, CI run,
+signed release assets and image digests. This entry is not evidence
+that 0.5.1 has been published.
+
+## Source-only documentation check for 0.6.0 (2026-11-26)
+
+The docs lane checked its descriptions against integration source
+`6efd0aa`, verified local Markdown paths and heading anchors in `docs/`,
+`README.md` and `AGENTS.md`, and ran `git diff --check`. This was a
+documentation check, not a runtime, native desktop or publication gate.
+
 ## Published: Metro 0.5.0 (2026-11-25, GitHub release v0.5.0)
 
 **What was published.** The stable

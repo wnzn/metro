@@ -6,7 +6,9 @@ come back as `{"error": "..."}`.
 
 ## Identity
 
-Your identity provider decides who you are. Metro keeps no user directory.
+Your sign-in provider determines your stable ID. The
+[server directory](messages.md#direct-messages-and-the-directory)
+is in the source, not released; it doesn't change how IDs are assigned.
 
 | Sign-in mode | Your `id` (stable, used for membership) | Your `actor` (display only) |
 | --- | --- | --- |
@@ -54,10 +56,11 @@ The live dev service's profile read endpoints were also checked.
   a fresh PNG (`image/png`), with no metadata. It never fetches an image
   from a URL. `avatar_version` changes on every upload, so clients know when
   to fetch again.
-- **Who can read whose profile.** You can read your own, and those of people
-  who share a Space with you right now. It's checked on every request.
-  Anyone else, and unknown ids, get `404`. There's no directory, and no
-  admin bypass.
+- **Who can read whose profile.** In 0.5.0, you can read your own and
+  those of people who share a Space with you right now. Other people
+  and unknown IDs get `404`. The
+  [server directory and DM profile access](messages.md#direct-messages-and-the-directory)
+  change this in the source, not in the published builds.
 - Avatars have no public URL. They're read with your bearer token and
   served with `Cache-Control: no-store`.
 - New messages record the display name in force when they're written. Older
@@ -93,7 +96,9 @@ The live dev service's profile read endpoints were also checked.
   recently deleted Pages, and Space Page drafts, including drafts that
   had not yet created a page. [Recently deleted](pages.md#deleting-pages-and-spaces)
   cannot recover them after Space deletion.
-- A Space holds at most 100 members and 200 rooms, threads included.
+- A Space holds at most 100 members and 200 rooms, including agent-created
+  threads. [Reply threads](messages.md#reply-threads) in the source, not
+  released, have a separate limit.
 
 | Request | Who | Result |
 | --- | --- | --- |
@@ -186,6 +191,11 @@ See [desktop mentions](released-0.5.0.md#mentions-in-rooms-and-threads),
 [private sender notices](released-0.5.0.md#private-sender-notices), and the
 [Space send protocol](released-0.5.0.md#space-send-protocol-client-developers)
 for the 0.5.0 composer and API.
+
+The table and rules below describe 0.5.0. **In the source, not released:**
+[Replying to an agent](messages.md#reply) adds an explicit recipient, and
+the [opt-in classifier](system-one.md#classification-in-the-source-not-released)
+uses a lower threshold and brief room context for unaddressed text.
 
 | You write | Addressed to | Which agent runs |
 | --- | --- | --- |
@@ -294,6 +304,29 @@ works on human and agent messages in Chat, rooms and threads.
 - When the agent is addressed, it may answer with a single reaction instead of
   a redundant reply, for example acknowledging a thank-you.
 
+## Space agent behaviour
+
+**In the source, not released.** A Space agent's built-in prompt asks it
+to answer usefully (in Markdown when helpful), acknowledge with a reaction
+if enough, or send no reply if it would interrupt people. The prompt
+discourages silence when a person names the agent or replies to it with
+a question or request. An empty final answer or `METRO_NO_REPLY` completes
+the run without an agent message; a reaction followed by
+`METRO_REACTION_ONLY` can acknowledge a message without a text reply.
+The completed activity distinguishes replies, reactions and no reply.
+
+New Spaces get a default agent instructed to help the whole room,
+suggest a better-suited agent by handle when appropriate, and ask a
+short question rather than guess. Existing agents keep their stored
+instructions. Owner instructions add to, not replace, Metro's prompt.
+
+Room runs get a bounded **Space context** block (up to 8 KiB): Space
+name and description, room or thread, applicable parent and anchor
+information, current members' display names, stable IDs and roles (up
+to 50 members), and the agent roster. This goes to the run's model;
+names and descriptions written by people are context, not instructions.
+Personal Chat doesn't get this block.
+
 ## Threads
 
 A room's agent can delegate work to **child threads** with the tools
@@ -308,6 +341,12 @@ A room's agent can delegate work to **child threads** with the tools
 - Threads go only one level deep: a thread can't create threads. A room can
   have at most 16 of them.
 
+**In the source, not released:** [Reply threads](messages.md#reply)
+are anchored to a room message. They include the anchor in agent
+history and don't mirror answers into the parent room. If an
+agent-created thread completes without a reply, its parent still gets a
+completion note.
+
 ## Personal Chat
 
 - Every user has a private Chat with the agent. Only that user can see it, and
@@ -318,11 +357,13 @@ A room's agent can delegate work to **child threads** with the tools
   for `POST /v1/chat/messages` and compatibility behavior.
   Read the transcript with `GET /v1/chat/events?after=<id>`.
 - The Chat agent can acknowledge a message with `react_to_message`.
-  Web tools require a separate [opt-in](web-search.md). It has no runner, workspace or thread
-  tools, and it can't read Space transcripts. Chat never uses a runner, not
-  even your personal registered one, and Chat messages are never forwarded
-  into a Space.
-- The cross-Space controls in Chat are for you, not the agent. **Agent runs**
+  Web tools require a separate [opt-in](web-search.md). Chat never uses a
+  runner directly and has no workspace or agent-thread management tools.
+  In 0.5.0 it cannot read Space transcripts or post in Spaces.
+  **In the source, not released:** [Metro in Chat](next-source.md#metro-in-chat)
+  can read and post as you after its notice gate, and you can
+  [forward](messages.md#forward) a message yourself.
+- The manual cross-Space controls in Chat are separate. **Agent runs**
   lists only Space runs, including threads; you can open, follow up on or
   stop runs where permitted (see [Runs](#runs)).
   [New task and Follow up](released-0.5.0.md#recipient-safe-dispatch-and-exact-destination-follow-up)
@@ -344,6 +385,10 @@ A room's agent can delegate work to **child threads** with the tools
   out.
 - Run history is kept in memory, bounded, and lost on restart. Room
   transcripts are durable.
+- **In the source, not released:** the initiator can
+  [retry eligible runs](next-source.md#new-api-routes-and-fields);
+  personal Chat has a separate turn stop endpoint and remains out of
+  the runs list.
 - At most 4 agent runs are active per Space, and 8 per server.
 
 ## Monitoring events

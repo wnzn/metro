@@ -22,6 +22,17 @@ the sidebar hides completely.
 
 This page also covers the server settings that operators set behind them.
 
+**In the source, not released:**
+
+- **Settings → Metro in Chat** controls [which Spaces Metro may use in
+  Chat](next-source.md#metro-in-chat).
+- **Settings → Model choices → Conversation summaries** controls
+  [automatic compaction](next-source.md#conversation-summaries) for runs
+  you start. **Space classification** has a
+  [new threshold and disclosure](system-one.md#classification-in-the-source-not-released).
+- The model list's **Context size…** lets connection owners set the
+  context window used to estimate when to summarize.
+
 ## Adding a connection in Settings → Model connections
 
 As seen in the 0.2.0 Linux candidate:
@@ -595,6 +606,14 @@ is its default model and is always one of its enabled models.
 | `PATCH /v1/providers/{id}/model-list` `{"model_id", "display_name"?, "enabled"?, "thinking"?, "position"?, "default"?}` | Rename (`null` or `""` goes back to the catalog name), enable or disable, set or clear (`null`) thinking options, reorder, or make it the default model |
 | `DELETE /v1/providers/{id}/model-list?model_id=ID` | Remove a model (not the default model) |
 | `POST /v1/providers/{id}/model-list/refresh` | The same as `POST /v1/providers/{id}/models` |
+
+**In the source, not released:** `GET /v1/providers/{id}/model-list`
+includes `context_tokens` on each model (an integer from 1,024 to
+10,000,000, or `null` for unknown). Connection owners can set it when
+adding (`POST`) or editing (`PATCH`) a model in this list. Send `null`
+on `PATCH` to clear it; omitting it keeps the saved value. Provider
+listings don't fill it and `POST /v1/providers` doesn't set it.
+Metro uses 32,000 tokens when the value is unknown.
 
 In the desktop app, **Model connections** groups your connections by
 capability (Chat, System One, Embeddings) in compact rows. A connection's

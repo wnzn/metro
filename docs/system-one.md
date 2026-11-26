@@ -133,7 +133,8 @@ A person can turn on classification for **their own** outgoing messages. In
 Spaces it's a setting **per Space** (`classify_unaddressed` in
 [your preferences for that Space](spaces.md#your-preferences-in-a-space)).
 It can be turned on only while the person has a System One connection
-usable in that Space. It is off by default.
+usable in that Space. It is off by default. The rules below are for
+0.5.0; see [source changes](#classification-in-the-source-not-released).
 
 **In a Space room**, it decides two things for the sender's messages:
 
@@ -169,6 +170,34 @@ When the per-Space setting was introduced, everyone who had
 `infer_addressing` on with a System One connection got
 `classify_unaddressed` on in each Space they were a member of then. That
 happened once; Spaces joined later start with it off.
+
+### Classification in the source, not released
+
+Classification is still opt-in per Space and still uses one typed System
+One Choice for unaddressed text. The prompt now tells the classifier to
+pick a useful agent when unsure and reserve *No agent* for clearly
+human-only conversation. Along with the available agent options and
+the new message, the sender's System One connection receives the Space
+name and up to 300 characters of its description, the room or thread
+name, and excerpts (up to 400 characters each) from up to three recent
+human or agent messages there, with speaker labels but no stable
+participant IDs or owner instructions. The generic `@agent` decision
+doesn't use this room history.
+
+For unaddressed text, directedness is `1 − P(No agent)` when that score
+is present; otherwise it's the chosen agent's probability, or zero if
+none. At or above `min_directedness`, Metro runs the chosen agent, or
+the highest-scoring agent option if System One picked *No agent*.
+Below the threshold, nothing starts. A failed decision still starts
+nothing and returns a sender-only `addressing_note`.
+
+In **Settings → Model choices → Space classification**, the threshold
+now defaults to 35% (range 20–100%). A one-time upgrade migration changes
+stored `0.85` values to `0.35`, including custom choices that happened
+to equal the old default; all other values stay as they were. This
+doesn't turn classification on. [Replying to a specific agent](messages.md#reply)
+addresses it directly and bypasses the unaddressed classifier, as does
+a named agent mention.
 
 ## Use-case routing
 
@@ -220,7 +249,7 @@ Each person has their own settings. Use-case routing is off by default.
 | `classifier_id` | Your System One connection. Used for routing, per-Space classification and the search rerank. |
 | `embedding_id` | Your embeddings connection, used for [search](#semantic-search) |
 | `default_chat_id` | The chat connection to use on `no_match`. Leave it out to keep your default. |
-| `min_directedness` | 0.5 to 1, default 0.85 |
+| `min_directedness` | In 0.5.0: 0.5 to 1, default 0.85. In the source, not released: 0.2 to 1, default 0.35 (see [migration](#classification-in-the-source-not-released)). |
 | `min_route_probability` | 0 to 1, default 0.65 |
 | `cases` | Up to 16 entries of `{"key", "label", "description", "connection_id"}`. Keys match `[a-z][a-z0-9_]*`, up to 32 characters, are unique, and can't be `no_match`. Labels are up to 64 characters, and descriptions, the criterion System One judges, up to 500. |
 
@@ -257,10 +286,12 @@ Only people's messages and the agent's final replies are indexed. Tool calls,
 tool output, activity, status, errors, thread mirrors and reactions are
 never indexed, and neither are runner files or workspaces. A message that
 contains a Metro credential prefix (`metro_rt_`, `metro_pc_`) is skipped.
-Search is your own feature. It doesn't give the personal Chat agent access
-to Space transcripts. Files you upload are a separate corpus with its own
-search. See [Documents & media](library.md), which is in development. This
-message search doesn't change.
+Search is your own feature. In 0.5.0 it doesn't give the Chat agent access
+to Space transcripts. **In the source, not released:** [Metro in Chat](next-source.md#metro-in-chat)
+has a separate access setting and notice before it can search your
+Spaces. DMs, Chat posting receipts and compaction markers aren't
+indexed. Uploaded files are a separate corpus with its own search; see
+[Documents & media](library.md).
 
 **How a search runs.**
 
