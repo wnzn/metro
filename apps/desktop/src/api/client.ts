@@ -888,8 +888,10 @@ export function createClient(options: ClientOptions) {
       assetIds?: readonly string[],
       choice?: TurnModelChoice,
       reply?: ReplyAddress,
-    ): Promise<PostedSenderNotes | null> {
-      const body: Record<string, unknown> = { invoke_agent: false, ...addressing, infer_text_mentions: false, ...turnModelBody(choice) };
+    ): Promise<SentSpaceMessage> {
+      // The message is stored and shown at once; System One decides afterwards
+      // (collect its sender-only notes with messageDecisions).
+      const body: Record<string, unknown> = { invoke_agent: false, ...addressing, infer_text_mentions: false, ...turnModelBody(choice), defer_decisions: true };
       const ids = assetIdsBody(assetIds);
       if (ids) body.asset_ids = ids;
       if (reply) {
@@ -898,7 +900,8 @@ export function createClient(options: ClientOptions) {
       }
       try {
         const data = await request("POST", `${room(spaceId, roomId)}/messages`, body);
-        return readPostedNotes(data, { ...addressing, kind: "space", reply });
+        const pending = isObject(data) && data.decisions_pending === true && isEventId(data.id) ? data.id : null;
+        return { notes: readPostedNotes(data, { ...addressing, kind: "space", reply }), decisionsPending: pending };
       } catch (error) {
         if (error instanceof ApiError && error.status === 422) {
           throw new ApiError("http", "Update Metro Server to send Space messages with safe addressing. Your draft was kept and was not sent.", 422);
@@ -908,6 +911,44 @@ export function createClient(options: ClientOptions) {
         }
         throw error;
       }
+    },
+
+    /**
+     * The sender-only notes of a message whose System One decisions came
+     * after it was stored. `undefined` while still deciding (ask again);
+     * null when there's nothing to show or nothing is pending any more.
+     */
+    async messageDecisions(
+      spaceId: string,
+      roomId: string,
+      eventId: number,
+      addressing: SpaceMessageBody,
+      reply?: ReplyAddress,
+    ): Promise<PostedSenderNotes | null | undefined> {
+      try {
+        const data = await request("POST", `${room(spaceId, roomId)}/messages/${encodeURIComponent(String(eventId))}/decisions`, {}, undefined, 120_000);
+        if (isObject(data) && data.decisions_pending === true) return undefined;
+        if (!isObject(data) || data.id !== eventId) return null;
+        return readPostedNotes(data, { ...addressing, kind: "space", reply });
+      } catch (error) {
+        // Already collected, a restart, or no access any more: no notes.
+        if (error instanceof ApiError && error.kind === "not_found") return null;
+        throw error;
+      }
+    },
+
+    /**
+     * Deletes a message (see the server's permission rules); resolves to the
+     * `message_deleted` events it wrote, which polling also delivers.
+     */
+    async deleteEvent(scope: { chat: true } | { spaceId: string; roomId: string }, eventId: number): Promise<RoomEvent[]> {
+      const base = "chat" in scope ? "/v1/chat" : room(scope.spaceId, scope.roomId);
+      const data = await request("DELETE", `${base}/events/${encodeURIComponent(String(eventId))}`);
+      const events = isObject(data) && Array.isArray(data.events) ? data.events.filter(isEvent).map(toEvent) : [];
+      if (!events.some(e => parseDeletion(e)?.targetEventId === eventId)) {
+        throw new ApiError("protocol", "The server did not confirm the deletion.");
+      }
+      return events;
     },
 
     async runDemo(spaceId: string, roomId: string): Promise<void> {
@@ -1494,7 +1535,8 @@ export function toActivity(v: unknown): EventActivity | undefined {
   const agent = toEventAgent(v.agent);
   if (agent) activity.agent = agent;
   const pick = shortText(v.pick, 200);
-  if (pick) activity.pick = pick;
+  // The classifier's pick shows as the run's agent, with no label of its own.
+  if (pick && !pick.startsWith("Picked by classifier")) activity.pick = pick;
   const tool = parseWebTool(v.tool);
   if (tool && v.source === "agent") activity.tool = tool;
   return activity;
@@ -1635,6 +1677,25 @@ async function safeSnippet(response: Response): Promise<string> {
   } catch {
     return "";
   }
+}
+
+/** What a Space message POST returned: its sender notes, and whether System One decides afterwards. */
+export type SentSpaceMessage = { notes: PostedSenderNotes | null; decisionsPending: number | null };
+
+/** The JSON payload of a `message_deleted` event's text. */
+export type Deletion = { targetEventId: number; tombstone: boolean };
+
+export function parseDeletion(event: RoomEvent): Deletion | null {
+  if (event.kind !== "message_deleted") return null;
+  try {
+    const v = JSON.parse(event.text);
+    if (isObject(v) && isEventId(v.target_event_id) && typeof v.tombstone === "boolean") {
+      return { targetEventId: v.target_event_id, tombstone: v.tombstone };
+    }
+  } catch {
+    /* malformed: ignore */
+  }
+  return null;
 }
 
 /** The JSON payload of a `reaction` event's text. */

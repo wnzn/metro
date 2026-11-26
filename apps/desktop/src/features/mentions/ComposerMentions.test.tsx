@@ -69,7 +69,7 @@ test("authoritative thread/room sends preserve mixed quoted-email and code text 
     const recipient = text.includes("@Bob Tan") ? {
       mentions: [{ kind: "user", id: "bob" }], spans: [span(text, "@Bob Tan", 0)],
     } : {};
-    expect(JSON.parse(requests(app)[i].body!)).toEqual({ text, infer_text_mentions: false, invoke_agent: false, ...recipient });
+    expect(JSON.parse(requests(app)[i].body!)).toEqual({ text, infer_text_mentions: false, defer_decisions: true, invoke_agent: false, ...recipient });
   }
 });
 
@@ -107,7 +107,7 @@ test("ambiguity offers only the same stable candidates, never sends on Return, t
   await app.press("id:send");
   await app.waitUntil(() => requests(app).length === 1);
   expect(JSON.parse(requests(app)[0].body!)).toEqual({
-    text, infer_text_mentions: false, invoke_agent: false,
+    text, infer_text_mentions: false, defer_decisions: true, invoke_agent: false,
     mentions: [{ kind: "user", id: "carol" }], spans: [span(text, "@Álex Rivera", 0)],
   });
 });
@@ -195,7 +195,7 @@ test("a suffix edit reopens the chooser for an automatically captured agent, and
   await app.press("id:send");
   await app.waitUntil(() => requests(app).length === 1);
   expect(JSON.parse(requests(app)[0].body!)).toEqual({
-    text: after, invoke_agent: false, infer_text_mentions: false,
+    text: after, invoke_agent: false, infer_text_mentions: false, defer_decisions: true,
     mentions: [{ kind: "agent" }], spans: [span(after, "@agent", 0)],
   });
 });
@@ -211,7 +211,7 @@ test("a completed token typed before the directory arrives stays unresolved afte
   expect(app.shows("id:mention-chip:bob")).toBe(false);
   await app.press("id:send");
   await app.waitUntil(() => requests(app).length === 1);
-  expect(JSON.parse(requests(app)[0].body!)).toEqual({ text, infer_text_mentions: false, invoke_agent: false });
+  expect(JSON.parse(requests(app)[0].body!)).toEqual({ text, infer_text_mentions: false, defer_decisions: true, invoke_agent: false });
 });
 
 test("without a verified roster even a reserved typed token is plain, not a guessed recipient", async () => {
@@ -229,7 +229,7 @@ test("without a verified roster even a reserved typed token is plain, not a gues
   expect(app.shows("id:mention-chip:agent")).toBe(false);
   await app.press("id:send");
   await app.waitUntil(() => requests(app).length === 1);
-  expect(JSON.parse(requests(app)[0].body!)).toEqual({ text, infer_text_mentions: false, invoke_agent: false });
+  expect(JSON.parse(requests(app)[0].body!)).toEqual({ text, infer_text_mentions: false, defer_decisions: true, invoke_agent: false });
 });
 
 test("span text cannot turn a people-only message into one for an agent whose handle is its prefix", async () => {
@@ -250,7 +250,7 @@ test("span text cannot turn a people-only message into one for an agent whose ha
   await app.press("id:send");
   await app.waitUntil(() => requests(app).length === 1);
   expect(JSON.parse(requests(app)[0].body!)).toEqual({
-    text, invoke_agent: false, infer_text_mentions: false,
+    text, invoke_agent: false, infer_text_mentions: false, defer_decisions: true,
     mentions: [{ kind: "user", id: "bob" }], spans: [span(text, "@River Tan", 0)],
   });
 });
@@ -279,7 +279,7 @@ test("a delayed upload rechecks recipient membership and retains draft and uploa
   await app.press("id:send");
   await app.waitUntil(() => requests(app).length === 1);
   expect(JSON.parse(requests(app)[0].body!)).toEqual({
-    text: "", infer_text_mentions: false, invoke_agent: false, asset_ids: [w.l.assets[0]!.id],
+    text: "", infer_text_mentions: false, defer_decisions: true, invoke_agent: false, asset_ids: [w.l.assets[0]!.id],
   });
 });
 
@@ -329,7 +329,7 @@ test("post-upload preflight detects a moved same-visit alias and keeps the draft
   await app.waitUntil(() => requests(app).length === 1);
   expect(w.l.assets).toHaveLength(1);
   expect(JSON.parse(requests(app)[0].body!)).toMatchObject({
-    text: "🌿 @New Coder please check", infer_text_mentions: false, mentions: [{ kind: "agent", agent_id: "ag-b" }],
+    text: "🌿 @New Coder please check", infer_text_mentions: false, defer_decisions: true, mentions: [{ kind: "agent", agent_id: "ag-b" }],
     asset_ids: [w.l.assets[0]!.id],
   });
 });
@@ -790,7 +790,7 @@ test("fast members do not verify a cached agent alias or card while the exact re
   await app.press("id:send");
   await app.waitUntil(() => requests(app).length === 1);
   expect(JSON.parse(requests(app)[0].body!)).toEqual({
-    text: unresolved, infer_text_mentions: false, invoke_agent: false,
+    text: unresolved, infer_text_mentions: false, defer_decisions: true, invoke_agent: false,
   });
   await app.type("id:composer", "@coder please review");
   await app.waitFor(`id:mention-chip:agent:${b.id}`);
@@ -815,6 +815,6 @@ test("unsupported or uncertain Space POST is never replayed and keeps the exact 
     await app.waitFor(code === 422 ? "text:/Update Metro Server to send Space messages/" : "text:/Check the conversation before sending again/");
     expect(app.value("id:composer")).toBe(text);
     expect(requests(app)).toHaveLength(1);
-    expect(JSON.parse(requests(app)[0].body!)).toMatchObject({ text, infer_text_mentions: false, mentions: [{ kind: "user", id: "bob" }] });
+    expect(JSON.parse(requests(app)[0].body!)).toMatchObject({ text, infer_text_mentions: false, defer_decisions: true, mentions: [{ kind: "user", id: "bob" }] });
   }
 });

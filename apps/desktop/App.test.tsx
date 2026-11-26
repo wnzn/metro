@@ -114,7 +114,7 @@ test("@mentions: pick a member, send, prune and clear on room change", async () 
   await app.press("id:send");
   await app.waitUntil(() => f.posts().some(p => p.path.endsWith("/messages")));
   const sent = f.posts().find((p) => p.path.endsWith("/messages"))!;
-  expect(sent.body).toEqual({ text: "can you look @bob ", invoke_agent: false, infer_text_mentions: false,
+  expect(sent.body).toEqual({ text: "can you look @bob ", invoke_agent: false, infer_text_mentions: false, defer_decisions: true,
     mentions: [{ kind: "user", id: "bob" }], spans: [{ start: 13, end: 17, index: 0 }] });
   expect(f.state.events.get("acme/lobby")!.some((e) => e.actor === "agent")).toBe(false); // a person only
   // The header names the recipient itself: a pill for bob, no agent badge, no "to people" note.
@@ -130,7 +130,7 @@ test("@mentions: pick a member, send, prune and clear on room change", async () 
   // Ask agent with no mention: invoke_agent on the wire, and one "to the agent" badge.
   await app.type("id:composer", "summarise the lobby");
   await askAgent(app);
-  expect(f.posts().filter((p) => p.path.endsWith("/messages")).at(-1)!.body).toEqual({ text: "summarise the lobby", invoke_agent: true, infer_text_mentions: false });
+  expect(f.posts().filter((p) => p.path.endsWith("/messages")).at(-1)!.body).toEqual({ text: "summarise the lobby", invoke_agent: true, infer_text_mentions: false, defer_decisions: true });
   const asked = f.state.events.get("acme/lobby")!.find((e) => e.text === "summarise the lobby")!;
   await app.waitFor(`id:recipient:${asked.id}:ask-agent`);
   expect(app.count(`id:recipient:${asked.id}:ask-agent`)).toBe(1);
