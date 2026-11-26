@@ -486,6 +486,21 @@ async fn schedule_create(ctx: &Ctx, a: Value) -> R {
     let own = ctx.own_text.clone();
     let max = ctx.state.config.limits.max_message_chars.min(PROMPT_MAX);
     on_db(ctx, move |db, grant| {
+        // A scheduled prompt later counts as the person's own words, so it
+        // may name only Spaces they named: otherwise Space content could
+        // launder a post destination through a schedule.
+        if let Ok(spaces) = grant.spaces(&db.lock())?
+            && let Some(s) = spaces.iter().find(|s| {
+                send::named_by_user(std::slice::from_ref(&a.prompt), s)
+                    && !send::named_by_user(&own, s)
+            })
+        {
+            return Ok(Err(format!(
+                "the prompt names {:?}, which the user didn't name in their own messages; ask \
+                 the user to confirm the Space by name",
+                s.name
+            )));
+        }
         let space_name = match &target {
             None => {
                 if let Err(d) = grant.on(&db.lock())? {
