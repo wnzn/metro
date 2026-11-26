@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::AppState;
-use crate::agent::{start_personal_run, stop_runs_of};
+use crate::agent::stop_runs_of;
 use crate::attachments::{self, Append, IdsError, Place};
 use crate::auth::{Human, Runner, new_runner_token, runner_token_hash, valid_id};
 use crate::db::reactions::{ReactionScope, Reactor, valid_emoji};
@@ -1016,80 +1016,66 @@ pub async fn chat_message(
             &state,
             &who,
             None,
-            body.provider_connection_id,
-            body.model_id,
-            body.reasoning_effort,
+            body.provider_connection_id.clone(),
+            body.model_id.clone(),
+            body.reasoning_effort.clone(),
             addressing,
         )
         .await?
     };
-    let settings = if addressing == Addressing::Agent && chosen.is_none() {
-        Some(
+    // With a choice: only that connection. Otherwise routing, if the sender
+    // turned it on, or their default; a connection that cannot be used fails
+    // the reply. Notes have neither a choice nor routing settings.
+    let how = match chosen {
+        Some(route) => Some(ChatRoute::Chosen(Box::new(route))),
+        None if addressing == Addressing::Agent => Some(ChatRoute::Routing(
             routing::preferences(&state, &who.id)
                 .await
                 .map_err(ApiError::internal)?,
-        )
-    } else {
-        None
+        )),
+        None => None,
     };
+    // A turn to start is durable with its message: a restart starts it.
+    let pending = how.as_ref().map(|_| crate::decisions::NewPending {
+        scope: crate::decisions::Scope::Personal,
+        user_id: who.id.clone(),
+        place: None,
+        payload: json!({"choice": body.provider_connection_id.as_ref().map(|id| json!({
+            "provider_connection_id": id,
+            "model_id": body.model_id,
+            "reasoning_effort": body.reasoning_effort,
+        }))}),
+    });
     let addressed = addressed(&resolved);
     let (uid, author, stored) = (who.id.clone(), who.author(), text.clone());
-    let event = if body.asset_ids.is_empty() {
-        db(&state, move |db| {
-            db.append_personal(&uid, kind::MESSAGE, &author, &stored, &addressed)
-        })
-        .await?
-    } else {
-        let ids = body.asset_ids;
-        let place = Place::Personal { user_id: uid };
-        match db(&state, move |db| {
-            attachments::append_message(
-                db,
-                &place,
-                &author,
-                &stored,
-                &addressed,
-                &ids,
-                &[],
-                &MessageMeta::default(),
-            )
-        })
-        .await?
-        {
-            Append::Posted(event) => *event,
-            Append::NoRoom | Append::NoAsset | Append::NoRecipient | Append::NoReplyTarget => {
-                return Err(no_attachment());
-            }
+    let ids = body.asset_ids;
+    let place = Place::Personal { user_id: uid };
+    let event = match db(&state, move |db| {
+        attachments::append_message(
+            db,
+            &place,
+            &author,
+            &stored,
+            &addressed,
+            &ids,
+            &[],
+            &MessageMeta::default(),
+            pending.as_ref(),
+        )
+    })
+    .await?
+    {
+        Append::Posted(event) => *event,
+        Append::NoRoom | Append::NoAsset | Append::NoRecipient | Append::NoReplyTarget => {
+            return Err(no_attachment());
         }
     };
-    // With a choice: only that connection. Otherwise routing, if the sender
-    // turned it on, or their default; a connection that cannot be used fails
-    // the reply. Notes have neither a choice nor routing settings. Routing
-    // (a System One call) runs after the response: the message is already
-    // stored and shown, and a turn that cannot start says why in the Chat.
-    if settings.is_some() || chosen.is_some() {
-        let event = event.clone();
-        tokio::spawn(async move {
-            let route = match settings {
-                Some(settings) => {
-                    routing::route_turn(
-                        &state,
-                        &who.id,
-                        None,
-                        &settings,
-                        &event.text,
-                        AddressedBy::Explicit,
-                        None,
-                    )
-                    .await
-                }
-                None => match chosen {
-                    Some(route) => route,
-                    None => return,
-                },
-            };
-            let _ = start_personal_run(&state, &who.id, &event, route).await;
-        });
+    // Routing (a System One call) and the turn come after the response:
+    // the message is already stored and shown, in the order it was sent.
+    if let Some(how) = how {
+        let ticket = state.decisions.chat_ticket(&who.id);
+        let (state, user, event) = (state.clone(), who.id.clone(), event.clone());
+        tokio::spawn(chat_turn(state, user, event, how, ticket));
     }
     Ok((
         StatusCode::ACCEPTED,
@@ -1100,6 +1086,155 @@ pub async fn chat_message(
             decisions_pending: false,
         }),
     ))
+}
+
+/// How a personal Chat turn gets its model.
+pub(crate) enum ChatRoute {
+    /// The model chosen for this turn, already checked.
+    Chosen(Box<routing::Route>),
+    /// The sender's routing, if on, or their default.
+    Routing(routing::RoutingSettings),
+}
+
+/// Route and start the Chat turn answering `event` once `ticket` is served,
+/// so a person's turns start in send order. The turn is registered first,
+/// while it waits and routes, so Stop and the busy check see it; one
+/// stopped meanwhile never starts. Its pending decision is settled with its
+/// `started` marker, or here when nothing starts.
+pub(crate) async fn chat_turn(
+    state: AppState,
+    user: String,
+    event: Event,
+    how: ChatRoute,
+    ticket: crate::decisions::Ticket,
+) {
+    use crate::decisions::{Scope, forget};
+    let turn = crate::db::Activity::chat();
+    let (cancel, guard) = state.chat_runs.register(&turn.id, &user);
+    let _in_line = ticket.wait().await;
+    let route = match how {
+        ChatRoute::Chosen(route) => *route,
+        ChatRoute::Routing(settings) => {
+            // Only use-case routing calls System One.
+            let _slot = match settings.enabled {
+                true => Some(state.decisions.slot(&user).await),
+                false => None,
+            };
+            routing::route_turn(
+                &state,
+                &user,
+                None,
+                &settings,
+                &event.text,
+                AddressedBy::Explicit,
+                None,
+            )
+            .await
+        }
+    };
+    if *cancel.borrow() {
+        return forget(&state, Scope::Personal, event.id).await;
+    }
+    let (started, written) = tokio::sync::oneshot::channel();
+    let start = crate::agent::ChatStart {
+        turn,
+        cancel,
+        guard,
+        started,
+    };
+    // A turn that cannot start says why in the Chat.
+    if crate::agent::start_chat_turn(&state, &user, &event, route, start)
+        .await
+        .is_err()
+    {
+        return forget(&state, Scope::Personal, event.id).await;
+    }
+    // Hold the line until this turn's `started` marker is written (or it
+    // found its message deleted).
+    let _ = written.await;
+}
+
+/// Start a Chat turn left pending at shutdown ([`crate::decisions::resume`]).
+pub(crate) async fn resume_chat_turn(
+    state: AppState,
+    row: crate::decisions::Stored,
+    ticket: crate::decisions::Ticket,
+) {
+    use crate::decisions::{Scope, forget};
+    let (user, eid) = (row.user_id.clone(), row.event_id);
+    let found = state
+        .db
+        .call(move |db| {
+            let conn = db.lock();
+            let mut stmt = conn.prepare(
+                "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at
+                 FROM personal_events WHERE id = ?1 AND user_id = ?2 AND kind = 'message'",
+            )?;
+            Ok(stmt
+                .query_row(rusqlite::params![eid, user], crate::db::row_event)
+                .ok())
+        })
+        .await;
+    let event = match found {
+        Ok(Some(event)) => event,
+        Ok(None) => return forget(&state, Scope::Personal, row.event_id).await,
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "resuming a pending Chat turn");
+            return;
+        }
+    };
+    let how = match row.payload["choice"].as_object() {
+        Some(choice) => {
+            let who = Human {
+                id: row.user_id.clone(),
+                name: event.actor.clone(),
+            };
+            let text = |k: &str| choice.get(k).and_then(|v| v.as_str()).map(str::to_owned);
+            match check_choice(
+                &state,
+                &who,
+                None,
+                text("provider_connection_id"),
+                text("model_id"),
+                text("reasoning_effort"),
+                Addressing::Agent,
+            )
+            .await
+            {
+                Ok(Some(route)) => ChatRoute::Chosen(Box::new(route)),
+                Ok(None) => return forget(&state, Scope::Personal, row.event_id).await,
+                Err(e) => {
+                    let message = format!(
+                        "Metro restarted before this turn started, and its chosen model can't be \
+                         used now: {} No agent ran.",
+                        e.message()
+                    );
+                    let (user, author) = (row.user_id.clone(), Author::server(actor::SYSTEM));
+                    let _ = state
+                        .db
+                        .call(move |db| {
+                            db.append_personal(
+                                &user,
+                                kind::ERROR,
+                                &author,
+                                &message,
+                                &Addressed::room(),
+                            )
+                        })
+                        .await;
+                    return forget(&state, Scope::Personal, row.event_id).await;
+                }
+            }
+        }
+        None => match routing::preferences(&state, &row.user_id).await {
+            Ok(settings) => ChatRoute::Routing(settings),
+            Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), "routing settings for a pending turn");
+                return;
+            }
+        },
+    };
+    chat_turn(state, row.user_id, event, how, ticket).await;
 }
 
 #[cfg(test)]

@@ -1474,7 +1474,7 @@ pub async fn submit_scheduled(
             let prefs = crate::space_prefs::load(state, space_id, &uid).await?;
             let targets = vec![crate::agent_dispatch::Target {
                 agent,
-                pick: "Scheduled prompt: default agent".to_owned(),
+                pick: Some("Scheduled prompt: default agent".to_owned()),
                 addressed_by: AddressedBy::Schedule,
             }];
             let started = crate::agent_dispatch::start_runs(

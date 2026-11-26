@@ -265,6 +265,16 @@ pub async fn post_room_message(
         ..MessageMeta::default()
     };
     let (writer, ids, stored_text) = (author.clone(), msg.asset_ids, text.clone());
+    // Durable with the message: a restart makes the decision again.
+    let pending = deferred.then(|| crate::decisions::NewPending {
+        scope: crate::decisions::Scope::Space,
+        user_id: who.id.clone(),
+        place: Some((space.id.clone(), room.id.clone())),
+        payload: serde_json::json!({
+            "resolved": resolved,
+            "reply_agent": reply_agent.as_ref().map(|a| a.id.clone()),
+        }),
+    });
     // Include targets derived from classification, @agent or a reply as
     // well as stored explicit recipients. A refusal reveals no classifier
     // result.
@@ -282,6 +292,7 @@ pub async fn post_room_message(
             &ids,
             &recipients,
             &meta,
+            pending.as_ref(),
         )
     })
     .await?
@@ -298,7 +309,7 @@ pub async fn post_room_message(
     };
     if deferred {
         let decided = crate::decisions::Key::new(&who.id, &space.id, &room.id, event.id);
-        let done = state.decisions.register(decided, event.clone());
+        let finisher = state.decisions.register(decided, event.clone());
         let job = Deferred {
             state: state.clone(),
             user: who.id.clone(),
@@ -306,18 +317,16 @@ pub async fn post_room_message(
             room,
             author,
             event: event.clone(),
-            text,
             resolved,
             addressing,
             settings,
             prefs,
-            reply_agent,
-            chosen,
+            reply_agent: reply_agent.map(|a| a.id),
         };
         tokio::spawn(async move {
             let outcome = job.run().await;
             // Nobody may be waiting; the registry keeps it briefly.
-            let _ = done.send(Some(outcome.into()));
+            finisher.finish(outcome.into());
         });
         return Ok(Posted {
             event,
@@ -352,6 +361,11 @@ fn needs_system_one(
     agents: &[SpaceAgent],
     chosen: &Option<crate::model_routing::Route>,
 ) -> bool {
+    // A model chosen for this turn isn't stored with a pending decision, so
+    // such a message decides before it returns, as before.
+    if chosen.is_some() {
+        return false;
+    }
     match addressing {
         Addressing::PeopleOnly => false,
         Addressing::Unaddressed => !text.is_empty() && prefs.classify_unaddressed,
@@ -360,10 +374,7 @@ fn needs_system_one(
                 && prefs.classify_unaddressed
                 && settings.classifier_id.is_some()
                 && agents.len() >= 2;
-            let routes = chosen.is_none()
-                && settings.enabled
-                && prefs.routing
-                && prefs.default_model.is_none();
+            let routes = settings.enabled && prefs.routing && prefs.default_model.is_none();
             picks || routes
         }
     }
@@ -436,13 +447,12 @@ struct Deferred {
     room: crate::db::Room,
     author: Author,
     event: Event,
-    text: String,
     resolved: Vec<Mention>,
     addressing: Addressing,
     settings: RoutingSettings,
     prefs: crate::space_prefs::SpacePrefs,
-    reply_agent: Option<SpaceAgent>,
-    chosen: Option<crate::model_routing::Route>,
+    /// The id of the agent whose reply this message answers.
+    reply_agent: Option<String>,
 }
 
 impl Deferred {
@@ -467,7 +477,11 @@ impl Deferred {
             .await
         {
             Ok(Some(agents)) => agents,
-            Ok(None) => return nothing(),
+            Ok(None) => {
+                let id = self.event.id;
+                crate::decisions::forget(&self.state, crate::decisions::Scope::Space, id).await;
+                return nothing();
+            }
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "loading agents for a deferred decision");
                 return nothing();
@@ -476,13 +490,15 @@ impl Deferred {
         let reply_agent = self
             .reply_agent
             .as_ref()
-            .and_then(|r| agents.iter().find(|a| a.id == r.id).cloned());
+            .and_then(|r| agents.iter().find(|a| a.id == *r).cloned());
+        // System One calls wait for a slot; none is dropped.
+        let _slot = self.state.decisions.slot(&self.user).await;
         let plan = crate::agent_dispatch::plan(
             &self.state,
             &self.user,
             &self.space,
             &self.room.id,
-            &self.text,
+            &self.event.text,
             &self.resolved,
             self.addressing,
             &self.settings,
@@ -491,19 +507,82 @@ impl Deferred {
             reply_agent.as_ref(),
         )
         .await;
-        finish(
+        let finished = finish(
             &self.state,
             &self.space,
             &self.room,
             &self.author,
             &self.event,
             plan,
-            self.chosen,
+            None,
             &self.settings,
             &self.prefs,
         )
-        .await
+        .await;
+        // Settled already if a run was accepted; otherwise nothing started.
+        crate::decisions::forget(&self.state, crate::decisions::Scope::Space, self.event.id).await;
+        finished
     }
+}
+
+/// Make a Space message's decision left pending at shutdown
+/// ([`crate::decisions::resume`]) with the sender's current settings.
+pub(crate) async fn resume_space(state: AppState, row: crate::decisions::Stored) {
+    use crate::decisions::{Scope, forget};
+    let (Some(space), Some(room)) = (row.space_id.clone(), row.room_id.clone()) else {
+        return forget(&state, Scope::Space, row.event_id).await;
+    };
+    let (sid, rid, eid) = (space.clone(), room.clone(), row.event_id);
+    let found = state
+        .db
+        .call(move |db| {
+            let conn = db.lock();
+            let room = crate::db::Db::room_in(&conn, &sid, &rid)?;
+            let event = crate::replies::event_in(&conn, &sid, &rid, eid)?;
+            Ok(room.zip(event))
+        })
+        .await;
+    let (room, event) = match found {
+        Ok(Some((room, event))) if event.kind == kind::MESSAGE => (room, event),
+        Ok(_) => return forget(&state, Scope::Space, row.event_id).await,
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "resuming a pending decision");
+            return;
+        }
+    };
+    let resolved: Vec<Mention> =
+        serde_json::from_value(row.payload["resolved"].clone()).unwrap_or_default();
+    let reply_agent = row.payload["reply_agent"].as_str().map(str::to_owned);
+    let addressing = if reply_agent.is_some() {
+        Addressing::Agent
+    } else {
+        Addressing::of(&resolved)
+    };
+    let settings = routing::preferences(&state, &row.user_id).await;
+    let prefs = crate::space_prefs::load(&state, &space, &row.user_id).await;
+    let (Ok(settings), Ok(prefs)) = (settings, prefs) else {
+        tracing::error!("loading settings for a pending decision");
+        return;
+    };
+    let author = Author {
+        id: Some(row.user_id.clone()),
+        name: event.actor.clone(),
+    };
+    let job = Deferred {
+        state: state.clone(),
+        user: row.user_id,
+        space,
+        room,
+        author,
+        event,
+        resolved,
+        addressing,
+        settings,
+        prefs,
+        reply_agent,
+    };
+    // Its sender's notes went with the old process: nobody collects them.
+    let _ = job.run().await;
 }
 
 /// The stored recipients: `resolved`, then the replied agent unless it was

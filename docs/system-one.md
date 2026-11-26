@@ -161,8 +161,9 @@ For these decisions:
 - An unaddressed message that started a run this way is stored with
   `addressed_by: "classifier"`, which no client can send. The run's activity
   shows how its agent was chosen, for example *Picked by classifier: Coder*.
-  In the source, not released, [deferred decisions](#decisions-after-posting)
-  don't store the pick and the desktop doesn't show that label.
+  In the source, not released, the run shows only as the picked agent's
+  run: [deferred decisions](#decisions-after-posting) don't store the pick
+  on the message, and the server no longer writes that label.
 - It never sees a people-only message, which never starts an agent.
 - It never sees a message to a named agent (`@coder`, or Ask agent with an
   agent chosen).
@@ -208,27 +209,49 @@ a named agent mention.
 returns the message at once. If it would otherwise wait on System One
 (the sender's opt-in classification, the classifier's pick for `@agent`,
 or use-case routing), the response has `decisions_pending: true`; the
-server then makes those decisions exactly once and starts the runs they
-choose, whether or not anyone collects the result. People-only messages
-and messages to a named agent are still never classified.
+server then makes those decisions and starts the runs they choose,
+whether or not anyone collects the result. People-only messages and
+messages to a named agent are still never classified. A message whose
+POST chooses a model for the turn (`provider_connection_id`) still
+decides before the POST returns.
 
+- **It survives a restart.** The pending decision is saved in the same
+  transaction as the message. At startup the server makes every decision
+  still pending, in message order, with the sender's current settings.
+  Registering the run it starts (or finding that nothing starts) settles
+  it in the same transaction that checks the message still exists, so a
+  message starts its runs at most once.
+- **A deleted message starts nothing.** Deleting the message drops its
+  pending decision, and a run is never registered for a message deleted
+  while System One was deciding, so no model is called for it. An agent
+  deleted meanwhile isn't picked either.
+- **Bounded.** At most 8 deferred decisions call System One at once on a
+  server, and 2 per person; more wait their turn and none is dropped.
 - The decision never edits the stored message: a classifier's pick isn't
-  added to its recipients. It appears only as run activity, and the
-  desktop no longer labels it *Picked by classifier* or *detected by
-  System One*.
+  added to its recipients. It appears only as the run of that agent; the
+  server writes no *Picked by classifier* label and the desktop shows no
+  *detected by System One* pill.
 - `POST /v1/spaces/{sid}/rooms/{rid}/messages/{eid}/decisions` with `{}`
   returns the sender-only `addressing_note` and `routing_note`, as POST
   metadata shaped like the message response. Only the message's
   authenticated sender gets them, once, while still a member and while
-  the message exists; anyone else, a second call, a deleted message or a
-  server restart gets `404`. Outcomes are kept in memory for up to 10
-  minutes. If the decisions are still running after 90 seconds, the call
-  returns `202 {decisions_pending: true}`; ask again.
-- An agent deleted, or a message deleted, before the decision is made
-  starts nothing.
+  the message still exists as their message (a deleted message's
+  tombstone doesn't count). Membership is checked when the call arrives
+  and again after the wait. The notes are kept in memory only, for up to
+  10 minutes after the decision finished: anyone else, a second call, a
+  deleted message, a decision whose task ended without an outcome, or a
+  decision made again after a restart gets `404` (the decision itself
+  still runs). If the decisions are still running after 90 seconds, the
+  call returns `202 {decisions_pending: true}`; ask again.
 - Without `defer_decisions`, the POST waits for the decisions as before.
-- Personal Chat routing also runs after the message is stored and
-  returned. A turn that can't start says why in the Chat.
+- **Personal Chat** returns the message first too, then routes and starts
+  the turn, saved the same way so a restart still starts it. A person's
+  Chat turns start in the order they were sent. Each turn is registered
+  while it waits and routes, so **Stop** and the "reply running" check see
+  it; a turn stopped before it started, or whose message was deleted,
+  never starts. A turn that can't start says why in the Chat; after a
+  restart, a turn whose chosen model can no longer be used says so and
+  doesn't run.
 
 In a local test with a scripted System One taking 1,000 ms, the message
 was visible to another member 1–2 ms after the POST, against about

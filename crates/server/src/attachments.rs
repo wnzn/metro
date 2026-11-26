@@ -139,6 +139,7 @@ pub fn append_message(
     asset_ids: &[String],
     recipients: &[crate::mentions::Mention],
     meta: &MessageMeta,
+    pending: Option<&crate::decisions::NewPending>,
 ) -> anyhow::Result<Append> {
     let Some(sender) = author.id.as_deref() else {
         return Ok(Append::NoRoom);
@@ -227,6 +228,10 @@ pub fn append_message(
             "INSERT INTO message_attachments (scope, event_id, position, asset_id) VALUES (?1, ?2, ?3, ?4)",
             params![place.scope(), event.id, position as i64, a.asset_id],
         )?;
+    }
+    // A decision to make after the response is durable with its message.
+    if let Some(p) = pending {
+        crate::decisions::insert_in(&tx, p, event.id)?;
     }
     tx.commit()?;
     event.attachments = attachments.into_iter().map(Attachment::File).collect();

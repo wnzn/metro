@@ -317,3 +317,25 @@ test("only your own DM messages offer Delete; a confirmed delete removes it for 
   expect(app.shows("text:From Dana")).toBe(true);
   expect(app.shows("text:/target_event_id/")).toBe(false);
 });
+
+test("deleting the oldest DM message keeps the transcript and a reply in progress", async () => {
+  const { app, incoming } = await fixture();
+  // Alice's message is the oldest one (the fixture's pages hold two).
+  const oldest = incoming("oldest of mine");
+  Object.assign(oldest, { actor_id: "alice", actor: "Alice" });
+  const later = incoming("Second from Dana");
+  incoming("Third from Dana");
+  await app.waitFor("id:dm:dm-one", { timeout: 9000 });
+  await app.press("id:dm:dm-one");
+  await app.waitFor("text:Third from Dana", { timeout: 9000 });
+  await app.press(`id:reply:${later.id}`);
+  await app.waitFor("id:dm-reply-context");
+  await app.press(`id:delete:${oldest.id}`);
+  await app.press(`id:delete-dialog:${oldest.id}:confirm`);
+  await app.waitFor("text:oldest of mine", { state: "gone" });
+  // Several polls later: no reload of the transcript, the reply stays.
+  await app.wait(6000);
+  expect(app.shows("id:dm-reply-context")).toBe(true);
+  expect(app.shows("text:Second from Dana")).toBe(true);
+  expect(app.shows("text:Third from Dana")).toBe(true);
+});

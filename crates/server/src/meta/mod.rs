@@ -230,6 +230,16 @@ impl ChatTurns {
         (rx, TurnGuard(self.clone(), turn.to_owned()))
     }
 
+    /// The ids of `user`'s registered Chat turns (running, or waiting to
+    /// start), in no particular order.
+    pub fn turns_of(&self, user: &str) -> Vec<String> {
+        self.lock()
+            .iter()
+            .filter(|(_, (owner, _))| owner == user)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     /// Whether `user` has a Chat turn running.
     pub fn running_for(&self, user: &str) -> bool {
         self.lock().values().any(|(owner, _)| owner == user)

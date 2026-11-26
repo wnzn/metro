@@ -68,8 +68,8 @@ def latency(f, classifier, sid, lobby):
             and decided["addressing_note"] is None, "the sender's decision outcome was wrong")
     decisions(f, "bob", lobby, after["id"], 404)
     started = f.phase("bob", lobby, after["id"], "started")
-    require(activity(started).get("pick", "").startswith("Picked by classifier"),
-            "the deferred decision didn't start the picked agent")
+    require("pick" not in activity(started) and activity(started).get("agent"),
+            "the deferred decision didn't start the picked agent, shown plainly")
     f.phase("bob", lobby, after["id"])
     require(len(classifier.posts()) == 2, "a message was classified more than once")
     require(not any("addressing_note" in e or "classified" in e for e in f.events("bob", lobby)),

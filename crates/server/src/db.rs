@@ -272,7 +272,8 @@ pub struct Activity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentBadge>,
     /// Only on a Space turn's `started` event: how its agent was chosen,
-    /// e.g. `Picked by classifier: Coder` or `Addressed: @coder`.
+    /// e.g. `Addressed: @coder` or `Default agent`. Absent when the
+    /// classifier picked it; older history may still say so.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pick: Option<String>,
     /// On a `page_draft` event only: public card metadata, never the draft body.
@@ -685,6 +686,7 @@ impl Db {
         // After spaces (exclusions reference them).
         crate::meta::prefs::init(&conn)?;
         crate::compaction::init(&conn)?;
+        crate::decisions::init(&conn)?;
         // After spaces (Space pages reference them).
         crate::pages::init(&conn)?;
         let version: Option<String> = conn
@@ -1548,6 +1550,62 @@ impl Db {
             activity,
             at,
         ))
+    }
+
+    /// [`Db::append_personal_with`], only while event `trigger` of the
+    /// same Chat is still a `message`, in one transaction that also drops
+    /// its pending decision ([`crate::decisions`]). `None` (nothing
+    /// written) once the message was deleted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_personal_for_message(
+        &self,
+        user_id: &str,
+        trigger: i64,
+        kind: &str,
+        author: &Author,
+        text: &str,
+        activity: Option<&Activity>,
+    ) -> anyhow::Result<Option<Event>> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let present: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM personal_events WHERE id = ?1 AND user_id = ?2 AND kind = 'message')",
+            params![trigger, user_id],
+            |r| r.get(0),
+        )?;
+        crate::decisions::forget_in(&tx, crate::decisions::Scope::Personal, trigger)?;
+        if !present {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let at = now_ms();
+        let addressed = Addressed::room();
+        tx.execute(
+            "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                user_id,
+                kind,
+                author.name,
+                author.id,
+                text,
+                addressed.mentions.to_string(),
+                addressed.audience,
+                at,
+                activity_json(activity)?,
+            ],
+        )?;
+        let event = new_event(
+            tx.last_insert_rowid(),
+            kind,
+            author,
+            text,
+            &addressed,
+            activity,
+            at,
+        );
+        tx.commit()?;
+        Ok(Some(event))
     }
 
     pub fn personal_after(
@@ -2455,6 +2513,55 @@ mod tests {
             db.remove_member(&s.id, "bob").unwrap(),
             RemoveMember::NotMember
         );
+    }
+
+    #[test]
+    fn a_chat_turn_marker_is_written_only_for_a_message_still_there() {
+        let db = Db::open_in_memory().unwrap();
+        let alice = Author {
+            id: Some("alice".into()),
+            name: "alice".into(),
+        };
+        let kept = db
+            .append_personal("alice", kind::MESSAGE, &alice, "hi", &Addressed::room())
+            .unwrap();
+        let gone = db
+            .append_personal("alice", kind::MESSAGE, &alice, "bye", &Addressed::room())
+            .unwrap();
+        for e in [&kept, &gone] {
+            crate::decisions::insert(
+                &db,
+                &crate::decisions::NewPending {
+                    scope: crate::decisions::Scope::Personal,
+                    user_id: "alice".into(),
+                    place: None,
+                    payload: serde_json::json!({}),
+                },
+                e.id,
+            )
+            .unwrap();
+        }
+        db.lock()
+            .execute("DELETE FROM personal_events WHERE id = ?1", [gone.id])
+            .unwrap();
+        let agent = Author::server(actor::AGENT);
+        let turn = Activity::chat().at(activity::STARTED);
+        let marker = |id| {
+            db.append_personal_for_message("alice", id, kind::ACTIVITY, &agent, "", Some(&turn))
+                .unwrap()
+        };
+        assert!(
+            marker(gone.id).is_none(),
+            "a deleted message starts nothing"
+        );
+        assert!(marker(kept.id).is_some());
+        // Another person's Chat id is no trigger of alice's.
+        assert!(
+            db.append_personal_for_message("bob", kept.id, kind::ACTIVITY, &agent, "", Some(&turn))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(crate::decisions::count(&db).unwrap(), 0, "both settled");
     }
 
     #[test]

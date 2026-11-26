@@ -403,27 +403,25 @@ export function ComposerField(
   // Grows with its text (one empty line's height while empty), then scrolls.
   const height = signal(FIELD_MIN);
   return (
-    <>
-      <Input
-        class="w-full bg-transparent px-(--space-3) pt-(--space-3) pb-(--space-1) text-(length:--text-md) text-foreground placeholder:text-muted-foreground disabled:opacity-60"
-        style={{ height: height() + FIELD_PAD }}
-        ref={props.ref as never}
-        value={props.value}
-        onChange={({ value }) => props.onChange(value)}
-        onSubmit={() => props.onSubmit()}
-        submitBehavior="submit"
-        multiline
-        placeholder={props.placeholder}
-        disabled={props.disabled}
-        onFocus={() => props.onFocusChange?.(true)}
-        onBlur={() => props.onFocusChange?.(false)}
-        onCaretMove={props.onCaretMove}
-        onSelectionChange={props.onSelectionChange}
-        onContentSizeChange={({ size }) => height.set(Math.max(FIELD_MIN, Math.min(FIELD_MAX, Math.ceil(size.height))))}
-        testID={props.testID}
-        accessibilityLabel={props.accessibilityLabel ?? props.placeholder}
-      />
-    </>
+    <Input
+      class="w-full bg-transparent px-(--space-3) pt-(--space-3) pb-(--space-1) text-(length:--text-md) text-foreground placeholder:text-muted-foreground disabled:opacity-60"
+      style={{ height: height() + FIELD_PAD }}
+      ref={props.ref as never}
+      value={props.value}
+      onChange={({ value }) => props.onChange(value)}
+      onSubmit={() => props.onSubmit()}
+      submitBehavior="submit"
+      multiline
+      placeholder={props.placeholder}
+      disabled={props.disabled}
+      onFocus={() => props.onFocusChange?.(true)}
+      onBlur={() => props.onFocusChange?.(false)}
+      onCaretMove={props.onCaretMove}
+      onSelectionChange={props.onSelectionChange}
+      onContentSizeChange={({ size }) => height.set(Math.max(FIELD_MIN, Math.min(FIELD_MAX, Math.ceil(size.height))))}
+      testID={props.testID}
+      accessibilityLabel={props.accessibilityLabel ?? props.placeholder}
+    />
   );
 }
 

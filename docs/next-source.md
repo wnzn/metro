@@ -9,17 +9,20 @@ for release records.
 - **Delete messages.** Delete your own messages, any message or agent
   reply in a Space you own, anything in your personal Chat, and your own
   DM messages. It's permanent and removes reactions, attachment links,
-  search entries and covering summaries; a thread anchor with replies
-  leaves a **Message deleted** line. See [Delete](messages.md#delete).
+  search entries and covering summaries; a message with a reply thread
+  leaves a **Message deleted** line and its thread. See [Delete](messages.md#delete).
 - **Messages appear before System One decides.** The desktop stores and
   shows a Space message at once, then runs opt-in classification, the
   `@agent` pick and use-case routing in the background. In local tests
   with a scripted System One that takes 1,000 ms, the message was visible
   to another member 1–2 ms after the POST instead of about 1,022 ms.
-  Private notices still reach only the sender. A classifier's pick is
-  no longer added to the message's recipients or labelled *Picked by
-  classifier* or *detected by System One*; the run shows as that
-  agent's. Personal Chat now routes after the message is stored too.
+  Private notices still reach only the sender. Pending decisions are
+  saved with the message, so a restart still makes them, once; a message
+  deleted meanwhile starts nothing. A classifier's pick is no longer added
+  to the message's recipients or labelled *Picked by classifier* or
+  *detected by System One*; the run shows as that agent's. Personal Chat
+  now routes and starts its turn after the message is stored too, in send
+  order, and **Stop** works while it waits.
   See [classification](system-one.md#decisions-after-posting).
 - **Quieter transcript.** The composer no longer shows *Markdown
   supported*. A run that ends without an agent message shows nothing in
