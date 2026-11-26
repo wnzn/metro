@@ -1273,6 +1273,7 @@ mod tests {
 
     #[test]
     fn start_counter_rolls_back_after_three() {
+        let _no_forks = crate::test_gate::exclusive();
         let dir = managed("0.5.1");
         let root = dir.path();
         let new = Version::parse("0.5.1").unwrap();
@@ -1313,6 +1314,7 @@ mod tests {
 
     #[test]
     fn a_rollback_waits_for_another_installs_lock() {
+        let _no_forks = crate::test_gate::exclusive();
         let dir = managed("0.5.1");
         let root = dir.path();
         let new = Version::parse("0.5.1").unwrap();
@@ -1336,6 +1338,7 @@ mod tests {
 
     #[test]
     fn malformed_or_foreign_pending_files_are_left_alone() {
+        let _no_forks = crate::test_gate::exclusive();
         let new = Version::parse("0.5.1").unwrap();
         for raw in [
             &b"not json"[..],
@@ -1368,6 +1371,7 @@ mod tests {
 
     #[test]
     fn confirm_prunes_other_versions_under_the_lock() {
+        let _no_forks = crate::test_gate::exclusive();
         let dir = managed("0.5.1");
         let root = dir.path();
         fs::create_dir_all(root.join("versions/0.4.0")).unwrap();
@@ -1396,6 +1400,7 @@ mod tests {
 
     #[test]
     fn lock_rules() {
+        let _no_forks = crate::test_gate::exclusive();
         let dir = managed("0.5.0");
         let root = dir.path();
         let held = Lock::take(root).unwrap();
@@ -1410,6 +1415,7 @@ mod tests {
 
     #[test]
     fn a_switch_never_releases_a_lock_it_no_longer_owns() {
+        let _no_forks = crate::test_gate::exclusive();
         let parent = tempfile::tempdir().unwrap();
         let original = managed("0.5.0");
         let root = parent.path().join("install");

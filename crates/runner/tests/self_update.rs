@@ -18,6 +18,16 @@ use metro_release::testing::{FixtureRelease, TestVerifier, release_json, tar_gz}
 use metro_release::{Channel, Version};
 use metro_runner::update::{self, InstallKind, PendingFile, SelfUpdate, Switch, Updater};
 
+/// Every test here takes the install lock, a `flock` that belongs to its
+/// open file description, and most start processes (start checks, `fork`).
+/// A child forked by one test thread holds a copy of every descriptor until
+/// its `exec`, so another test's dropped lock can stay held in that window
+/// and its next take sees `installer_busy`. Run the tests one at a time.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 const OLD: &str = "0.9.0";
 const NEW: &str = "0.9.1";
 
@@ -134,6 +144,7 @@ fn set_exec(p: &Path) {
 
 #[test]
 fn runner_updater_and_published_installer_exclude_each_other() {
+    let _serial = serial();
     use std::process::{Command, Stdio};
     let r = managed_root();
     let temp = tempfile::tempdir().unwrap();
@@ -227,6 +238,7 @@ fn leftovers(root: &Path) -> Vec<String> {
 
 #[test]
 fn happy_path_stages_verifies_and_execs_the_new_version() {
+    let _serial = serial();
     let root = managed_root();
     let rel = release(runner_archive(NEW, "runner", &stub(0)));
     let f = serve(rel.files.clone(), NEW);
@@ -334,6 +346,7 @@ fn happy_path_stages_verifies_and_execs_the_new_version() {
 
 #[test]
 fn a_failed_exec_points_current_back() {
+    let _serial = serial();
     let root = managed_root();
     let dest = root.path.join("versions").join(NEW);
     fs::create_dir_all(&dest).unwrap();
@@ -368,6 +381,7 @@ fn a_failed_exec_points_current_back() {
 
 #[test]
 fn changing_a_non_executable_after_prepare_refuses_the_switch() {
+    let _serial = serial();
     let root = managed_root();
     let rel = release(runner_archive(NEW, "runner", &stub(0)));
     let f = serve(rel.files, NEW);
@@ -385,6 +399,7 @@ fn changing_a_non_executable_after_prepare_refuses_the_switch() {
 
 #[test]
 fn failed_rollback_exec_keeps_retry_intent_and_the_previous_copy() {
+    let _serial = serial();
     let root = managed_root();
     let old = root.path.join("versions").join(OLD).join(update::BINARY);
     fs::write(&old, b"#!/no-such-interpreter\n").unwrap();
@@ -422,6 +437,7 @@ fn failed_rollback_exec_keeps_retry_intent_and_the_previous_copy() {
 
 #[test]
 fn rollback_preparation_failure_does_not_allow_the_trial_to_confirm() {
+    let _serial = serial();
     let root = managed_root();
     let old = root.path.join("versions").join(OLD).join(update::BINARY);
     let keep = old.with_extension("temporarily-unavailable");
@@ -457,6 +473,7 @@ fn rollback_preparation_failure_does_not_allow_the_trial_to_confirm() {
 
 #[test]
 fn a_published_layout_needs_the_supported_migration_before_self_update() {
+    let _serial = serial();
     let root = managed_root();
     fs::write(
         root.path.join(update::MARKER),
@@ -480,6 +497,7 @@ fn a_published_layout_needs_the_supported_migration_before_self_update() {
 
 #[test]
 fn a_failing_start_check_changes_nothing() {
+    let _serial = serial();
     let root = managed_root();
     let rel = release(runner_archive(NEW, "runner", &stub(3)));
     let f = serve(rel.files.clone(), NEW);
@@ -496,6 +514,7 @@ fn a_failing_start_check_changes_nothing() {
 
 #[test]
 fn refusals() {
+    let _serial = serial();
     // Not newer: no request at all.
     let root = managed_root();
     let rel = release(runner_archive(NEW, "runner", &stub(0)));
@@ -576,6 +595,7 @@ fn refusals() {
 
 #[test]
 fn a_busy_installer_lock_stops_the_update() {
+    let _serial = serial();
     let root = managed_root();
     fs::create_dir(root.path.join(update::LOCK)).unwrap(); // the script's lock
     let rel = release(runner_archive(NEW, "runner", &stub(0)));
@@ -593,6 +613,7 @@ fn a_busy_installer_lock_stops_the_update() {
 
 #[test]
 fn only_an_enabled_managed_release_runner_acts_on_a_request() {
+    let _serial = serial();
     let root = managed_root();
     let rel = release(runner_archive(NEW, "runner", &stub(0)));
     let f = serve(rel.files.clone(), NEW);
@@ -653,6 +674,7 @@ fn only_an_enabled_managed_release_runner_acts_on_a_request() {
 
 #[test]
 fn check_start_validates_without_contacting_the_server() {
+    let _serial = serial();
     use std::process::Command;
     let ws = tempfile::tempdir().unwrap();
     // A listener that records whether anything connected.
