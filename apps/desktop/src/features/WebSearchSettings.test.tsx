@@ -222,7 +222,7 @@ test("Web search describes device selection and privacy with no disclosure requi
   const w = fixture();
   w.alice.device.worker = "offline";
   const app = await start(w, true, { width: 720, height: 480 });
-  await app.waitFor("id:websearch-worker >> text:Offline");
+  await app.waitFor("id:websearch-worker >> text:Disconnected");
   expect(text(app)).toContain("This switch and these provider settings apply only to this computer.");
   expect(text(app)).toContain("For runs you start, Metro selects your most recently seen online web device on this server for each permitted search or page read.");
   expect(text(app)).toContain("If none of your web devices is online");
@@ -428,7 +428,7 @@ test("missing and old helper, unsupported server and out-of-service worker never
   const w = fixture();
   w.alice.device.worker = "offline";
   const app = await start(w);
-  await app.waitFor("id:websearch-worker >> text:Offline");
+  await app.waitFor("id:websearch-worker >> text:Disconnected");
   w.alice.device.worker = "error";
   w.alice.device.detail = "Couldn't set up web search with Metro: This Metro server doesn't offer web search yet";
   await app.press("id:websearch-refresh");
