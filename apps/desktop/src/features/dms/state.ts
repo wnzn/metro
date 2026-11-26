@@ -36,6 +36,8 @@ let readThrough = 0;
 let firstId = 0;
 let tail = 0;
 let reactionOffset = 0;
+/** Messages of this transcript known to be deleted: the floor check ignores them. */
+const deletedIds = new Set<number>();
 const denied = (error: unknown) => error instanceof ApiError && (error.kind === "not_found" || error.kind === "forbidden");
 const loadFailure = "Couldn't load this conversation. Try again.";
 
@@ -60,6 +62,7 @@ function clearTranscript() {
     dmReply.set(null);
   });
   readThrough = firstId = tail = reactionOffset = 0;
+  deletedIds.clear();
 }
 
 function leaveDm() {
@@ -201,6 +204,7 @@ function adoptPage(page: { events: RoomEvent[]; reactions: Reactions }) {
     if (gone) {
       // A deletion, in cursor order: the message and its reactions go.
       rows.delete(gone.targetEventId);
+      deletedIds.add(gone.targetEventId);
       delete reactions[gone.targetEventId];
       if (dmReply()?.id === gone.targetEventId) dmReply.set(null);
       continue;
@@ -232,6 +236,19 @@ async function pollActive(api: NonNullable<ReturnType<typeof apiClient>>) {
     const head = await page(0);
     if (!current()) return;
     const first = head.events.find(e => e.kind === "message")?.id ?? 0;
+    // The first message changes when the floor moves (a hide elsewhere), not
+    // when the oldest message was deleted: look ahead for that deletion first.
+    if (firstId && first !== firstId && !deletedIds.has(firstId) && first > firstId) {
+      let after = tail;
+      for (let pages = 0; pages < 10 && !deletedIds.has(firstId); pages++) {
+        const next = await page(after);
+        if (!current()) return;
+        if (!next.events.length) break;
+        adoptPage(next);
+        after = next.events.at(-1)!.id;
+      }
+    }
+    if (firstId && first !== firstId && deletedIds.has(firstId) && first > firstId) firstId = first;
     if (firstId && first !== firstId) {
       clearTranscript();
       dmProblem.set("");

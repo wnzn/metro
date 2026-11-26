@@ -16,10 +16,10 @@
 //! One transaction removes the message from the transcript with its
 //! reactions (and their `reaction` events), attachment links, everyone's
 //! search vectors and any conversation summary that covers it, so no later
-//! run sends it to a model. A message that anchors a reply thread with
-//! events keeps a [`kind::DELETED`] row with no text, recipients or
-//! metadata, so the thread still has its place; otherwise the row is gone
-//! (with an empty reply thread). A [`kind::MESSAGE_DELETED`] event in the
+//! run sends it to a model. A message that anchors a reply thread (even an
+//! empty one) keeps a [`kind::DELETED`] row with no text, recipients or
+//! metadata, so the thread keeps its place; otherwise the row is gone. A
+//! pending System One decision for it is dropped ([`crate::decisions`]). A [`kind::MESSAGE_DELETED`] event in the
 //! same stream tells every reader, like a `reaction` event. Runs already
 //! started go on; deleting never starts agent work and never calls a model.
 
@@ -155,15 +155,8 @@ pub fn delete_in_space(
             |r| r.get(0),
         )
         .optional()?;
-    let thread_events: i64 = match &thread {
-        Some(t) => tx.query_row(
-            "SELECT COUNT(*) FROM space_events WHERE space_id = ?1 AND room_id = ?2",
-            params![sid, t],
-            |r| r.get(0),
-        )?,
-        None => 0,
-    };
-    let tombstone = thread_events > 0;
+    // The thread stays, even empty, under a tombstone of its anchor.
+    let tombstone = thread.is_some();
     tx.execute(
         "DELETE FROM space_reactions WHERE space_id = ?1 AND room_id = ?2 AND target_event_id = ?3",
         params![sid, rid, eid],
@@ -192,25 +185,22 @@ pub fn delete_in_space(
         )?;
     } else {
         tx.execute("DELETE FROM space_events WHERE id = ?1", [eid])?;
-        if let Some(t) = &thread {
-            tx.execute(
-                "DELETE FROM space_rooms WHERE space_id = ?1 AND id = ?2",
-                params![sid, t],
-            )?;
-        }
     }
-    // Summaries of this room or its threads that cover it.
+    crate::decisions::forget_in(&tx, crate::decisions::Scope::Space, eid)?;
+    // Summaries that cover it: of its own room, and of the reply thread
+    // anchored on it (whose history begins with it).
     let covering: Vec<(i64, String)> = {
         let mut stmt = tx.prepare(&format!(
             "SELECT id, room_id FROM space_events
              WHERE space_id = ?1 AND kind = 'compaction'
-               AND room_id IN (SELECT id FROM space_rooms WHERE space_id = ?1
-                               AND (id = ?2 OR parent_room_id = ?2))
+               AND (room_id = ?2 OR room_id = ?4)
                AND {}",
             covers(3)
         ))?;
-        stmt.query_map(params![sid, rid, eid], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<Result<_, _>>()?
+        stmt.query_map(params![sid, rid, eid, thread], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<Result<_, _>>()?
     };
     let at = now_ms();
     let mut written = Vec::with_capacity(1 + covering.len());
@@ -286,6 +276,7 @@ pub fn delete_in_chat(
         params![who.id, eid],
     )?;
     tx.execute("DELETE FROM personal_events WHERE id = ?1", [eid])?;
+    crate::decisions::forget_in(&tx, crate::decisions::Scope::Personal, eid)?;
     let covering: Vec<i64> = {
         let mut stmt = tx.prepare(&format!(
             "SELECT id FROM personal_events WHERE user_id = ?1 AND kind = 'compaction' AND {}",
@@ -422,14 +413,27 @@ mod tests {
                 )
                 .unwrap();
             }
-            for (from, through) in [(keep.id, gone.id), (keep.id, keep.id)] {
+            // Covering in its room, not covering, and covering ids but in
+            // another thread of the room: only the first goes.
+            conn.execute(
+                "INSERT INTO space_rooms (space_id, id, name, parent_room_id, created_at)
+                 VALUES (?1, 'other-thread', 'Other', 'lobby', 1)",
+                [&space.id],
+            )
+            .unwrap();
+            for (room, from, through) in [
+                ("lobby", keep.id, gone.id),
+                ("lobby", keep.id, keep.id),
+                ("other-thread", keep.id, gone.id),
+            ] {
                 conn.execute(
                     "INSERT INTO space_events (space_id, room_id, kind, actor, text, created_at, activity)
-                     VALUES (?1, 'lobby', 'compaction', 'Metro', 'summary', 1, ?2)",
+                     VALUES (?1, ?3, 'compaction', 'Metro', 'summary', 1, ?2)",
                     params![
                         space.id,
                         json!({"compaction": {"from_event_id": from, "through_event_id": through}})
-                            .to_string()
+                            .to_string(),
+                        room
                     ],
                 )
                 .unwrap();
@@ -470,7 +474,7 @@ mod tests {
                 "SELECT COUNT(*) FROM space_events WHERE kind = 'compaction' AND ?1 > 0",
                 1
             ),
-            1
+            2
         );
         let left = db.events_after(&space.id, "lobby", 0, 100).unwrap();
         assert!(left.iter().any(|e| e.id == keep.id));

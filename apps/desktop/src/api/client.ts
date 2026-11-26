@@ -61,7 +61,7 @@ export type EventActivity = {
   route?: ActivityRoute;
   /** The Space agent working this turn, on every event of it (absent in personal Chat, Demo and older history). */
   agent?: EventAgent;
-  /** Only on a Space turn's `started` marker: how its agent was chosen ("Picked by classifier: Coder"). */
+  /** Only on a Space turn's `started` marker: how its agent was chosen ("Addressed: @coder"); absent when the classifier picked it. */
   pick?: string;
   /** The small room-visible proposal card, not the draft itself. */
   page_draft?: PageDraftEvent;
@@ -1535,8 +1535,7 @@ export function toActivity(v: unknown): EventActivity | undefined {
   const agent = toEventAgent(v.agent);
   if (agent) activity.agent = agent;
   const pick = shortText(v.pick, 200);
-  // The classifier's pick shows as the run's agent, with no label of its own.
-  if (pick && !pick.startsWith("Picked by classifier")) activity.pick = pick;
+  if (pick) activity.pick = pick;
   const tool = parseWebTool(v.tool);
   if (tool && v.source === "agent") activity.tool = tool;
   return activity;

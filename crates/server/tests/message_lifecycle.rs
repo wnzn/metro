@@ -132,14 +132,21 @@ struct H {
     http: reqwest::Client,
     backend: Arc<Backend>,
     model_calls: Arc<Mutex<Vec<Value>>>,
+    state: AppState,
 }
 
 impl H {
     async fn start() -> Self {
+        Self::start_with(None, 0).await
+    }
+
+    /// A server on `file` (a fresh in-memory database without one) whose
+    /// System One answers after `delay_ms`.
+    async fn start_with(file: Option<&std::path::Path>, delay_ms: u64) -> Self {
         let model_calls = Arc::new(Mutex::new(Vec::new()));
         let config = Config {
             bind: "127.0.0.1:0".parse().unwrap(),
-            db_path: ":memory:".into(),
+            db_path: file.map_or(":memory:".into(), |f| f.to_path_buf()),
             model: Some(ModelConfig {
                 base_url: model(model_calls.clone()).await,
                 model: "env-model".into(),
@@ -151,19 +158,35 @@ impl H {
             },
             org_admins: vec!["carol".into()],
         };
-        let db = Db::open_in_memory().unwrap();
+        let db = match file {
+            Some(f) => Db::open(f).unwrap(),
+            None => Db::open_in_memory().unwrap(),
+        };
         let mut state = AppState::new(config, db, Arc::new(FakeAuth)).await.unwrap();
         let backend = Arc::new(Backend::default());
+        backend.delay_ms.store(delay_ms, Ordering::SeqCst);
         state.routing = Routing::new(backend.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+        let served = state.clone();
+        tokio::spawn(async move { axum::serve(listener, router(served)).await.unwrap() });
         Self {
             base,
             http: reqwest::Client::new(),
             backend,
             model_calls,
+            state,
         }
+    }
+
+    fn pending(&self) -> i64 {
+        metro_server::decisions::count(&self.state.db).unwrap()
+    }
+
+    async fn chat(&self, who: &str) -> Vec<Value> {
+        let (s, v) = self.req(Method::GET, who, "/v1/chat/events", None).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        v["events"].as_array().unwrap().clone()
     }
 
     async fn req(
@@ -375,13 +398,9 @@ async fn a_deferred_classification_shows_the_message_before_system_one_answers()
             e["kind"] == "activity" && e["activity"]["phase"] == "started"
         })
         .await;
-    assert!(
-        started["activity"]["pick"]
-            .as_str()
-            .unwrap()
-            .starts_with("Picked by classifier"),
-        "{started}"
-    );
+    // The pick is the run's agent, with no "Picked by classifier" label.
+    assert!(started["activity"].get("pick").is_none(), "{started}");
+    assert!(started["activity"]["agent"]["id"].is_string(), "{started}");
     h.reply_after(&sid, "lobby", id(&posted)).await;
     assert_eq!(
         h.decisions("alice", &sid, id(&posted)).await.0,
@@ -741,7 +760,7 @@ async fn a_thread_anchor_with_replies_leaves_a_tombstone() {
         .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 
-    // Without replies, the message and its empty thread go entirely.
+    // An empty thread stays too, under a tombstone with no replies.
     let lonely = h
         .sent("bob", &sid, "lobby", json!({"text": "no replies"}))
         .await;
@@ -757,18 +776,34 @@ async fn a_thread_anchor_with_replies_leaves_a_tombstone() {
         .delete("bob", &format!("{room}/events/{}", id(&lonely)))
         .await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(payload(&deleted["events"][0])["tombstone"], false);
+    assert_eq!(payload(&deleted["events"][0])["tombstone"], true);
+    let stone = h
+        .events("alice", &sid, "lobby")
+        .await
+        .into_iter()
+        .find(|e| id(e) == id(&lonely))
+        .unwrap();
+    assert_eq!(stone["kind"], "deleted");
+    assert_eq!(stone["replies"]["count"], 0, "{stone}");
     let (_, rooms) = h
         .req(Method::GET, "bob", &format!("/v1/spaces/{sid}/rooms"), None)
         .await;
     assert!(
-        !rooms["rooms"]
+        rooms["rooms"]
             .as_array()
             .unwrap()
             .iter()
             .any(|r| r["id"] == empty["id"]),
         "{rooms}"
     );
+    let (s, again) = h
+        .post(
+            "bob",
+            &format!("{room}/events/{}/thread", id(&lonely)),
+            json!({}),
+        )
+        .await;
+    assert_eq!((s, &again["id"]), (StatusCode::OK, &empty["id"]));
 }
 
 #[tokio::test]
@@ -833,4 +868,287 @@ async fn personal_chat_deletion_is_the_owners_alone() {
     let left = ids(chat["events"].as_array().unwrap());
     assert!(!left.contains(&id(&note)) && !left.contains(&id(&reply)));
     assert!(left.contains(&id(&asked)));
+}
+
+// ---- Durable, rechecked decisions ----
+
+fn started_for(events: &[Value], after: i64) -> usize {
+    events
+        .iter()
+        .filter(|e| id(e) > after && e["kind"] == "activity" && e["activity"]["phase"] == "started")
+        .count()
+}
+
+#[tokio::test]
+async fn a_restart_makes_a_pending_decision_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("metro.sqlite3");
+    // The first server's System One never answers in time: it "crashes"
+    // with the decision pending.
+    let before = H::start_with(Some(&file), 60_000).await;
+    let sid = before.space().await;
+    before.classify(&sid).await;
+    let posted = before
+        .sent(
+            "alice",
+            &sid,
+            "lobby",
+            json!({"text": "decide after a restart", "defer_decisions": true}),
+        )
+        .await;
+    assert_eq!(posted["decisions_pending"], true);
+    assert_eq!(
+        before.pending(),
+        1,
+        "the pending decision is stored with its message"
+    );
+    // A Chat turn left pending by a crash between storing and starting.
+    let note = {
+        let author = metro_server::db::Author {
+            id: Some("bob".into()),
+            name: "bob".into(),
+        };
+        let addressed = metro_server::db::Addressed {
+            mentions: json!([{"kind": "agent"}]),
+            audience: "agent".into(),
+            spans: None,
+        };
+        let eid = before
+            .state
+            .db
+            .append_personal(
+                "bob",
+                "message",
+                &author,
+                "chat after a restart",
+                &addressed,
+            )
+            .unwrap()
+            .id;
+        metro_server::decisions::insert(
+            &before.state.db,
+            &metro_server::decisions::NewPending {
+                scope: metro_server::decisions::Scope::Personal,
+                user_id: "bob".into(),
+                place: None,
+                payload: json!({"choice": null}),
+            },
+            eid,
+        )
+        .unwrap();
+        eid
+    };
+    assert_eq!(before.pending(), 2);
+
+    let after = H::start_with(Some(&file), 0).await;
+    assert_eq!(
+        metro_server::decisions::resume(after.state.clone())
+            .await
+            .unwrap(),
+        2
+    );
+    after.reply_after(&sid, "lobby", id(&posted)).await;
+    let mut answered = false;
+    for _ in 0..400 {
+        if after
+            .chat("bob")
+            .await
+            .iter()
+            .any(|e| e["kind"] == "agent" && id(e) > note)
+        {
+            answered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        answered,
+        "the pending Chat turn didn't start after the restart"
+    );
+    assert_eq!(after.classifier_calls(), 1);
+    assert_eq!(after.pending(), 0, "a decision that ran is settled");
+    // Another restart finds nothing to do: no double dispatch.
+    assert_eq!(
+        metro_server::decisions::resume(after.state.clone())
+            .await
+            .unwrap(),
+        0
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let room = after.events("alice", &sid, "lobby").await;
+    assert_eq!(started_for(&room, id(&posted)), 1);
+    assert_eq!(started_for(&after.chat("bob").await, note), 1);
+    assert_eq!(after.classifier_calls(), 1);
+}
+
+#[tokio::test]
+async fn a_message_deleted_while_system_one_decides_starts_nothing() {
+    let h = H::start_with(None, 700).await;
+    let sid = h.space().await;
+    h.classify(&sid).await;
+    let room = format!("/v1/spaces/{sid}/rooms/lobby");
+    let calls = h.model_calls.lock().unwrap().len();
+    let posted = h
+        .sent(
+            "alice",
+            &sid,
+            "lobby",
+            json!({"text": "never mind this", "defer_decisions": true}),
+        )
+        .await;
+    assert_eq!(posted["decisions_pending"], true);
+    let (s, _) = h
+        .delete("alice", &format!("{room}/events/{}", id(&posted)))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.pending(), 0, "deleting drops the pending decision");
+    assert_eq!(
+        h.decisions("alice", &sid, id(&posted)).await.0,
+        StatusCode::NOT_FOUND
+    );
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let events = h.events("alice", &sid, "lobby").await;
+    assert_eq!(started_for(&events, id(&posted)), 0, "{events:?}");
+    assert!(!events.iter().any(|e| e["kind"] == "error"), "{events:?}");
+    assert_eq!(
+        h.model_calls.lock().unwrap().len(),
+        calls,
+        "the model was called"
+    );
+}
+
+#[tokio::test]
+async fn a_chat_message_deleted_before_its_turn_starts_nothing() {
+    let h = H::start().await;
+    // Hold Alice's line: her next turn waits behind this ticket.
+    let held = h.state.decisions.chat_ticket("alice");
+    let (s, sent) = h
+        .post("alice", "/v1/chat/messages", json!({"text": "forget this"}))
+        .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{sent}");
+    let (s, _) = h
+        .delete("alice", &format!("/v1/chat/events/{}", id(&sent)))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    drop(held);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let chat = h.chat("alice").await;
+    assert_eq!(started_for(&chat, 0), 0, "{chat:?}");
+    assert!(h.model_calls.lock().unwrap().is_empty());
+    assert_eq!(h.pending(), 0);
+    assert!(h.state.chat_runs.turns_of("alice").is_empty());
+}
+
+#[tokio::test]
+async fn a_chat_turn_can_be_stopped_before_it_starts_and_turns_keep_send_order() {
+    let h = H::start().await;
+    let held = h.state.decisions.chat_ticket("alice");
+    let mut sent = Vec::new();
+    for text in ["first", "second", "third"] {
+        let (s, v) = h
+            .post("alice", "/v1/chat/messages", json!({"text": text}))
+            .await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+        sent.push(id(&v));
+    }
+    // All three are registered while they wait, so Stop finds them.
+    let mut turns = Vec::new();
+    for _ in 0..100 {
+        turns = h.state.chat_runs.turns_of("alice");
+        if turns.len() == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(turns.len(), 3);
+    // Compaction waits while a turn is registered.
+    let (s, _) = h.post("alice", "/v1/chat/compact", json!({})).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    // Stop one of them (which one doesn't matter: each answers its own message).
+    let (s, v) = h
+        .post(
+            "alice",
+            &format!("/v1/chat/turns/{}/stop", turns[0]),
+            json!({}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    drop(held);
+    for _ in 0..400 {
+        let chat = h.chat("alice").await;
+        if chat.iter().filter(|e| e["kind"] == "agent").count() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let chat = h.chat("alice").await;
+    assert_eq!(
+        chat.iter().filter(|e| e["kind"] == "agent").count(),
+        2,
+        "{chat:?}"
+    );
+    assert_eq!(started_for(&chat, 0), 2, "the stopped turn never started");
+    // Started markers follow send order: each before the next message's.
+    let firsts: Vec<i64> = chat
+        .iter()
+        .filter(|e| e["kind"] == "activity" && e["activity"]["phase"] == "started")
+        .map(id)
+        .collect();
+    assert!(firsts.windows(2).all(|w| w[0] < w[1]));
+    assert_eq!(h.pending(), 0);
+    let _ = sent;
+}
+
+#[tokio::test]
+async fn a_tombstone_has_no_decisions_and_isnt_in_reply_thread_history() {
+    let h = H::start_with(None, 300).await;
+    let sid = h.space().await;
+    h.classify(&sid).await;
+    let room = format!("/v1/spaces/{sid}/rooms/lobby");
+    let anchor = h
+        .sent(
+            "alice",
+            &sid,
+            "lobby",
+            json!({"text": "the anchor says pineapple", "defer_decisions": true}),
+        )
+        .await;
+    let (s, thread) = h
+        .post(
+            "bob",
+            &format!("{room}/events/{}/thread", id(&anchor)),
+            json!({}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (s, _) = h
+        .delete("alice", &format!("{room}/events/{}", id(&anchor)))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    // A tombstone is not the sender's message any more.
+    assert_eq!(
+        h.decisions("alice", &sid, id(&anchor)).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let tid = thread["id"].as_str().unwrap();
+    let ask = h
+        .sent(
+            "bob",
+            &sid,
+            tid,
+            json!({"text": "@agent what was it about?"}),
+        )
+        .await;
+    h.reply_after(&sid, tid, id(&ask)).await;
+    let saw = h.model_saw();
+    assert!(saw.contains("what was it about"));
+    assert!(
+        !saw.contains("pineapple"),
+        "a deleted anchor reached the model"
+    );
+    assert!(
+        !saw.contains("replying_to"),
+        "a deleted anchor is still in the preamble"
+    );
 }

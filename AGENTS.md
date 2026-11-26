@@ -227,16 +227,22 @@ see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
   the sender only, not a room event. The selected run acts as the sender.
   With `defer_decisions` (what the desktop sends), the message is stored
   and shown first and the decision follows; the pick is run activity and
-  is never written into the stored recipients. The desktop shows no
-  "Picked by classifier" or "detected by System One" label. Never
+  is never written into the stored recipients. Nothing labels it "Picked
+  by classifier" or "detected by System One". The pending decision is a
+  `pending_decisions` row written with the message and remade at startup;
+  it's settled in the transaction that registers its run, which also
+  checks the message still exists, so a run starts at most once and
+  never for a deleted message. Deferred System One calls are bounded per
+  server and per person and wait rather than drop. Never
   classify people-only or explicitly named recipients. With
   classification off (the default), unaddressed text is ordinary
   conversation.
 - Sender-only notice details are POST metadata, never a polled event,
   search result or model history. Either or both fields may be present.
-  Deferred decisions hand them out once, in memory only, through the
+  Deferred decisions hand them out once, in memory only (lost on
+  restart, while the decision itself still runs), through the
   sender-only `POST .../messages/{eid}/decisions`, which rechecks
-  membership and that the message still exists.
+  membership and that the message still exists as the sender's message.
   Bind them to the originating authenticated sender, destination and
   matching transcript row. Don't replay them after dismissal, session
   reset or access loss, or expose private model details in a shared
@@ -248,7 +254,10 @@ see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
   text mentions and the legacy `invoke_agent` flag. `infer_addressing`
   remains accepted for compatibility and the existing one-time Space
   migration, but doesn't control Chat dispatch. Use-case routing remains
-  separate and can choose the answering connection.
+  separate and can choose the answering connection. The POST returns
+  first; the turn is saved as a pending decision, registered (so Stop
+  works) before it routes, started in send order, and never started if
+  stopped or its message was deleted meanwhile.
 - **Metro in Chat** can read and act as the user in their eligible
   Spaces. The per-account switch is on by default but gated on showing
   the notice, with per-Space exclusions and live access checks. Space
@@ -369,9 +378,11 @@ see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
   bypass; unreadable or unknown is 404, not allowed is 403, not a message
   or agent reply is 409. One transaction removes its reactions,
   attachment links, everyone's search vectors and covering summaries, so
-  it never reaches a model again. A thread anchor with replies stays as
-  a `deleted` tombstone. A `message_deleted` event tells readers.
-  Deleting never starts or cancels a run.
+  it never reaches a model again. A thread anchor (even of an empty
+  thread) stays as a `deleted` tombstone, kept out of model history and
+  the thread preamble. A `message_deleted` event tells readers. Deleting
+  never starts or cancels a started run; a run not yet registered for it
+  never starts.
 - **Compaction** keeps the saved transcript intact. Chat, Space rooms
   and threads can use a model-written summary as untrusted history
   (never DMs or Page conversations). Auto is per initiator, on by default

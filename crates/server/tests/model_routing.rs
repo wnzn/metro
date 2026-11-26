@@ -761,7 +761,8 @@ async fn addressing_inference_is_opt_in_thresholded_and_abstains() {
     let started = h
         .started_after("alice", &sid, e["id"].as_i64().unwrap())
         .await;
-    assert_eq!(started["pick"], "Picked by classifier: Metro");
+    // The classifier's pick shows only as the run's agent.
+    assert!(started.get("pick").is_none(), "{started}");
     let route = h
         .route_after("alice", Some(&sid), e["id"].as_i64().unwrap())
         .await;
@@ -862,11 +863,11 @@ async fn addressing_inference_is_opt_in_thresholded_and_abstains() {
         .await;
     assert_eq!(e["audience"], "agent");
     assert_eq!(e["mentions"][0]["agent_id"], coder);
-    assert_eq!(
-        h.started_after("alice", &sid, e["id"].as_i64().unwrap())
-            .await["pick"],
-        "Picked by classifier: Coder"
-    );
+    let started = h
+        .started_after("alice", &sid, e["id"].as_i64().unwrap())
+        .await;
+    assert!(started.get("pick").is_none(), "{started}");
+    assert_eq!(started["agent"]["id"], coder);
     let (_, _, _, payload, _) = h.fake.last_call();
     assert_eq!(payload["previous"][2]["speaker_kind"], "agent");
     assert_eq!(payload["previous"][2]["speaker"], "Metro");
@@ -1956,7 +1957,7 @@ async fn the_classifier_picks_among_agents_only_for_the_sender_who_opted_in() {
         .started_after("alice", &sid, e["id"].as_i64().unwrap())
         .await;
     assert_eq!(started["agent"]["id"], coder.as_str());
-    assert_eq!(started["pick"], "Picked by classifier: Coder");
+    assert!(started.get("pick").is_none(), "{started}");
     let q = h.fake.last_call().4;
     let options = q["agent"]["criteria"].as_object().unwrap();
     assert_eq!(options.len(), 2);
@@ -2595,7 +2596,7 @@ async fn mention_spans_keep_generic_and_named_recipients_distinct_from_run_targe
     let generic_id = e["id"].as_i64().unwrap();
     let started = h.started_after("alice", &sid, generic_id).await;
     assert_eq!(started["agent"]["id"], coder.as_str());
-    assert_eq!(started["pick"], "Picked by classifier: Coder");
+    assert!(started.get("pick").is_none(), "{started}");
     assert_eq!(h.fake.calls(), before + 1);
     assert_eq!(e["mentions"], json!([user, generic]));
     assert_eq!(

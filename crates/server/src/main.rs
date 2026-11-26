@@ -55,6 +55,15 @@ async fn main() -> anyhow::Result<()> {
     }
     // Scheduled prompts are dispatched by this one task, started once.
     metro_server::schedules::spawn(state.clone());
+    // System One decisions and Chat turns still pending from before a restart.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = metro_server::decisions::resume(state).await {
+                tracing::error!(error = %format!("{e:#}"), "resuming pending decisions");
+            }
+        });
+    }
     // The daily verified release check (release builds, METRO_UPDATE_CHECK on).
     metro_server::updates::spawn(state.clone());
     metro_server::pages::spawn_cleanup(state.clone());

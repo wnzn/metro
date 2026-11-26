@@ -113,7 +113,7 @@ test("a run and its reply show their agent: name, picture or initial, and how it
   const badge = { id: coder.id, handle: "coder", name: "Coder", color: "#059669" };
   const a = { id: "run_c1", name: "Coder", source: "agent", agent: badge };
   w.f.post("acme/lobby", { kind: "message", actor: "alice", text: "can someone check the tests?", mentions: [{ kind: "agent", addressed_by: "classifier", agent_id: coder.id }], audience: "agent" } as any);
-  w.f.post("acme/lobby", { kind: "activity", actor: "agent", text: "", activity: { ...a, phase: "started", pick: "Picked by classifier: Coder" } } as any);
+  w.f.post("acme/lobby", { kind: "activity", actor: "agent", text: "", activity: { ...a, phase: "started" } } as any);
   w.f.post("acme/lobby", { kind: "reasoning_summary", actor: "agent", text: "Look at the failing test first.", activity: a } as any);
   w.f.post("acme/lobby", { kind: "activity", actor: "agent", text: "", activity: { ...a, phase: "completed" } } as any);
   const reply = w.f.post("acme/lobby", { kind: "agent", actor: "agent", text: "The flaky test depends on the clock.", activity: a } as any);

@@ -65,9 +65,11 @@ There is no admin bypass. Deleting removes the message for everyone, with
 its reactions, attachment links (the Library file stays), everyone's
 search index entries for it and any conversation summary that covers
 it, so no later run sends it to a model. A message that anchors a reply
-thread with replies leaves a **Message deleted** line so the thread keeps
-its place; an empty thread is removed with it. Runs it already started
-keep going; deleting never starts or stops agent work. Copies already
+thread, even an empty one, leaves a **Message deleted** line so the thread
+keeps its place; the deleted message is no longer part of that thread's
+agent history. Runs it already started keep going; a run that hadn't
+started yet (for example while System One was still deciding) never
+starts. Deleting never starts or stops agent work. Copies already
 forwarded, and anything already sent to a model, aren't affected.
 
 ## Direct messages and the directory
@@ -132,8 +134,9 @@ gets `403`; anything other than a `message` or `agent` event gives `409`.
 A `message_deleted` event arrives through the normal `after` poll; its
 `text` is JSON `{target_event_id, tombstone}`. With `tombstone: true`,
 the target stays as a `kind: "deleted"` event with no text, recipients
-or metadata, anchoring its reply thread. A deletion also removes covering
-`compaction` events, each with its own `message_deleted` event. DM polls
+or metadata, anchoring its reply thread. A deletion also removes the
+`compaction` events that cover it in its own room and in the reply thread
+anchored on it, each with its own `message_deleted` event. DM polls
 include deletions only with `GET /v1/dms/{id}/events?after=&deletions=1`,
 so older clients keep receiving messages only.
 
