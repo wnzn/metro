@@ -240,7 +240,15 @@ see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
   message after each wait and before each System One call, so a deleted
   message reaches no model. Classification context is only events before
   the message. Deferred System One calls are bounded per server and per
-  person and wait rather than drop. Never
+  person and wait rather than drop; a slot is held only for the call.
+  Failed pending work (any error path or panic, via a drop guard) is
+  dropped with a visible room or Chat note; work older than an hour at
+  recovery is noted as unanswered, never run. Deleting a Space deletes
+  its pending rows. A resumed choice's refusal is a generic room note.
+  One `metro-server` process per database (no lock: the dev supervisor
+  and desktop hand over a listening socket and overlap briefly); work an
+  overlapping older process stored is recovered at the next restart.
+  Never
   classify people-only or explicitly named recipients. With
   classification off (the default), unaddressed text is ordinary
   conversation.

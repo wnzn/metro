@@ -218,7 +218,8 @@ whether or not anyone collects the result. People-only messages and
 messages to a named agent are still never classified. A model chosen for
 the turn (`provider_connection_id`) is saved with the decision, so such a
 message defers too; after a restart the choice is checked again, and one
-that can no longer be used says so in the room and runs nothing.
+that can no longer be used runs nothing (see below for what the room
+reads).
 
 - **It survives a restart.** The pending decision is saved in the same
   transaction as the message, claimed by the server process that stores
@@ -231,16 +232,29 @@ that can no longer be used says so in the room and runs nothing.
   next start begins it. Runs a decision planned start one by one, so a
   restart between them starts the rest.
 - **Recovery comes first.** At startup, before accepting any request, the
-  server claims every decision and planned run the previous process left,
-  in one transaction, and queues them in message order. Only the claimant
-  dispatches, so nothing runs twice.
+  server claims every decision and planned run that another process
+  left, in one transaction, and queues them in message order. Only the
+  claimant dispatches, so nothing runs twice. This assumes
+  [one server process per database](deploy.md#after-install); work a
+  briefly overlapping older process stored is picked up at the next
+  restart.
+- **Old or failed work is said, not replayed.** Work stored more than an
+  hour before a restart isn't started: the room (or the sender's Chat)
+  reads *Metro restarted; this message wasn't answered.* If pending work
+  fails instead (an error, or its task ends), it's dropped at once with a
+  note in the room or the sender's Chat, so it can't run at a later
+  restart. A model chosen for the turn that can't be used after a restart
+  gets *Metro restarted and couldn't start this message's agent run.*,
+  with no reason or connection details in the room.
 - **A deleted message reaches no model.** The message is read again after
   every wait and before every System One call (the classification, and
   each run's use-case routing). Once it's deleted, nothing more is sent
   or started, and deleting it drops what's pending for it. An agent
   deleted meanwhile isn't picked or started either.
-- **Bounded.** At most 8 deferred decisions call System One at once on a
-  server, and 2 per person; more wait their turn and none is dropped.
+- **Bounded.** At most 8 System One calls for deferred work run at once
+  on a server, and 2 per person; more wait their turn and none is
+  dropped. A slot is held only during the call itself, never while runs
+  start, so many messages at once can't block each other.
 - The decision never edits the stored message: a classifier's pick isn't
   added to its recipients. It appears only as the run of that agent; the
   server writes no *Picked by classifier* label and the desktop shows no

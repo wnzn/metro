@@ -140,7 +140,8 @@ pub struct RouteCase {
 }
 
 impl RoutingSettings {
-    fn wants_case_routing(&self) -> bool {
+    /// Whether use-case routing calls System One for a turn.
+    pub(crate) fn wants_case_routing(&self) -> bool {
         self.enabled && !self.cases.is_empty() && self.classifier_id.is_some()
     }
 

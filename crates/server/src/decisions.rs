@@ -19,11 +19,17 @@
 //! the next startup closes as `interrupted`, visibly. A Chat turn's row is
 //! settled with its `started` marker the same way.
 //!
-//! **Recovery.** At startup, before the listener accepts anything,
+//! **Recovery.** One server process per database is assumed (there is no
+//! lock: the dev supervisor and the desktop hand a listening socket over
+//! and overlap briefly). At startup, before the listener accepts anything,
 //! [`resume`] claims every row another process left (in one transaction:
 //! `UPDATE ... RETURNING`) and enqueues it, in message order; a Chat turn
 //! gets its place in its sender's line then. Only a row's claimant ever
-//! dispatches it, so nothing runs twice. Work is reloaded from the live
+//! dispatches it, so nothing runs twice; rows an overlapping older process
+//! stored after this one started wait for the next restart. Rows older
+//! than [`STALE_AFTER`] are dropped with [`STALE_NOTE`], never run. Every
+//! flow holds a [`Watch`]: any error path or panic drops its rows with a
+//! visible note, so nothing failed is left to replay later. Work is reloaded from the live
 //! message after every wait and before every System One call; a message
 //! deleted meanwhile goes no further and reaches no model.
 //!
@@ -31,8 +37,9 @@
 //! it starts (`POST /v1/chat/turns/{id}/stop`) is saved in its pending row
 //! before the call answers, so neither this process nor the next starts it.
 //!
-//! **Bounded.** At most [`AT_ONCE`] decisions run at once on the server,
-//! and [`PER_USER`] per person; more wait their turn, none is dropped. A
+//! **Bounded.** At most [`AT_ONCE`] System One calls for deferred work run
+//! at once on the server, and [`PER_USER`] per person; more wait their
+//! turn, none is dropped. A [`Slot`] is held only for the call itself. A
 //! person's Chat turns start in the order their messages were sent.
 //!
 //! **Sender-only notes.** `POST /v1/spaces/{sid}/rooms/{rid}/messages/{eid}/decisions`
@@ -188,6 +195,22 @@ pub fn insert_in(conn: &Connection, p: &NewPending, event_id: i64) -> rusqlite::
 /// [`insert_in`] on its own, for an event stored already (tools and tests).
 pub fn insert(db: &crate::db::Db, p: &NewPending, event_id: i64) -> anyhow::Result<()> {
     Ok(insert_in(&db.lock(), p, event_id)?)
+}
+
+/// [`insert`] with a given creation time (tools and tests).
+pub fn insert_at(
+    db: &crate::db::Db,
+    p: &NewPending,
+    event_id: i64,
+    created_at: i64,
+) -> anyhow::Result<()> {
+    let conn = db.lock();
+    insert_in(&conn, p, event_id)?;
+    conn.execute(
+        "UPDATE pending_decisions SET created_at = ?1 WHERE scope = ?2 AND event_id = ?3",
+        params![created_at, p.scope.as_str(), event_id],
+    )?;
+    Ok(())
 }
 
 /// How many decisions and planned runs are pending.
@@ -375,6 +398,187 @@ pub fn cancelled(db: &crate::db::Db, event_id: i64) -> anyhow::Result<bool> {
         == Some(1))
 }
 
+/// Work stored longer ago than this isn't started at recovery: it says so
+/// instead, so nothing answers a message hours or days later.
+pub const STALE_AFTER: Duration = Duration::from_secs(60 * 60);
+
+/// What the room (or the sender's Chat) reads when pending work for a
+/// message is dropped at a restart for being too old.
+pub const STALE_NOTE: &str = "Metro restarted; this message wasn't answered.";
+/// ... when pending work for it failed (an error, or the server's task ended).
+/// ... when a resumed message's chosen model can't be used: no reason or
+/// connection details in the room.
+pub const RESTART_NOTE: &str = "Metro restarted and couldn't start this message's agent run.";
+pub const FAILED_SPACE_NOTE: &str =
+    "Metro restarted or hit an error and couldn't start this message's agent run.";
+pub const FAILED_CHAT_NOTE: &str =
+    "Metro couldn't start a reply to this message. Send it again to retry.";
+
+/// Where a dropped message's note goes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Notice {
+    Space { space: String, room: String },
+    Chat { user: String },
+}
+
+/// Drop what's pending for message `event_id` and, if the message is still
+/// there, note `text` after it (a room error, or an error in the sender's
+/// Chat), in the caller's transaction.
+pub fn fail_in(
+    conn: &Connection,
+    scope: Scope,
+    event_id: i64,
+    notice: &Notice,
+    text: &str,
+) -> rusqlite::Result<()> {
+    forget_in(conn, scope, event_id)?;
+    match notice {
+        Notice::Space { space, room } => {
+            if crate::replies::event_in(conn, space, room, event_id)?.is_some() {
+                crate::db::Db::append_event_in(
+                    conn,
+                    space,
+                    room,
+                    crate::db::kind::ERROR,
+                    &crate::db::Author::server(crate::db::actor::SYSTEM),
+                    text,
+                    &crate::db::Addressed::room(),
+                    None,
+                )
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
+            }
+        }
+        Notice::Chat { user } => {
+            conn.execute(
+                "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, mentions, audience, created_at)
+                 SELECT ?1, 'error', ?2, NULL, ?3, '[]', 'room', ?4
+                 WHERE EXISTS (SELECT 1 FROM personal_events WHERE id = ?5 AND user_id = ?1)",
+                params![user, crate::db::actor::AGENT, text, crate::db::now_ms(), event_id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Drop every row stored before `cutoff`, each message noted once.
+fn drop_stale_in(conn: &Connection, cutoff: i64) -> rusqlite::Result<()> {
+    let mut stale: Vec<(Scope, i64, Notice)> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT scope, event_id, user_id, space_id, room_id FROM pending_decisions WHERE created_at < ?1",
+        )?;
+        let rows = stmt.query_map([cutoff], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (scope, id, user, space, room) = row?;
+            stale.push(match (scope.as_str(), space, room) {
+                ("space", Some(space), Some(room)) => {
+                    (Scope::Space, id, Notice::Space { space, room })
+                }
+                _ => (Scope::Personal, id, Notice::Chat { user }),
+            });
+        }
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT event_id, space_id, room_id FROM pending_targets WHERE created_at < ?1",
+        )?;
+        let rows = stmt.query_map([cutoff], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        for row in rows {
+            let (id, space, room): (i64, String, String) = row?;
+            if !stale.iter().any(|(s, e, _)| *s == Scope::Space && *e == id) {
+                stale.push((Scope::Space, id, Notice::Space { space, room }));
+            }
+        }
+    }
+    for (scope, id, notice) in stale {
+        if let Notice::Space { space, room } = &notice
+            && crate::db::Db::room_in(conn, space, room)?.is_none()
+        {
+            forget_in(conn, scope, id)?;
+            continue;
+        }
+        fail_in(conn, scope, id, &notice, STALE_NOTE)?;
+    }
+    Ok(())
+}
+
+/// Watches one message's pending work. Dropped while armed (an error path
+/// returned early, or the task panicked), it drops the work and notes
+/// [`Watch::note`] after the message, so nothing is left to replay at a
+/// later restart and the sender sees what happened. [`Watch::done`]
+/// disarms it where the work settled, or stopped on purpose (the message
+/// was deleted, the turn stopped).
+pub struct Watch {
+    state: Option<AppState>,
+    scope: Scope,
+    event_id: i64,
+    notice: Notice,
+    /// What the note says.
+    pub note: &'static str,
+}
+
+impl Watch {
+    pub fn space(state: &AppState, space: &str, room: &str, event_id: i64) -> Self {
+        Self {
+            state: Some(state.clone()),
+            scope: Scope::Space,
+            event_id,
+            notice: Notice::Space {
+                space: space.to_owned(),
+                room: room.to_owned(),
+            },
+            note: FAILED_SPACE_NOTE,
+        }
+    }
+
+    pub fn chat(state: &AppState, user: &str, event_id: i64) -> Self {
+        Self {
+            state: Some(state.clone()),
+            scope: Scope::Personal,
+            event_id,
+            notice: Notice::Chat {
+                user: user.to_owned(),
+            },
+            note: FAILED_CHAT_NOTE,
+        }
+    }
+
+    /// The work settled or stopped on purpose: nothing to note.
+    pub fn done(mut self) {
+        self.state = None;
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        let (scope, id, notice, note) = (self.scope, self.event_id, self.notice.clone(), self.note);
+        let work = async move {
+            let r = state
+                .db
+                .call(move |db| Ok(fail_in(&db.lock(), scope, id, &notice, note)?))
+                .await;
+            if let Err(e) = r {
+                tracing::error!(error = %format!("{e:#}"), "noting failed pending work");
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(work);
+            }
+            Err(_) => tracing::error!(event = id, "pending work ended outside the runtime"),
+        }
+    }
+}
+
 /// One pending decision as stored.
 #[derive(Clone, Debug)]
 pub struct Stored {
@@ -406,6 +610,7 @@ fn claim_all(
 ) -> rusqlite::Result<(Vec<Stored>, Vec<StoredTargets>)> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     tx.execute("DELETE FROM pending_decisions WHERE cancelled = 1", [])?;
+    drop_stale_in(&tx, crate::db::now_ms() - STALE_AFTER.as_millis() as i64)?;
     let decisions = {
         let mut stmt = tx.prepare(
             "UPDATE pending_decisions SET claimed_by = ?1
