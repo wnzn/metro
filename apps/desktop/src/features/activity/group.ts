@@ -133,7 +133,6 @@ export function groupTranscript(events: readonly RoomEvent[]): TranscriptItem[] 
         terminal: null,
         route: null,
         agent: meta.agent ?? null,
-       
         activityId: meta.id,
         firstMs: null,
         lastMs: null,
@@ -244,10 +243,15 @@ export function routeConfidence(r: ActivityRoute | null): number | null {
   return Number.isFinite(p) && p >= 0 && p <= 1 ? Math.round(p * 100) : null;
 }
 
+/** Legacy text that says an agent was picked, or its run started, by the classifier. */
+const CLASSIFIER_ATTRIBUTION = /picked by (the )?classifier|detected by system one|started by system one|judged that the message asked|classifier was unsure|the classifier\b/i;
+
 /** A route's reason with "(p 0.91)" said in words ("with 91% probability"); a malformed one is dropped. */
 function readableReason(r: ActivityRoute): string {
-  // How a run was picked is never attributed to System One or a classifier, even in text an older server stored.
-  if (/system one|classifier/i.test(r.reason)) return "";
+  // How a run was picked is never attributed to a classifier, even in text an older
+  // server stored. Use-case routing's own explanations and failures ("System One
+  // matched the use case …", "routing failed: System One took too long") stay.
+  if (CLASSIFIER_ATTRIBUTION.test(r.reason)) return "";
   const pct = routeConfidence(r);
   return r.reason.replace(PROBABILITY, pct === null ? "" : ` with ${pct}% probability`).trim().replace(/[.\s]+$/, "");
 }

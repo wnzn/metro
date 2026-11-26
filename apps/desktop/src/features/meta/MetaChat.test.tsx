@@ -298,3 +298,39 @@ test("Stop works on a turn that hasn't started yet, by the id its POST returned"
   await app.waitFor("id:chat-stop", { state: "gone" });
   expect(app.shows("id:send")).toBe(true);
 });
+
+function droppingServer(f: ReturnType<typeof setup>) {
+  const base = f.network[`POST ${BASE}/v1/*`]!;
+  f.network[`POST ${BASE}/v1/*`] = req => {
+    if (new URL(req.url).pathname !== "/v1/chat/messages") return base(req);
+    const body = JSON.parse(req.body!);
+    const ev = f.addChat({ kind: "message", actor: "alice", actor_id: "alice", text: body.text, audience: "agent" } as any);
+    return ok({ ...ev, actor_id: "alice", turn_id: liveId }, 202);
+  };
+}
+
+test("a pending turn the server drops without a word stops offering Stop after two minutes", async () => {
+  const f = setup({ notice_shown: true });
+  droppingServer(f);
+  const app = await launch(f, 1200, true);
+  await app.type("id:composer", "dropped");
+  await app.press("id:send");
+  await app.waitFor("id:chat-stop");
+  await app.clock!.runFor(60_000);
+  expect(app.shows("id:chat-stop")).toBe(true);
+  await app.clock!.runFor(61_000);
+  await app.waitFor("id:chat-stop", { state: "gone" });
+  expect(app.shows("id:send")).toBe(true);
+});
+
+test("a Chat error after a pending turn's message clears its Stop", async () => {
+  const f = setup({ notice_shown: true });
+  droppingServer(f);
+  const app = await launch(f);
+  await app.type("id:composer", "refused later");
+  await app.press("id:send");
+  await app.waitFor("id:chat-stop");
+  f.addChat({ kind: "error", actor: "agent", text: "That turn was dropped." } as any);
+  await app.waitFor("id:chat-stop", { state: "gone" });
+  expect(app.shows("id:send")).toBe(true);
+});
