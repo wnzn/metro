@@ -3,11 +3,81 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
-## Metro 0.5.1 publication record pending
+## Published: Metro 0.5.1 (2026-11-26, GitHub release v0.5.1)
 
-Reserved for the verified publication time, tag and commit, CI run,
-signed release assets and image digests. This entry is not evidence
-that 0.5.1 has been published.
+**What was published.** The stable
+[Metro 0.5.1 release](https://github.com/wnzn/metro/releases/tag/v0.5.1)
+was published at `2026-11-26T00:41:30Z` (not a draft or prerelease,
+marked latest).
+Tag `v0.5.1` points to `5120c5225c0eb173ef5122bd61f1d6cd1dde6cf8`,
+the merge of [PR #18](https://github.com/wnzn/metro/pull/18).
+The push to `main` ran
+[CI 45725172627](https://github.com/wnzn/metro/actions/runs/45725172627)
+successfully, including the native Windows preview gate, asset and image
+signing, and publication. Windows code signing was skipped.
+
+The [0.5.1 Pages guide](released-0.5.1.md) describes the shipped changes.
+The [0.6.0 changes](next-source.md) are not part of this release.
+
+**Assets** (18):
+
+| File | Verification |
+| --- | --- |
+| `Metro-0.5.1-linux-x64.tar.gz` + `.sha256` | `Metro-0.5.1-linux-x64.tar.gz.sigstore.json` |
+| `Metro-0.5.1-windows-x64.zip` + `.sha256` | No Authenticode; check against the signed manifest |
+| `Metro-0.5.1-windows-x64.unsigned-preview.msi` + `.sha256` | No Authenticode; check against the signed manifest |
+| `Metro-runner-0.5.1-linux-x64.tar.gz` + `.sha256` | `Metro-runner-0.5.1-linux-x64.tar.gz.sigstore.json` |
+| `install-metro-linux.sh`, `install-metro-runner-linux.sh`, `install-metro-windows.ps1`, `metro-runner-container.sh`, `metro-runner-container.ps1` | Listed in `SHA256SUMS`; the PowerShell scripts have no Authenticode |
+| `IMAGES.txt` | Listed in `SHA256SUMS` |
+| `SHA256SUMS` | `SHA256SUMS.sigstore.json` |
+
+**Images.** Pin by digest; there is no `latest` tag. The release's
+[`IMAGES.txt`](https://github.com/wnzn/metro/releases/download/v0.5.1/IMAGES.txt)
+records these references and the workflow's keyless Sigstore verification
+of each digest against the exact source commit.
+
+| Reference | Digest | Platforms |
+| --- | --- | --- |
+| `ghcr.io/wnzn/metro-server:v0.5.1` | `sha256:2c5502775dd0f1b5dce5a7dc1814c43268951d9817af166b388e27b644878a35` | `linux/amd64`, `linux/arm64` |
+| `ghcr.io/wnzn/metro-server` | `sha256:5409378f1c6088d260b78f1b43d2f269092d82e9982867c6852ff33a1c848245` | `linux/amd64` |
+| `ghcr.io/wnzn/metro-server` | `sha256:fe12ec320d92d84ed819942611922e0edc8ac087e416407c6cb9a4d5c890d93b` | `linux/arm64` |
+| `ghcr.io/wnzn/metro-runner:v0.5.1` | `sha256:d1281ae24eb85515b83db1e910519f1d7d3f53a85c8a35b1f8b61f7026cedcf2` | `linux/amd64`, `linux/arm64` |
+| `ghcr.io/wnzn/metro-runner` | `sha256:b52235d809bc275e7cb4e3636fe91dd37dfcc3e6f67cec0c46fd471cec1f7b19` | `linux/amd64` |
+| `ghcr.io/wnzn/metro-runner` | `sha256:0da649943e36080fbc463a47c93bd26a51f6cfa6353016a00e0652ebc0711d22` | `linux/arm64` |
+| `ghcr.io/wnzn/metro-embeddinggemma2:v0.5.1` | `sha256:4f7eb84ac17aafa60695522c25544a17e335366ab74cdf8698faa5e66920aa8f` | `linux/amd64` (no weights) |
+| `ghcr.io/wnzn/metro-embeddinggemma2` | `sha256:63e6cfbf64dc527d193b64255b52ae279e31a46323f239b032b8d7fa172c9d89` | `linux/amd64` |
+
+**How it was checked** (2026-11-26, read-only):
+
+```sh
+gh release view v0.5.1 --repo wnzn/metro --json tagName,publishedAt,isPrerelease,isDraft,url,assets
+gh api repos/wnzn/metro/releases/latest --jq .tag_name
+gh api repos/wnzn/metro/git/ref/tags/v0.5.1
+gh pr view 18 --repo wnzn/metro --json mergeCommit
+gh run view 45725172627 --repo wnzn/metro --json conclusion,event,headSha,jobs
+gh release download v0.5.1 --repo wnzn/metro --pattern IMAGES.txt --output -
+gh release download v0.5.1 --repo wnzn/metro --pattern SHA256SUMS --output -
+```
+
+The 18 asset names and eight image references matched the release, and
+`IMAGES.txt` matched its checksum in `SHA256SUMS`. No release binary or
+container was run and no signature was independently verified in this
+check. The Windows CI gate is unattended, not a desktop or MSI wizard run
+by a person on native Windows. Real vendor accounts and sign-ins remain
+unverified.
+
+## Source-only 0.6.0 polish check (2026-11-26)
+
+At `f2a57d2`, 29 focused NSH tests passed for thread replies, commands,
+model controls and DMs. The picker regression caught the old layout:
+the Ask agent button intercepted a press on the picker’s chevron.
+The full desktop suite passed 956/956 from a read-only `git archive` of
+the same commit, including `crates/url-policy/testdata`.
+The offline `metro-server` suite passed 704 tests (one ignored),
+including a scheduled Chat turn posting as the owner's display name
+with the same stable ID. `nsh check`, Rust formatting and offline
+workspace Clippy passed. The publication docs passed 513 local link
+and heading-anchor checks; `git diff --check` passed.
 
 ## Source-only documentation check for 0.6.0 (2026-11-26)
 
@@ -35,7 +105,7 @@ The [0.5.0 feature guide](released-0.5.0.md) describes the shipped
 changes. The [local desktop gate at b444379](#source-only-final-local-acceptance-at-b444379)
 and [bounded backend gate at 2cb1beb](#source-only-bounded-backend-gate-at-2cb1beb)
 remain evidence for those source cuts, not runs of the published files.
-[Later Pages work](next-source.md) is not part of this release.
+[Later Pages work](released-0.5.1.md) is not part of this release.
 
 **Assets** (18):
 

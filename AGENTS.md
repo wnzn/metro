@@ -397,13 +397,15 @@ see [New in Metro 0.5.0](docs/released-0.5.0.md); for later changes, see
     Documents & media gate (497 Rust tests, the 83 hardened media-service
     tests, `nsh test` 106/106) and the earlier 403-test gate are historical
     milestones.
-  - **Metro 0.5.0 is published**: stable GitHub release `v0.5.0`
-    (2026-11-25T20:56:24Z), tag on `6a038f1` (PR #17), made by CI run
-    45692417663, with 18 assets, Sigstore-signed `SHA256SUMS`, unsigned
-    Windows files and signed GHCR images (see [release record](docs/acceptance.md#published-metro-050-2026-11-25-github-release-v050)).
+  - **Metro 0.5.1 is published**: stable GitHub release `v0.5.1`
+    (2026-11-26T00:41:30Z), tag on `5120c52` (PR #18), made by CI run
+    45725172627, with 18 assets, Sigstore-signed `SHA256SUMS`, unsigned
+    Windows files and signed GHCR images (see [release record](docs/acceptance.md#published-metro-051-2026-11-26-github-release-v051)).
     Native Windows by a person, real vendor accounts and real sign-ins
-    remain unverified. Pages work after `6a038f1` is not released.
-  - The previous release, Metro 0.4.0: GitHub release `v0.4.0` (2026-11-25),
+    remain unverified. [Pages work for 0.5.1](docs/released-0.5.1.md) is
+    released; [0.6.0 work](docs/next-source.md) is not.
+  - The previous release was [Metro 0.5.0](docs/acceptance.md#published-metro-050-2026-11-25-github-release-v050).
+    Before it, Metro 0.4.0: GitHub release `v0.4.0` (2026-11-25),
     tag on `1a743e5`, made by CI run 45560122825, with Sigstore-signed
     `SHA256SUMS`, unsigned Windows files and GHCR images signed by the release workflow
     (`docs/acceptance.md`). Metro 0.3.2 (`v0.3.2` on `d943797`, CI run
@@ -426,16 +428,16 @@ see [New in Metro 0.5.0](docs/released-0.5.0.md); for later changes, see
   sidecar next to the desktop app. Source builds live only in
   [docs/development.md](docs/development.md). Docs point to the published
   release by the names and URLs recorded in `docs/acceptance.md`: the
-  current one is **Metro 0.5.0**
-  (https://github.com/wnzn/metro/releases/tag/v0.5.0, tag `v0.5.0` on
-  `6a038f1`), with `Metro-0.5.0-linux-x64.tar.gz`,
-  `Metro-0.5.0-windows-x64.zip`,
-  `Metro-0.5.0-windows-x64.unsigned-preview.msi`,
-  `Metro-runner-0.5.0-linux-x64.tar.gz` (each with `.sha256`), the
+  current one is **Metro 0.5.1**
+  (https://github.com/wnzn/metro/releases/tag/v0.5.1, tag `v0.5.1` on
+  `5120c52`), with `Metro-0.5.1-linux-x64.tar.gz`,
+  `Metro-0.5.1-windows-x64.zip`,
+  `Metro-0.5.1-windows-x64.unsigned-preview.msi`,
+  `Metro-runner-0.5.1-linux-x64.tar.gz` (each with `.sha256`), the
   installer scripts, `SHA256SUMS` with its Sigstore bundle, `IMAGES.txt`,
-  and the images `ghcr.io/wnzn/metro-server:v0.5.0`,
-  `ghcr.io/wnzn/metro-runner:v0.5.0` and
-  `ghcr.io/wnzn/metro-embeddinggemma2:v0.5.0` (pinned by digest). Windows
+  and the images `ghcr.io/wnzn/metro-server:v0.5.1`,
+  `ghcr.io/wnzn/metro-runner:v0.5.1` and
+  `ghcr.io/wnzn/metro-embeddinggemma2:v0.5.1` (pinned by digest). Windows
   files are **unsigned** (no Authenticode). Docs never present source
   that came after a release's commit as part of that release; label it
   "in the source, not released". A newer release is named in docs only

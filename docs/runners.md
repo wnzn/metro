@@ -157,8 +157,8 @@ registered runner it offers list and read only.
 These steps use the published runner image and need no Metro source. The
 workspaces live in a named Docker volume.
 
-> **Published:** `ghcr.io/wnzn/metro-runner:v0.5.0` is in
-> [Metro 0.5.0](https://github.com/wnzn/metro/releases/tag/v0.5.0). Pin it
+> **Published:** `ghcr.io/wnzn/metro-runner:v0.5.1` is in
+> [Metro 0.5.1](https://github.com/wnzn/metro/releases/tag/v0.5.1). Pin it
 > by the digest in the release's `IMAGES.txt`
 > ([deploy.md](deploy.md#release-files-and-images)). Contributors can build
 > the same image themselves ([development.md](development.md#images-and-binaries)).

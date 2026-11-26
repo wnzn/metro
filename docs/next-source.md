@@ -149,25 +149,3 @@ A `kind: "compaction"` event has the summary in `text` and a top-level
 `trigger` (`"auto"` or `"manual"`), `by` (user ID), `by_name`, and optional
 `focus` and `previous` (an older summary event ID). A failed automatic
 summary can set `compaction_failure: {message}` on the initiator's run view.
-
-## Pages 0.5.1 work
-
-This section tracks the Pages changes from the 0.5.1 source cut, separately
-from the 0.6.0 work above. See [Acceptance](acceptance.md) for publication
-status.
-
-- Resume private drafts from Pages while you still have access to the
-  destination. Recovery and retries don't apply the draft.
-- When a Space template needs a destination (Daily brief, Release watch,
-  Space overview), pick its top-level room. It uses the Space's default
-  agent. If that room or agent changes before compilation, the server
-  refuses the draft instead of substituting another destination.
-  Runs and Files don't ask for a room.
-- The Page editor and action dialogs retain more context when dismissed
-  or retried. Daily briefs can follow an in-progress run without sending
-  it again.
-- Draft review uses **Publish page** or **Apply changes**. **Refresh** is
-  **Refresh data**; a Space brief's **Keep this answer fresh…** is
-  **Schedule brief…**.
-- The desktop changes improve Pages layout and the accessibility of
-  tables, links, diffs and headings.

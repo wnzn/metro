@@ -1,16 +1,16 @@
 # Pages and Daily briefs
 
-> **Released in Metro 0.5.0.** Use matching desktop and server releases.
-> Later [Pages 0.5.1 work](next-source.md#pages-051-work) is in the source,
-> not released.
+> Use matching desktop and server releases. See
+> [what changed in Metro 0.5.1](released-0.5.1.md).
 
 **Pages** in the sidebar holds personal dashboards and dashboards for
 Spaces you belong to. **New page** can start from a template or a prompt.
 For an existing page, use **Edit with prompt** for the whole page or
 **Select a block** to focus the change. A generated draft can be previewed
-and compared with its base. It changes nothing until **Apply**. Changes
-outside a selected block require additional confirmation, and a stale
-draft cannot overwrite a newer version.
+and compared with its base. It changes nothing until you select
+**Publish page** or **Apply changes**. Changes outside a selected block
+require additional confirmation, and a stale draft cannot overwrite a
+newer version.
 
 Pages use **Page TSX**: the server validates a restricted set of
 components, data sources and actions, and Metro renders the result with
@@ -73,7 +73,7 @@ prompts there. It is not limited to outputs of one particular task.
 An answer block explicitly linked to a Page button is different: it
 shows runs started from that button, not later scheduled room replies.
 
-For a matching Space brief, choose **Keep this answer fresh…**, then
+For a matching Space brief, choose **Schedule brief…**, then
 **Open task form** to open a prefilled scheduled prompt. This works only
 with a top-level room and the Space's default agent. Choose the
 schedule and time zone and save the task yourself;
