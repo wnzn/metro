@@ -79,11 +79,12 @@ pub(super) async fn space_send(ctx: &Ctx, a: Value) -> R {
         return Err(format!("at most {MENTIONS_MAX} people can be mentioned"));
     }
     // The grant, provenance and the addressed agent, checked together.
-    let (own, sid, rid, wanted) = (
+    let (own, sid, rid, wanted, reply_to) = (
         ctx.own_text.clone(),
         a.space_id.clone(),
         a.room_id.clone(),
         a.agent_id.clone(),
+        a.reply_to,
     );
     let (space, room, agent) = on_db(ctx, move |db, grant| {
         let conn = db.lock();
@@ -104,8 +105,22 @@ pub(super) async fn space_send(ctx: &Ctx, a: Value) -> R {
             None => return Ok(Err("no such room".to_owned())),
         };
         let agents = crate::space_agents::list_in(&conn, &space.id)?;
-        let agent = match &wanted {
-            Some(id) => agents.into_iter().find(|a| &a.id == id),
+        // A reply to an agent's message asks that agent, like a person's
+        // reply; otherwise the default agent. Exactly one agent is asked.
+        let replied = match (&wanted, reply_to) {
+            (None, Some(id)) => {
+                match crate::replies::reply_target_in(&conn, &space.id, &room.id, id)? {
+                    Ok(target) => match crate::replies::reply_agent(&target, &agents) {
+                        crate::replies::ReplyAgent::Agent(a) => Some(a.id.clone()),
+                        _ => None,
+                    },
+                    Err(_) => None,
+                }
+            }
+            _ => None,
+        };
+        let agent = match wanted.or(replied) {
+            Some(id) => agents.into_iter().find(|a| a.id == id),
             None => agents.into_iter().find(|a| a.is_default),
         };
         match agent {
@@ -135,6 +150,9 @@ pub(super) async fn space_send(ctx: &Ctx, a: Value) -> R {
             mentions,
             infer_text_mentions: false,
             reply_to: a.reply_to,
+            // The agent above is the only one asked: a reply to another
+            // agent's message doesn't add that agent too.
+            reply_to_agent: false,
             via: Some(Via::Metro),
             ..Outgoing::new(text)
         },

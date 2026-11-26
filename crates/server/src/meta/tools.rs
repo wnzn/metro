@@ -192,7 +192,8 @@ impl Tool {
             ),
             Tool::Send => (
                 "Post a message into a Space room or thread now, as the user, marked via Metro. \
-                 It asks the Space's default agent unless agent_id names another. Only to a \
+                 It asks exactly one agent: agent_id, else the agent whose message reply_to \
+                 answers, else the Space's default agent. Only to a \
                  Space the user named in their own messages. With wait, wait up to two minutes \
                  for the agent's answer.",
                 json!({"space_id": id, "room_id": id,

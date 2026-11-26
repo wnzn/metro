@@ -740,6 +740,67 @@ async fn a_destination_named_only_by_space_content_is_refused() {
 }
 
 #[tokio::test]
+async fn a_post_replying_to_an_agent_asks_only_that_agent() {
+    let h = H::start().await;
+    let s = h.space("Design").await;
+    let (st, v) = h
+        .post(
+            "alice",
+            &format!("/v1/spaces/{}/agents", s.id),
+            json!({"name": "Coder", "handle": "coder", "description": "Writes code"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{v}");
+    let coder = v["id"].as_str().unwrap().to_owned();
+    h.say(
+        "alice",
+        &s.id,
+        "hi",
+        json!({"mentions": [{"kind": "agent", "agent_id": coder}]}),
+    )
+    .await;
+    let reply = h.wait_room(&s.id, |e| e["kind"] == "agent").await;
+    assert_eq!(reply["activity"]["agent"]["id"], coder.as_str(), "{reply}");
+    let eid = reply["id"].as_i64().unwrap();
+    let (st, thread) = h
+        .post(
+            "alice",
+            &format!("/v1/spaces/{}/rooms/lobby/events/{eid}/thread", s.id),
+            json!({}),
+        )
+        .await;
+    assert!(st.is_success(), "{thread}");
+    let tid = thread["id"].as_str().unwrap().to_owned();
+    h.notice("bob").await;
+    let replies = h
+        .chat(
+            "bob",
+            &plan(
+                "reply in Design",
+                json!([["space_send", {"space_id": s.id, "room_id": tid, "text": "thanks",
+                                       "reply_to": eid}]]),
+            ),
+        )
+        .await;
+    let sent = data(&replies[0]);
+    assert_eq!(sent["agent"]["id"], coder.as_str(), "{sent}");
+    let events = h
+        .get("alice", &format!("/v1/spaces/{}/rooms/{tid}/events", s.id))
+        .await;
+    let posted = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == sent["event_id"])
+        .unwrap()
+        .clone();
+    assert_eq!(
+        posted["mentions"],
+        json!([{"kind": "agent", "agent_id": coder, "addressed_by": "metro"}])
+    );
+}
+
+#[tokio::test]
 async fn delegate_and_wait_brings_the_answer_back() {
     let h = H::start().await;
     let s = h.space("Design").await;
