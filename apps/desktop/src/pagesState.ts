@@ -1,10 +1,11 @@
 import { batch, computed, effect, signal, untracked } from "nsh";
+import type { TurnModelChoice } from "./api/client";
 import { isPageStatus } from "./api/pages";
 import type { DraftMeta, PageMeta } from "./api/pages";
 import { ApiError, apiClient, describe, disconnect, isAborted, mainPlace, onSessionEnd, openPlace, sessionGuard, spaces } from "./store";
 
 export type PagesRoute =
-  | { kind: "home"; spaceId?: string }
+  | { kind: "home"; spaceId?: string; afterDelete?: boolean }
   | { kind: "page"; id: string; spaceId?: string }
   | { kind: "draft"; id: string; spaceId?: string; returnPage?: string; returnRoom?: string; returnChat?: boolean };
 
@@ -13,10 +14,19 @@ const route = signal<PagesRoute>({ kind: "home" });
 export const pagesRouteMount = signal(0);
 const entries = signal<{ page: PageMeta; valid?: () => boolean }[]>([]);
 const draftEntries = signal<{ draft: DraftMeta; valid: () => boolean }[]>([]);
+// Session-only overlays; neither opening a draft nor remembering a model adds a list row.
+const unavailableDrafts = signal<ReadonlySet<string>>(new Set());
+const draftModels = new Map<string, TurnModelChoice>();
+export const pageDraftUnavailable = (id: string) => unavailableDrafts().has(id);
+export const pageDraftModel = (id: string) => draftModels.get(id);
+export function rememberPageDraftModel(id: string, choice?: TurnModelChoice) {
+  if (choice) draftModels.set(id, choice);
+}
 export const pagesRoute = computed(route);
 export const pages = computed(() => entries().filter(e => scopeVisible(e.page) && (e.valid?.() ?? true)).map(e => e.page));
 /** Metadata only. Review always loads the draft again by ID. */
-export const pageDrafts = computed(() => draftEntries().filter(e => scopeVisible(e.draft) && e.valid()).map(e => e.draft));
+export const pageDrafts = computed(() => draftEntries()
+  .filter(e => !pageDraftUnavailable(e.draft.id) && scopeVisible(e.draft) && e.valid()).map(e => e.draft));
 export const pageDraftsError = signal("");
 export const pagesError = signal("");
 export const pagesLoading = signal(false);
@@ -64,7 +74,11 @@ export function goPages(next: PagesRoute = { kind: "home" }) {
 
 export function forgetPageDraft(id: string) {
   draftsRequest++;
-  draftEntries.set(draftEntries().filter(entry => entry.draft.id !== id));
+  draftModels.delete(id);
+  batch(() => {
+    if (!pageDraftUnavailable(id)) unavailableDrafts.set(new Set(unavailableDrafts()).add(id));
+    draftEntries.set(draftEntries().filter(entry => entry.draft.id !== id));
+  });
 }
 
 export function pageGuard(current: PagesRoute, spaceId = current.spaceId) {
@@ -130,6 +144,8 @@ onSessionEnd(() => {
   listRequest++;
   draftsRequest++;
   entries.set([]);
+  unavailableDrafts.set(new Set());
+  draftModels.clear();
   draftEntries.set([]);
   pageDraftsError.set("");
   pagesError.set("");

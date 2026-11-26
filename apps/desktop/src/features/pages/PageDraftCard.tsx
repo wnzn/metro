@@ -1,6 +1,7 @@
 import { cleanup, signal } from "nsh";
 import type { RoomEvent } from "../../api/client";
-import { goPages, hasSpace, scopeVisible, spaceGrants } from "../../pagesState";
+import { isPageStatus } from "../../api/pages";
+import { forgetPageDraft, goPages, hasSpace, pageDraftUnavailable, scopeVisible, spaceGrants } from "../../pagesState";
 import { activeRoomId, activeSpaceId, apiClient, describe, mainPlace, me, readHostedAccess, sessionGuard, settingsOpen } from "../../store";
 import { Action, Badge, Column, Label, Row, Surface } from "../../ui";
 
@@ -19,7 +20,7 @@ export function PageDraftCard(props: { event: RoomEvent }) {
     : !!sid && !!rid && hasSpace(sid) && mainPlace() === "space" && activeSpaceId() === sid && activeRoomId() === rid);
   const review = async () => {
     const draft = card(), c = apiClient();
-    if (!draft || !c || !owner() || pending()) return;
+    if (!draft || !c || !owner() || pending() || pageDraftUnavailable(draft.draft_id)) return;
     if (Date.now() >= Date.parse(draft.expires_at)) { expired.set(true); return; }
     if (!inChat) {
       goPages({ kind: "draft", id: draft.draft_id, spaceId: sid!, returnRoom: rid! });
@@ -28,7 +29,7 @@ export function PageDraftCard(props: { event: RoomEvent }) {
     // Chat proposals can belong to a Space or the personal library. The card
     // has no scope; resolve it through the authenticated draft read.
     const grants = spaceGrants();
-    const valid = () => mounted && owner() && !settingsOpen() && draft.draft_id === card()?.draft_id;
+    const valid = () => mounted && owner() && !settingsOpen() && draft.draft_id === card()?.draft_id && !pageDraftUnavailable(draft.draft_id);
     pending.set(true);
     error.set("");
     try {
@@ -40,7 +41,10 @@ export function PageDraftCard(props: { event: RoomEvent }) {
       }
       goPages({ kind: "draft", id: next.id, spaceId: next.space_id ?? undefined, returnChat: true });
     } catch (problem) {
-      if (valid()) error.set(describe(problem, "Could not open the draft"));
+      if (valid()) {
+        if (isPageStatus(problem, 403) || isPageStatus(problem, 404)) forgetPageDraft(draft.draft_id);
+        else error.set(describe(problem, "Could not open the draft"));
+      }
     } finally {
       if (mounted) pending.set(false);
     }
@@ -52,12 +56,14 @@ export function PageDraftCard(props: { event: RoomEvent }) {
     </Row>
     <Label variant="strong">{card()?.title || "Page draft"}</Label>
     <Label color="muted">{card()?.summary || event().text}</Label>
+    <Label variant="caption" color="muted">Nothing has been published by this proposal.</Label>
     <If when={owner()}>
       <Column gap={1} align="start">
-        <If when={expired() || Date.now() >= Date.parse(card()?.expires_at ?? "")} else={
+        <If when={expired() || Date.now() >= Date.parse(card()?.expires_at ?? "") || pageDraftUnavailable(card()?.draft_id ?? "")} else={
           <Action compact testID={`review-page-draft:${event().id}`} label="Review draft"
+            accessibilityLabel={`Review draft: ${card()?.title || "Page draft"}`}
             busy={pending()} busyLabel="Opening…" onPress={() => void review()} />
-        }><Label variant="caption" color="muted">This draft has expired.</Label></If>
+        }><Label variant="caption" color="muted">This draft is no longer available.</Label></If>
         <If when={error()}><Label variant="caption" color="danger">{error()}</Label></If>
       </Column>
     </If>

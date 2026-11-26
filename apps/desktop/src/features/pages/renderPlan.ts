@@ -105,7 +105,7 @@ export function capabilityOf(data: PageValues | null, key: string): Capability |
 
 export type PlanBlock = {
   type: string; instance: string; key?: string; issue?: string; text: string; p: Record<string, unknown>;
-  children: PlanBlock[]; headings?: string[]; rows?: Cell[][]; entries?: DisplayEntry[];
+  children: PlanBlock[]; headings?: string[]; rows?: Cell[][]; numericColumns?: boolean[]; entries?: DisplayEntry[];
   points?: { label: string; value: number }[]; answer?: DisplayEntry & { error: string }; action?: ActionKind;
   stat?: Cell; disabledReason?: string;
   document?: TextViewDocument; messages?: (TextViewDocument | undefined)[];
@@ -226,10 +226,18 @@ export function planPage(spec: unknown, data: PageValues | null, pending: boolea
           });
           node.headings = columns.map(c => plain(c.label));
           node.rows = [];
+          const numeric = columns.map(() => false), nonNumeric = columns.map(() => false);
           if (columns.length) for (const row of items(p.rows)) {
             if (!spend(columns.length)) break;
-            node.rows.push(columns.map(c => formatted(own(row, c.field), c.format)));
+            node.rows.push(columns.map((c, i) => {
+              const value = own(row, c.field);
+              const result = formatted(value, c.format);
+              if (number(value) !== undefined && c.format !== "status") numeric[i] = true;
+              else if (result.label !== "—" && result.label !== "") nonNumeric[i] = true;
+              return result;
+            }));
           }
+          node.numericColumns = columns.map((c, i) => ["number", "percent", "bytes"].includes(c.format) || (numeric[i] && !nonNumeric[i]));
           break;
         }
         case "Chart":

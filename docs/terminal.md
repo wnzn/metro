@@ -1,12 +1,12 @@
 # Terminal client (`metro-tui`)
 
-The terminal's [new server transport policy](next-source.md#http-tailscale-and-proxies)
-is in the source, not released. Follow the published client's steps below.
+The terminal follows the
+[0.5.0 server transport policy](released-0.5.0.md#http-tailscale-and-proxies).
 
 > **Status: released in [Metro 0.3.2](https://github.com/wnzn/metro/releases/tag/v0.3.2).**
 > `metro-tui` has been in the source since `142bc85`. CI builds it into
 > every desktop download, including the unsigned
-> [test builds](install.md#test-builds-from-github-actions); the 0.3.2 and 0.4.0
+> [test builds](install.md#test-builds-from-github-actions); the 0.3.2, 0.4.0 and 0.5.0
 > Linux and Windows archives contain it. The
 > [57409bb setup cut](acceptance.md#staged-installers-and-setup-at-57409bb-2026-11-23-project-manager-local)
 > doesn't include it. Its test runs the real Linux binary in a
@@ -21,7 +21,7 @@ GTK, the desktop app or a display, and it never reads Metro's database.
 
 ## Where it is
 
-It's inside each desktop download, including the 0.3.2 and 0.4.0 release archives.
+It's inside each desktop download, including the 0.5.0 release archives.
 
 | Download | Where `metro-tui` is |
 | --- | --- |
@@ -41,16 +41,15 @@ Metro conversations in an interactive terminal
 Usage: metro-tui [OPTIONS] --server <ORIGIN>
 
 Options:
-      --server <ORIGIN>    Explicit Metro origin (HTTPS, or HTTP with a literal loopback IP)
+      --server <ORIGIN>    Explicit Metro origin (HTTPS or HTTP; plain HTTP outside loopback and Tailscale prints a warning)
       --token-file <PATH>  Read a token from a private regular file instead of prompting without echo
   -h, --help               Print help
   -V, --version            Print version
 ```
 
 - **`--server` is required.** Use the server's `https://` origin, such as
-  `https://metro.example.com`. Plain `http://` is accepted only for a
-  literal loopback IP with its port, such as `http://127.0.0.1:8787` or
-  `http://[::1]:8787`; not `localhost`. A path, query, fragment or
+  `https://metro.example.com`, or an SSH forward. Plain HTTP outside
+  loopback and recognized Tailscale hosts prints a warning. A path, query, fragment or
   credentials in the address are refused. Redirects aren't followed, and
   proxy environment variables aren't used.
 - **Your token.** Without `--token-file`, it asks for `Metro token:` and
@@ -98,10 +97,10 @@ example `Enter Ask agent · F2 Ask · F3 Save note`.
   A people-only message never starts an agent. **F2** always asks the
   generic agent (the Space's default agent, or your classifier's pick). An
   unaddressed **Send** follows your Metro settings for that Space.
-- **Personal Chat.** When a chat model is ready for you and you haven't set
-  up System One, **Enter** on a typed question is **Ask agent**, and **F3**
-  is **Save note**, which saves it without calling any model. Otherwise
-  **Enter** sends, and **F2** asks.
+- **Personal Chat.** **F2** explicitly asks, and the draft hint shows which
+  key sends or saves a note. Unlike the desktop composer, the terminal
+  uses the legacy `invoke_agent` field: a note does not start a run unless
+  its text explicitly mentions `@agent`.
 - **Model and thinking level (F4).** It lists only the models the server
   offers you in that place, and only the levels it advertises for each. The
   server checks your choice when you send. If it's no longer available, the

@@ -20,7 +20,7 @@ function setup(initial?: Partial<SpacesAccess>) {
   const stopped: unknown[] = [], retried: unknown[] = [];
   const control = { stopDelay: 0, retryDelay: 0, refuseNotice: false };
   const addChat = (e: Parameters<typeof f.post>[1]) => f.post("chat:alice", e);
-  for (const method of ["GET", "PUT", "POST"]) {
+  for (const method of ["GET", "PUT", "POST", "DELETE"]) {
     const key = `${method} ${BASE}/v1/*`;
     const fallback = f.network[key]!;
     f.network[key] = req => {
@@ -42,6 +42,7 @@ function setup(initial?: Partial<SpacesAccess>) {
         id: "pgd_fixture", scope: "space", space_id: "acme", status: "generating",
         diagnostics: [], outside_selection: [], page_id: null, error: null,
       });
+      if (p === "/v1/pages/drafts/pgd_fixture" && method === "DELETE") return ok({});
       if (p === `/v1/chat/turns/${liveId}/stop` && method === "POST") {
         stopped.push(body);
         addChat({ kind: "activity", actor: "agent", text: "Turn stopped.", activity: turn(liveId, "cancelled") });
@@ -255,8 +256,16 @@ test("meta tool results are concise, alongside legacy tool events and Chat draft
   await app.press(`id:review-page-draft:${draft.id}`);
   await app.waitFor("id:page-draft-view");
   await app.waitFor("text:‹ Back to Chat");
+  await app.waitFor("id:page-discard");
   await app.press("id:page-draft-back");
   await app.waitFor("id:chat-view");
+  await app.press(`id:review-page-draft:${draft.id}`);
+  await app.waitFor("id:page-discard");
+  await app.press("id:page-discard");
+  await app.press("id:page-discard-now");
+  await app.waitFor("id:chat-view");
+  await app.waitFor("text:This draft is no longer available.");
+  expect(app.shows(`id:review-page-draft:${draft.id}`)).toBe(false);
 });
 
 test("older servers leave Chat usable with no notice and no Stop for legacy turn markers", async () => {

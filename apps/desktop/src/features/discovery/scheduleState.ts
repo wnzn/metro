@@ -110,8 +110,14 @@ export function openNewTask() {
 
 /** Pages may prefill the normal form for a verified top-level Space room.
  * This only opens a draft; the person still reviews and saves the task. */
+export function pageTaskPrefillIssue(spaceId: string): string | undefined {
+  if (!spaces().some(s => s.id === spaceId)) return "This Space is no longer available.";
+  if (formOpen()) return "Close the open scheduled task form before setting up this brief.";
+  if (atTaskLimit()) return "Delete a scheduled task to make room for this brief.";
+}
+
 export function prefillPageTask(spaceId: string, roomId: string, prompt: string): boolean {
-  if (formOpen() || atTaskLimit() || !spaces().some(s => s.id === spaceId)) return false;
+  if (pageTaskPrefillIssue(spaceId)) return false;
   batch(() => {
     resetForm();
     formDestination.set({ kind: "room", spaceId, roomId });

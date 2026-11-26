@@ -61,6 +61,47 @@ test("Page sheet content and footer share the same responsive gutter", async () 
   expect(app.shows("text:Section gap: 16")).toBe(true);
 });
 
+test("Empty Pages shows what templates do and opens either start mode at a compact viewport", async () => {
+  const f = pagesFixture();
+  f.entries.clear();
+  const app = await start(f, "alice", false, { width: 720, height: 480 });
+  await app.press("id:nav-pages");
+  await app.waitFor("id:pages-empty >> text:Recent library files");
+  expect(app.shows("id:pages-empty >> text:Watch a Space")).toBe(true);
+  await app.press("id:pages-start-template");
+  await app.waitFor("id:page-template");
+  expect(app.shows("id:new-page-form:footer >> id:create-page-template")).toBe(true);
+  await app.press("id:new-page-form:footer >> label:Cancel");
+  await app.press("id:pages-start-prompt");
+  await app.waitFor("id:page-prompt");
+  expect(app.shows("id:new-page-form:footer >> id:page-generate")).toBe(true);
+  expect(app.enabled("id:page-generate")).toBe(false);
+  await app.keyboard.press("escape");
+  await app.waitFor("id:new-page-sheet", { state: "gone" });
+  expect(f.calls("", "POST")).toHaveLength(0);
+  expect(f.calls("/drafts", "POST")).toHaveLength(0);
+});
+
+test("Named page rows open in their scope and unpinned page and draft keep Pages selected", async () => {
+  const f = pagesFixture();
+  f.entries.set(PERSONAL, { ...f.entries.get(PERSONAL)!, pinned: false });
+  const app = await start(f);
+  await app.press("id:nav-pages");
+  await app.waitFor("text:Members of Acme");
+  expect(app.shows("text:Only you")).toBe(true);
+  const active = app.viewStyle("id:nav-pages")?.backgroundColor;
+  expect(active).toBeTruthy();
+  await app.press("id:open-page:pg_personal >> text:Alice’s dashboard");
+  await app.waitFor("id:page-renderer");
+  expect(app.viewStyle("id:nav-pages")?.backgroundColor).toBe(active);
+  await app.press("id:page-edit");
+  await app.type("id:page-prompt", "Change this page");
+  await app.press("id:page-generate");
+  await app.waitFor("id:page-draft-summary");
+  expect(app.viewStyle("id:nav-pages")?.backgroundColor).toBe(active);
+  expect(app.shows("id:page-draft-view:footer >> text:Apply changes")).toBe(true);
+});
+
 test("Pages navigation, scoped list, pins and Space template creation", async () => {
   const f = pagesFixture();
   const app = await start(f);
@@ -141,6 +182,27 @@ test("Pages home can resume and discard a draft after restarting", async () => {
   await restarted.press("id:pages-reload");
   await restarted.waitUntil(() => f.calls("/drafts").length >= 3);
   expect(restarted.shows(`id:continue-page-draft:${id}`)).toBe(false);
+});
+
+test("A draft opened this session appears once when the server lists it", async () => {
+  const f = pagesFixture();
+  const app = await start(f);
+  await app.press("id:nav-pages");
+  await app.press("id:new-page");
+  await app.type("id:page-prompt", "Open this draft before the list arrives");
+  await app.press("id:page-generate");
+  await app.waitFor("id:page-apply");
+
+  const resume = "id:continue-page-draft:pgd_1";
+  const lists = f.calls("/drafts").length;
+  f.state.draftListDelay = 3_000;
+  await app.press("id:page-draft-back");
+  await app.waitUntil(() => f.calls("/drafts").length > lists);
+  expect(app.count(resume)).toBe(0);
+  await app.waitFor(resume);
+  expect(app.count(resume)).toBe(1);
+  await app.press(resume);
+  await app.waitFor("id:page-apply");
 });
 
 test("Pages home lists a Space edit draft only for its author while they have access", async () => {
@@ -259,9 +321,10 @@ test("Schedule consent sends the exact displayed version and revision, never ret
   expect(text(app)).toContain("Send the exact release summary");
   expect(text(app)).toContain("Release reminder");
   expect(text(app)).toContain("Acme › Renamed room");
-  expect(app.shows("id:page-action-confirm >> text:/covers every agent and schedule button on this page version/")).toBe(true);
-  expect(app.shows("id:page-action-confirm >> text:/Only this action runs now. The other buttons still need a click/")).toBe(true);
+  expect(app.shows("id:page-action-confirm >> text:/Approves every agent and schedule button in version 1. Only this button runs now/")).toBe(true);
+  expect(app.shows("id:page-action-confirm >> text:Task revision 3")).toBe(true);
   expect(app.shows("id:page-action-confirm >> text:/Permission and schedule checks still apply/")).toBe(true);
+  expect(text(app).indexOf("Only this button runs now")).toBeLessThan(text(app).indexOf("Send the exact release summary"));
   expect(f.state.started).toBe(0);
   await app.press("id:page-action-confirm >> label:Cancel");
   await app.waitFor("id:page-action-confirm", { state: "gone" });
@@ -358,6 +421,66 @@ test("Personal page action stays on the page; a missing room link never falls ba
   expect(f.f.posts()).toHaveLength(0);
 });
 
+test("A personal brief refreshes until its linked answer updates", async () => {
+  const f = pagesFixture();
+  f.entries.set(PERSONAL, { ...f.entries.get(PERSONAL)!, spec: briefSpec(true) });
+  f.state.answerStatus = "running";
+  const app = await start(f);
+  await jump(app, PERSONAL);
+  await app.press("id:page-action:ask");
+  await app.press("id:page-action-run");
+  await app.waitFor("text:/Waiting for a page answer/");
+  expect(app.enabled("id:page-action:ask")).toBe(false);
+  const reads = () => f.calls(`/${PERSONAL}/data`, "POST").length;
+  await app.setLifecycle("background");
+  const whileHidden = reads();
+  f.state.answerStatus = "done";
+  await app.clock!.fastForward(5_000);
+  expect(reads()).toBe(whileHidden);
+  await app.setLifecycle("active");
+  await app.waitFor("text:Private page-only answer");
+  await app.waitFor("text:Page answer updated.");
+  const before = reads();
+  await app.clock!.fastForward(5_000);
+  expect(reads()).toBe(before);
+  expect(f.state.runReads).toBe(0);
+});
+
+test("A Space brief ignores unrelated replies for click status and checks the exact room run", async () => {
+  const f = pagesFixture();
+  f.replaceTeam(briefSpec(false));
+  const app = await start(f);
+  await jump(app);
+  await app.press("id:page-action:ask");
+  await app.press("id:page-action-run");
+  await app.waitFor("text:/Waiting for the run/");
+  f.state.answer = "Unrelated scheduled brief";
+  await app.waitFor("text:Unrelated scheduled brief");
+  expect(text(app)).toContain("Latest room answer");
+  expect(text(app)).toContain("Waiting for the run");
+  expect(f.state.runReads).toBeGreaterThan(0);
+  f.state.runStatus = "completed";
+  f.state.answer = "New room answer";
+  await app.waitFor("text:Agent run finished in the room.");
+  await app.waitFor("text:New room answer");
+});
+
+test("Action failure survives a passive refresh failure and recovery", async () => {
+  const f = pagesFixture();
+  const app = await start(f);
+  await jump(app, PERSONAL);
+  await app.press("id:page-action:ask");
+  f.state.actionError = "The model could not start.";
+  f.state.dataError = "Data temporarily unavailable";
+  await app.press("id:page-action-run");
+  await app.waitFor("id:page-action-error >> text:The model could not start.");
+  await app.waitFor("id:pages-error");
+  f.state.dataError = "";
+  await app.press("id:page-refresh");
+  await app.waitFor("id:pages-error", { state: "gone" });
+  expect(app.shows("id:page-action-error")).toBe(true);
+});
+
 test("A page republished while its confirmation is open does not run the superseded button", async () => {
   const f = pagesFixture();
   const app = await start(f);
@@ -425,6 +548,94 @@ for (const clear of [true, false]) {
   });
 }
 
+test("A republished page keeps the prompt and requires reselecting a removed block", async () => {
+  const f = pagesFixture();
+  const app = await start(f);
+  await jump(app);
+  await app.press("id:page-select-block");
+  await app.press("label:Edit stat: Active runs with prompt");
+  await app.keyboard.press("x");
+  expect(app.value("id:page-prompt")).toBe("x");
+  const textBefore = "Keep this prompt";
+  await app.clear("id:page-prompt");
+  await app.type("id:page-prompt", textBefore);
+  const previous = f.entries.get(TEAM)!;
+  f.entries.set(TEAM, { ...previous, head_version: 2, version: { ...previous.version, version: 2 } });
+  await app.clock!.fastForward(30_100);
+  await app.waitFor("text:New version published");
+  expect(app.value("id:page-prompt")).toBe(textBefore);
+  expect(app.enabled("id:page-generate")).toBe(true);
+  f.entries.set(TEAM, { ...previous, head_version: 3, version: { ...previous.version, version: 3 },
+    spec: { ...previous.spec, blocks: [{ type: "Text", key: "replacement", content: [lit("Replacement")] }] } });
+  await app.press("id:page-refresh");
+  await app.waitFor("text:/The selected block is gone/");
+  expect(app.value("id:page-prompt")).toBe(textBefore);
+  expect(app.shows("text:Edit whole page")).toBe(false);
+  expect(app.enabled("id:page-generate")).toBe(false);
+  expect(f.calls("/drafts", "POST")).toHaveLength(0);
+  await app.press("id:page-edit-block:replacement");
+  await app.press("id:page-generate");
+  await app.waitFor("id:page-draft-view");
+  expect(f.calls("/drafts", "POST").map(r => r.body)).toEqual([{ page_id: TEAM, block_key: "replacement", prompt: textBefore }]);
+});
+
+test("Escape closes the inline edit prompt and returns keyboard focus to Edit with prompt", async () => {
+  const app = await start(pagesFixture());
+  await jump(app);
+  await app.press("id:page-edit");
+  await app.keyboard.press("escape");
+  await app.waitFor("id:page-edit-prompt", { state: "gone" });
+  await app.keyboard.press("space");
+  await app.waitFor("id:page-edit-prompt");
+});
+
+for (const removed of [false, true]) {
+  test(`Failed draft retry retains its prompt and ${removed ? "blocks a removed model until Default is chosen" : "keeps the explicit model"}`, async () => {
+    const f = pagesFixture();
+    const conn = f.f.addConnection("alice", "openai", "Fixture connection", "gpt-fixture-1");
+    f.state.draftError = "The draft model was unavailable.";
+    const app = await spaceModelForm(f);
+    await app.press("id:page-generate");
+    await app.waitFor("text:The draft model was unavailable.");
+    if (removed) f.f.state.connections.delete(conn.id);
+    await app.press("id:page-retry-failed");
+    expect(app.value("id:page-prompt")).toBe("Explicit model for this dashboard");
+    if (removed) {
+      await app.waitFor("text:/The selected model or thinking level is unavailable/");
+      expect(app.enabled("id:page-generate")).toBe(false);
+      expect(f.calls("/drafts", "POST")).toHaveLength(1);
+      await app.press("id:composer-model");
+      await app.press("id:page-model-options");
+      await app.press("text:Default model");
+    }
+    f.state.draftError = "";
+    await app.waitUntil(() => app.enabled("id:page-generate"));
+    await app.press("id:page-generate");
+    await app.waitFor("text:Proposed dashboard");
+    expect(f.calls("/drafts", "POST").at(-1)?.body).toEqual({
+      scope: "space", space_id: "acme", prompt: "Explicit model for this dashboard",
+      ...(removed ? {} : { provider_connection_id: conn.id, model_id: "gpt-fixture-1" }),
+    });
+  });
+}
+
+test("Transient draft data failure retries only the preview", async () => {
+  const f = pagesFixture();
+  f.state.previewError = "Preview temporarily unavailable";
+  const app = await start(f);
+  await app.press("id:nav-pages");
+  await app.press("id:new-page");
+  await app.type("id:page-prompt", "Build a page");
+  await app.press("id:page-generate");
+  await app.waitFor("label:Retry preview");
+  f.state.previewError = "";
+  f.state.answer = "Recovered preview data";
+  await app.press("label:Retry preview");
+  await app.waitFor("text:Recovered preview data");
+  expect(f.calls("/drafts", "POST")).toHaveLength(1);
+  expect(f.calls("/drafts/pgd_1/data", "POST")).toHaveLength(2);
+});
+
 for (const loss of ["edit", "read", "membership"] as const) {
   test(`Apply denied: ${loss === "edit" ? "retain preview, diff and Discard for a still-member editor" : `hide draft after ${loss} loss`}`, async () => {
     const f = pagesFixture();
@@ -487,6 +698,8 @@ test("Scheduled refresh is offered only for a room-and-agent Space brief, not a 
   await app.press("id:page-schedule:answer");
   await app.waitFor("id:page-open-schedule-form");
   expect(text(app)).toContain("including scheduled answers");
+  expect(text(app)).toContain("Acme › lobby · Agent (default agent)");
+  expect(text(app)).toContain("Saving the task starts the schedule; opening the form does not.");
   await app.press("id:page-open-schedule-form");
   await app.waitFor("id:schedule-prompt");
   expect(app.value("id:schedule-prompt")).toBe("Summarize today");
@@ -495,6 +708,17 @@ test("Scheduled refresh is offered only for a room-and-agent Space brief, not a 
   f.replaceTeam(briefSpec(false, true));
   await jump(app);
   expect(app.shows("id:page-schedule:answer")).toBe(false);
+});
+
+test("Scheduling explains why a non-default agent's brief is unavailable", async () => {
+  const f = pagesFixture();
+  f.replaceTeam(briefSpec(false));
+  f.state.defaultAgent = false;
+  const app = await start(f);
+  await jump(app);
+  await app.press("id:page-schedule:answer");
+  await app.waitFor("text:/This answer follows a different agent/");
+  expect(app.shows("id:page-open-schedule-form")).toBe(false);
 });
 
 test("Prompt creation polls a private draft, previews disabled actions and applies once", async () => {
@@ -506,13 +730,19 @@ test("Prompt creation polls a private draft, previews disabled actions and appli
   await app.type("id:page-prompt", "Build a release dashboard");
   await app.press("id:page-generate");
   await app.waitFor("id:page-draft-generating");
+  expect(text(app)).toContain("Pages → Drafts");
   await app.waitFor("text:Proposed dashboard");
+  expect(app.shows("text:Draft · not published")).toBe(true);
+  expect(text(app)).toContain("1 added · 1 changed · 1 removed");
+  expect(app.shows("id:page-draft-view:footer >> text:Publish page")).toBe(true);
   await app.waitFor("id:page-action:ask");
   await expect(app.press("id:page-action:ask")).rejects.toMatchObject({ code: "ERR_NSH_TEST_DISABLED" });
   expect(f.calls("/drafts", "POST")[0]?.body).toEqual({ scope: "personal", prompt: "Build a release dashboard" });
   expect(f.state.started).toBe(0);
   await app.press("id:page-draft-tab:changes");
   await app.waitFor("id:page-source-diff");
+  expect(app.shows("text:Before: Empty page")).toBe(true);
+  expect(app.shows("text:After: Draft source")).toBe(true);
   await app.press("id:page-draft-tab:source");
   await app.waitFor("id:page-code");
   await app.press("id:page-apply");
@@ -529,8 +759,11 @@ test("Selected-block edit requires review of outside changes; stale conflict re-
   await jump(app);
   await app.press("id:page-select-block");
   await app.press("id:page-edit-block:stat");
-  await app.waitFor("text:Editing block: stat");
-  await app.type("id:page-prompt", "Retitle the metric");
+  await app.waitFor("text:Editing stat: Active runs");
+  expect(app.shows("label:Describe what to change in stat: Active runs")).toBe(true);
+  await app.keyboard.press("shift+r");
+  expect(app.value("id:page-prompt")).toBe("R");
+  await app.type("id:page-prompt", "etitle the metric");
   await app.press("id:page-generate");
   await app.waitFor("text:Changes outside the selected block");
   expect(f.calls("/drafts", "POST")[0]?.body).toEqual({ page_id: TEAM, block_key: "stat", prompt: "Retitle the metric" });
@@ -539,6 +772,7 @@ test("Selected-block edit requires review of outside changes; stale conflict re-
   await app.press("id:page-apply-outside");
   await app.waitFor("text:Comparing draft with current version 2");
   await app.waitFor("id:page-source-diff");
+  expect(app.shows("label:Current version 2 to draft source")).toBe(true);
   expect(f.calls("/drafts/pgd_1/apply", "POST")[0]?.body).toEqual({ confirm_outside: true });
   await expect(app.press("id:page-apply")).rejects.toMatchObject({ code: "ERR_NSH_TEST_DISABLED" });
   expect(f.state.applied).toBe(0);
@@ -560,6 +794,7 @@ test("Only the proposal author can open a thread’s review; a missing draft has
   const app = await start(f, "bob");
   await thread(app);
   expect(app.shows(`id:review-page-draft:${event.id}`)).toBe(false);
+  expect(text(app)).toContain("Nothing has been published");
   expect(f.calls(`/drafts/${DRAFT}`)).toHaveLength(0);
   await app.press("id:account-menu");
   await app.press("id:disconnect");
@@ -574,6 +809,10 @@ test("Only the proposal author can open a thread’s review; a missing draft has
   await app.press(`id:review-page-draft:${gone.id}`);
   await app.waitFor("text:/This draft is no longer available/");
   expect(app.shows("id:page-apply")).toBe(false);
+  await app.press("id:page-draft-back");
+  await app.waitFor(`id:page-draft-card:${gone.id} >> text:This draft is no longer available.`);
+  expect(app.shows(`id:review-page-draft:${gone.id}`)).toBe(false);
+  expect(f.calls("/drafts/pgd_missing")).toHaveLength(1);
 });
 
 test("Live data stops polling in the background, under Settings, and on another route", async () => {
@@ -761,6 +1000,29 @@ test("Page TSX source editor checks diagnostics before saving a version", async 
   expect(f.calls(`/${TEAM}/versions`, "POST").map(r => r.body.base_version)).toEqual([1]);
 });
 
+test("Dirty source survives Close, Escape and a native dialog-dismiss request", async () => {
+  const f = pagesFixture();
+  const app = await start(f);
+  await jump(app);
+  await menu(app, "page-source");
+  await app.type("id:page-code", "// Unsaved source\n");
+  await app.press("id:page-close-source");
+  expect(app.shows("id:page-keep-source")).toBe(true);
+  await app.press("id:page-keep-source");
+  // Headless presses hit a selector's center, covered by this centered dialog.
+  // Back exercises the same guarded native dismissal callback as the backdrop.
+  await app.back();
+  expect(app.shows("id:page-keep-source")).toBe(true);
+  await app.press("id:page-keep-source");
+  await app.keyboard.press("escape");
+  expect(text(app)).toContain("Unsaved source");
+  expect(app.shows("id:page-source-sheet")).toBe(true);
+  if (!app.shows("id:page-discard-source")) await app.press("id:page-close-source");
+  await app.press("id:page-discard-source");
+  await app.waitFor("id:page-source-sheet", { state: "gone" });
+  expect(f.calls(`/${TEAM}/versions`, "POST")).toHaveLength(0);
+});
+
 test("Source conflict preserves my changes, diffs the new head, and requires an explicit retry", async () => {
   const f = pagesFixture();
   f.state.staleSource = true;
@@ -780,6 +1042,7 @@ test("Source conflict preserves my changes, diffs the new head, and requires an 
   expect(text(app)).toContain("Kept my unsaved edit");
   expect(saves().map(r => r.body)).toEqual([{ base_version: 1, source: edited }]);
   expect(app.enabled("id:page-save-source")).toBe(false);
+  expect(app.shows("text:Keep my source and review before saving")).toBe(true);
   await app.press("id:page-use-current-base");
   await app.waitFor("id:page-code");
   expect(saves()).toHaveLength(1);
@@ -794,6 +1057,8 @@ test("Settings rename, history restore, delete and undelete preserve version che
   const app = await start(f);
   await jump(app);
   await menu(app, "page-settings");
+  expect(text(app)).toContain("Everyone in Acme can view.");
+  expect(text(app)).toContain("Editing doesn’t grant permission to delete or manage");
   await app.clear("id:page-setting-title");
   await app.type("id:page-setting-title", "Renamed dashboard");
   await app.press("id:page-members-edit");
@@ -804,6 +1069,7 @@ test("Settings rename, history restore, delete and undelete preserve version che
   await app.press("id:page-version:1");
   await app.press("id:page-history-tab:changes");
   await app.waitFor("id:page-source-diff");
+  expect(text(app)).toContain("Version 1 → current (version 2)");
   await app.press("id:page-restore-version");
   await app.press("id:page-restore-now");
   await app.waitFor("text:/Version 3/");
@@ -811,7 +1077,9 @@ test("Settings rename, history restore, delete and undelete preserve version che
   await menu(app, "page-delete");
   await app.press("id:page-delete-now");
   await app.waitFor("id:pages-home");
-  await app.press("id:pages-deleted");
+  await app.press("id:page-deleted-recovery");
+  await app.waitFor("text:Restore page");
+  expect(text(app)).toMatch(/left to restore|Restore window ended/);
   await app.press(`id:undelete-page:${TEAM}`);
   await app.waitFor("id:page-view");
   expect(f.calls(`/${TEAM}/undelete`, "POST")).toHaveLength(1);

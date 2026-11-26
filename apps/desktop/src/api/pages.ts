@@ -61,7 +61,8 @@ export type Confirmation = {
     | { kind: "runSchedule"; prompt: string; schedule: string; schedule_id: string; schedule_revision: number; space_id: string; room_id: string; room: string };
 };
 export type PageClick = { version: number; block_key: string; confirm?: true; schedule_revision?: number };
-type ClickResult = { kind: "runAgent"; started: boolean; error?: string } | { kind: "runSchedule"; run: { status: string; detail: string | null } };
+type ClickResult = { kind: "runAgent"; started: boolean; error?: string; run_id?: string; room_id?: string }
+  | { kind: "runSchedule"; run: { status: string; detail: string | null } };
 type PageFailure = { error?: string; head_version?: number; schedule_revision?: number; confirmation?: Confirmation; outside_selection?: string[]; diagnostics?: PageDiagnostic[] };
 
 export function pageFailure(error: unknown): PageFailure {

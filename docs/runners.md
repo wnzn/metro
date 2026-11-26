@@ -1,10 +1,9 @@
 # Runners: dedicated and registered
 
-The setup steps below are for published releases. The desktop's
-[guarded local runner offer](next-source.md#this-computers-runner),
-[Space Runner settings](next-source.md#guarded-runner-changes) and
-[runner update controls](updates.md#runner-and-server-updates) are in
-the source, not released.
+Metro 0.5.0 includes the desktop's
+[local runner offer](released-0.5.0.md#this-computers-runner),
+[guarded Space Runner settings](released-0.5.0.md#guarded-runner-changes)
+and [runner update controls](updates.md#runner-and-server-updates).
 
 A runner is a `metro-runner` process on someone's machine. It gives a Space's
 agent tools over files on that machine. A Space works without one. This page
@@ -41,9 +40,9 @@ Space's jobs to a runner that isn't attached to that Space.
 
 ### Dedicated runners
 
-These are the original Space-owned tokens, and they work unchanged. The owner
-issues the token (it's shown once and stored only as a hash). Issuing it again
-rotates it, and the owner can revoke it. See
+These are Space-owned tokens. The owner issues the token (it's shown once
+and stored only as a hash), and can rotate or revoke the reviewed
+assignment from Space settings. See
 [spaces.md](spaces.md#runner-pairing). A dedicated runner stays private to its
 Space: it can't be shared or attached anywhere else.
 
@@ -81,6 +80,9 @@ server.
 
 ### API
 
+Use the [guarded Space assignment routes](released-0.5.0.md#guarded-runner-changes)
+for new clients. The unguarded Space writes below are legacy routes.
+
 | Request | Who | Result |
 | --- | --- | --- |
 | `GET /v1/runners` | anyone | `{"runners": [{"id", "name", "visibility", "can_manage"}]}`: your personal runners and every organization runner |
@@ -91,9 +93,9 @@ server.
 | `PUT /v1/spaces/{sid}/runner` `{"runner_id"}` | Space owner | Attaches the runner, replacing any other registered runner. `409` while the Space has a dedicated token. |
 | `DELETE /v1/spaces/{sid}/runner` `{}` | Space owner | `204`. Detaches the registered runner, or revokes the dedicated token. |
 
-`GET /v1/me` also returns `is_org_admin`. Every change to who serves a Space
-(attach, detach, a new credential, delete) makes that Space's queued and
-claimed jobs fail instead of moving to the new runner.
+`GET /v1/me` also returns `is_org_admin`. Removing or replacing an
+assignment drops its queued and claimed work. Rotation invalidates
+claimed work; unclaimed work can remain queued for the same runner.
 
 ## Workspace layout
 
@@ -155,8 +157,8 @@ registered runner it offers list and read only.
 These steps use the published runner image and need no Metro source. The
 workspaces live in a named Docker volume.
 
-> **Published:** `ghcr.io/wnzn/metro-runner:v0.4.0` is in
-> [Metro 0.4.0](https://github.com/wnzn/metro/releases/tag/v0.4.0). Pin it
+> **Published:** `ghcr.io/wnzn/metro-runner:v0.5.0` is in
+> [Metro 0.5.0](https://github.com/wnzn/metro/releases/tag/v0.5.0). Pin it
 > by the digest in the release's `IMAGES.txt`
 > ([deploy.md](deploy.md#release-files-and-images)). Contributors can build
 > the same image themselves ([development.md](development.md#images-and-binaries)).
@@ -215,12 +217,12 @@ Inside a container, `127.0.0.1` is the container itself, not your machine. Set
   `https://metro.example.com`. This is the normal choice. See
   [deploy.md](deploy.md) for the TLS reverse proxy.
 - **Server in Docker on the same machine:** join its network
-  and use plain HTTP to the service name, which you allow deliberately with
-  `METRO_ALLOW_INSECURE_HTTP=1`. Find the network with
+  and use plain HTTP to the service name only on a trusted private
+  network. Find the network with
   `docker network ls`. It's `<project>_default`, for example `metro_default`.
 
-Never set `METRO_ALLOW_INSECURE_HTTP=1` for a hop that leaves your machine or a
-private network you control.
+Metro 0.5.0 warns on ordinary plain HTTP and does not require an
+environment opt-in. Use HTTPS for untrusted networks.
 
 ### 4. Start the runner
 
@@ -237,13 +239,12 @@ docker run -d --name metro-registered-runner --init --restart unless-stopped \
   ghcr.io/wnzn/metro-runner:<tag>
 ```
 
-With a Compose server on the same machine on the same machine, replace the
-`METRO_SERVER_URL` line with these three:
+With a Compose server on the same machine, replace the
+`METRO_SERVER_URL` line with these two:
 
 ```sh
   --network metro_default \
   -e METRO_SERVER_URL='http://server:8787' \
-  -e METRO_ALLOW_INSECURE_HTTP=1 \
 ```
 
 A new named volume takes the ownership of the image's `/workspace`, so it's

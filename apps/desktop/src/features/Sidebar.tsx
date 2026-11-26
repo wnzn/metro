@@ -68,7 +68,7 @@ export function Sidebar(props: { mode: "full" | "rail" | "hidden" }) {
             onPress={openChat}
           />
           <NavItem testID="nav-library" label="Library" icon="library" selected={mainPlace() === "library"} onPress={() => openPlace("library")} />
-          <NavItem testID="nav-pages" label="Pages" icon="file" selected={mainPlace() === "pages" && pagesRoute().kind === "home" && !pagesRoute().spaceId} onPress={() => goPages()} />
+          <NavItem testID="nav-pages" label="Pages" icon="file" selected={selectedPages()} onPress={() => goPages()} />
           <PinnedPages />
           <NavItem testID="nav-schedules" label="Scheduled tasks" icon="clock" selected={mainPlace() === "schedules"} onPress={() => openPlace("schedules")} />
           <DirectMessagesSection visible={props.mode === "full"} />
@@ -221,12 +221,12 @@ function SpacesSection(props: { visible: boolean }) {
               <If when={space().id === activeSpaceId()}><RoomTree /></If>
               <NavGroup>
                 <NavItem testID={`space-pages:${space().id}`} label="Pages" icon="file" depth={1}
-                  selected={mainPlace() === "pages" && pagesRoute().kind === "home" && pagesRoute().spaceId === space().id}
+                  selected={selectedPages(space().id)}
                   onPress={() => goPages({ kind: "home", spaceId: space().id })} />
                 <If when={mainPlace() === "pages" && pagesRoute().spaceId === space().id}>
                   <Each of={pages().filter(page => page.space_id === space().id)} key={page => page.id}>
                     {page => <NavItem testID={`space-page:${page().id}`} label={[page().icon, page().title].filter(Boolean).join(" ")}
-                      icon="file" depth={2} selected={selectedPage(page().id)}
+                      icon="file" depth={2} selected={false}
                       onPress={() => goPages({ kind: "page", id: page().id, spaceId: space().id })} />}
                   </Each>
                 </If>
@@ -244,6 +244,12 @@ function SpacesSection(props: { visible: boolean }) {
       </If>
     </Column>
   );
+}
+
+function selectedPages(spaceId?: string) {
+  const route = pagesRoute();
+  return mainPlace() === "pages" && route.spaceId === spaceId
+    && (route.kind !== "page" || !pages().some(p => p.id === route.id && p.pinned));
 }
 
 function selectedPage(id: string) {

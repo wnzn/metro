@@ -54,7 +54,7 @@ invalid or contradictory value. Empty values count as unset.
 | `METRO_RUNNER_TOKEN` | **required** | A dedicated Space token, or a registered runner credential (`metro_rt_v2_…`) |
 | `METRO_WORKSPACE` | **required** | An existing directory, canonicalized at startup. Registered runners need it writable, and refuse `/`. |
 | `METRO_SERVER_URL` | `http://127.0.0.1:8787` | Set it explicitly for any runner that isn't on the server's machine. Plain `http://` is allowed only for loopback hosts. |
-| `METRO_ALLOW_INSECURE_HTTP` | `0` | `1` allows plain HTTP to a non-loopback host. Set it only for a private network hop, such as `http://server:8787` inside Compose. |
+| `METRO_ALLOW_INSECURE_HTTP` | `0` | Accepted for compatibility; not needed in 0.5.0. The runner warns on plain HTTP outside loopback and recognized Tailscale hosts. Prefer HTTPS or an SSH forward. |
 | `METRO_POLL_INTERVAL_MS` | `1000` | 50 – 600000 |
 | `METRO_HTTP_TIMEOUT_SECS` | `30` | See [Time limits](#time-limits) |
 | `METRO_CHECK_ARGV` | unset (no check) | JSON argv |
@@ -134,10 +134,10 @@ runner image or the Linux runner binary. Either needs Linux ≥ 5.6
 (`openat2`). The remote runner must reach the server over `https://`, so
 expose the server through a TLS reverse proxy (see [deploy.md](deploy.md)).
 
-> **Published in [Metro 0.4.0](https://github.com/wnzn/metro/releases/tag/v0.4.0):**
-> the image `ghcr.io/wnzn/metro-runner:v0.4.0` (`linux/amd64`,
+> **Published in [Metro 0.5.0](https://github.com/wnzn/metro/releases/tag/v0.5.0):**
+> the image `ghcr.io/wnzn/metro-runner:v0.5.0` (`linux/amd64`,
 > `linux/arm64`; pin the digest from the release's `IMAGES.txt`) and the
-> binary archive `Metro-runner-0.4.0-linux-x64.tar.gz` with its `.sha256`
+> binary archive `Metro-runner-0.5.0-linux-x64.tar.gz` with its `.sha256`
 > ([deploy.md](deploy.md#release-files-and-images)). Building them yourself
 > is contributor tooling ([development.md](development.md#images-and-binaries)).
 

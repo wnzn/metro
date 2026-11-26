@@ -26,12 +26,12 @@ server yourself, or let the desktop app run one just for you. Each person
 brings their own model, and each Space can give the agent tools over its
 own files.
 
-The install and feature guide below is for Metro 0.4.0. For changes after
-that release, see [In the source, not released](docs/next-source.md).
+The install and feature guide below is for [Metro 0.5.0](docs/released-0.5.0.md).
+For later changes, see [In the source, not released](docs/next-source.md).
 
 ## Features
 
-- **Personal Chat:** a private conversation with the agent, plus your agent runs across Spaces.
+- **Personal Chat:** Send asks your agent directly; **Save note** keeps a message without starting a run. You can also see your agent runs across Spaces.
 - **Spaces:** private groups of rooms. Only members see them, and only the owner adds people, renames or deletes the Space and manages its agents. Any member except the owner can leave.
 - **Several agents per Space:** up to 16, each with its own `@handle`, description, instructions and tools, and one default. Every member can read their settings ([details](docs/spaces.md#agents)).
 - **Child threads:** a room's agent can hand work to bounded threads that report back.
@@ -40,8 +40,7 @@ that release, see [In the source, not released](docs/next-source.md).
 - **Runners (optional):** give one Space's agent tools over that Space's own directory.
 - **Native desktop app** with reactions, profiles, and dark and light themes.
 
-Several agents per Space, `@handle` addressing, per-Space classification and
-per-connection model lists are released in 0.4.0.
+- **[Pages and Daily briefs](docs/pages.md):** personal and Space dashboards, with previews before applying generated edits.
 
 Opt-in extras:
 
@@ -49,6 +48,7 @@ Opt-in extras:
 - **Classification (per Space) and use-case routing:** System One decides which agent, if any, an unaddressed message is for, and which of your models answers.
 - **Semantic search:** embeddings over what you can already read, reranked by System One.
 - **Documents & media:** files you upload yourself, indexed on request and searchable by content.
+- **[Web search and fetch](docs/web-search.md):** agent tools that run on your paired computer, with separate opt-ins.
 
 ## Screenshots
 
@@ -75,22 +75,23 @@ local accounts or OIDC sign-in. Everyone else installs the desktop app and
 connects with the server's URL and their own token. Details:
 [docs/deploy.md](docs/deploy.md).
 
-With the 0.4.0 desktop app, send tokens only over loopback, an SSH port
-forward or HTTPS. That app refuses plain `http://` to any other host.
+Prefer HTTPS or an SSH port forward for remote servers. The desktop asks
+before sending a token over ordinary plain HTTP; see
+[transport and proxy rules](docs/released-0.5.0.md#http-tailscale-and-proxies).
 
-> **Latest release: [Metro 0.4.0](https://github.com/wnzn/metro/releases/tag/v0.4.0)**
-> (2026-11-25). Downloads: `Metro-0.4.0-linux-x64.tar.gz`,
-> `Metro-0.4.0-windows-x64.zip`, `Metro-0.4.0-windows-x64.unsigned-preview.msi`
-> and `Metro-runner-0.4.0-linux-x64.tar.gz` (each with a `.sha256`), the
+> **Latest release: [Metro 0.5.0](https://github.com/wnzn/metro/releases/tag/v0.5.0)**
+> (2026-11-25). Downloads: `Metro-0.5.0-linux-x64.tar.gz`,
+> `Metro-0.5.0-windows-x64.zip`, `Metro-0.5.0-windows-x64.unsigned-preview.msi`
+> and `Metro-runner-0.5.0-linux-x64.tar.gz` (each with a `.sha256`), the
 > installer scripts, and `SHA256SUMS` with its Sigstore bundle. Images,
-> listed by digest in the release's `IMAGES.txt`:
-> `ghcr.io/wnzn/metro-server:v0.4.0` and `ghcr.io/wnzn/metro-runner:v0.4.0`
+> listed by digest in the release's [`IMAGES.txt`](https://github.com/wnzn/metro/releases/download/v0.5.0/IMAGES.txt):
+> `ghcr.io/wnzn/metro-server:v0.5.0` and `ghcr.io/wnzn/metro-runner:v0.5.0`
 > (`linux/amd64`, `linux/arm64`). There's no macOS build for now. Windows
 > files are **unsigned** (no Authenticode signature), so expect SmartScreen
 > warnings and check them against the Sigstore-signed `SHA256SUMS`
 > ([docs/install.md](docs/install.md#check-a-download)). The desktop app
-> hasn't been tried by a person on native Windows. What's verified so far:
-> [docs/acceptance.md](docs/acceptance.md).
+> hasn't been tried by a person on native Windows. Real vendor accounts and
+> sign-ins remain unverified. See the [release record](docs/acceptance.md#published-metro-050-2026-11-25-github-release-v050).
 
 ## Repository layout
 
@@ -123,6 +124,9 @@ forward or HTTPS. That app refuses plain `http://` to any other host.
 | [Schedules](docs/schedules.md) | Scheduled prompts |
 | [System One](docs/system-one.md) | Classification, routing, semantic search |
 | [Library](docs/library.md) | Documents & media |
+| [Pages](docs/pages.md) | Personal and Space dashboards, Daily briefs |
+| [Web search](docs/web-search.md) | Paired web devices and privacy |
+| [Updates](docs/updates.md) | Update checks, installation and recovery |
 | [Terminal](docs/terminal.md) | The `metro-tui` client |
 | [Desktop app](apps/desktop/README.md) | The app, requirements, troubleshooting |
 | [Acceptance](docs/acceptance.md) | What's verified, and how to repeat it |
