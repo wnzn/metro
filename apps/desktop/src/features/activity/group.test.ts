@@ -1,7 +1,7 @@
 import { expect, test } from "nsh/test";
 import type { EventActivity, RoomEvent } from "../../api/client";
 import { toActivity } from "../../api/client";
-import { currentStep, durationText, groupAccessibleLabel, groupOutcomeText, groupTitle, groupTranscript, liveTitle, pickBadge, routeBadge, routeConfidence, routeText, shortArgs, summaryParts, timeline, toolCount } from "./group";
+import { currentStep, durationText, groupAccessibleLabel, groupOutcomeText, groupTitle, groupTranscript, liveTitle, routeBadge, routeConfidence, routeText, shortArgs, summaryParts, timeline, toolCount } from "./group";
 import type { ActivityGroup, TranscriptItem } from "./group";
 
 let nextId = 1;
@@ -134,12 +134,14 @@ test("route attribution: a compact badge, and the full sentence in words, never 
   expect(routeBadge(route({ reason: 'System One matched the use case "Code review" (p 1.00)' }))).toBe("Routed: Code review · 100%");
   expect(routeBadge(route({ reason: "picked" }))).toBe("Routed: Code review"); // no probability given
   expect(routeBadge(route({ source: "override", caseLabel: null, addressedBy: "explicit" }))).toBe("Routed: chosen model");
-  expect(routeBadge(route({ source: "default", caseLabel: null }))).toBe("Started by System One");
+  expect(routeBadge(route({ source: "default", caseLabel: null }))).toBe(null); // never attributed to System One
   expect(routeBadge(route({ source: "default", caseLabel: null, addressedBy: "schedule" }))).toBe("Scheduled");
   expect(routeBadge(route({ source: "default", caseLabel: null, addressedBy: "explicit" }))).toBe(null);
 
   const sentence = routeText(route({ reason: 'System One matched the use case "Code review" (p 0.91).' }));
-  expect(sentence).toBe('Use case “Code review” answered: System One matched the use case "Code review" with 91% probability. System One judged that the message asked the agent; nobody typed @agent.');
+  expect(sentence).toBe("Use case “Code review” answered."); // no System One or classifier attribution, even in stored text
+  expect(routeText(route({ source: "default", caseLabel: null, reason: "Default agent (the classifier was unsure: best Coder at 0.41)" }))).not.toMatch(/classifier|System One/i);
+  expect(routeText(route({ source: "default", caseLabel: null, reason: "Picked by classifier: Coder" }))).not.toMatch(/classifier|System One/i);
   // An out-of-range probability is dropped, not shown.
   expect(routeConfidence(route({ reason: "matched (p 7.5)" }))).toBe(null);
   expect(routeText(route({ reason: "matched (p 7.5)" }))).not.toContain("p 7.5");
@@ -179,20 +181,16 @@ test("short arguments, the live step, and the summary's parts", () => {
     ev("tool_call", "agent", "workspace.list {}", run("c")),
     ev("activity", "agent", "", run("c", "Metro", "cancelled")),
   ]))[0]!;
-  expect(summaryParts(g)).toEqual({ pick: null, duration: null, tools: "1 tool", route: null, stopped: "cancelled" });
-  // How a Space turn's agent was chosen: on the collapsed line only when it says more than the name.
-  expect(summaryParts({ ...g, pick: "Picked by classifier: Coder" }).pick).toBe("Picked by classifier: Coder");
-  expect(pickBadge("Default agent")).toBe(null);
-  expect(pickBadge("Addressed: @coder")).toBe(null);
-  expect(pickBadge("Default agent (the classifier was unsure: best Coder at 0.41)")).toBe("Default agent (the classifier was unsure: best Coder at 0.41)");
-  // The started marker's agent and pick reach the group.
+  expect(summaryParts(g)).toEqual({ duration: null, tools: "1 tool", route: null, stopped: "cancelled" });
+  // The started marker's agent reaches the group; its stored pick text is never kept.
   const badge = { id: "ag-2", handle: "coder", name: "Coder", color: "#059669" };
   const picked = groups(groupTranscript([
     ev("activity", "agent", "", { ...run("p", "Coder", "started"), agent: badge, pick: "Picked by classifier: Coder" } as any),
+    ev("tool_call", "agent", "workspace.list {}", run("p")),
     ev("activity", "agent", "", { ...run("p", "Coder", "completed"), agent: badge } as any),
   ]))[0]!;
   expect(picked.agent).toEqual(badge);
-  expect(picked.pick).toBe("Picked by classifier: Coder");
+  expect(JSON.stringify(picked)).not.toMatch(/classifier/i);
   expect(durationText({ ...g, firstMs: 0, lastMs: 12_400 })).toBe("thought 12s");
   expect(durationText({ ...g, firstMs: 0, lastMs: 400 })).toBe(null);
   expect(durationText({ ...g, outcome: "live", firstMs: 0, lastMs: 9_000 })).toBe(null);

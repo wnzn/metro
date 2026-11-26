@@ -48,7 +48,7 @@ export function ActivityGroupRow(props: {
   const id = () => g().key;
   const name = () => (g().source === "agent" ? props.agentName || g().name : "Runner activity");
   /** Something to open: its steps, or the route it took. */
-  const hasDetails = () => g().steps.length > 0 || !!g().route || !!g().pick || !!privateCompactionReason();
+  const hasDetails = () => g().steps.length > 0 || !!g().route || !!privateCompactionReason();
   /** Still working, and nothing has failed: the live line shows. */
   const working = () => g().outcome === "live" && !g().failed;
   const failed = () => groupOutcomeText(g()) === "failed";
@@ -57,7 +57,6 @@ export function ActivityGroupRow(props: {
     if (working()) return [];
     const p = summaryParts(g());
     return [
-      p.pick && { text: p.pick, testID: `activity-pick:${id()}` },
       p.duration && { text: p.duration },
       p.tools && { text: p.tools, testID: `activity-tools:${id()}` },
       p.route && { text: p.route, testID: `activity-route-badge:${id()}` },
@@ -66,7 +65,6 @@ export function ActivityGroupRow(props: {
   };
   // While live, a route still shows: it says which model is answering.
   const liveRoute = () => (working() ? summaryParts(g()).route : null);
-  const livePick = () => (working() ? summaryParts(g()).pick : null);
   /** The Space run behind this turn, while it can still be stopped. */
   const run = () => {
     const aid = g().activityId;
@@ -102,7 +100,6 @@ export function ActivityGroupRow(props: {
             onPress={() => toggle(key())}
           >
             <SummaryParts parts={parts()} />
-            <If when={livePick()}>{(p) => <SummaryParts parts={[{ text: p(), testID: `activity-pick:${id()}` }]} />}</If>
             <If when={liveRoute()}>{(r) => <SummaryParts parts={[{ text: r(), testID: `activity-route-badge:${id()}` }]} />}</If>
           </DisclosureToggle>
         </If>
@@ -140,15 +137,6 @@ export function ActivityGroupRow(props: {
         <Column gap={0} selectable testID={`activity-details:${id()}`}>
           <If when={privateCompactionReason()}>
             {reason => <Label variant="caption" color="muted" testID={`activity-compaction-private:${id()}`}>{reason()}</Label>}
-          </If>
-          <If when={g().pick}>
-            {(p) => (
-              <TimelineEntry phase="progress" last={g().steps.length === 0 && !g().route}>
-                <Label variant="caption" color="muted" testID={`activity-pick-text:${id()}`}>
-                  {p()}
-                </Label>
-              </TimelineEntry>
-            )}
           </If>
           <If when={g().route}>
             {(r) => (
