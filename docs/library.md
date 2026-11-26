@@ -3,8 +3,9 @@
 > **Status: verified locally with fixtures.** It's in the published
 > [Metro 0.3.2](https://github.com/wnzn/metro/releases/tag/v0.3.2),
 > [0.4.0](https://github.com/wnzn/metro/releases/tag/v0.4.0),
-> [0.5.0](https://github.com/wnzn/metro/releases/tag/v0.5.0) and
-> [0.5.1](https://github.com/wnzn/metro/releases/tag/v0.5.1).
+> [0.5.0](https://github.com/wnzn/metro/releases/tag/v0.5.0),
+> [0.5.1](https://github.com/wnzn/metro/releases/tag/v0.5.1) and
+> [0.6.0](https://github.com/wnzn/metro/releases/tag/v0.6.0).
 > The checks below were local runs, not runs of the release files. It's part of the
 > [final local gate](acceptance.md#demonstrated-final-local-gate-with-documents--media-2026-11-22-primary-workspace-local):
 > 497 Rust tests, all seven e2e scripts (`library.py` ran twice), the 83
@@ -740,7 +741,7 @@ around `google/embeddinggemma-2`. Upload, listing, preview and download work
 without one.
 
 - **The reference service image is published** as
-  `ghcr.io/wnzn/metro-embeddinggemma2:v0.5.1` (`linux/amd64` only, no
+  `ghcr.io/wnzn/metro-embeddinggemma2:v0.6.0` (`linux/amd64` only, no
   weights; pin the digest from the release's `IMAGES.txt`). Running that
   image from the registry hasn't been recorded, and this page doesn't yet
   describe running it outside the `compose.media.yaml` override, which

@@ -7,8 +7,8 @@ come back as `{"error": "..."}`.
 ## Identity
 
 Your sign-in provider determines your stable ID. The
-[server directory](messages.md#direct-messages-and-the-directory)
-is in the source, not released; it doesn't change how IDs are assigned.
+[server directory](messages.md#direct-messages-and-the-directory),
+added in 0.6.0, doesn't change how IDs are assigned.
 
 | Sign-in mode | Your `id` (stable, used for membership) | Your `actor` (display only) |
 | --- | --- | --- |
@@ -56,11 +56,11 @@ The live dev service's profile read endpoints were also checked.
   a fresh PNG (`image/png`), with no metadata. It never fetches an image
   from a URL. `avatar_version` changes on every upload, so clients know when
   to fetch again.
-- **Who can read whose profile.** In 0.5.0, you can read your own and
+- **Who can read whose profile.** In 0.5.x, you can read your own and
   those of people who share a Space with you right now. Other people
   and unknown IDs get `404`. The
   [server directory and DM profile access](messages.md#direct-messages-and-the-directory)
-  change this in the source, not in the published builds.
+  added in 0.6.0 widen this.
 - Avatars have no public URL. They're read with your bearer token and
   served with `Cache-Control: no-store`.
 - New messages record the display name in force when they're written. Older
@@ -97,8 +97,8 @@ The live dev service's profile read endpoints were also checked.
   had not yet created a page. [Recently deleted](pages.md#deleting-pages-and-spaces)
   cannot recover them after Space deletion.
 - A Space holds at most 100 members and 200 rooms, including agent-created
-  threads. [Reply threads](messages.md#reply-threads) in the source, not
-  released, have a separate limit.
+  threads. [Reply threads](messages.md#reply-threads) (since 0.6.0) have a
+  separate limit.
 
 | Request | Who | Result |
 | --- | --- | --- |
@@ -152,7 +152,8 @@ always means "the default agent, or the one the classifier picks" (below).
   (`activity.agent`: id, handle, name, picture version and colour). Its
   `started` marker also says how the agent was chosen (`activity.pick`, for
   example *Addressed: @coder*, *Default agent* or *Picked by classifier:
-  Coder*).
+  Coder*). In the source, not released, the desktop no longer shows the
+  *Picked by classifier* label.
 - Threads an agent's run creates keep that agent.
 - [Scheduled prompts](schedules.md) in a Space use its default agent.
 
@@ -192,10 +193,13 @@ See [desktop mentions](released-0.5.0.md#mentions-in-rooms-and-threads),
 [Space send protocol](released-0.5.0.md#space-send-protocol-client-developers)
 for the 0.5.0 composer and API.
 
-The table and rules below describe 0.5.0. **In the source, not released:**
-[Replying to an agent](messages.md#reply) adds an explicit recipient, and
-the [opt-in classifier](system-one.md#classification-in-the-source-not-released)
+The table and rules below describe 0.5.0. **Since 0.6.0,**
+[replying to an agent](messages.md#reply) adds an explicit recipient, and
+the [opt-in classifier](system-one.md#classification-since-060)
 uses a lower threshold and brief room context for unaddressed text.
+In the source, not released (0.6.1), a message is stored and shown before
+[System One decides](system-one.md#decisions-after-posting), and members
+can [delete messages](messages.md#delete).
 
 | You write | Addressed to | Which agent runs |
 | --- | --- | --- |
@@ -306,14 +310,16 @@ works on human and agent messages in Chat, rooms and threads.
 
 ## Space agent behaviour
 
-**In the source, not released.** A Space agent's built-in prompt asks it
+**Since 0.6.0,** a Space agent's built-in prompt asks it
 to answer usefully (in Markdown when helpful), acknowledge with a reaction
 if enough, or send no reply if it would interrupt people. The prompt
 discourages silence when a person names the agent or replies to it with
 a question or request. An empty final answer or `METRO_NO_REPLY` completes
 the run without an agent message; a reaction followed by
 `METRO_REACTION_ONLY` can acknowledge a message without a text reply.
-The completed activity distinguishes replies, reactions and no reply.
+The completed activity metadata distinguishes replies, reactions and no
+reply. In the source, not released (0.6.1), the desktop shows nothing in the
+transcript for a run that ends without an agent message.
 
 New Spaces get a default agent instructed to help the whole room,
 suggest a better-suited agent by handle when appropriate, and ask a
@@ -341,7 +347,7 @@ A room's agent can delegate work to **child threads** with the tools
 - Threads go only one level deep: a thread can't create threads. A room can
   have at most 16 of them.
 
-**In the source, not released:** [Reply threads](messages.md#reply)
+**Since 0.6.0,** [reply threads](messages.md#reply)
 are anchored to a room message. They include the anchor in agent
 history and don't mirror answers into the parent room. If an
 agent-created thread completes without a reply, its parent still gets a
@@ -359,8 +365,8 @@ completion note.
 - The Chat agent can acknowledge a message with `react_to_message`.
   Web tools require a separate [opt-in](web-search.md). Chat never uses a
   runner directly and has no workspace or agent-thread management tools.
-  In 0.5.0 it cannot read Space transcripts or post in Spaces.
-  **In the source, not released:** [Metro in Chat](next-source.md#metro-in-chat)
+  In 0.5.x it cannot read Space transcripts or post in Spaces.
+  **Since 0.6.0,** [Metro in Chat](released-0.6.0.md#metro-in-chat)
   can read and post as you after its notice gate, and you can
   [forward](messages.md#forward) a message yourself.
 - The manual cross-Space controls in Chat are separate. **Agent runs**
@@ -385,8 +391,8 @@ completion note.
   out.
 - Run history is kept in memory, bounded, and lost on restart. Room
   transcripts are durable.
-- **In the source, not released:** the initiator can
-  [retry eligible runs](next-source.md#new-api-routes-and-fields);
+- **Since 0.6.0,** the initiator can
+  [retry eligible runs](released-0.6.0.md#new-api-routes-and-fields);
   personal Chat has a separate turn stop endpoint and remains out of
   the runs list.
 - At most 4 agent runs are active per Space, and 8 per server.

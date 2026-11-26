@@ -20,7 +20,7 @@ GTK, the desktop app or a display, and it never reads Metro's database.
 
 ## Where it is
 
-It's inside each desktop download, including the 0.5.1 release archives.
+It's inside each desktop download, including the 0.6.0 release archives.
 
 | Download | Where `metro-tui` is |
 | --- | --- |

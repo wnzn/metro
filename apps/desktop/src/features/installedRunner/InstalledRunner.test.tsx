@@ -1438,13 +1438,13 @@ test("an update offer changed while confirming never requests a different target
   const id = `id:runner-update:${mine.id}`;
   await app.press(id);
   await app.waitFor(`${id}:warning`);
-  f.state.runnerRelease.set(mine.id, fixtureRelease("managed", "self_update", { latest: "0.6.0" }));
+  f.state.runnerRelease.set(mine.id, fixtureRelease("managed", "self_update", { latest: "0.6.1" }));
   await app.press(`${id}:confirm`);
   await app.waitFor(`id:runner-update-error:${mine.id}`);
   expect(text(app)).toContain("This runner is no longer eligible for that update. Nothing was requested.");
   expect(f.posts().filter((p) => p.path.endsWith("/update"))).toEqual([]);
   await app.press(id);
-  expect(text(app)).toContain("Build box downloads 0.6.0 from GitHub");
+  expect(text(app)).toContain("Build box downloads 0.6.1 from GitHub");
 });
 
 test("a held keyboard update keeps its scoped busy panel and restores focus to retry or result", async () => {

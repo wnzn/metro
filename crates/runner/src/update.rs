@@ -1355,8 +1355,8 @@ mod tests {
         }
         // Well-formed but about another state of the install (`current` was
         // moved by a manual install): no action, nothing deleted.
-        let other = Version::parse("0.6.0").unwrap();
-        let dir = managed("0.6.0");
+        let other = Version::parse("0.6.1").unwrap();
+        let dir = managed("0.6.1");
         let root = dir.path();
         pending(root, MAX_STARTS);
         assert!(matches!(

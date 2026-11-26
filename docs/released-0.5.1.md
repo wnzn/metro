@@ -22,4 +22,4 @@ for the features this release builds on.
 - Page layout and the accessibility of tables, links, diffs and headings
   have improved.
 
-The [0.6.0 changes](next-source.md) are in the source, not released.
+The [0.6.0 changes](released-0.6.0.md) came in the next release.

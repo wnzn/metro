@@ -22,14 +22,14 @@ the sidebar hides completely.
 
 This page also covers the server settings that operators set behind them.
 
-**In the source, not released:**
+**Since 0.6.0:**
 
 - **Settings → Metro in Chat** controls [which Spaces Metro may use in
-  Chat](next-source.md#metro-in-chat).
+  Chat](released-0.6.0.md#metro-in-chat).
 - **Settings → Model choices → Conversation summaries** controls
-  [automatic compaction](next-source.md#conversation-summaries) for runs
+  [automatic compaction](released-0.6.0.md#conversation-summaries) for runs
   you start. **Space classification** has a
-  [new threshold and disclosure](system-one.md#classification-in-the-source-not-released).
+  [new threshold and disclosure](system-one.md#classification-since-060).
 - The model list's **Context size…** lets connection owners set the
   context window used to estimate when to summarize.
 
@@ -607,7 +607,7 @@ is its default model and is always one of its enabled models.
 | `DELETE /v1/providers/{id}/model-list?model_id=ID` | Remove a model (not the default model) |
 | `POST /v1/providers/{id}/model-list/refresh` | The same as `POST /v1/providers/{id}/models` |
 
-**In the source, not released:** `GET /v1/providers/{id}/model-list`
+**Since 0.6.0,** `GET /v1/providers/{id}/model-list`
 includes `context_tokens` on each model (an integer from 1,024 to
 10,000,000, or `null` for unknown). Connection owners can set it when
 adding (`POST`) or editing (`PATCH`) a model in this list. Send `null`
@@ -698,7 +698,9 @@ isn't secret and never leaves the device.
     credentials ([screenshot](screenshots/route-attribution.png)).
   - Since 0.4.0, the group is named
     after the Space agent working the turn, can show how that agent was
-    chosen (for example *Picked by classifier: Coder*), and shows the
+    chosen (for example *Picked by classifier: Coder*; in the source,
+    not released, that label and *detected by System One* are no longer
+    shown), and shows the
     provider's reasoning summaries (`reasoning_summary` events) as
     plain text. Collapsed, the group is one summary line (for example
     *thought 12s · 2 tools*); while live it names the current step and

@@ -134,7 +134,7 @@ Spaces it's a setting **per Space** (`classify_unaddressed` in
 [your preferences for that Space](spaces.md#your-preferences-in-a-space)).
 It can be turned on only while the person has a System One connection
 usable in that Space. It is off by default. The rules below are for
-0.5.0; see [source changes](#classification-in-the-source-not-released).
+0.5.0; see [source changes](#classification-since-060).
 
 **In a Space room**, it decides two things for the sender's messages:
 
@@ -161,6 +161,8 @@ For these decisions:
 - An unaddressed message that started a run this way is stored with
   `addressed_by: "classifier"`, which no client can send. The run's activity
   shows how its agent was chosen, for example *Picked by classifier: Coder*.
+  In the source, not released, [deferred decisions](#decisions-after-posting)
+  don't store the pick and the desktop doesn't show that label.
 - It never sees a people-only message, which never starts an agent.
 - It never sees a message to a named agent (`@coder`, or Ask agent with an
   agent chosen).
@@ -171,7 +173,7 @@ When the per-Space setting was introduced, everyone who had
 `classify_unaddressed` on in each Space they were a member of then. That
 happened once; Spaces joined later start with it off.
 
-### Classification in the source, not released
+### Classification since 0.6.0
 
 Classification is still opt-in per Space and still uses one typed System
 One Choice for unaddressed text. The prompt now tells the classifier to
@@ -198,6 +200,39 @@ to equal the old default; all other values stay as they were. This
 doesn't turn classification on. [Replying to a specific agent](messages.md#reply)
 addresses it directly and bypasses the unaddressed classifier, as does
 a named agent mention.
+
+### Decisions after posting
+
+**In the source, not released (0.6.1).** A Space message POST with
+`"defer_decisions": true` (the desktop always sends it) stores and
+returns the message at once. If it would otherwise wait on System One
+(the sender's opt-in classification, the classifier's pick for `@agent`,
+or use-case routing), the response has `decisions_pending: true`; the
+server then makes those decisions exactly once and starts the runs they
+choose, whether or not anyone collects the result. People-only messages
+and messages to a named agent are still never classified.
+
+- The decision never edits the stored message: a classifier's pick isn't
+  added to its recipients. It appears only as run activity, and the
+  desktop no longer labels it *Picked by classifier* or *detected by
+  System One*.
+- `POST /v1/spaces/{sid}/rooms/{rid}/messages/{eid}/decisions` with `{}`
+  returns the sender-only `addressing_note` and `routing_note`, as POST
+  metadata shaped like the message response. Only the message's
+  authenticated sender gets them, once, while still a member and while
+  the message exists; anyone else, a second call, a deleted message or a
+  server restart gets `404`. Outcomes are kept in memory for up to 10
+  minutes. If the decisions are still running after 90 seconds, the call
+  returns `202 {decisions_pending: true}`; ask again.
+- An agent deleted, or a message deleted, before the decision is made
+  starts nothing.
+- Without `defer_decisions`, the POST waits for the decisions as before.
+- Personal Chat routing also runs after the message is stored and
+  returned. A turn that can't start says why in the Chat.
+
+In a local test with a scripted System One taking 1,000 ms, the message
+was visible to another member 1–2 ms after the POST, against about
+1,022 ms before ([record](acceptance.md#source-only-metro-061-lanes-2026-11-27-local)).
 
 ## Use-case routing
 
@@ -249,7 +284,7 @@ Each person has their own settings. Use-case routing is off by default.
 | `classifier_id` | Your System One connection. Used for routing, per-Space classification and the search rerank. |
 | `embedding_id` | Your embeddings connection, used for [search](#semantic-search) |
 | `default_chat_id` | The chat connection to use on `no_match`. Leave it out to keep your default. |
-| `min_directedness` | In 0.5.0: 0.5 to 1, default 0.85. In the source, not released: 0.2 to 1, default 0.35 (see [migration](#classification-in-the-source-not-released)). |
+| `min_directedness` | In 0.5.x: 0.5 to 1, default 0.85. Since 0.6.0: 0.2 to 1, default 0.35 (see [migration](#classification-since-060)). |
 | `min_route_probability` | 0 to 1, default 0.65 |
 | `cases` | Up to 16 entries of `{"key", "label", "description", "connection_id"}`. Keys match `[a-z][a-z0-9_]*`, up to 32 characters, are unique, and can't be `no_match`. Labels are up to 64 characters, and descriptions, the criterion System One judges, up to 500. |
 
@@ -286,8 +321,8 @@ Only people's messages and the agent's final replies are indexed. Tool calls,
 tool output, activity, status, errors, thread mirrors and reactions are
 never indexed, and neither are runner files or workspaces. A message that
 contains a Metro credential prefix (`metro_rt_`, `metro_pc_`) is skipped.
-Search is your own feature. In 0.5.0 it doesn't give the Chat agent access
-to Space transcripts. **In the source, not released:** [Metro in Chat](next-source.md#metro-in-chat)
+Search is your own feature. In 0.5.x it doesn't give the Chat agent access
+to Space transcripts. **Since 0.6.0,** [Metro in Chat](released-0.6.0.md#metro-in-chat)
 has a separate access setting and notice before it can search your
 Spaces. DMs, Chat posting receipts and compaction markers aren't
 indexed. Uploaded files are a separate corpus with its own search; see

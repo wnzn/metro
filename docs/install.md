@@ -3,12 +3,12 @@
 This guide uses published installers. See [Updates](updates.md) for the
 update controls and Linux journal diagnostic.
 
-> **Latest release: [Metro 0.5.1](https://github.com/wnzn/metro/releases/tag/v0.5.1)**
-> (2026-11-26, from `5120c52`). Releases are published automatically when a
+> **Latest release: [Metro 0.6.0](https://github.com/wnzn/metro/releases/tag/v0.6.0)**
+> (2026-11-26, from `430c835`). Releases are published automatically when a
 > version bump is merged into the protected `main` branch
 > ([how](#official-releases)). Its `SHA256SUMS` is signed with Sigstore; its
 > Windows files are **not** code-signed. What was checked is in
-> [acceptance](acceptance.md#published-metro-051-2026-11-26-github-release-v051).
+> [acceptance](acceptance.md#published-metro-060-2026-11-26-github-release-v060).
 >
 > This page describes the per-user installer scripts at `fb7cb06`, the
 > Windows MSI from `ff28b09` onwards, and the desktop's runner screen at
@@ -87,12 +87,12 @@ against the Sigstore-verified `SHA256SUMS` before you run it
 come back once a certificate is set up and it says `signed`
 ([deploy.md](deploy.md#windows-releases-signed-or-unsigned)).
 
-**Unattended checks on native Windows.** In 0.5.1 and earlier releases, the
+**Unattended checks on native Windows.** In 0.6.0 and earlier releases, the
 run's `windows-distribution / preview` job on a GitHub `windows-2025`
 runner installed the unsigned MSI into a chosen folder, checked its
 payload, ran the server and uninstalled it, and passed the MSI lane's
 native tests (upgrade, repair, downgrade, uninstall), all unattended
-([0.5.1 release record](acceptance.md#published-metro-051-2026-11-26-github-release-v051), [0.5.0](acceptance.md#published-metro-050-2026-11-25-github-release-v050), [0.4.0](acceptance.md#published-metro-040-2026-11-25-github-release-v040), [0.3.2](acceptance.md#published-metro-032-2026-11-24-github-release-v032)).
+([0.6.0 release record](acceptance.md#published-metro-060-2026-11-26-github-release-v060), [0.5.1](acceptance.md#published-metro-051-2026-11-26-github-release-v051), [0.5.0](acceptance.md#published-metro-050-2026-11-25-github-release-v050), [0.4.0](acceptance.md#published-metro-040-2026-11-25-github-release-v040), [0.3.2](acceptance.md#published-metro-032-2026-11-24-github-release-v032)).
 Earlier local desktop GUI smoke tests ran under Wine on Linux, not on
 native Windows. **No person has verified the desktop GUI or the MSI
 wizard on native Windows.** See the [MSI notes](../packaging/windows-msi/README.md).
@@ -118,8 +118,8 @@ wizard on native Windows.** See the [MSI notes](../packaging/windows-msi/README.
   an unknown publisher, and to check the file against its SHA-256 checksum
   (`SHA256SUMS`) before installing. Windows SmartScreen may warn about it. Only a signed release
   has `Metro-<version>-windows-x64.msi`, signed with Authenticode ([check
-  it](#check-a-download)). The 0.5.1 release has the unsigned
-  `Metro-0.5.1-windows-x64.unsigned-preview.msi` only.
+  it](#check-a-download)). The 0.6.0 release has the unsigned
+  `Metro-0.6.0-windows-x64.unsigned-preview.msi` only.
 
 ### The portable ZIP and `install-metro-windows.ps1`
 
@@ -264,7 +264,7 @@ sh metro-runner-container.sh status
 - On a Linux host, the token file must be readable by the image's runner
   user (uid 1000); otherwise use the native runner.
 - The image named by `--version` is the GHCR runner image
-  `ghcr.io/wnzn/metro-runner:v<version>`, published in 0.5.1
+  `ghcr.io/wnzn/metro-runner:v<version>`, published in 0.6.0
   (`linux/amd64`, `linux/arm64`).
 
 ### Networking
@@ -316,9 +316,9 @@ that.
 
 ## Official releases
 
-> **This process published [Metro 0.5.1](https://github.com/wnzn/metro/releases/tag/v0.5.1)**
-> on 2026-11-26, from `5120c52`, in CI run
-> [45725172627](https://github.com/wnzn/metro/actions/runs/45725172627).
+> **This process published [Metro 0.6.0](https://github.com/wnzn/metro/releases/tag/v0.6.0)**
+> on 2026-11-26, from `430c835`, in CI run
+> [45737693549](https://github.com/wnzn/metro/actions/runs/45737693549).
 > There's no Windows code-signing setup, so releases ship Windows unsigned
 > for now ([deploy.md](deploy.md#windows-releases-signed-or-unsigned)).
 
