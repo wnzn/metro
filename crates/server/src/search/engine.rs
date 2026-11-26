@@ -331,7 +331,9 @@ impl<'a> Engine<'a> {
             report.indexed += stored as u64;
             match outcome {
                 // The source is full; `waiting` reports it.
-                StoreOutcome::Stored if stored < keep.len() => return Ok(true),
+                StoreOutcome::Full => return Ok(true),
+                // Vectors of events deleted or changed meanwhile were
+                // skipped; the cursor is past them, so carry on.
                 StoreOutcome::Stored => {}
                 // Someone else's request moved this source on; theirs wins.
                 StoreOutcome::Raced => return Ok(true),
