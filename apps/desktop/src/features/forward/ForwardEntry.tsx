@@ -18,7 +18,7 @@ export function ForwardEntry() {
   });
   return (
     <Modal testID="forward-dialog" title="Forward message" open={!!forwardSelection()?.current()}
-      onClose={closeForward} size={sidePanelFits() ? "compact" : "full-height"}>
+      onClose={closeForward} size={sidePanelFits() ? "form" : "full-height"}>
       <If when={forwardSelection()?.current() ? forwardSelection() : null}>
         {selection => <ForwardForm selection={selection()} />}
       </If>
