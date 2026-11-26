@@ -2,7 +2,7 @@ import { effect, signal } from "nsh";
 import type { InputRef, ViewRef } from "nsh";
 import type { DirectoryPerson } from "../../api/directory";
 import {
-  Action, AnchoredPopover, Banner, Column, compactWidth, ComposerBar, ComposerBox, ComposerField, IdentityCardFrame,
+  Action, AnchoredPopover, Banner, Column, compactWidth, ComposerBar, ComposerBox, ComposerContext, ComposerField, IdentityCardFrame,
   Label, Row, ScrollArea, SendButton,
 } from "../../ui";
 import { ConnectionBanner, messageAuthorName, replyExcerpt, Transcript } from "../Conversation";
@@ -85,7 +85,7 @@ export function DmView() {
         <Column padX={4} padY={3}>
           <ComposerBox testID="dm-composer-box">
             <If when={dmReply()}>
-              {event => <Row gap={1} align="center" testID="dm-reply-context">
+              {event => <ComposerContext testID="dm-reply-context">
                 <Column grow>
                   <Label variant="caption" color="muted" lines={2}>{`Reply to ${messageAuthorName(event())} · ${replyExcerpt(event())}`}</Label>
                 </Column>
@@ -94,7 +94,7 @@ export function DmView() {
                   if (replyOpener) replyOpener.focus();
                   else focusInput();
                 }} />
-              </Row>}
+              </ComposerContext>}
             </If>
             <ComposerField testID="dm-composer" ref={node => { input = node; }} value={dmDraft()} onChange={dmDraft.set}
               onSubmit={() => void sendDm()} disabled={!dmLoaded() || dmHiding() === dm().id} placeholder={`Message ${dm().peer.name}`} />

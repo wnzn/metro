@@ -63,6 +63,7 @@ import {
   Badge,
   Banner,
   Column,
+  ComposerContext,
   ComposerHint,
   InlineLink,
   Label,
@@ -546,9 +547,11 @@ function RoomComposer(props: { thread?: boolean }) {
         <>
           <If when={replyTarget()}>
             {target => <Column gap={1} testID="reply-context">
-              <Label variant="caption" color="muted" lines={2} testID="composer-reply-quote">
-                {messageAuthorName(target().event)} · {replyExcerpt(target().event)}
-              </Label>
+              <ComposerContext>
+                <Label variant="caption" color="muted" lines={2} testID="composer-reply-quote">
+                  {messageAuthorName(target().event)} · {replyExcerpt(target().event)}
+                </Label>
+              </ComposerContext>
               <If when={commandDraft() ? null : replyAgent()}>
                 {agent => <RecipientBar><RecipientChip testID="reply-agent-chip" agent
                   label={`Replying to ${agent().name}`} accessibilityLabel={`Don't ask ${agent().name} to reply`}

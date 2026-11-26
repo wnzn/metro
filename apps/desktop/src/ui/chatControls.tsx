@@ -447,6 +447,15 @@ export function ComposerHint(props: Testable & { text: string }) {
   );
 }
 
+/** Context above the field, inset like the recipients: the message a reply quotes. */
+export function ComposerContext(props: Testable & { children?: JSX.Element }) {
+  return (
+    <View class="flex-row items-center gap-(--space-1) px-(--space-3) pt-(--space-2)" testID={props.testID}>
+      {props.children}
+    </View>
+  );
+}
+
 /** The quiet "To:" line of explicit recipients above the field. */
 export function RecipientBar(props: Testable & { children?: JSX.Element }) {
   return (
