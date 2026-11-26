@@ -80,6 +80,9 @@ test("creates and reopens the same thread, showing the anchor, count and partici
   expect(app.shows("id:resize-thread")).toBe(true);
   await app.waitFor("id:reply-agent-chip");
   expect(app.shows("label:Don't ask Coder to reply")).toBe(true);
+  // An open thread with no reply adds no "0 replies" under the message.
+  await app.wait(50);
+  expect(app.shows(`id:replies:${anchor.id}`)).toBe(false);
   await app.type("id:composer", "Tell me more");
   await app.press("id:send");
   await app.waitFor("text:New agent reply");

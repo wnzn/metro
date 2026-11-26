@@ -428,7 +428,9 @@ function MessageRow(props: { row: () => Of<"event">; actions: TranscriptActions 
   const forwarded = () => event().forwarded;
   const forwardedTime = () => stampOf(forwarded()?.sentAt, clock())?.full;
   const sourceRoom = () => rooms().find(r => r.id === forwarded()?.sameSpace?.roomId);
-  const replies = () => props.actions.onReply && !props.actions.readOnly ? event().replies : undefined;
+  // A thread opened without a reply yet shows nothing under its message.
+  const replies = () => props.actions.onReply && !props.actions.readOnly && event().replies?.count
+    ? event().replies : undefined;
   const palette = signal(false);
   const copied = signal(false);
   let reactButton: ViewRef | null = null;
