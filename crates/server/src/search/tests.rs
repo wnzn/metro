@@ -36,6 +36,9 @@ struct Fake {
     /// Noul per candidate text; missing means "fail this call".
     nouls: Mutex<HashMap<String, f64>>,
     decide_fails: Mutex<bool>,
+    /// Run once, inside the first embed call (between the batch's read and
+    /// its store).
+    on_embed: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 const WORDS: [&str; 4] = ["deploy", "lunch", "invoice", "holiday"];
@@ -52,6 +55,7 @@ impl Fake {
             pad: Mutex::new(0),
             nouls: Mutex::default(),
             decide_fails: Mutex::new(false),
+            on_embed: Mutex::default(),
         }
     }
 
@@ -108,6 +112,9 @@ impl Models for Fake {
         _c: &'a str,
         inputs: Vec<String>,
     ) -> ModelFuture<'a, Vec<Vec<f32>>> {
+        if let Some(hook) = self.on_embed.lock().unwrap().take() {
+            hook();
+        }
         let out = {
             let mut calls = self.calls.lock().unwrap();
             calls.embed_calls += 1;
@@ -652,6 +659,44 @@ async fn indexing_is_incremental_with_a_cursor() {
         .collect();
     assert_eq!(embedded.len(), total + 1);
     assert_eq!(embedded.iter().collect::<HashSet<_>>().len(), total + 1);
+}
+
+#[tokio::test]
+async fn a_deletion_during_embedding_skips_its_vector_without_stopping_indexing() {
+    let w = World::new();
+    let fake = Fake::new();
+    fake.allow(None, "fp");
+    let ids: Vec<i64> = (0..INDEX_BATCH * 2)
+        .map(|i| w.chat("alice", kind::MESSAGE, &format!("lunch note {i}")))
+        .collect();
+    let (db, gone) = (w.db.clone(), ids[3]);
+    *fake.on_embed.lock().unwrap() = Some(Box::new(move || {
+        let who = crate::auth::Human {
+            id: "alice".into(),
+            name: "alice".into(),
+        };
+        crate::deletion::delete_in_chat(&db, gone, &who)
+            .unwrap()
+            .unwrap();
+    }));
+    // One call indexes both batches: the skipped event isn't "source full".
+    let i = w.index(&fake, "alice", Scope::Chat).await;
+    assert!(i.done, "{i:?}");
+    assert_eq!(i.remaining, 0);
+    let stored: Vec<i64> = w
+        .db
+        .lock()
+        .prepare("SELECT event_id FROM search_vectors WHERE user_id = 'alice' ORDER BY event_id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let expected: Vec<i64> = ids.iter().copied().filter(|id| *id != gone).collect();
+    assert_eq!(
+        stored, expected,
+        "the deleted event's vector never comes back"
+    );
 }
 
 #[tokio::test]

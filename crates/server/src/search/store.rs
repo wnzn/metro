@@ -210,7 +210,13 @@ pub struct NewVector {
 /// Why a batch was not stored.
 #[derive(Debug, PartialEq, Eq)]
 pub enum StoreOutcome {
+    /// Every vector whose event is unchanged was stored (events deleted or
+    /// changed since the batch was read are skipped) and the cursor moved
+    /// to the batch's end.
     Stored,
+    /// The source reached its vector limit: the cursor stops before the
+    /// first vector left out, which stays waiting.
+    Full,
     /// The source's fingerprint, dimension or cursor moved while the batch
     /// was being embedded (a concurrent request, or a reconfiguration).
     Raced,
@@ -305,7 +311,12 @@ pub fn store_batch(
         params![user, key, to, dims.map(|d| d as i64)],
     )?;
     tx.commit()?;
-    Ok((StoreOutcome::Stored, stored))
+    let outcome = if full_at.is_some() {
+        StoreOutcome::Full
+    } else {
+        StoreOutcome::Stored
+    };
+    Ok((outcome, stored))
 }
 
 /// Does `v`'s event still exist in `source`, of an indexed kind, in the same
@@ -595,7 +606,7 @@ mod tests {
             1,
         )
         .unwrap();
-        assert_eq!((outcome, stored), (StoreOutcome::Stored, 1));
+        assert_eq!((outcome, stored), (StoreOutcome::Full, 1));
         assert_eq!(ids(&db, "alice", &source), [c]);
         assert_eq!(cursor(&db, "alice", &source), d - 1, "d is still waiting");
     }
