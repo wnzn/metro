@@ -17,7 +17,7 @@ type Req = { method: string; url: string; headers: Record<string, string>; body?
 
 const ROOT = "/home/me/.config/metro-desktop/local-tools/runner/0123456789abcdef/spaces";
 
-type Opts = { requested?: boolean; available?: boolean; state?: string; canReconnect?: boolean; legacy?: boolean; unavailableFor?: string; unconfirmedName?: string };
+type Opts = { requested?: boolean; available?: boolean; state?: string; canReconnect?: boolean; legacy?: boolean; unavailableFor?: string; unconfirmedName?: string; detail?: string };
 
 /** The fake bridge plus the personal runner routes. */
 function bridgeWithRunner(f: F, runnerId: string | null, name: string, opts: Opts = {}) {
@@ -31,7 +31,7 @@ function bridgeWithRunner(f: F, runnerId: string | null, name: string, opts: Opt
     marker_detail: null,
     available: st.available,
     state: !st.available ? "unavailable" : st.state,
-    detail: st.state === "revoked" ? "This computer's runner is no longer accepted by the local Metro server." : null,
+    detail: opts.detail ?? (st.state === "revoked" ? "This computer's runner is no longer accepted by the local Metro server." : null),
     runner: !st.available || !st.runnerId ? null : { id: st.runnerId, name },
     ...(opts.unconfirmedName && !st.runnerId ? { unconfirmed_name: opts.unconfirmedName } : {}),
     spaces_folder: !st.available ? null : ROOT,
@@ -1556,4 +1556,16 @@ test("Docker guidance only exposes official version-matched pinned images; embed
   expect(app.shows(`id:runner-copy-image:${wrong.id}`)).toBe(false);
   expect(text(app)).toContain("The server did not provide a valid pinned Metro runner image.");
   expect(f.posts().filter((p) => p.path.endsWith("/update"))).toEqual([]);
+});
+
+test("a runner that didn't start says why under its badge", async () => {
+  const f = world();
+  const mine = f.addRunner("This PC", "personal", "alice");
+  const why = "Metro couldn't open its local tools folder C:\\Users\\me\\AppData\\Local\\Metro\\local-tools: Access is denied.";
+  const t = bridgeWithRunner(f, mine.id, "This PC", { state: "failed", detail: why });
+  const app = await openWith(f, t);
+  await signInToRunners(app, "alice");
+  await app.waitFor("id:installed-runner-detail");
+  expect(installedRunnerBadge(parseInstalledRunner({ requested: true, available: true, state: "failed", tools: [] })!).label).toBe("Failed");
+  expect(text(app)).toContain("Access is denied.");
 });

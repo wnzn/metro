@@ -265,7 +265,12 @@ pub async fn call_runner(
             state
                 .monitor_space(space, crate::monitoring::Code::from(e))
                 .await;
-            let text = format!("{} failed: {e}", tool.runner_name());
+            // "Not picked up" says whether the runner is connected at all.
+            let why = match e {
+                JobError::NotClaimed => crate::runners::not_claimed_reason(state, space).await,
+                e => e.to_string(),
+            };
+            let text = format!("{} failed: {why}", tool.runner_name());
             state
                 .append_with(
                     space,

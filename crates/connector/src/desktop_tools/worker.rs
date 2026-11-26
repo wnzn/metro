@@ -35,6 +35,8 @@ pub enum WorkerState {
     Offline,
     /// The token was revoked or replaced; stopped for good.
     Revoked,
+    /// Didn't start, or stopped unexpectedly; `detail` says why.
+    Failed,
     Stopped,
 }
 
@@ -78,6 +80,7 @@ impl Handle {
 
 /// What the worker needs; all owned, nothing shared with other Spaces but
 /// the root handle (from which it opens only its own folder).
+#[derive(Clone)]
 pub struct Spec {
     pub hosted: Hosted,
     pub root: Arc<File>,
@@ -96,7 +99,30 @@ pub fn spawn(spec: Spec) -> Handle {
         detail: None,
     }));
     let etag = spec.etag.clone();
-    let task = tokio::spawn(run(spec, rx, status.clone()));
+    let crash_status = status.clone();
+    let sid = spec.space_id.clone();
+    let task = tokio::spawn({
+        let status = status.clone();
+        supervise(
+            rx,
+            FIRST_RESTART,
+            move |delay| {
+                eprintln!(
+                    "metro-desktop: local tools for Space {sid} stopped unexpectedly; restarting in {}s",
+                    delay.as_secs()
+                );
+                set(
+                    &crash_status,
+                    WorkerState::Failed,
+                    Some(format!(
+                        "Local tools stopped unexpectedly. Metro restarts them in {} s.",
+                        delay.as_secs().max(1)
+                    )),
+                );
+            },
+            move |rx| run(spec.clone(), rx, status.clone()),
+        )
+    });
     Handle {
         stop: tx,
         task,
@@ -112,8 +138,54 @@ fn set(status: &Mutex<Status>, state: WorkerState, detail: Option<String>) {
     }
 }
 
+/// The first restart delay after a crash; doubled up to [`MAX_RESTART`].
+pub(super) const FIRST_RESTART: Duration = Duration::from_secs(1);
+const MAX_RESTART: Duration = Duration::from_secs(60);
+
+/// Aborts the task it holds when dropped, so stopping (or aborting) the
+/// supervisor never leaves its current run behind.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Run `make(rx)` until it returns (asked to stop, or stopped for good,
+/// such as a revoked token). If it panics, `crashed(delay)` records why,
+/// and it runs again after `delay`, doubling up to a minute, until asked
+/// to stop. Shared by the per-Space workers and this computer's runner.
+pub(super) async fn supervise<F, Fut>(
+    mut rx: watch::Receiver<bool>,
+    first: Duration,
+    crashed: impl Fn(Duration),
+    mut make: F,
+) where
+    F: FnMut(watch::Receiver<bool>) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut delay = first;
+    loop {
+        let mut run = AbortOnDrop(tokio::spawn(make(rx.clone())));
+        match (&mut run.0).await {
+            Err(e) if e.is_panic() => {}
+            // Finished (stopped, revoked) or cancelled: done.
+            _ => return,
+        }
+        if *rx.borrow() {
+            return;
+        }
+        crashed(delay);
+        if !pause(&mut rx, delay).await {
+            return;
+        }
+        delay = (delay * 2).min(MAX_RESTART);
+    }
+}
+
 /// Sleep unless asked to stop; false when stopping.
-async fn pause(rx: &mut watch::Receiver<bool>, d: Duration) -> bool {
+pub(super) async fn pause(rx: &mut watch::Receiver<bool>, d: Duration) -> bool {
     if *rx.borrow() {
         return false;
     }
@@ -322,4 +394,65 @@ pub fn truncate_utf8(mut s: String, max: usize) -> String {
     }
     s.truncate(cut);
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[tokio::test]
+    async fn a_crashed_run_is_reported_and_restarted_with_backoff() {
+        let (_tx, rx) = watch::channel(false);
+        let runs = Arc::new(AtomicU32::new(0));
+        let crashes = Arc::new(Mutex::new(Vec::new()));
+        let (r, c) = (runs.clone(), crashes.clone());
+        supervise(
+            rx,
+            Duration::from_millis(5),
+            move |delay| c.lock().unwrap().push(delay),
+            move |_rx| {
+                let n = r.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n < 2 {
+                        panic!("simulated worker crash");
+                    }
+                }
+            },
+        )
+        .await;
+        // Two crashes, each reported with a doubling delay, then a run that
+        // returned normally ended the supervisor.
+        assert_eq!(runs.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            *crashes.lock().unwrap(),
+            [Duration::from_millis(5), Duration::from_millis(10)]
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_ends_the_restarts() {
+        let (tx, rx) = watch::channel(false);
+        let runs = Arc::new(AtomicU32::new(0));
+        let r = runs.clone();
+        let sup = tokio::spawn(supervise(
+            rx,
+            Duration::from_secs(30),
+            |_| {},
+            move |_rx| {
+                r.fetch_add(1, Ordering::SeqCst);
+                async { panic!("simulated worker crash") }
+            },
+        ));
+        // It crashed once and now waits 30 s; stopping ends it at once.
+        while runs.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), sup)
+            .await
+            .expect("the supervisor stopped")
+            .unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
 }

@@ -207,6 +207,9 @@ struct Inner {
     workers: HashMap<String, worker::Handle>,
     /// The installer-requested personal runner (see [`runner`]).
     runner: runner::Slot,
+    /// Why the last start didn't serve every pairing (`None`: it did).
+    /// Shown in the status; the next session bind tries again.
+    problem: Option<String>,
 }
 
 /// The desktop's local tools manager. One per launcher; `Send + Sync`.
@@ -227,6 +230,7 @@ impl DesktopTools {
                 bound: None,
                 workers: HashMap::new(),
                 runner: runner::Slot::default(),
+                problem: None,
             }),
             store_lock: Arc::new(Mutex::new(())),
             marker: runner::Marker::Absent,
@@ -251,6 +255,25 @@ impl DesktopTools {
         Ok(f)
     }
 
+    /// The root, or the person-facing reason it can't be opened.
+    fn root_or_problem(&self, inner: &mut Inner) -> Result<Arc<File>, String> {
+        if let Some(r) = &inner.root {
+            return Ok(r.clone());
+        }
+        let f = store::open_root(&self.root_path).map_err(|e| {
+            crate::secret::clean_line(
+                &format!(
+                    "Metro couldn't open its local tools folder {}: {e}",
+                    self.root_path.display()
+                ),
+                300,
+            )
+        })?;
+        let f = Arc::new(f);
+        inner.root = Some(f.clone());
+        Ok(f)
+    }
+
     /// Stop workers that belong to another server or account than `hosted`.
     async fn rebind(inner: &mut Inner, hosted: Option<&HostedSession>) {
         let key = hosted.map(|h| (h.server_url.clone(), h.account_id.clone()));
@@ -260,6 +283,7 @@ impl DesktopTools {
             }
             inner.runner.stop().await;
             inner.bound = key;
+            inner.problem = None;
         }
     }
 
@@ -371,7 +395,10 @@ impl DesktopTools {
             ),
             Some(p) => match w {
                 Some((etag, s)) if etag == p.etag => (true, "on", s.state, s.detail),
-                _ => (true, "on", WorkerState::Stopped, None),
+                _ => match &inner.problem {
+                    Some(why) => (true, "on", WorkerState::Failed, Some(why.clone())),
+                    None => (true, "on", WorkerState::Stopped, None),
+                },
             },
         };
         json!({
@@ -411,8 +438,12 @@ impl DesktopTools {
             }
             let mut inner = self.inner.lock().await;
             Self::rebind(&mut inner, hosted.as_ref()).await;
-            if hosted.is_some() {
-                self.root(&mut inner)?;
+            if hosted.is_some()
+                && let Err(why) = self.root_or_problem(&mut inner)
+            {
+                // Say why instead of failing the status read.
+                runner::start_failed(&mut inner.runner, &self.marker, &why);
+                inner.problem = Some(why);
             }
             return Ok(self.runner_status(&inner, hosted.as_ref()));
         }
@@ -462,6 +493,9 @@ impl DesktopTools {
             store_lock: &self.store_lock,
         };
         if let Some(sid) = folder_sid {
+            // Asked right after attaching: a runner that didn't start (or
+            // stopped) gets another go now, not only at the next sign-in.
+            runner::ensure(&mut inner.runner, &cx).await;
             return runner::folder_for(&cx, sid).await;
         }
         runner::reconnect(&mut inner.runner, &cx, choice).await?;
@@ -479,7 +513,20 @@ impl DesktopTools {
                 "local_runner": self.runner_status(&inner, None),
             }));
         };
-        let root = self.root(&mut inner)?;
+        let root = match self.root_or_problem(&mut inner) {
+            Ok(r) => r,
+            Err(why) => {
+                runner::start_failed(&mut inner.runner, &self.marker, &why);
+                inner.problem = Some(why);
+                return Ok(json!({
+                    "available": true,
+                    "reason": null,
+                    "problem": inner.problem,
+                    "spaces": [],
+                    "local_runner": self.runner_status(&inner, Some(h)),
+                }));
+            }
+        };
         let records = {
             let _g = self.store_lock.lock();
             store::list(&root, &h.account_id).map_err(|_| fs_error("read its settings"))?
@@ -492,6 +539,7 @@ impl DesktopTools {
         Ok(json!({
             "available": true,
             "reason": null,
+            "problem": inner.problem,
             "spaces": spaces,
             "local_runner": local_runner,
         }))
@@ -701,22 +749,47 @@ impl DesktopTools {
     pub async fn resume(&self, hosted: HostedSession) {
         let mut inner = self.inner.lock().await;
         Self::rebind(&mut inner, Some(&hosted)).await;
-        let Ok(root) = self.root(&mut inner) else {
-            return;
+        let problem = self.start(&mut inner, &hosted).await;
+        if let Some(why) = &problem {
+            eprintln!("metro-desktop: local tools didn't fully start: {why}");
+            runner::start_failed(&mut inner.runner, &self.marker, why);
+        }
+        inner.problem = problem;
+    }
+
+    /// Start every active pairing's worker and this computer's runner.
+    /// `Some(reason)` when something can't be served; nothing here stays
+    /// silent, and the next session bind tries again.
+    async fn start(&self, inner: &mut Inner, hosted: &HostedSession) -> Option<String> {
+        let root = match self.root_or_problem(inner) {
+            Ok(r) => r,
+            Err(why) => return Some(why),
         };
         let Ok(api) = Hosted::new(&hosted.server_url) else {
-            return;
+            return Some("Metro couldn't set up its connection to the local Metro server.".into());
         };
-        if Self::check_account(&api, &hosted).await.is_err() {
+        if let Err(e) = Self::check_account(&api, hosted).await {
             for (_, w) in inner.workers.drain() {
                 w.stop().await;
             }
             inner.runner.stop().await;
-            return;
+            return Some(format!("Local tools didn't start: {}", e.message));
         }
-        let records = {
+        let listed = {
             let _g = self.store_lock.lock();
-            store::list(&root, &hosted.account_id).unwrap_or_default()
+            store::list_all(&root, &hosted.account_id)
+        };
+        let (records, unreadable) = match listed {
+            Ok(l) => l,
+            Err(e) => {
+                return Some(crate::secret::clean_line(
+                    &format!(
+                        "Metro couldn't read its local tools settings in {}: {e}",
+                        self.root_path.display()
+                    ),
+                    300,
+                ));
+            }
         };
         for p in records.iter().filter(|p| p.state == PairingState::Active) {
             let running = inner
@@ -725,7 +798,7 @@ impl DesktopTools {
                 .map(|w| w.etag == p.etag && !w.is_finished())
                 .unwrap_or(false);
             if !running {
-                let _ = self.spawn_worker(&mut inner, &api, &root, p);
+                let _ = self.spawn_worker(inner, &api, &root, p);
             }
         }
         // This computer's personal runner, if the installer asked for it:
@@ -734,11 +807,22 @@ impl DesktopTools {
             marker: &self.marker,
             root: &root,
             root_path: &self.root_path,
-            hosted: &hosted,
+            hosted,
             api: &api,
             store_lock: &self.store_lock,
         };
         runner::ensure(&mut inner.runner, &cx).await;
+        (!unreadable.is_empty()).then(|| {
+            format!(
+                "Metro couldn't read the local tools pairing of {} on this computer, so it isn't \
+                 served. Turn local tools off and on again there.",
+                if unreadable.len() == 1 {
+                    format!("Space {}", unreadable[0])
+                } else {
+                    format!("{} Spaces ({})", unreadable.len(), unreadable.join(", "))
+                }
+            )
+        })
     }
 
     /// Stop every worker (sign-out, server or account switch, app exit).

@@ -18,7 +18,7 @@ const LOCAL_RUNNER_SECRET = "metro_rt_local_fixture_secret";
 const FOLDER = "/home/me/.config/metro-desktop/local-tools/accounts/a1/spaces/solo/workspace";
 
 /** The fake bridge plus local tools. `available`: is this session the computer's own workspace? */
-function bridgeWithTools(f: F, available = true, opts: { startingReads?: number; legacy?: boolean } = {}) {
+function bridgeWithTools(f: F, available = true, opts: { startingReads?: number; legacy?: boolean; problem?: string } = {}) {
   /** After enable, this many status reads still report the worker as starting. */
   let starting = 0;
   const delay = { enable: 0, disable: 0 };
@@ -35,7 +35,7 @@ function bridgeWithTools(f: F, available = true, opts: { startingReads?: number;
         if (e.worker === "starting" && starting-- <= 0) e.worker = "online";
       }
       return available
-        ? { status: 200, body: { available: true, reason: null, spaces: [...tools.values()] } }
+        ? { status: 200, body: { available: true, reason: null, problem: opts.problem ?? null, spaces: [...tools.values()] } }
         : { status: 200, body: { available: false, reason: "Local tools work only in this computer's own Metro workspace.", spaces: [] } };
     }
     const m = /^\/v1\/local-tools\/spaces\/([^/]+)\/(enable|disable|disable-if-current)$/.exec(path);
@@ -355,4 +355,26 @@ test("badge reflects the worker honestly", () => {
   expect(localToolsBadge({ ...base, state: "on", worker: "offline" }).tone).toBe("warning");
   expect(localToolsBadge({ ...base, state: "revoked", worker: "revoked" }).tone).toBe("danger");
   expect(localToolsBadge({ ...base, state: "on", worker: "stopped" }).label).toBe("Paused");
+  expect(localToolsBadge({ ...base, state: "on", worker: "failed" })).toEqual({ tone: "danger", label: "Not working" });
+});
+
+test("a pairing that isn't served says why, and so does a problem on this computer", async () => {
+  const f = world();
+  f.addSpace("solo", "Solo", "alice");
+  f.state.spaces.get("solo")!.runnerToken = LOCAL_RUNNER_SECRET;
+  const why = "Metro couldn't open its local tools folder C:\\Users\\me\\AppData\\Local\\Metro\\local-tools: Access is denied.";
+  const other = "Metro couldn't read the local tools pairing of Space s-other on this computer, so it isn't served.";
+  const t = bridgeWithTools(f, true, { problem: other });
+  t.tools.set("solo", { space_id: "solo", enabled: true, state: "on", worker: "failed", detail: why, folder: FOLDER,
+    tools: ["workspace.list", "workspace.read"], pairing_revision: "7" });
+  const app = await openWith(f, t);
+  await signIn(app, "alice");
+  await manage(app, "solo");
+  await app.waitFor("id:local-tools-detail");
+  expect(app.shows("text:Not working")).toBe(true);
+  expect(text(app)).toContain("Access is denied.");
+  // The computer-wide reason is shown too, once.
+  await app.waitFor("id:local-tools-problem");
+  expect(text(app)).toContain("s-other");
+  expect(text(app)).not.toContain(LOCAL_RUNNER_SECRET);
 });
