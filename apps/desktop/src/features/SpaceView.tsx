@@ -45,6 +45,7 @@ import {
   removeMention,
   previewMentionDraft,
   previewMentionMatches,
+  replyAnchor,
   rooms,
   roomsLoaded,
   replyPane,
@@ -547,11 +548,13 @@ function RoomComposer(props: { thread?: boolean }) {
         <>
           <If when={replyTarget()}>
             {target => <Column gap={1} testID="reply-context">
-              <ComposerContext>
-                <Label variant="caption" color="muted" lines={2} testID="composer-reply-quote">
-                  {messageAuthorName(target().event)} · {replyExcerpt(target().event)}
-                </Label>
-              </ComposerContext>
+              <If when={!props.thread || target().event.id !== replyAnchor()?.id}>
+                <ComposerContext>
+                  <Label variant="caption" color="muted" lines={2} testID="composer-reply-quote">
+                    {messageAuthorName(target().event)} · {replyExcerpt(target().event)}
+                  </Label>
+                </ComposerContext>
+              </If>
               <If when={commandDraft() ? null : replyAgent()}>
                 {agent => <RecipientBar><RecipientChip testID="reply-agent-chip" agent
                   label={`Replying to ${agent().name}`} accessibilityLabel={`Don't ask ${agent().name} to reply`}

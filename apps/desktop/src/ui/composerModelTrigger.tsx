@@ -31,7 +31,7 @@ export function ComposerModelTrigger(props: {
       <If when={props.thinking}>
         {t => <Text class="shrink-0 text-(length:--text-xs) text-muted-foreground" style={{ numberOfLines: 1 }} testID="composer-model-thinking">· {t()}</Text>}
       </If>
-      <Icon name="chevron-down" size={14} color="muted" />
+      <Icon name="chevron-down" size={14} color="muted" testID="composer-model-chevron" />
     </Button>
   );
 }

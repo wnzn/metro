@@ -14,7 +14,9 @@ const summary = {
 };
 
 async function signIn(network: ReturnType<typeof world>["network"], user = "alice", width = 1200) {
-  const app = await open("../../../App.tsx", { modules: launched(), network: network as any, platform: "linux", width, height: 840, clock: {} });
+  const app = await open("../../../App.tsx", { modules: launched(), network: network as any, platform: "linux", width, height: 840, clock: {},
+    localeSettings: { timeZone: "UTC", hourCycle: "h23" },
+  });
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS[user]!);
@@ -114,7 +116,11 @@ test("keyboard selection, focused compaction and expandable copyable marker in n
   expect(app.shows("text:Unchanged earlier message.")).toBe(true);
   await app.press(`id:${id}:toggle`);
   await app.waitFor(`id:${id}:body`);
-  await app.waitFor("text:/Summarized for Alice.*focus: decisions/");
+  await app.waitFor("text:Summarized for Alice");
+  expect(app.shows("text:· focus: decisions")).toBe(true);
+  expect(app.shows(`id:${id}:time`)).toBe(true);
+  expect(app.texts()).toContain("· 12:00");
+  expect(app.shows("label:/12:00:00 \\(UTC\\)$/")).toBe(true);
   expect(app.shows(`id:react:${posted[0]}`)).toBe(false);
   expect(app.shows(`id:reply:${posted[0]}`)).toBe(false);
   expect(app.shows(`id:forward:${posted[0]}`)).toBe(false);

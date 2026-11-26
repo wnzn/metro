@@ -423,10 +423,10 @@ function MessageRow(props: { row: () => Of<"event">; actions: TranscriptActions 
   const direct = () => props.actions.direct;
   const nearby = () => direct()?.events() ?? (roomId() ? eventsInRoom(roomId()!) : activeEvents());
   const bodyScope = () => direct() ? `${disclosureScope()}\u0001dm:${direct()!.id}` : disclosureScope();
-  const quoted = () => event().replyTo ? nearby().find(e => e.id === event().replyTo) ??
-    (props.actions.replyAnchor?.id === event().replyTo ? props.actions.replyAnchor : null) : null;
+  const showQuote = () => !!event().replyTo && props.actions.replyAnchor?.id !== event().replyTo;
+  const quoted = () => nearby().find(e => e.id === event().replyTo);
   const forwarded = () => event().forwarded;
-  const forwardedTime = () => stampOf(forwarded()?.sentAt, clock())?.full;
+  const forwardedTime = () => stampOf(forwarded()?.sentAt, clock());
   const sourceRoom = () => rooms().find(r => r.id === forwarded()?.sameSpace?.roomId);
   // A thread opened without a reply yet shows nothing under its message.
   const replies = () => props.actions.onReply && !props.actions.readOnly && event().replies?.count
@@ -580,7 +580,7 @@ function MessageRow(props: { row: () => Of<"event">; actions: TranscriptActions 
           </Each>
         </MessageHeader>
       </If>
-      <If when={event().replyTo}>
+      <If when={showQuote()}>
         <Label variant="caption" color="muted" lines={2} testID={`reply-quote:${event().id}`}>
           {quoted() ? `Reply to ${messageAuthorName(quoted()!)} · ${replyExcerpt(quoted()!)}` : "Reply to an earlier message"}
         </Label>
@@ -592,7 +592,9 @@ function MessageRow(props: { row: () => Of<"event">; actions: TranscriptActions 
             <InlineLink label={`Forwarded from ${f().authorName} in ${sourceRoom()?.anchorEventId ? "Thread" : `#${sourceRoom()?.name}`}`}
               onPress={() => { const s = f().sameSpace; if (s) void openLocation({ spaceId: spaceId()!, roomId: s.roomId, eventId: s.eventId }); }} />
           </If>
-          <If when={forwardedTime()}><Label variant="caption" color="muted">· {forwardedTime()}</Label></If>
+          <If when={forwardedTime()}>
+            {s => <Timestamp text={`· ${s().short}`} full={s().full} testID={`forwarded-time:${event().id}`} />}
+          </If>
         </Row>}
       </If>
       <If

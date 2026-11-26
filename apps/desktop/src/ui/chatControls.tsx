@@ -366,12 +366,12 @@ export function ComposerBox(props: Testable & { children?: JSX.Element }) {
   );
 }
 
-/** The bottom bar of the composer: tools on the left, the send controls on the right. */
+/** Tools on the left, send controls on the right or on their own line if needed. */
 export function ComposerBar(props: { leading?: JSX.Element; trailing?: JSX.Element }) {
   return (
-    <View class="flex-row items-center gap-(--space-2) px-(--space-2) pb-(--space-2)">
-      <View class="flex-1 min-w-0 flex-row items-center gap-(--space-1)">{props.leading}</View>
-      <View class="shrink-0 flex-row items-center gap-(--space-2)">{props.trailing}</View>
+    <View class="flex-row flex-wrap items-center gap-(--space-2) px-(--space-2) pb-(--space-2)">
+      <View class="min-w-0 max-w-full flex-row items-center gap-(--space-1)">{props.leading}</View>
+      <View class="ml-auto shrink-0 flex-row items-center gap-(--space-2)">{props.trailing}</View>
     </View>
   );
 }

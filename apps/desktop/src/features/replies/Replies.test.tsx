@@ -58,7 +58,9 @@ async function fixture(width = 1300) {
       ...e, replies: { room_id: replyRoom.id, count: messages.length, last_at: last ? date : null, participant_ids: last ? ["alice"] : [] },
     }) } };
   };
-  const app = await open("../../../App.tsx", { modules: launched(), network: network as any, platform: "linux", width, height: 840, clock: {} });
+  const app = await open("../../../App.tsx", { modules: launched(), network: network as any, platform: "linux", width, height: 840, clock: {},
+    localeSettings: { timeZone: "UTC", hourCycle: "h23" },
+  });
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS.alice!);
@@ -104,26 +106,52 @@ test("creates and reopens the same thread, showing the anchor, count and partici
   expect(opens()).toBe(3);
 });
 
-test("removing the implicit agent keeps the exact quote and opts out without erasing the draft", async () => {
+test("the anchor isn't quoted again, while replying to another thread message still quotes it", async () => {
   const { app, anchor, sends, f } = await fixture();
   await app.press(`id:reply:${anchor.id}`);
   await app.waitFor("id:reply-agent-chip");
   await app.type("id:composer", "People only please");
   await app.press("id:reply-agent-chip");
   expect(app.shows("id:reply-agent-chip")).toBe(false);
-  expect(app.shows("text:Coder · The anchor response")).toBe(true);
+  expect(app.shows("id:composer-reply-quote")).toBe(false);
   expect(app.value("id:composer")).toBe("People only please");
   await app.press("id:close-thread");
   await app.press(`id:reply:${anchor.id}`);
-  await app.waitFor("id:composer-reply-quote");
+  await app.waitFor(`id:anchor:${anchor.id}`);
+  expect(app.shows("id:composer-reply-quote")).toBe(false);
   expect(app.shows("id:reply-agent-chip")).toBe(false);
   await app.press("id:send");
   await app.waitFor("text:People only please");
   expect(sends[0]).toMatchObject({ reply_to: anchor.id, reply_to_agent: false });
   const reply = f.state.events.get("acme/reply-room")![0]!;
+  expect(app.shows(`id:reply-quote:${reply.id}`)).toBe(false);
   await app.press(`id:reply:${reply.id}`);
-  expect(app.shows("text:alice · People only please")).toBe(true);
+  await app.waitFor("id:composer-reply-quote");
+  expect(app.texts()).toContain("alice · People only please");
   expect(app.shows("id:reply-agent-chip")).toBe(false);
+  await app.type("id:composer", "A follow-up to the reply");
+  await app.press("id:send");
+  await app.waitFor("text:Reply to alice · People only please");
+});
+
+test("the thread model picker fits like the room picker at default and narrow widths", async () => {
+  const { app, anchor } = await fixture();
+  const pickerFits = async () => {
+    // The chevron is after both labels, where the trigger used to clip.
+    await app.press("id:composer-model-chevron");
+    await app.waitFor("text:Model for agent turns");
+    await app.keyboard.press("escape");
+    await app.waitFor("text:Model for agent turns", { state: "gone" });
+  };
+  await pickerFits();
+  await app.press(`id:reply:${anchor.id}`);
+  await app.waitFor("id:thread-aside");
+  await pickerFits();
+  await app.drag("id:resize-thread", { x: 120, y: 0 });
+  await pickerFits();
+  await app.setViewport(440, 840);
+  await app.waitFor("id:thread-dialog");
+  await pickerFits();
 });
 
 test("an access denial closes the narrow thread immediately; resizing chooses the aside without losing the draft", async () => {
@@ -160,6 +188,10 @@ test("legacy messages still render and cancelling Forward sends nothing; modern 
   } as any);
   await app.waitFor(`id:via-metro:${modern.id}`);
   expect(app.shows("label:Forwarded from Alex in #lobby")).toBe(true);
+  const time = `id:forwarded-time:${modern.id}`;
+  expect(app.shows(time)).toBe(true);
+  expect(app.texts()).toContain("· 12:00");
+  expect(app.shows("label:/12:00:00 \\(UTC\\)$/")).toBe(true);
   f.post("acme/lobby", { kind: "activity", actor: "agent", text: "",
     activity: { id: "no-reply", name: "Coder", source: "agent", phase: "completed", outcome: "no_reply" },
   } as any);

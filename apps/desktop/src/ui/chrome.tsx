@@ -139,10 +139,11 @@ const ICON_TOKEN = {
 } as const;
 
 /** A decorative icon: screen readers skip it; say what it means in the control's label. */
-export function Icon(props: { name: IconName; color?: IconColor; size?: 12 | 14 | 16 | 20 }) {
+export function Icon(props: { name: IconName; color?: IconColor; size?: 12 | 14 | 16 | 20; testID?: string }) {
   const size = () => props.size ?? 16;
   return (
     <Image
+      testID={props.testID}
       src={ICONS[props.name]}
       fadeDuration={0}
       style={{
