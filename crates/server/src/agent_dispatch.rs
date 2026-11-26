@@ -74,7 +74,7 @@ fn options(agents: &[SpaceAgent]) -> Vec<(String, String)> {
 
 /// Whether the sender opted in to classification here and has a System
 /// One connection set.
-fn classifies(prefs: &SpacePrefs, settings: &RoutingSettings) -> bool {
+pub(crate) fn classifies(prefs: &SpacePrefs, settings: &RoutingSettings) -> bool {
     prefs.classify_unaddressed && settings.classifier_id.is_some()
 }
 

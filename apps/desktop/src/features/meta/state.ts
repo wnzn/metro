@@ -100,9 +100,8 @@ export const runningChatTurn = computed(() => {
   for (let i = pending.length - 1; i >= 0; i--) {
     const p = pending[i]!;
     if (done.has(p.id) || seen.has(p.id)) continue;
-    const at = events.findIndex(e => e.id === p.eventId);
-    // Not shown (yet, or deleted), or refused with a note in the Chat.
-    if (at < 0 || events.slice(at + 1).some(e => e.kind === "error" && !e.activity)) continue;
+    // Not shown yet, or ended by the Chat error that names this turn.
+    if (!events.some(e => e.id === p.eventId) || events.some(e => e.kind === "error" && e.turnId === p.id)) continue;
     return p.id;
   }
   return null;

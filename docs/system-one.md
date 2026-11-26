@@ -241,11 +241,22 @@ reads).
 - **Old or failed work is said, not replayed.** Work stored more than an
   hour before a restart isn't started: the room (or the sender's Chat)
   reads *Metro restarted; this message wasn't answered.* If pending work
-  fails instead (an error, or its task ends), it's dropped at once with a
-  note in the room or the sender's Chat, so it can't run at a later
-  restart. A model chosen for the turn that can't be used after a restart
-  gets *Metro restarted and couldn't start this message's agent run.*,
-  with no reason or connection details in the room.
+  fails instead (an error, or its task panics or ends, including a Chat
+  turn whose start fails before its `started` marker is written), it's
+  dropped at once with a note in the room or the sender's Chat, so it
+  can't run at a later restart. A Chat note names the turn (`turn_id` on
+  the `error` event), so only that turn's pending **Stop** clears. A model
+  chosen for the turn that can't be used after a restart gets *Metro
+  restarted and couldn't start this message's agent run.*, with no reason
+  or connection details in the room.
+- **Unaddressed messages stay quiet.** Only the sender's own opt-in
+  classification can start anything for an unaddressed message, so
+  dropping its work (old or failed) posts nothing in the room; that would
+  reveal the opt-in. Work for `@agent`, a named agent or a reply to an
+  agent is noted as above.
+- **A clean shutdown keeps everything.** Once the server begins shutting
+  down, work it doesn't finish is left as it is, with no note, and the
+  next start picks it up.
 - **A deleted message reaches no model.** The message is read again after
   every wait and before every System One call (the classification, and
   each run's use-case routing). Once it's deleted, nothing more is sent

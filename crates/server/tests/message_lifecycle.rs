@@ -1645,7 +1645,12 @@ async fn failed_pending_work_is_dropped_and_said_never_left_to_replay() {
         "lobby",
         id(&msg),
     ));
-    drop(metro_server::decisions::Watch::chat(&h.state, "bob", chat));
+    drop(metro_server::decisions::Watch::chat(
+        &h.state,
+        "bob",
+        chat,
+        Some("chat_0123"),
+    ));
     // A settled one says nothing.
     metro_server::decisions::Watch::space(&h.state, &sid, "lobby", id(&msg)).done();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1728,4 +1733,218 @@ async fn deleting_a_space_drops_its_pending_work() {
         .await;
     assert_eq!(s, StatusCode::NO_CONTENT, "{v}");
     assert_eq!(h.pending(), 0);
+}
+
+// ---- Final review: quiet drops, shutdown, tagged Chat errors, failed starts ----
+
+#[tokio::test]
+async fn dropping_an_unaddressed_message_says_nothing_in_the_room() {
+    let h = H::start().await;
+    let sid = h.space().await;
+    let quiet = h
+        .sent("alice", &sid, "lobby", json!({"text": "just chatting", "mentions": [{"kind": "user", "id": "bob"}], "infer_text_mentions": false}))
+        .await;
+    let loud = h
+        .sent("alice", &sid, "lobby", json!({"text": "for the agent", "mentions": [{"kind": "user", "id": "bob"}], "infer_text_mentions": false}))
+        .await;
+    let db = &h.state.db;
+    metro_server::decisions::insert(
+        db,
+        &space_pending(&sid, json!({"resolved": []})),
+        id(&quiet),
+    )
+    .unwrap();
+    metro_server::decisions::insert(
+        db,
+        &space_pending(&sid, json!({"resolved": [{"kind": "agent"}]})),
+        id(&loud),
+    )
+    .unwrap();
+    // Failed: an unaddressed message's work goes without a room note (that
+    // would reveal its sender's opt-in); addressed work says so.
+    drop(metro_server::decisions::Watch::space(&h.state, &sid, "lobby", id(&quiet)).quiet(true));
+    drop(metro_server::decisions::Watch::space(
+        &h.state,
+        &sid,
+        "lobby",
+        id(&loud),
+    ));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let errors: Vec<Value> = h
+        .events("bob", &sid, "lobby")
+        .await
+        .into_iter()
+        .filter(|e| e["kind"] == "error")
+        .collect();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(h.pending(), 0);
+    // Stale at a restart: the same rule.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let old = now - 2 * 3_600_000;
+    metro_server::decisions::insert_at(
+        db,
+        &space_pending(&sid, json!({"resolved": [], "reply_agent": null})),
+        id(&quiet),
+        old,
+    )
+    .unwrap();
+    assert_eq!(
+        metro_server::decisions::resume(h.state.clone())
+            .await
+            .unwrap(),
+        0
+    );
+    let after: Vec<Value> = h
+        .events("bob", &sid, "lobby")
+        .await
+        .into_iter()
+        .filter(|e| e["kind"] == "error")
+        .collect();
+    assert_eq!(
+        after.len(),
+        1,
+        "a stale unaddressed message got a room note: {after:?}"
+    );
+    assert_eq!(h.pending(), 0);
+}
+
+#[tokio::test]
+async fn during_shutdown_a_guard_leaves_work_for_the_next_start() {
+    let h = H::start().await;
+    let sid = h.space().await;
+    let msg = h
+        .sent("alice", &sid, "lobby", json!({"text": "@agent later", "mentions": [{"kind": "user", "id": "bob"}], "infer_text_mentions": false}))
+        .await;
+    metro_server::decisions::insert(
+        &h.state.db,
+        &space_pending(&sid, json!({"resolved": [{"kind": "agent"}]})),
+        id(&msg),
+    )
+    .unwrap();
+    h.state.decisions.begin_shutdown();
+    drop(metro_server::decisions::Watch::space(
+        &h.state,
+        &sid,
+        "lobby",
+        id(&msg),
+    ));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.pending(), 1, "shutdown dropped pending work");
+    assert!(
+        !h.events("bob", &sid, "lobby")
+            .await
+            .iter()
+            .any(|e| e["kind"] == "error")
+    );
+}
+
+#[test]
+fn work_pending_at_shutdown_survives_and_resumes() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("metro.sqlite3");
+    // The first server runs on its own runtime, with System One too slow to
+    // answer before it shuts down.
+    let (sid, msg) = {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (state, sid, msg) = rt.block_on(async {
+            let h = H::start_with(Some(&file), 60_000).await;
+            let sid = h.space().await;
+            with_coder(&h, &sid).await;
+            h.classify(&sid).await;
+            let msg = h
+                .sent(
+                    "alice",
+                    &sid,
+                    "lobby",
+                    json!({"text": "@agent after the restart", "defer_decisions": true}),
+                )
+                .await;
+            // Its decision is waiting on System One.
+            for _ in 0..100 {
+                if h.classifier_calls() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(h.classifier_calls(), 1);
+            (h.state.clone(), sid, id(&msg))
+        });
+        state.decisions.begin_shutdown();
+        // The runtime goes, and every task with it.
+        rt.shutdown_timeout(Duration::from_secs(2));
+        (sid, msg)
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let after = H::start_with(Some(&file), 0).await;
+        assert_eq!(
+            after.pending(),
+            1,
+            "the pending decision survived the shutdown"
+        );
+        assert!(
+            !after
+                .events("alice", &sid, "lobby")
+                .await
+                .iter()
+                .any(|e| e["kind"] == "error")
+        );
+        assert_eq!(
+            metro_server::decisions::resume(after.state.clone())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(all_started(&after, &sid, msg, 1).await, 1);
+        assert_eq!(after.pending(), 0);
+    });
+}
+
+#[tokio::test]
+async fn a_dropped_chat_turn_names_its_turn_and_a_failed_start_is_said() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("metro.sqlite3");
+    let h = H::start_with(Some(&file), 0).await;
+    // The `started` marker can't be written: the start fails after the
+    // turn was handed to its worker.
+    rusqlite::Connection::open(&file)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse_start BEFORE INSERT ON personal_events WHEN new.kind = 'activity'
+             BEGIN SELECT RAISE(ABORT, 'no starts'); END;",
+        )
+        .unwrap();
+    let (s, sent) = h
+        .post(
+            "alice",
+            "/v1/chat/messages",
+            json!({"text": "will not start"}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{sent}");
+    let turn = sent["turn_id"].as_str().unwrap().to_owned();
+    let mut note = Value::Null;
+    for _ in 0..200 {
+        if let Some(e) = h
+            .chat("alice")
+            .await
+            .into_iter()
+            .find(|e| e["kind"] == "error")
+        {
+            note = e;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        note["text"],
+        metro_server::decisions::FAILED_CHAT_NOTE,
+        "{note}"
+    );
+    assert_eq!(note["turn_id"], turn.as_str(), "the note names its turn");
+    assert_eq!(h.pending(), 0);
+    assert!(h.model_calls.lock().unwrap().is_empty());
 }

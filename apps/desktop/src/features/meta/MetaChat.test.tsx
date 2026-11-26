@@ -299,38 +299,48 @@ test("Stop works on a turn that hasn't started yet, by the id its POST returned"
   expect(app.shows("id:send")).toBe(true);
 });
 
-function droppingServer(f: ReturnType<typeof setup>) {
+function droppingServer(f: ReturnType<typeof setup>, ids: string[] = [liveId]) {
   const base = f.network[`POST ${BASE}/v1/*`]!;
+  let n = 0;
   f.network[`POST ${BASE}/v1/*`] = req => {
     if (new URL(req.url).pathname !== "/v1/chat/messages") return base(req);
     const body = JSON.parse(req.body!);
     const ev = f.addChat({ kind: "message", actor: "alice", actor_id: "alice", text: body.text, audience: "agent" } as any);
-    return ok({ ...ev, actor_id: "alice", turn_id: liveId }, 202);
+    return ok({ ...ev, actor_id: "alice", turn_id: ids[Math.min(n++, ids.length - 1)] }, 202);
   };
 }
 
-test("a pending turn the server drops without a word stops offering Stop after two minutes", async () => {
+test("a pending turn the server drops without a word keeps Stop through load, then stops offering it after ten minutes", async () => {
   const f = setup({ notice_shown: true });
   droppingServer(f);
   const app = await launch(f, 1200, true);
   await app.type("id:composer", "dropped");
   await app.press("id:send");
   await app.waitFor("id:chat-stop");
-  await app.clock!.runFor(60_000);
+  // Waiting several minutes for a System One slot keeps it stoppable.
+  await app.clock!.runFor(300_000);
   expect(app.shows("id:chat-stop")).toBe(true);
-  await app.clock!.runFor(61_000);
+  await app.clock!.runFor(301_000);
   await app.waitFor("id:chat-stop", { state: "gone" });
   expect(app.shows("id:send")).toBe(true);
 });
 
-test("a Chat error after a pending turn's message clears its Stop", async () => {
+test("only the Chat error naming a pending turn clears its Stop; another turn's error doesn't", async () => {
   const f = setup({ notice_shown: true });
-  droppingServer(f);
+  droppingServer(f, ["chat_later"]);
   const app = await launch(f);
-  await app.type("id:composer", "refused later");
+  await app.type("id:composer", "later");
   await app.press("id:send");
   await app.waitFor("id:chat-stop");
-  f.addChat({ kind: "error", actor: "agent", text: "That turn was dropped." } as any);
+  // An untagged error, and an earlier turn's own error arriving now: the
+  // later turn keeps Stop.
+  f.addChat({ kind: "error", actor: "agent", text: "Something else failed." } as any);
+  f.addChat({ kind: "error", actor: "agent", text: "An earlier turn was dropped.", turn_id: "chat_earlier" } as any);
+  await app.wait(1500);
+  expect(app.shows("text:An earlier turn was dropped.")).toBe(true);
+  expect(app.shows("id:chat-stop")).toBe(true);
+  // Its own error clears it.
+  f.addChat({ kind: "error", actor: "agent", text: "The later turn was dropped.", turn_id: "chat_later" } as any);
   await app.waitFor("id:chat-stop", { state: "gone" });
   expect(app.shows("id:send")).toBe(true);
 });

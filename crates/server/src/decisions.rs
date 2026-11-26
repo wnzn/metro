@@ -29,7 +29,11 @@
 //! stored after this one started wait for the next restart. Rows older
 //! than [`STALE_AFTER`] are dropped with [`STALE_NOTE`], never run. Every
 //! flow holds a [`Watch`]: any error path or panic drops its rows with a
-//! visible note, so nothing failed is left to replay later. Work is reloaded from the live
+//! visible note, so nothing failed is left to replay later (silent in the
+//! room for an unaddressed message, whose note would reveal its sender's
+//! opt-in; tagged with the turn for a Chat turn). After graceful shutdown
+//! begins ([`Pending::begin_shutdown`]) guards leave everything for the
+//! next start. Work is reloaded from the live
 //! message after every wait and before every System One call; a message
 //! deleted meanwhile goes no further and reaches no model.
 //!
@@ -417,8 +421,16 @@ pub const FAILED_CHAT_NOTE: &str =
 /// Where a dropped message's note goes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Notice {
-    Space { space: String, room: String },
-    Chat { user: String },
+    /// `quiet`: the message was unaddressed, so only the sender's opt-in
+    /// classification could have started anything; dropping it says
+    /// nothing in the room (that would reveal the opt-in).
+    Space {
+        space: String,
+        room: String,
+        quiet: bool,
+    },
+    /// The note carries the turn's id, so the sender's pending Stop clears.
+    Chat { user: String, turn: Option<String> },
 }
 
 /// Drop what's pending for message `event_id` and, if the message is still
@@ -433,8 +445,8 @@ pub fn fail_in(
 ) -> rusqlite::Result<()> {
     forget_in(conn, scope, event_id)?;
     match notice {
-        Notice::Space { space, room } => {
-            if crate::replies::event_in(conn, space, room, event_id)?.is_some() {
+        Notice::Space { space, room, quiet } => {
+            if !quiet && crate::replies::event_in(conn, space, room, event_id)?.is_some() {
                 crate::db::Db::append_event_in(
                     conn,
                     space,
@@ -448,16 +460,25 @@ pub fn fail_in(
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
             }
         }
-        Notice::Chat { user } => {
+        Notice::Chat { user, turn } => {
+            let meta = turn
+                .as_ref()
+                .map(|t| serde_json::json!({ "turn_id": t }).to_string());
             conn.execute(
-                "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, mentions, audience, created_at)
-                 SELECT ?1, 'error', ?2, NULL, ?3, '[]', 'room', ?4
+                "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
+                 SELECT ?1, 'error', ?2, NULL, ?3, '[]', 'room', ?4, ?6
                  WHERE EXISTS (SELECT 1 FROM personal_events WHERE id = ?5 AND user_id = ?1)",
-                params![user, crate::db::actor::AGENT, text, crate::db::now_ms(), event_id],
+                params![user, crate::db::actor::AGENT, text, crate::db::now_ms(), event_id, meta],
             )?;
         }
     }
     Ok(())
+}
+
+/// Whether a Space decision's stored payload is for an unaddressed message
+/// (no explicit recipient, no agent replied to).
+pub fn unaddressed(payload: &serde_json::Value) -> bool {
+    payload["resolved"].as_array().is_none_or(|r| r.is_empty()) && payload["reply_agent"].is_null()
 }
 
 /// Drop every row stored before `cutoff`, each message noted once.
@@ -465,7 +486,8 @@ fn drop_stale_in(conn: &Connection, cutoff: i64) -> rusqlite::Result<()> {
     let mut stale: Vec<(Scope, i64, Notice)> = Vec::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT scope, event_id, user_id, space_id, room_id FROM pending_decisions WHERE created_at < ?1",
+            "SELECT scope, event_id, user_id, space_id, room_id, payload, turn_id
+             FROM pending_decisions WHERE created_at < ?1",
         )?;
         let rows = stmt.query_map([cutoff], |r| {
             Ok((
@@ -474,30 +496,39 @@ fn drop_stale_in(conn: &Connection, cutoff: i64) -> rusqlite::Result<()> {
                 r.get::<_, String>(2)?,
                 r.get::<_, Option<String>>(3)?,
                 r.get::<_, Option<String>>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
             ))
         })?;
         for row in rows {
-            let (scope, id, user, space, room) = row?;
+            let (scope, id, user, space, room, payload, turn) = row?;
             stale.push(match (scope.as_str(), space, room) {
                 ("space", Some(space), Some(room)) => {
-                    (Scope::Space, id, Notice::Space { space, room })
+                    let payload: serde_json::Value =
+                        serde_json::from_str(&payload).unwrap_or_default();
+                    let quiet = unaddressed(&payload);
+                    (Scope::Space, id, Notice::Space { space, room, quiet })
                 }
-                _ => (Scope::Personal, id, Notice::Chat { user }),
+                _ => (Scope::Personal, id, Notice::Chat { user, turn }),
             });
         }
+        // Planned runs: quiet when every one came from the classifier.
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT event_id, space_id, room_id FROM pending_targets WHERE created_at < ?1",
+            "SELECT event_id, space_id, room_id, MIN(addressed_by = 'classifier')
+             FROM pending_targets WHERE created_at < ?1 GROUP BY event_id, space_id, room_id",
         )?;
-        let rows = stmt.query_map([cutoff], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let rows = stmt.query_map([cutoff], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, bool>(3)?))
+        })?;
         for row in rows {
-            let (id, space, room): (i64, String, String) = row?;
+            let (id, space, room, quiet): (i64, String, String, bool) = row?;
             if !stale.iter().any(|(s, e, _)| *s == Scope::Space && *e == id) {
-                stale.push((Scope::Space, id, Notice::Space { space, room }));
+                stale.push((Scope::Space, id, Notice::Space { space, room, quiet }));
             }
         }
     }
     for (scope, id, notice) in stale {
-        if let Notice::Space { space, room } = &notice
+        if let Notice::Space { space, room, .. } = &notice
             && crate::db::Db::room_in(conn, space, room)?.is_none()
         {
             forget_in(conn, scope, id)?;
@@ -532,18 +563,29 @@ impl Watch {
             notice: Notice::Space {
                 space: space.to_owned(),
                 room: room.to_owned(),
+                quiet: false,
             },
             note: FAILED_SPACE_NOTE,
         }
     }
 
-    pub fn chat(state: &AppState, user: &str, event_id: i64) -> Self {
+    /// For an unaddressed message: dropping it says nothing in the room.
+    pub fn quiet(mut self, quiet: bool) -> Self {
+        if let Notice::Space { quiet: q, .. } = &mut self.notice {
+            *q = quiet;
+        }
+        self
+    }
+
+    /// Chat turn `turn` answering message `event_id`.
+    pub fn chat(state: &AppState, user: &str, event_id: i64, turn: Option<&str>) -> Self {
         Self {
             state: Some(state.clone()),
             scope: Scope::Personal,
             event_id,
             notice: Notice::Chat {
                 user: user.to_owned(),
+                turn: turn.map(str::to_owned),
             },
             note: FAILED_CHAT_NOTE,
         }
@@ -560,6 +602,11 @@ impl Drop for Watch {
         let Some(state) = self.state.take() else {
             return;
         };
+        // Shutting down: tasks end with the runtime, unfinished. Their rows
+        // stay for the next start, and nobody is told anything failed.
+        if state.decisions.shutting_down() {
+            return;
+        }
         let (scope, id, notice, note) = (self.scope, self.event_id, self.notice.clone(), self.note);
         let work = async move {
             let r = state
@@ -874,6 +921,7 @@ type Entries = HashMap<Key, Entry>;
 pub struct Pending {
     /// This process's claim on pending decisions.
     epoch: String,
+    shutting_down: std::sync::atomic::AtomicBool,
     /// Held while a Chat message is stored and given its place in line, so
     /// line order is storage order.
     chat_insert: Mutex<()>,
@@ -887,6 +935,7 @@ impl Default for Pending {
     fn default() -> Self {
         Self {
             epoch: format!("epoch_{}", uuid::Uuid::new_v4().simple()),
+            shutting_down: Default::default(),
             chat_insert: Mutex::default(),
             entries: Arc::default(),
             all: Arc::new(Semaphore::new(AT_ONCE)),
@@ -1007,6 +1056,16 @@ impl Pending {
             _all: all,
             _mine: mine,
         }
+    }
+
+    /// Graceful shutdown began: [`Watch`]es no longer drop work.
+    pub fn begin_shutdown(&self) {
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn shutting_down(&self) -> bool {
+        self.shutting_down.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// This process's claim token.
