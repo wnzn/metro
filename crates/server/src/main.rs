@@ -88,9 +88,12 @@ async fn main() -> anyhow::Result<()> {
     if let Some(path) = env_path(READY_FILE) {
         write_ready(&path, &addr.to_string()).with_context(|| format!("writing {READY_FILE}"))?;
     }
+    let decisions = state.decisions.clone();
     axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown(stop_rx))
+        .with_graceful_shutdown(shutdown(stop_rx, decisions.clone()))
         .await?;
+    // Tasks are dropped with the runtime: pending work stays for a restart.
+    decisions.begin_shutdown();
     Ok(())
 }
 
@@ -316,7 +319,10 @@ fn flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v.trim() == "1")
 }
 
-async fn shutdown(mut stop: watch::Receiver<bool>) {
+async fn shutdown(
+    mut stop: watch::Receiver<bool>,
+    decisions: std::sync::Arc<metro_server::decisions::Pending>,
+) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -339,5 +345,8 @@ async fn shutdown(mut stop: watch::Receiver<bool>) {
         _ = term => {},
         _ = stopped => {},
     }
+    // From here, work that ends unfinished is left for the next start,
+    // never dropped or noted as failed.
+    decisions.begin_shutdown();
     tracing::info!("shutting down");
 }

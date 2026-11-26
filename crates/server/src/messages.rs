@@ -336,7 +336,8 @@ pub async fn post_room_message(
             chosen: chosen.map(Box::new),
             choice,
         };
-        let watch = crate::decisions::Watch::space(state, &space.id, &job.room.id, event.id);
+        let watch = crate::decisions::Watch::space(state, &space.id, &job.room.id, event.id)
+            .quiet(addressing == Addressing::Unaddressed);
         tokio::spawn(async move {
             let outcome = job.run(watch).await;
             // Nobody may be waiting; the registry keeps it briefly.
@@ -734,9 +735,9 @@ fn plan_calls_system_one(
     settings: &RoutingSettings,
     prefs: &crate::space_prefs::SpacePrefs,
 ) -> bool {
-    let classifies = prefs.classify_unaddressed && settings.classifier_id.is_some();
+    let classifies = crate::agent_dispatch::classifies(prefs, settings);
     match addressing {
-        Addressing::Unaddressed => !text.is_empty() && prefs.classify_unaddressed,
+        Addressing::Unaddressed => !text.is_empty() && classifies,
         Addressing::Agent => classifies && resolved.contains(&Mention::Agent),
         Addressing::PeopleOnly => false,
     }
@@ -830,7 +831,8 @@ pub(crate) async fn resume_space(state: AppState, row: crate::decisions::Stored)
         return forget(&state, Scope::Space, row.event_id).await;
     };
     // From here every early return drops the work and says so in the room.
-    let mut watch = crate::decisions::Watch::space(&state, &space, &room.id, row.event_id);
+    let mut watch = crate::decisions::Watch::space(&state, &space, &room.id, row.event_id)
+        .quiet(crate::decisions::unaddressed(&row.payload));
     let resolved: Vec<Mention> =
         serde_json::from_value(row.payload["resolved"].clone()).unwrap_or_default();
     let reply_agent = row.payload["reply_agent"].as_str().map(str::to_owned);
@@ -879,7 +881,13 @@ pub(crate) async fn resume_targets(state: AppState, planned: crate::decisions::S
     else {
         return forget(&state, Scope::Space, eid).await;
     };
-    let mut watch = crate::decisions::Watch::space(&state, &planned.space_id, &room.id, eid);
+    // Runs only the classifier chose (an unaddressed message) drop quietly.
+    let quiet = planned
+        .targets
+        .iter()
+        .all(|t| t.addressed_by == crate::model_routing::AddressedBy::Classifier);
+    let mut watch =
+        crate::decisions::Watch::space(&state, &planned.space_id, &room.id, eid).quiet(quiet);
     let Some((settings, prefs)) =
         current_settings(&state, &planned.user_id, &planned.space_id).await
     else {

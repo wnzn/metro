@@ -1095,7 +1095,7 @@ pub async fn chat_message(
     // the message is already stored and shown.
     if let (Some(how), Some(turn)) = (how, turn_id.clone()) {
         let (state, user, event) = (state.clone(), who.id.clone(), event.clone());
-        let watch = crate::decisions::Watch::chat(&state, &user, event.id);
+        let watch = crate::decisions::Watch::chat(&state, &user, event.id, Some(&turn));
         tokio::spawn(chat_turn(state, user, event, how, ticket, turn, watch));
     }
     Ok((
@@ -1186,9 +1186,11 @@ pub(crate) async fn chat_turn(
         return forget(&state, Scope::Personal, event.id).await;
     }
     // Hold the line until this turn's `started` marker is written (or it
-    // found its message deleted, or the turn stopped first).
-    let _ = written.await;
-    watch.done();
+    // found its message deleted, or the turn stopped first). Anything else
+    // (the start failed or panicked before its marker) is said in the Chat.
+    if written.await.is_ok() {
+        watch.done();
+    }
 }
 
 /// Whether the sender stopped this turn: live, or remembered with its
@@ -1243,7 +1245,7 @@ pub(crate) async fn resume_chat_turn(
         .clone()
         .unwrap_or_else(|| crate::db::Activity::chat().id);
     // From here every early return drops the turn and says so in the Chat.
-    let watch = crate::decisions::Watch::chat(&state, &row.user_id, row.event_id);
+    let watch = crate::decisions::Watch::chat(&state, &row.user_id, row.event_id, Some(&turn_id));
     let how = match row.payload["choice"].as_object() {
         Some(choice) => {
             let who = Human {
@@ -1270,16 +1272,20 @@ pub(crate) async fn resume_chat_turn(
                          used now: {} No agent ran.",
                         e.message()
                     );
-                    let (user, author) = (row.user_id.clone(), Author::server(actor::SYSTEM));
+                    let (user, author, turn) = (
+                        row.user_id.clone(),
+                        Author::server(actor::SYSTEM),
+                        turn_id.clone(),
+                    );
                     let _ = state
                         .db
                         .call(move |db| {
-                            db.append_personal(
+                            db.append_personal_for_turn(
                                 &user,
                                 kind::ERROR,
                                 &author,
                                 &message,
-                                &Addressed::room(),
+                                &turn,
                             )
                         })
                         .await;

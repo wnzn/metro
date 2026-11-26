@@ -112,6 +112,8 @@ export type RoomEvent = {
   forwarded?: { authorName: string; authorKind: "person" | "agent"; sentAt?: string; sameSpace?: { roomId: string; eventId: number } };
   replies?: { roomId: string; count: number; lastAt?: string; participantIds: string[] };
   compaction?: { events: number; trigger: "auto" | "manual"; byName: string; focus?: string };
+  /** On a personal Chat error: the Chat turn it ended before it started. */
+  turnId?: string;
 };
 export type ReplyAddress = { eventId: number; askAgent: boolean; agentId?: string };
 /**
@@ -1435,6 +1437,7 @@ function toEvent(v: RoomEvent): RoomEvent {
   if (attachments.length) event.attachments = attachments;
   if (isEventId(raw.reply_to)) event.replyTo = raw.reply_to;
   if (raw.via === "metro") event.via = raw.via;
+  if (event.kind === "error" && typeof raw.turn_id === "string" && /^chat_[A-Za-z0-9]{1,64}$/.test(raw.turn_id)) event.turnId = raw.turn_id;
   const f = raw.forwarded;
   if (isObject(f) && typeof f.author_name === "string" && (f.author_kind === "person" || f.author_kind === "agent")) {
     const link = f.same_space;

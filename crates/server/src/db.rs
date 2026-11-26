@@ -110,6 +110,10 @@ pub struct MessageMeta {
     /// triggered it ([`crate::compaction`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<crate::compaction::Meta>,
+    /// Only on a personal Chat `error`: the Chat turn it ends before it
+    /// started (its sender knew its id from the POST).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
 }
 
 impl MessageMeta {
@@ -131,6 +135,7 @@ impl MessageMeta {
             via: key(m, "via"),
             forwarded: key(m, "forwarded"),
             compaction: key(m, "compaction"),
+            turn_id: key(m, "turn_id"),
         }
     }
 }
@@ -1610,6 +1615,51 @@ impl Db {
         Ok(Some(event))
     }
 
+    /// A personal Chat event naming Chat turn `turn` (`turn_id`), such as
+    /// the error that ends it before it started.
+    pub fn append_personal_for_turn(
+        &self,
+        user_id: &str,
+        kind: &str,
+        author: &Author,
+        text: &str,
+        turn: &str,
+    ) -> anyhow::Result<Event> {
+        let conn = self.lock();
+        let at = now_ms();
+        let addressed = Addressed::room();
+        let meta = MessageMeta {
+            turn_id: Some(turn.to_owned()),
+            ..MessageMeta::default()
+        };
+        conn.execute(
+            "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                user_id,
+                kind,
+                author.name,
+                author.id,
+                text,
+                addressed.mentions.to_string(),
+                addressed.audience,
+                at,
+                event_metadata_json(None, None, &meta)?,
+            ],
+        )?;
+        let mut event = new_event(
+            conn.last_insert_rowid(),
+            kind,
+            author,
+            text,
+            &addressed,
+            None,
+            at,
+        );
+        event.meta = meta;
+        Ok(event)
+    }
+
     pub fn personal_after(
         &self,
         user_id: &str,
@@ -1710,6 +1760,17 @@ pub(crate) fn row_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
     let metadata: Option<String> = r.get(7)?;
     let kind: String = r.get(1)?;
     let (spans, meta) = match metadata.as_deref() {
+        // A Chat error's turn id; everything else of its metadata is activity.
+        Some(raw) if kind == kind::ERROR => match serde_json::from_str::<serde_json::Value>(raw) {
+            Ok(serde_json::Value::Object(m)) => (
+                None,
+                MessageMeta {
+                    turn_id: m.get("turn_id").and_then(|v| v.as_str()).map(str::to_owned),
+                    ..MessageMeta::default()
+                },
+            ),
+            _ => (None, MessageMeta::default()),
+        },
         Some(raw) if kind == kind::MESSAGE || kind == kind::COMPACTION => {
             match serde_json::from_str::<serde_json::Value>(raw) {
                 Ok(serde_json::Value::Object(mut m)) => (
@@ -2393,6 +2454,7 @@ mod tests {
                 }),
             }),
             compaction: None,
+            turn_id: None,
         };
         let addressed = Addressed {
             spans: Some(Vec::new()),

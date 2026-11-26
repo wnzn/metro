@@ -1968,7 +1968,10 @@ pub struct ChatStart {
     pub turn: Activity,
     pub cancel: watch::Receiver<bool>,
     pub guard: crate::meta::TurnGuard,
-    pub started: tokio::sync::oneshot::Sender<()>,
+    /// `true` once the `started` marker is written; `false` when it was
+    /// deliberately not started (stopped, its message deleted, or another
+    /// process holds it). Dropped unsent: the start failed (or panicked).
+    pub started: tokio::sync::oneshot::Sender<bool>,
 }
 
 /// [`start_personal_run`] for a turn registered already. It starts only if
@@ -2055,7 +2058,34 @@ async fn run_personal(
     // In Chat a refusal stands alone; on a page it carries the turn, so the
     // page can show that this click failed.
     let tag = (lane != PersonalLane::Chat).then(|| turn.clone());
-    let append = |kind: &'static str, text: String| append_as(kind, text, tag.clone());
+    // A Chat turn its sender knows by id (it waited to start): its refusal
+    // names that id, so the sender's pending Stop clears.
+    let known = chat.as_ref().map(|c| c.turn.id.clone());
+    let append = |kind: &'static str, text: String| {
+        let (state, user, known, author, plain) = (
+            state.clone(),
+            user_id.clone(),
+            known.clone(),
+            agent_author.clone(),
+            append_as(kind, text.clone(), tag.clone()),
+        );
+        async move {
+            match known {
+                Some(turn) => {
+                    let r = state
+                        .db
+                        .call(move |db| {
+                            db.append_personal_for_turn(&user, kind, &author, &text, &turn)
+                        })
+                        .await;
+                    if let Err(e) = r {
+                        tracing::error!(error = %format!("{e:#}"), "appending personal event");
+                    }
+                }
+                None => plain.await,
+            }
+        }
+    };
     // Refusals are recorded only in this person's own scope, as a code.
     let model = match route_model(&state, &user_id, None, &mut route).await {
         Ok(model) => model,
@@ -2113,6 +2143,9 @@ async fn execute_personal_run(
     };
     // Stopped before it started: nothing to show.
     if cancel.as_ref().is_some_and(|c| *c.borrow()) {
+        if let Some(signal) = started_signal {
+            let _ = signal.send(false);
+        }
         return;
     }
     let agent_author = Author::server(actor::AGENT);
@@ -2161,7 +2194,13 @@ async fn execute_personal_run(
             .await;
         match written {
             Ok(Some(_)) => {}
-            Ok(None) => return,
+            Ok(None) => {
+                if let Some(signal) = started_signal {
+                    let _ = signal.send(false);
+                }
+                return;
+            }
+            // The sender (if waiting) learns the start failed.
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "starting a Chat turn");
                 return;
@@ -2171,7 +2210,7 @@ async fn execute_personal_run(
         append_as(kind::ACTIVITY, String::new(), Some(started)).await;
     }
     if let Some(signal) = started_signal {
-        let _ = signal.send(());
+        let _ = signal.send(true);
     }
     let end = |phase: &'static str| append_as(kind::ACTIVITY, String::new(), Some(turn.at(phase)));
     let tagged = |kind: &'static str, text: String| append_as(kind, text, Some(turn.clone()));
