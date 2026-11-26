@@ -407,3 +407,32 @@ test("a refused delete keeps the message and says why", async () => {
   await app.waitFor("id:action-error");
   expect(app.shows("text:hello from bob in acme")).toBe(true);
 });
+
+test("losing the session mid-delete releases the pending delete, so the next session can delete", async () => {
+  const f = world();
+  f.post("acme/lobby", { kind: "message", actor: "bob", actor_id: "bob", text: "a second message from bob" } as any);
+  const app = await inAcme(f);
+  const [first, second] = f.state.events.get("acme/lobby")!.filter((e) => e.kind === "message");
+  f.state.delays.set(`/v1/spaces/acme/rooms/lobby/events/${first!.id}`, 1500);
+  await app.press(`id:delete:${first!.id}`);
+  await app.press(`id:delete-dialog:${first!.id}:confirm`);
+  await app.waitUntil(() => deletes(f).some((p) => p.path.endsWith(`/events/${first!.id}`)));
+  // The answer is still on the wire when the person disconnects and signs in again.
+  await app.press("id:account-menu");
+  await app.press("id:disconnect");
+  await app.clear("id:server-url");
+  await app.type("id:server-url", BASE);
+  await app.type("id:access-token", TOKENS.alice!);
+  await app.press("id:connect");
+  await app.waitFor("id:space:acme");
+  await app.press("id:space:acme");
+  await app.waitFor(`id:event:${second!.id}`);
+  expect(f.state.events.get("acme/lobby")!.some((e) => e.id === second!.id)).toBe(true);
+  await app.wait(1800); // the old request's late answer must not touch the new session
+  const target = second!;
+  await app.hover(`id:event:${target.id}`);
+  await app.press(`id:delete:${target.id}`);
+  await app.press(`id:delete-dialog:${target.id}:confirm`);
+  await app.waitFor(`id:event:${target.id}`, { state: "gone" });
+  expect(deletes(f).map((p) => p.path.split("/").pop())).toEqual([String(first!.id), String(target.id)]);
+});

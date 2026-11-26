@@ -935,15 +935,30 @@ test("accepted files retire by key after a Space is revoked and rejoined, withou
   await pick("unrelated.txt");
   await space(app, "side");
   await pick("accepted.txt");
-  // Let the next ordinary /spaces refresh happen after revocation,
-  // but before the accepted POST reply's ten-second timeout.
+  // Timing is anchored to the app's own /spaces refresh, never to how much
+  // virtual time the waits above happened to use (that grows with machine
+  // load). The next ordinary refresh is ten seconds after the anchor; the
+  // send goes out three seconds after it, and its accepted reply comes
+  // 9.5 s later, inside the ten-second POST timeout: so the next refresh
+  // (at most 11.5 s after the anchor) always falls between the send and
+  // the reply.
+  const lists = () => app.requests().filter(r => r.method === "GET" && new URL(r.url).pathname === "/v1/spaces").length;
+  const seen = lists();
+  for (let i = 0; i < 400 && lists() === seen; i++) await app.clock!.runFor(100);
+  expect(lists()).toBeGreaterThan(seen);
   await app.clock!.runFor(5_000);
   await send(app, text);
   await app.waitUntil(() => w.sent.has(text));
   const id = w.sent.get(text)!.id;
   const members = w.f.state.spaces.get("side")!.members;
   members.delete("alice");
-  await app.waitFor("id:space:side", { state: "gone", timeout: 3_000 });
+  // Step the clock by hand until the revoking refresh lands. A waitFor would
+  // keep moving the clock while the app settles, and under load the follow-up
+  // refresh (1.5 s later) could run before Alice is added back, leaving the
+  // next one ten seconds away. Hundred-millisecond steps keep the re-add well
+  // inside that gap whatever the machine's speed.
+  for (let i = 0; i < 150 && app.shows("id:space:side"); i++) await app.clock!.runFor(100);
+  expect(app.shows("id:space:side")).toBe(false);
   members.add("alice");
   await app.waitFor("id:space:side", { timeout: 6_000 });
   await space(app, "side");

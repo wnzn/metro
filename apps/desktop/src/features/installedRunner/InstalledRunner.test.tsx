@@ -264,7 +264,9 @@ for (const status of [403, 404] as const) {
     t.network[post] = req => {
       if (new URL(req.url).pathname !== "/v1/local-tools/runner/spaces/target/folder") return bridge(req);
       parked = true;
-      return { status, delay: 5_000, body: { error: {
+      // Held far past the list refresh, so how fast the machine settles that
+      // refresh cannot race the refusal: it comes only when the test moves the clock.
+      return { status, delay: 25_000, body: { error: {
         code: status === 403 ? "not_owner" : "not_found", message: "Local folder refused.",
       } } };
     };
@@ -278,11 +280,11 @@ for (const status of [403, 404] as const) {
     await app.waitUntil(() => parked);
     f.state.spaces.get("target")!.name = "Target from the newer list";
     await app.clock!.runFor(3_500);
-    expect(app.shows("id:space:target >> text:Target from the newer list")).toBe(true);
+    await app.waitFor("id:space:target >> text:Target from the newer list"); // the refresh's answer settles in real time
     expect(app.shows("id:installed-runner-space:target")).toBe(true);
     expect(app.shows("id:installed-runner-error")).toBe(false);
 
-    await app.clock!.runFor(1_600);
+    await app.clock!.runFor(25_000);
     await app.waitFor("id:installed-runner-error");
     expect(app.shows("id:installed-runner-space:target")).toBe(false);
     expect(app.shows("id:installed-runner-path:target")).toBe(false);
@@ -976,22 +978,29 @@ test("persistent concurrent consumers see late online and subsequent offline; di
   await app.waitFor(`text:Create choice: ${mine.id}`);
   expect(reads()).toBe(1); // Both watchers use the initial read.
   expect(app.shows("id:dismiss-fixture-offer")).toBe(false);
-  await app.clock!.runFor(36_000); // Longer than the old six-try window.
+  // Longer than the old six-try window: seven polls, one per five seconds.
+  // Each step waits for its read to be answered before the clock moves on:
+  // the answers settle in real time, and under load a single long runFor
+  // finished with some of them still unread.
+  for (let i = 1; i <= 7; i++) {
+    await app.clock!.runFor(5_100);
+    await app.waitUntil(() => reads() >= 1 + i);
+  }
   expect(reads()).toBeGreaterThanOrEqual(7);
   expect(reads()).toBeLessThanOrEqual(8); // At most one poll per five seconds.
   expect(app.shows("id:dismiss-fixture-offer")).toBe(false);
 
   t.st.state = "online";
   await app.clock!.runFor(5100);
-  expect(app.shows("text:Offer appearances: 1")).toBe(true);
+  await app.waitFor("text:Offer appearances: 1");
   expect(app.shows("id:dismiss-fixture-offer")).toBe(true);
   t.st.state = "offline";
   await app.clock!.runFor(5100);
-  expect(app.shows("id:dismiss-fixture-offer")).toBe(false);
+  await app.waitFor("id:dismiss-fixture-offer", { state: "gone" });
   expect(app.shows(`text:Create choice: ${mine.id}`)).toBe(true);
   t.st.state = "online";
   await app.clock!.runFor(5100);
-  expect(app.shows("text:Offer appearances: 2")).toBe(true);
+  await app.waitFor("text:Offer appearances: 2");
 
   t.st.delay = 1500;
   const before = reads();

@@ -79,8 +79,8 @@ test("a classifier-started, use-case-routed turn: the agent shown plainly, one r
   await app.press("id:activity-toggle:agent:r1");
   await app.waitFor("id:activity-route:agent:r1");
   const line = text(app);
-  expect(line).toContain('Use case “Code review” (openai · gpt-fixture-2) answered: System One matched the use case "Code review" with 91% probability.');
-  expect(line).toContain("System One judged that the message asked the agent; nobody typed @agent.");
+  expect(line).toContain("Use case “Code review” (openai · gpt-fixture-2) answered.");
+  expect(line).not.toMatch(/System One|classifier/i); // never attributed, whatever an older server stored
   expect(line).not.toContain("(p 0.91)"); // never the raw probability
   expect(line).not.toContain("pc_0123456789abcdef"); // connection ids are never shown
 });
@@ -143,6 +143,6 @@ test("a probability of 1.00 reads 100% on the badge and in words when opened, ne
   expect(app.shows("id:activity-route-badge:agent:sure >> text:Routed: Incident review · 100%")).toBe(true);
   await app.press("id:activity-toggle:agent:sure");
   await app.waitFor("id:activity-route:agent:sure");
-  expect(text(app)).toContain('System One matched the use case "Incident review" with 100% probability.');
+  expect(text(app)).not.toMatch(/System One|classifier/i);
   expect(text(app)).not.toContain("p 1.00");
 });

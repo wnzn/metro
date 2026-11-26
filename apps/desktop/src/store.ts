@@ -1076,6 +1076,7 @@ function pickRoom(spaceId: string, list: readonly Room[]): string | null {
 function purgeSpace(spaceId: string, unlist: boolean) {
   clearSpaceRunnerOrder(spaceId);
   spaceEpoch.set(spaceId, epochOf(spaceId) + 1);
+  releaseDelete();
   // Keep denial evidence for the session. A complete list may still be on
   // the wire from before the denial, even if this id was unknown to it.
   roomListRequests.delete(spaceId);
@@ -1533,6 +1534,13 @@ async function collectDecisions(c: Client, origin: ReturnType<typeof captureSend
 
 /** The message waiting for a confirmed Delete, and the one being deleted. */
 export const deletePending = signal<number | null>(null);
+/** The delete request that owns `deletePending`; only it releases it, and a lost session or Space clears it. */
+let deleteOwner: object | null = null;
+function releaseDelete(owner: object | null = deleteOwner) {
+  if (owner !== deleteOwner) return;
+  deleteOwner = null;
+  deletePending.set(null);
+}
 
 /**
  * Whether the signed-in person may delete `event` here: their own message
@@ -1558,6 +1566,8 @@ export async function deleteMessage(event: RoomEvent, roomId?: string): Promise<
   if (!chat && (!sid || !rid)) return false;
   const scope = chat ? CHAT : scopeKey(sid!, rid!);
   const ok = chat ? guard() : guard(sid!);
+  const owner = {};
+  deleteOwner = owner;
   deletePending.set(event.id);
   actionError.set(null);
   try {
@@ -1572,7 +1582,7 @@ export async function deleteMessage(event: RoomEvent, roomId?: string): Promise<
     handleActionError(error, "Could not delete the message", chat ? undefined : sid!);
     return false;
   } finally {
-    if (ok()) deletePending.set(null);
+    releaseDelete(owner);
   }
 }
 
@@ -2620,6 +2630,7 @@ function endSession() {
   pollAgain.clear();
   lastRoomBySpace.clear();
   spaceEpoch.clear();
+  releaseDelete();
   roomEntryNavigation = undefined;
   pendingAccessReads.clear();
   pendingMembershipReads.clear();
