@@ -52,7 +52,7 @@ export function ActivityGroupRow(props: {
   /** Still working, and nothing has failed: the live line shows. */
   const working = () => g().outcome === "live" && !g().failed;
   const failed = () => groupOutcomeText(g()) === "failed";
-  const title = () => g().noReply && g().outcome === "completed" ? `${name()} chose not to reply` : working() ? liveTitle(g(), name()) : name();
+  const title = () => working() ? liveTitle(g(), name()) : name();
   const parts = () => {
     if (working()) return [];
     const p = summaryParts(g());

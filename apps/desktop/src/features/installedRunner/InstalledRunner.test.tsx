@@ -450,7 +450,7 @@ test("shows the installer's runner, read-only tools and how to attach; opening o
   expect(app.shows("id:installed-runner-space:other")).toBe(false);
   expect(app.shows("id:installed-runner-space:side")).toBe(false); // Bob's Space
   expect(text(app)).toContain("workspace.list, workspace.read");
-  expect(text(app)).toContain("Online");
+  expect(text(app)).toContain("Connected");
   expect(text(app)).toContain("Every Space you own has a runner.");
   expect(app.shows("id:installed-runner-reconnect")).toBe(false);
   await sleep(300);
@@ -522,7 +522,7 @@ test("reconnect is offered only when allowed, explains itself, and posts only af
   await app.waitFor("id:installed-runner-notice");
   // Plain `{}`: never a chosen runner id.
   expect(posts(t).map((l) => [l.path, l.body])).toEqual([["/v1/local-tools/runner/reconnect", "{}"]]);
-  expect(text(app)).toContain("Online");
+  expect(text(app)).toContain("Connected");
   expect(app.shows("id:installed-runner-reconnect")).toBe(false);
 });
 
@@ -881,7 +881,7 @@ for (const change of ["new", "moved", "replaced"] as const) {
       // A live status update for the same id is not a new runner.
       t.st.state = "offline";
       await app.clock!.runFor(5100);
-      await app.waitFor("id:installed-runner-state >> text:Can't reach the local server");
+      await app.waitFor("id:installed-runner-state >> text:Disconnected");
       expect(app.shows("id:runner-attach-many >> text:Attach to 1 Space")).toBe(true);
       t.st.state = "online";
     }
@@ -1300,7 +1300,7 @@ test("managed runner updates require confirmation, report denial and accepted pr
   const id = `id:runner-update:${mine.id}`;
   const posts = () => f.posts().filter((p) => p.path.endsWith("/update"));
   await app.waitFor(id);
-  expect(text(app)).toContain("v0.4.0 · Online");
+  expect(text(app)).toContain("v0.4.0 · Connected");
   expect(posts()).toEqual([]);
   await app.press(id);
   expect(text(app)).toContain("Build box downloads 0.5.0 from GitHub, verifies the signature itself and restarts.");
@@ -1339,7 +1339,7 @@ test("managed runner updates require confirmation, report denial and accepted pr
   completed.presence.version = "0.5.0";
   f.state.runnerRelease.set(mine.id, completed);
   await app.clock!.runFor(5100);
-  await app.waitFor("text:v0.5.0 · Online");
+  await app.waitFor("text:v0.5.0 · Connected");
   expect(app.shows(id)).toBe(false);
   expect(posts()).toHaveLength(3);
 });
@@ -1390,7 +1390,7 @@ test("an accepted update waits for the held pre-acceptance poll before polling a
   expect(authoritative.arrived()).toBe(1);
   expect(app.shows(pending)).toBe(true);
   await app.clock!.runFor(1700);
-  await app.waitFor("text:v0.5.0 · Online");
+  await app.waitFor("text:v0.5.0 · Connected");
   expect(app.shows(pending)).toBe(false);
   expect(app.shows(id)).toBe(false);
   await app.clock!.runFor(6000);
@@ -1511,7 +1511,7 @@ test("an idle confirmation closes without a POST and hands keyboard focus to sta
   await app.keyboard.press("tab"); // Cancel → Confirm, but don't submit.
   release.presence.online = false;
   await app.clock!.runFor(5100);
-  await app.waitFor(`id:runner-update-result:${mine.id} >> text:Bring this runner online to request an update.`);
+  await app.waitFor(`id:runner-update-result:${mine.id} >> text:Connect this runner to request an update.`);
   expect(app.shows(`${id}:panel`)).toBe(false);
   expect(app.shows(id)).toBe(false);
   await app.keyboard.press("enter"); // The focused status cannot submit.
@@ -1545,7 +1545,7 @@ test("Docker guidance only exposes official version-matched pinned images; embed
   expect(text(app)).toContain("Version unknown until it connects");
   expect(text(app)).toContain("Updates with Metro.");
   expect(text(app)).toContain("An org admin can update it.");
-  expect(text(app)).toContain("Bring this runner online to request an update.");
+  expect(text(app)).toContain("Connect this runner to request an update.");
   expect(app.shows(`id:runner-update-release:${manual.id}`)).toBe(true);
   for (const r of [docker, wrong, embedded, old, org, offline, manual]) expect(app.shows(`id:runner-update:${r.id}`)).toBe(false);
   await app.press(`id:runner-update-docker:${docker.id}:toggle`);

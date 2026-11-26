@@ -27,11 +27,11 @@ import type { InstalledRunner } from "./installedRunner";
 export function installedRunnerBadge(r: InstalledRunner): { tone: Tone; label: string } {
   switch (r.state) {
     case "online":
-      return { tone: "success", label: "Online" };
+      return { tone: "success", label: "Connected" };
     case "starting":
       return { tone: "neutral", label: "Starting…" };
     case "offline":
-      return { tone: "warning", label: "Can't reach the local server" };
+      return { tone: "warning", label: "Disconnected" };
     case "revoked":
       return { tone: "danger", label: "Token no longer accepted" };
     case "deleted":

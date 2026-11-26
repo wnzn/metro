@@ -213,7 +213,7 @@ function AttachRunner(props: { runner: RegisteredRunner }) {
   const name = () => installed() ? "This computer's runner" : r().name;
   return (
     <ConnectionItem testID={`attachable:${r().id}`} name={name()} tags={installed() ? [{ label: "Recommended", tone: "info" }, visibilityTag(r())] : [visibilityTag(r())]}
-      status={{ tone: "neutral", text: r().presence ? (r().presence?.online ? "Online" : "Offline") : "Online status unknown" }}
+      status={{ tone: "neutral", text: r().presence ? (r().presence?.online ? "Connected" : "Disconnected") : "Connection status unknown" }}
       trailing={
         <Action testID={`space-runner-attach:${r().id}`} label="Attach" accessibilityLabel={`Attach ${name()}`}
           busyLabel="Attaching…" busy={runnerBusy() === `attach:${r().id}`} disabled={busy()} variant="secondary"
