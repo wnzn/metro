@@ -32,3 +32,25 @@ pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 pub fn shutdown_requested() -> bool {
     SHUTDOWN.load(Ordering::SeqCst)
 }
+
+/// Unit tests that start processes run apart from tests that check the
+/// install lock. That lock is a `flock` on the install directory, which
+/// belongs to its open file description: a child forked by another test
+/// thread holds a copy of every descriptor until its `exec`, so dropping the
+/// lock does not release it in that window and the next take sees
+/// `installer_busy`. Spawning tests hold [`test_gate::spawning`]; lock tests
+/// hold [`test_gate::exclusive`].
+#[cfg(test)]
+pub(crate) mod test_gate {
+    use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+    static GATE: RwLock<()> = RwLock::new(());
+
+    pub fn spawning() -> RwLockReadGuard<'static, ()> {
+        GATE.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn exclusive() -> RwLockWriteGuard<'static, ()> {
+        GATE.write().unwrap_or_else(|p| p.into_inner())
+    }
+}

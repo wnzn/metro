@@ -503,6 +503,15 @@ fn scope_of(r: &RegisteredRunner) -> Scope {
 // ---- views ----
 
 /// `presence` and `update` objects for a runner view.
+/// How long ago (ms) the runner with presence `key` last claimed, if it has
+/// since this server started (presence is memory only), and whether that
+/// counts as online.
+pub fn last_seen(state: &AppState, key: &str) -> Option<(i64, bool)> {
+    let p = state.updates.presence(key)?;
+    let ago = (now_ms() - p.seen_at).max(0);
+    Some((ago, ago < ONLINE_WINDOW_MS))
+}
+
 pub fn runner_fields(state: &AppState, key: &str) -> (serde_json::Value, serde_json::Value) {
     let now = now_ms();
     let p = state.updates.presence(key);

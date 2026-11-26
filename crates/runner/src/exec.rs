@@ -544,6 +544,7 @@ mod tests {
 
     #[test]
     fn runs_in_workspace_with_clean_env() {
+        let _spawning = crate::test_gate::spawning();
         let ws = tempfile::tempdir().unwrap();
         // SAFETY: test-only; set before spawning, single var.
         unsafe { std::env::set_var("METRO_RUNNER_TOKEN", "leak-me") };
@@ -564,6 +565,7 @@ mod tests {
 
     #[test]
     fn argv_is_not_shell_interpreted() {
+        let _spawning = crate::test_gate::spawning();
         let ws = tempfile::tempdir().unwrap();
         let argv = vec![
             "/bin/echo".to_string(),
@@ -580,6 +582,7 @@ mod tests {
 
     #[test]
     fn timeout_kills_process_group() {
+        let _spawning = crate::test_gate::spawning();
         let ws = tempfile::tempdir().unwrap();
         let marker = ws.path().join("pid");
         let script = format!("sleep 30 & echo $! > {}; wait", marker.display());
@@ -605,6 +608,7 @@ mod tests {
 
     #[test]
     fn capture_is_bounded() {
+        let _spawning = crate::test_gate::spawning();
         let ws = tempfile::tempdir().unwrap();
         let p = prepare(
             &sh("head -c 1000000 /dev/zero"),
@@ -620,6 +624,7 @@ mod tests {
 
     #[test]
     fn missing_executable_is_spawn_error() {
+        let _spawning = crate::test_gate::spawning();
         let ws = tempfile::tempdir().unwrap();
         let p = prepare(
             &["/nonexistent/bin".to_string()],
@@ -636,6 +641,7 @@ mod tests {
 
     #[test]
     fn docker_args_are_hardened() {
+        let _spawning = crate::test_gate::spawning();
         let d = DockerSandbox {
             docker_bin: "docker".into(),
             image: "img@sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -678,6 +684,7 @@ mod tests {
 
     #[test]
     fn docker_missing_binary_fails_closed() {
+        let _spawning = crate::test_gate::spawning();
         let ws = tempfile::tempdir().unwrap();
         let d = Sandbox::Docker(DockerSandbox {
             docker_bin: "/nonexistent/docker".into(),

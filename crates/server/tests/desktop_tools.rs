@@ -846,3 +846,112 @@ async fn personal_chat_never_reaches_the_local_tools() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(s.claim(&token).await, StatusCode::NO_CONTENT);
 }
+
+/// A pairing record that can't be read is never served silently: the
+/// status names its Space, and the readable pairings still work.
+#[tokio::test]
+async fn an_unreadable_pairing_is_named_and_the_others_still_serve() {
+    let s = Server::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("local-tools");
+    let tools = DesktopTools::new(root.clone());
+    let alice = s.hosted(ALICE, "alice");
+    let good = s.space(ALICE, "good").await;
+    let bad = s.space(ALICE, "bad").await;
+    for sid in [&good, &bad] {
+        let (st, e) = enable(&tools, &alice, sid).await;
+        assert_eq!(st, 200, "{e}");
+    }
+    tools.stop_all().await;
+
+    // Damage one pairing record on disk, then start again.
+    let pairing = walk(&root)
+        .into_iter()
+        .find(|p| {
+            p.file_name().is_some_and(|n| n == "pairing.json")
+                && p.parent().is_some_and(|d| d.ends_with(&bad))
+        })
+        .expect("the bad Space's pairing file");
+    std::fs::write(&pairing, b"{not json").unwrap();
+    tools.resume(alice.clone()).await;
+
+    let v = status(&tools, Some(&alice)).await;
+    let problem = v["problem"].as_str().unwrap_or_default();
+    assert!(
+        problem.contains(&bad) && problem.contains("couldn't read the local tools pairing"),
+        "{v}"
+    );
+    wait_worker(&tools, &alice, &good, "online").await;
+    let (st, ev) = s.demo(ALICE, &good).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{ev}");
+    let result = s.wait_tool_result(ALICE, &good, 1).await;
+    assert!(
+        result["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("workspace.list ok"),
+        "{result}"
+    );
+    tools.stop_all().await;
+}
+
+fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+async fn wait_room_error(s: &Server, token: &str, sid: &str, n: usize) -> String {
+    for _ in 0..800 {
+        let (_, v) = s
+            .get(token, &format!("/v1/spaces/{sid}/rooms/lobby/events"))
+            .await;
+        let errors: Vec<String> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == "error")
+            .filter_map(|e| e["text"].as_str().map(str::to_owned))
+            .collect();
+        if errors.len() >= n {
+            return errors[n - 1].clone();
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("no room error #{n} in {sid}");
+}
+
+/// A job nobody picked up says whether the Space's runner is connected.
+#[tokio::test]
+async fn an_unclaimed_job_says_whether_the_runner_is_connected() {
+    let s = Server::start().await;
+    let sid = s.space(ALICE, "quiet runner").await;
+    let token = s.issue(ALICE, &sid).await;
+
+    // Paired, but nothing ever claimed with that token.
+    let (st, v) = s.demo(ALICE, &sid).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+    let text = wait_room_error(&s, ALICE, &sid, 1).await;
+    assert!(
+        text.starts_with("workspace.list failed: this Space's runner isn't connected")
+            && text.contains("hasn't checked in since this Metro server started"),
+        "{text}"
+    );
+
+    // It checks in once (connected) but doesn't take the next job.
+    assert_eq!(s.claim(&token).await, StatusCode::NO_CONTENT);
+    let (st, v) = s.demo(ALICE, &sid).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+    let text = wait_room_error(&s, ALICE, &sid, 2).await;
+    assert_eq!(
+        text,
+        "workspace.list failed: the runner is connected but didn't pick up the job in time.",
+    );
+}

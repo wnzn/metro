@@ -667,6 +667,39 @@ fn space_view(state: &AppState, space_id: &str, runner: &SpaceRunner) -> serde_j
     }
 }
 
+/// Why nobody picked up a job of `space_id` (`JobError::NotClaimed`), from
+/// what the Space's runner did: never checked in since this server
+/// started, last checked in a while ago, or connected but too slow.
+pub(crate) async fn not_claimed_reason(state: &AppState, space_id: &str) -> String {
+    let sid = space_id.to_owned();
+    let runner = state.db.call(move |db| db.space_runner(&sid)).await;
+    let key = match runner {
+        Ok(SpaceRunner::Dedicated) => format!("space:{space_id}"),
+        Ok(SpaceRunner::Registered(r)) => format!("runner:{}", r.id),
+        Ok(SpaceRunner::None) => return not_claimed_text(None),
+        Err(_) => return crate::jobs::JobError::NotClaimed.to_string(),
+    };
+    not_claimed_text(Some(crate::updates::last_seen(state, &key)))
+}
+
+/// `seen`: `None` without a runner, `Some(None)` when it hasn't checked in
+/// since this server started, `Some(Some((ms ago, online)))` otherwise.
+fn not_claimed_text(seen: Option<Option<(i64, bool)>>) -> String {
+    match seen {
+        None => "this Space has no runner, so nobody picked up the job.".into(),
+        Some(None) => "this Space's runner isn't connected: it hasn't checked in since this \
+                       Metro server started."
+            .into(),
+        Some(Some((_, true))) => {
+            "the runner is connected but didn't pick up the job in time.".into()
+        }
+        Some(Some((ago, false))) => {
+            let mins = (ago / 60_000).max(1);
+            format!("this Space's runner isn't connected: it last checked in {mins} min ago.")
+        }
+    }
+}
+
 const NO_RUNNER: &str = "no such runner";
 
 /// A runner `who` may see; 404 otherwise.
@@ -1021,6 +1054,23 @@ async fn change_dedicated_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn not_claimed_says_whether_the_runner_is_connected() {
+        assert!(not_claimed_text(None).contains("has no runner"));
+        assert!(not_claimed_text(Some(None)).contains("isn't connected"));
+        assert!(not_claimed_text(Some(None)).contains("since this Metro server started"));
+        let offline = not_claimed_text(Some(Some((5 * 60_000 + 1, false))));
+        assert!(
+            offline.contains("isn't connected") && offline.contains("5 min ago"),
+            "{offline}"
+        );
+        let online = not_claimed_text(Some(Some((900, true))));
+        assert!(
+            online.contains("is connected but didn't pick up"),
+            "{online}"
+        );
+    }
 
     fn db_with_space(owner: &str) -> (Db, String) {
         let db = Db::open_in_memory().unwrap();

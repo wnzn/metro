@@ -29,6 +29,8 @@ export function localToolsBadge(e: LocalToolsSpace | null): { tone: Tone; label:
       return { tone: "warning", label: "Can't reach the local server" };
     case "starting":
       return { tone: "neutral", label: "Starting…" };
+    case "failed":
+      return { tone: "danger", label: "Not working" };
     default:
       return { tone: "neutral", label: "Paused" };
   }
@@ -40,6 +42,11 @@ export function LocalToolsCard(props: { spaceId: string | null; runner: SpaceRun
   const sid = () => props.spaceId ?? undefined;
   const entry = () => localToolsFor(sid());
   const badge = () => localToolsBadge(entry());
+  // Why this computer can't serve its pairings, unless this Space's own detail already says it.
+  const problem = () => {
+    const p = localTools()?.problem;
+    return p && p !== entry()?.detail ? p : null;
+  };
   let open = true;
   cleanup(() => { open = false; });
   effect(() => {
@@ -105,13 +112,16 @@ export function LocalToolsCard(props: { spaceId: string | null; runner: SpaceRun
         <SettingRow label="Local pairing" description="Lets agents list and read files in one private folder while Metro is open. No file changes or commands.">
           <Badge testID="local-tools-state" tone={badge().tone} label={badge().label} />
         </SettingRow>
+        <If when={problem()}>
+          {(p) => <Label variant="caption" color="danger" testID="local-tools-problem">{p()}</Label>}
+        </If>
 
         <If when={entry()}>
           {(e) => (
             <SettingRow label="Workspace folder" testID="local-tools-on" stacked>
               <If when={e().detail}>
                 {(d) => (
-                  <Label variant="caption" color={e().state === "revoked" ? "danger" : "muted"} testID="local-tools-detail">
+                  <Label variant="caption" color={e().state === "revoked" || e().worker === "failed" ? "danger" : "muted"} testID="local-tools-detail">
                     {d()}
                   </Label>
                 )}
