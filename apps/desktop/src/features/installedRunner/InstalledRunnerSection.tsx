@@ -47,6 +47,11 @@ export function installedRunnerBadge(r: InstalledRunner): { tone: Tone; label: s
   }
 }
 
+/** What a "Disconnected" badge doesn't say: the local server isn't answering. */
+export function installedRunnerNote(r: InstalledRunner): string {
+  return r.state === "offline" ? "Can't reach the local server. " : "";
+}
+
 export function reconnectImpact(r: InstalledRunner): string {
   const fresh = "A new runner isn't attached to any Space. You can choose where to attach it afterward.";
   if (r.runner) {
@@ -87,7 +92,7 @@ function Section(props: { r: InstalledRunner; management?: JSX.Element; picks: A
     >
       <SettingRow
         label={r().runner?.name ?? (r().unconfirmedName ? `Not confirmed (asked for “${r().unconfirmedName}”)` : "Not registered yet")}
-        description={`${version() ? `v${version()}` : "Version unknown until it connects"}. Updates with Metro. Read-only: ${r().tools.join(", ") || "workspace.list, workspace.read"}. It never changes files, runs commands or MCP servers.`}
+        description={`${installedRunnerNote(r())}${version() ? `v${version()}` : "Version unknown until it connects"}. Updates with Metro. Read-only: ${r().tools.join(", ") || "workspace.list, workspace.read"}. It never changes files, runs commands or MCP servers.`}
       >
         <Badge testID="installed-runner-state" tone={badge().tone} label={badge().label} />
       </SettingRow>

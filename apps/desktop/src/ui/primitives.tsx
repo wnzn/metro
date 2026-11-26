@@ -1572,7 +1572,7 @@ export function SettingsGroup(props: Testable & { title?: string; description?: 
   return (
     <View class="flex-col gap-(--space-2)" testID={props.testID} accessibilityLabel={props.accessibilityLabel}>
       <If when={props.title || props.description}>
-        <View class="flex-col gap-px px-(--space-1)">
+        <View class="flex-col gap-px">
           <If when={props.title}>
             <Text class={cx(props.flat ? textClass.md : textClass.sm, "font-semibold text-foreground")} role="header"
               ref={props.focusTitle ? titleRef : undefined} focusable={props.focusTitle}>
