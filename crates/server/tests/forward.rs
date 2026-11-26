@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use metro_model_protocol::Capability;
-use metro_server::db::{Addressed, Author, Db, kind};
+use metro_server::db::{Activity, Addressed, AgentBadge, Author, Db, kind};
 use metro_server::model_routing::{BoxFuture, Routing, RoutingBackend};
 use metro_server::providers::{SelectedModel, UseError};
 use metro_server::{AppState, Config, Limits, router};
@@ -339,6 +339,38 @@ async fn cross_space_and_dm_forwards_do_not_expose_source_locations() {
     let forwarded =
         json!({"author_name":"Coder", "author_kind":"agent", "sent_at":json!(agent)["created_at"]});
     assert_eq!(cross["events"][0]["forwarded"], forwarded);
+
+    // A real agent reply is stored under the server actor, with its agent
+    // on the activity: the forward names the agent.
+    let mut activity = Activity::agent("run_x", "Metro");
+    activity.agent = Some(AgentBadge {
+        id: "ag-1".into(),
+        handle: "writer".into(),
+        name: "Writer".into(),
+        avatar_version: None,
+        color: "blue".into(),
+    });
+    let reply =
+        s.db.append_event_with(
+            &a,
+            "lobby",
+            kind::AGENT,
+            &Author::server("agent"),
+            "Done",
+            &Addressed::room(),
+            Some(&activity),
+        )
+        .unwrap();
+    let (status, named) = s
+        .forward(
+            ALICE,
+            &in_room(&a, "lobby", &json!(reply.id)),
+            &room(&b, "lobby"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{named}");
+    assert_eq!(named["events"][0]["forwarded"]["author_name"], "Writer");
 
     let (status, dm_copy) = s.forward(ALICE, &source, &to_dm("bob"), None).await;
     assert_eq!(status, StatusCode::CREATED, "{dm_copy}");

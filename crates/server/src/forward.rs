@@ -145,7 +145,12 @@ fn write(
     };
     let meta = MessageMeta {
         forwarded: Some(Forwarded {
-            author_name: event.actor,
+            // An agent's reply is stored under the server actor: its name
+            // is the agent's (or the turn's, `Metro` in Chat).
+            author_name: match (&event.kind[..], &event.activity) {
+                (kind::AGENT, Some(a)) => a.agent.as_ref().map_or(&a.name, |b| &b.name).clone(),
+                _ => event.actor,
+            },
             author_kind: if event.kind == kind::AGENT {
                 ForwardedAuthor::Agent
             } else {
