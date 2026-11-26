@@ -23,10 +23,12 @@ impl HumanAuth for FakeAuth {
     fn identity<'a>(&'a self, bearer: &'a str) -> AuthFuture<'a> {
         Box::pin(async move {
             match bearer {
-                "alice" | "bob" | "carol" => Ok(UserIdentity {
-                    id: bearer.to_owned(),
-                    actor: bearer.to_owned(),
-                }),
+                b if ["alice", "bob", "carol"].contains(&b) || b.starts_with("user") => {
+                    Ok(UserIdentity {
+                        id: bearer.to_owned(),
+                        actor: bearer.to_owned(),
+                    })
+                }
                 _ => Err(AuthFailure::Rejected("unknown token".to_owned())),
             }
         })
@@ -65,9 +67,10 @@ impl RoutingBackend for Backend {
             if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
-            if user != "alice" || id != CLASSIFIER {
+            if id != CLASSIFIER {
                 return Err(ProviderError::Use(UseError::NotFound).into());
             }
+            let _ = user;
             if payload["message"]
                 .as_str()
                 .is_some_and(|m| m.contains("[fail]"))
@@ -92,7 +95,7 @@ impl RoutingBackend for Backend {
         id: &'a str,
     ) -> BoxFuture<'a, anyhow::Result<Option<Capability>>> {
         Box::pin(async move {
-            Ok((user == "alice" && id == CLASSIFIER).then_some(Capability::SystemOne))
+            Ok((!user.is_empty() && id == CLASSIFIER).then_some(Capability::SystemOne))
         })
     }
 
@@ -143,9 +146,27 @@ impl H {
         Self::start_with(None, 0).await
     }
 
+    /// With room for many runs at once.
+    async fn roomy(delay_ms: u64) -> Self {
+        Self::start_limits(None, delay_ms, |l| Limits {
+            max_agent_runs: 64,
+            max_space_runs: 64,
+            ..l
+        })
+        .await
+    }
+
+    async fn start_with(file: Option<&std::path::Path>, delay_ms: u64) -> Self {
+        Self::start_limits(file, delay_ms, |l| l).await
+    }
+
     /// A server on `file` (a fresh in-memory database without one) whose
     /// System One answers after `delay_ms`.
-    async fn start_with(file: Option<&std::path::Path>, delay_ms: u64) -> Self {
+    async fn start_limits(
+        file: Option<&std::path::Path>,
+        delay_ms: u64,
+        limits: impl FnOnce(Limits) -> Limits,
+    ) -> Self {
         let model_calls = Arc::new(Mutex::new(Vec::new()));
         let config = Config {
             bind: "127.0.0.1:0".parse().unwrap(),
@@ -155,10 +176,10 @@ impl H {
                 model: "env-model".into(),
                 api_key: String::new(),
             }),
-            limits: Limits {
+            limits: limits(Limits {
                 agent_timeout: Duration::from_secs(20),
                 ..Limits::default()
-            },
+            }),
             org_admins: vec!["carol".into()],
         };
         let db = match file {
@@ -284,10 +305,14 @@ impl H {
     }
 
     async fn classify(&self, sid: &str) {
+        self.classify_as("alice", sid).await;
+    }
+
+    async fn classify_as(&self, who: &str, sid: &str) {
         let (s, v) = self
             .req(
                 Method::PUT,
-                "alice",
+                who,
                 "/v1/model-routing",
                 Some(json!({"enabled": false, "infer_addressing": false,
                             "classifier_id": CLASSIFIER, "cases": []})),
@@ -297,7 +322,7 @@ impl H {
         let (s, v) = self
             .req(
                 Method::PUT,
-                "alice",
+                who,
                 &format!("/v1/spaces/{sid}/prefs"),
                 Some(json!({"classify_unaddressed": true})),
             )
@@ -1420,4 +1445,287 @@ async fn stop_before_start_works_through_the_api_and_across_a_restart() {
     assert_eq!(started_for(&after.chat("alice").await, 0), 0);
     assert!(before.model_calls.lock().unwrap().is_empty());
     assert!(after.model_calls.lock().unwrap().is_empty());
+}
+
+// ---- Third review: slots, failure paths, stale work, Space deletion ----
+
+/// Each message's `started` markers after `after`.
+fn starts(events: &[Value], after: i64) -> usize {
+    started_for(events, after)
+}
+
+async fn with_coder(h: &H, sid: &str) {
+    let (s, v) = h
+        .post(
+            "alice",
+            &format!("/v1/spaces/{sid}/agents"),
+            json!({"name": "Coder", "handle": "coder", "description": "Writes code."}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+}
+
+async fn all_started(h: &H, sid: &str, after: i64, want: usize) -> usize {
+    let mut n = 0;
+    for _ in 0..600 {
+        n = starts(&h.events("alice", sid, "lobby").await, after);
+        if n >= want {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    n
+}
+
+#[tokio::test]
+async fn more_deferred_messages_than_one_persons_slots_all_start() {
+    let h = H::roomy(300).await;
+    let sid = h.space().await;
+    with_coder(&h, &sid).await;
+    h.classify(&sid).await;
+    let first = h.events("alice", &sid, "lobby").await.last().map_or(0, id);
+    let n = metro_server::decisions::PER_USER + 1;
+    for i in 0..n {
+        let v = h
+            .sent(
+                "alice",
+                &sid,
+                "lobby",
+                json!({"text": format!("@agent number {i}"), "defer_decisions": true}),
+            )
+            .await;
+        assert_eq!(v["decisions_pending"], true, "{v}");
+    }
+    assert_eq!(
+        all_started(&h, &sid, first, n).await,
+        n,
+        "a deferred decision deadlocked"
+    );
+    assert_eq!(h.classifier_calls(), n);
+}
+
+#[tokio::test]
+async fn more_deferred_messages_than_the_servers_slots_all_start() {
+    let h = H::roomy(300).await;
+    let sid = h.space().await;
+    with_coder(&h, &sid).await;
+    let n = metro_server::decisions::AT_ONCE + 1;
+    let people: Vec<String> = (0..n).map(|i| format!("user{i}")).collect();
+    for p in &people {
+        let (s, v) = h
+            .post(
+                "alice",
+                &format!("/v1/spaces/{sid}/members"),
+                json!({"user_id": p}),
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{v}");
+        h.classify_as(p, &sid).await;
+    }
+    let first = h.events("alice", &sid, "lobby").await.last().map_or(0, id);
+    for p in &people {
+        h.sent(
+            p,
+            &sid,
+            "lobby",
+            json!({"text": "@agent hello", "defer_decisions": true}),
+        )
+        .await;
+    }
+    assert_eq!(
+        all_started(&h, &sid, first, n).await,
+        n,
+        "a deferred decision deadlocked"
+    );
+}
+
+fn chat_pending(user: &str) -> metro_server::decisions::NewPending {
+    metro_server::decisions::NewPending {
+        scope: metro_server::decisions::Scope::Personal,
+        user_id: user.into(),
+        place: None,
+        payload: json!({"choice": null}),
+        claimed_by: "epoch_before".into(),
+        turn_id: Some("chat_0123".into()),
+    }
+}
+
+fn space_pending(sid: &str, payload: Value) -> metro_server::decisions::NewPending {
+    metro_server::decisions::NewPending {
+        scope: metro_server::decisions::Scope::Space,
+        user_id: "alice".into(),
+        place: Some((sid.into(), "lobby".into())),
+        payload,
+        claimed_by: "epoch_before".into(),
+        turn_id: None,
+    }
+}
+
+fn chat_message(h: &H, user: &str, text: &str) -> i64 {
+    let author = metro_server::db::Author {
+        id: Some(user.into()),
+        name: user.into(),
+    };
+    let addressed = metro_server::db::Addressed {
+        mentions: json!([{"kind": "agent"}]),
+        audience: "agent".into(),
+        spans: None,
+    };
+    h.state
+        .db
+        .append_personal(user, "message", &author, text, &addressed)
+        .unwrap()
+        .id
+}
+
+#[tokio::test]
+async fn stale_work_is_noted_at_a_restart_never_run() {
+    let h = H::start().await;
+    let sid = h.space().await;
+    let msg = h
+        .sent("alice", &sid, "lobby", json!({"text": "from yesterday", "mentions": [{"kind": "user", "id": "bob"}], "infer_text_mentions": false}))
+        .await;
+    let chat = chat_message(&h, "bob", "chat from yesterday");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let old = now - 2 * 3_600_000;
+    let db = &h.state.db;
+    metro_server::decisions::insert_at(
+        db,
+        &space_pending(&sid, json!({"resolved": [{"kind": "agent"}]})),
+        id(&msg),
+        old,
+    )
+    .unwrap();
+    metro_server::decisions::insert_at(db, &chat_pending("bob"), chat, old).unwrap();
+    assert_eq!(
+        metro_server::decisions::resume(h.state.clone())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(h.pending(), 0);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let room = h.events("alice", &sid, "lobby").await;
+    assert!(
+        room.iter().any(|e| id(e) > id(&msg)
+            && e["kind"] == "error"
+            && e["text"] == metro_server::decisions::STALE_NOTE),
+        "{room:?}"
+    );
+    assert_eq!(starts(&room, id(&msg)), 0);
+    let bobs = h.chat("bob").await;
+    assert!(
+        bobs.iter().any(|e| id(e) > chat
+            && e["kind"] == "error"
+            && e["text"] == metro_server::decisions::STALE_NOTE),
+        "{bobs:?}"
+    );
+    assert_eq!(starts(&bobs, chat), 0);
+    assert!(h.model_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn failed_pending_work_is_dropped_and_said_never_left_to_replay() {
+    let h = H::start().await;
+    let sid = h.space().await;
+    let msg = h
+        .sent("alice", &sid, "lobby", json!({"text": "will fail", "mentions": [{"kind": "user", "id": "bob"}], "infer_text_mentions": false}))
+        .await;
+    let chat = chat_message(&h, "bob", "will fail too");
+    metro_server::decisions::insert(&h.state.db, &space_pending(&sid, json!({})), id(&msg))
+        .unwrap();
+    metro_server::decisions::insert(&h.state.db, &chat_pending("bob"), chat).unwrap();
+    // An error path (or a panic) drops its watch armed.
+    drop(metro_server::decisions::Watch::space(
+        &h.state,
+        &sid,
+        "lobby",
+        id(&msg),
+    ));
+    drop(metro_server::decisions::Watch::chat(&h.state, "bob", chat));
+    // A settled one says nothing.
+    metro_server::decisions::Watch::space(&h.state, &sid, "lobby", id(&msg)).done();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.pending(), 0, "nothing left for a later restart");
+    let room = h.events("alice", &sid, "lobby").await;
+    let notes: Vec<&Value> = room.iter().filter(|e| e["kind"] == "error").collect();
+    assert_eq!(notes.len(), 1, "{room:?}");
+    assert_eq!(notes[0]["text"], metro_server::decisions::FAILED_SPACE_NOTE);
+    let bobs = h.chat("bob").await;
+    assert!(bobs.iter().any(|e| e["kind"] == "error"
+        && e["text"] == metro_server::decisions::FAILED_CHAT_NOTE), "{bobs:?}");
+}
+
+#[tokio::test]
+async fn a_resumed_choice_that_cant_be_used_says_only_that_metro_restarted() {
+    let h = H::start().await;
+    let sid = h.space().await;
+    let msg = h
+        .sent("alice", &sid, "lobby", json!({"text": "@agent with my model", "mentions": [{"kind": "user", "id": "bob"}], "infer_text_mentions": false}))
+        .await;
+    let gone = "pc_99999999999999999999999999999999";
+    metro_server::decisions::insert(
+        &h.state.db,
+        &space_pending(
+            &sid,
+            json!({"resolved": [{"kind": "agent"}], "choice": {"provider_connection_id": gone}}),
+        ),
+        id(&msg),
+    )
+    .unwrap();
+    assert_eq!(
+        metro_server::decisions::resume(h.state.clone())
+            .await
+            .unwrap(),
+        1
+    );
+    let mut note = Value::Null;
+    for _ in 0..200 {
+        if let Some(e) = h
+            .events("bob", &sid, "lobby")
+            .await
+            .into_iter()
+            .find(|e| e["kind"] == "error")
+        {
+            note = e;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        note["text"],
+        metro_server::decisions::RESTART_NOTE,
+        "{note}"
+    );
+    assert!(!note.to_string().contains("pc_"));
+    assert_eq!(h.pending(), 0);
+    assert!(h.model_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn deleting_a_space_drops_its_pending_work() {
+    let h = H::start_with(None, 60_000).await;
+    let sid = h.space().await;
+    h.classify(&sid).await;
+    h.sent(
+        "alice",
+        &sid,
+        "lobby",
+        json!({"text": "pending forever", "defer_decisions": true}),
+    )
+    .await;
+    assert_eq!(h.pending(), 1);
+    let (s, v) = h
+        .req(
+            Method::DELETE,
+            "alice",
+            &format!("/v1/spaces/{sid}"),
+            Some(json!({"confirm_name": "S"})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "{v}");
+    assert_eq!(h.pending(), 0);
 }

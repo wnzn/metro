@@ -184,6 +184,17 @@ to your deployment; Metro's only built-in address is loopback.
   codes, never message text, prompts or credentials. See
   [spaces.md](spaces.md#monitoring-events).
 
+**One server process per database.** Run exactly one `metro-server` on a
+given `METRO_DB` file (one container, one replica). Nothing locks the
+file: the dev supervisor and the desktop's **Use locally** hand a
+listening socket from one process to the next and overlap briefly while
+they do, so a lock would get in their way. Run history, Stop and the
+order of a person's Chat turns live in that one process. In the source,
+not released: a message stored by an older process during such an
+overlap whose System One decision or agent run hadn't started yet is
+picked up at the next restart (or noted as unanswered if that's more
+than an hour later), not by the process that took over.
+
 To upgrade from the single-room build, see
 [spaces.md](spaces.md#upgrading-from-the-single-room-build). The server
 refuses an old database that holds history, so back it up and start on a
