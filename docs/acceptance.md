@@ -9,27 +9,48 @@ Lane runs on local builds, reported by each lane; not release files, a
 native desktop check by a person or a publication gate.
 
 - **Messages lane** (`1c8c9dc`: message deletion, System One decisions
-  after posting). `cargo test -p metro-server` passed (396 unit tests
-  plus the integration tests, including `tests/message_lifecycle.rs`).
+  after posting, with later review fixes). `cargo test -p metro-server`
+  passed 754 tests, including `tests/message_lifecycle.rs`.
   The e2e scripts `smoke.py`, `threads.py`, `messaging.py`,
   `intelligence.py`, `schedules.py`, `meta_agent.py`, `attachments.py`,
   `compaction.py` and the new `message_lifecycle.py` passed. Desktop
-  `nsh test` passed 965/965. Latency, with a scripted System One that
+  `nsh test` passed 972/972. Latency, with a scripted System One that
   takes 1,000 ms: a deferred message was visible to another member
   1–2 ms after the POST, against about 1,022 ms for the waiting POST.
 - **Polish lane** (`5806e0b`, `5b58064`: composer hint, no-reply row,
   runner wording, Settings spacing). Desktop `nsh test` passed 956/956.
-- **Runner lane** (`0abfc38` on `lane/061-runner`, not yet merged at the
-  time of this record). `cargo test` for the runner, server and
+- **Runner lane** (`0abfc38` and later commits on `lane/061-runner`). `cargo test` for the runner, server and
   connector crates: 1,041 passed, 0 failed, 3 ignored. E2e `smoke.py`,
   `threads.py` and `settings.py` passed. Install-lock flakes went from
   3/60 lib runs and 12/40 `self_update` runs to 0/150 and 0/60. The new
   `tests/desktop_local_runner.rs` passed on Linux and as an
   `x86_64-pc-windows-gnu` build under Wine 10. It is added to the
-  release workflow's Windows job; it hasn't yet run on native Windows. The reported Windows **Test runner**
-  timeout wasn't reproduced.
+  release workflow's Windows job; it hasn't yet run on native Windows.
+  The reported Windows **Test runner** timeout wasn't reproduced.
 
-**Merged-branch final gate: pending.**
+**Final gate on the merged branch** (`29912b6` on `fix/061-polish`,
+2026-11-27, Linux, local; source only, not a release):
+
+- Rust formatting and Clippy with `-D warnings` passed.
+  `cargo test --workspace --locked`: 1,259 passed, 0 failed, 3 ignored.
+- E2e: 17/17 scripts passed, including the feature-gated `updates.py`
+  and the offline Docker `library_reference.py`.
+- Updater `desktop_update` stress: 10/10 runs (290 case passes).
+- Packaging: ShellCheck clean, 259 passed and 10 skipped; release
+  signatures 17 passed, 1 skipped; Windows signing 41 passed, 0 skipped.
+- Desktop: `nsh check` passed; CI-mode `nsh test` 972 passed, 0 failed,
+  across 73 files.
+- Workspace example and the TUI PTY test passed; admin browser tests
+  30/30; offline media protocol 83/83.
+- Latency with a 1,000 ms scripted System One: the message was visible
+  about 2 ms after the POST, against about 1,021 ms when waiting.
+- Reviews: Opus 5.5 only for this run, by the maintainer's decision,
+  plus one earlier Astra 6.2 review whose findings were fixed. The final
+  Opus 5.5 review found no blockers or major issues.
+- **Not verified:** native Windows (the new Windows CI step hasn't run,
+  and the reported Windows **Test runner** timeout wasn't reproduced;
+  such failures now report a reason), and real vendor accounts and
+  sign-ins.
 
 ## Published: Metro 0.6.0 (2026-11-26, GitHub release v0.6.0)
 

@@ -247,14 +247,13 @@ see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
   `turn_id`); work older than an hour at recovery is noted as
   unanswered, never run. For unaddressed messages both drops are silent
   in the room (a note would reveal the opt-in). After graceful shutdown
-  begins, guards drop and note nothing; the rows wait for the next start. Deleting a Space deletes
-  its pending rows. A resumed choice's refusal is a generic room note.
-  One `metro-server` process per database (no lock: the dev supervisor
-  and desktop hand over a listening socket and overlap briefly); work an
-  overlapping older process stored is recovered at the next restart.
-  Never
-  classify people-only or explicitly named recipients. With
-  classification off (the default), unaddressed text is ordinary
+  begins, guards drop and note nothing; the rows wait for the next start.
+  Deleting a Space deletes its pending rows. A resumed choice's refusal is
+  a generic room note. One `metro-server` process per database (no lock:
+  the dev supervisor and desktop hand over a listening socket and overlap
+  briefly); work an overlapping older process stored is recovered at the
+  next restart. Never classify people-only or explicitly named recipients.
+  With classification off (the default), unaddressed text is ordinary
   conversation.
 - Sender-only notice details are POST metadata, never a polled event,
   search result or model history. Either or both fields may be present.

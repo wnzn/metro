@@ -282,6 +282,9 @@ reads).
   decision made again after a restart gets `404` (the decision itself
   still runs). If the decisions are still running after 90 seconds, the
   call returns `202 {decisions_pending: true}`; ask again.
+- For an unaddressed message, if its pending work is dropped (a failure,
+  or work gone stale after a restart), the sender gets no notice. That's
+  deliberate: a note would reveal that they opted in to classification.
 - Without `defer_decisions`, the POST waits for the decisions as before.
 - **Personal Chat** returns the message first too, with the `turn_id` of
   the turn it starts, then routes and starts the turn, saved and claimed
