@@ -42,6 +42,7 @@ import { Action, ActionBar, Badge, Banner, Column, compactWidth, FactList, Field
 import type { Fact, ModelOption } from "../ui";
 import { vendorOf } from "./providerGroups";
 import { MediaModelSettings, MediaModelFeedback, MediaModelSaveBar } from "./library/LibraryView";
+import { CompactionSettings } from "./commands/CompactionSettings";
 
 const NONE = "";
 
@@ -98,7 +99,7 @@ export function ModelChoicesSettings() {
         </Column>
       }
     >
-      <PageHeader title="Model choices" subtitle="Choose how Metro routes requests, searches messages and indexes files." scope={settingsAccountScope()} />
+      <PageHeader title="Model choices" subtitle="Choose how Metro routes requests, summarizes conversations, searches messages and indexes files." scope={settingsAccountScope()} />
       <If when={!routingUnsupported()}>
         <If when={draft()} else={<If when={!routingError()}><SettingsGroup><SettingRow label="Loading your model choices…" /></SettingsGroup></If>}>
           {(d) => (
@@ -112,6 +113,7 @@ export function ModelChoicesSettings() {
           )}
         </If>
       </If>
+      <CompactionSettings />
       <MediaModelSettings separate canReveal={!availableLoading() && !!(draft() || routingUnsupported() || routingError())} />
       <If when={routingUnsupported() ? null : draft()}>
         {(d) => <DataFlow draft={d()} />}
@@ -390,7 +392,7 @@ function AddressingGroup(props: { draft: RoutingDraft }) {
     <SettingsGroup title="Space classification" description="Turn classification on or off in each Space's preferences. Personal Chat sends directly to your agent." testID="addressing-group">
       <SettingRow
         label="Minimum confidence"
-        description={`${FLOOR_PERCENT} to 100%. Below it, the message stays ordinary conversation.`}
+        description={`${FLOOR_PERCENT} to 100%. Lower values let an agent decide more often whether to reply, react, or stay quiet.`}
         stacked
       >
         <PercentField
@@ -400,7 +402,7 @@ function AddressingGroup(props: { draft: RoutingDraft }) {
           onChange={(v) => editRouting({ minDirectedness: fromPercent(v) })}
           error={percentError(percentText(d().minDirectedness), FLOOR_PERCENT)}
           disabled={routingSaving()}
-          placeholder="85"
+          placeholder="35"
         />
       </SettingRow>
     </SettingsGroup>
@@ -497,7 +499,7 @@ function DataFlow(props: { draft: RoutingDraft }) {
       />
       <SettingRow
         label="Space classification"
-        description="In Spaces where you turn it on, System One gets your new unaddressed messages and requests to the generic agent to choose an agent. This never applies to personal Chat."
+        description="Where enabled, System One gets your unaddressed message, the Space name and description, the room name, and up to three recent messages or agent replies from that room. It also receives your requests to the generic agent, without the recent messages. This never applies to personal Chat."
         testID="dataflow-addressing"
       />
       <FlowRow
@@ -514,8 +516,8 @@ function DataFlow(props: { draft: RoutingDraft }) {
         ]}
       />
       <SettingRow
-        label="Never sent"
-        description="Messages that mention only people, and other members' messages for routing or classification. Search can include messages you can read."
+        label="Messages addressed to people"
+        description="Messages addressed only to people don't start routing or classification. Recent room messages can be sent as classification context. Search can include messages you can read."
         testID="dataflow-never"
       />
       <If when={settingsExtensionAvailable("websearch")}>

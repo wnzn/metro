@@ -61,6 +61,8 @@ pub struct Limits {
     pub max_rooms: usize,
     /// Most threads under one top-level room.
     pub max_threads_per_room: usize,
+    /// Most reply threads in one Space; they count toward neither of the above.
+    pub max_reply_threads: usize,
     /// Most Spaces one user may own.
     pub max_spaces_per_owner: usize,
     /// Most members (owner included) in one Space.
@@ -101,6 +103,7 @@ impl Default for Limits {
             max_room_name_chars: 64,
             max_rooms: 200,
             max_threads_per_room: 16,
+            max_reply_threads: 5_000,
             max_spaces_per_owner: 50,
             max_members: 100,
             max_thread_text_chars: 8_000,

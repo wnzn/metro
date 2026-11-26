@@ -20,10 +20,9 @@
 //!   a side and re-encoded as a fresh PNG, so no metadata, colour profile,
 //!   animation or trailing bytes survive. Only that PNG is stored and
 //!   served, as `image/png`. Nothing is ever fetched from a URL.
-//! - **Who can read whose profile:** yourself, and people who are members
-//!   of a Space you are a member of right now. Checked on every request;
-//!   anyone else, and unknown ids, get 404. There is no directory and no
-//!   admin bypass. Avatars have no public or stable URL: they are read with
+//! - **Visibility:** signed-in users can see the cards of people who have
+//!   signed in before. Bios are visible to yourself, current Space peers
+//!   and DM peers only. There is no admin bypass. Avatars are read with
 //!   the reader's bearer token and are never cached (`no-store`).
 //!   `avatar_version` changes on every upload so clients can tell when to
 //!   fetch again.
@@ -70,7 +69,12 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
              avatar_png     BLOB,
              avatar_version TEXT,
              updated_at     INTEGER NOT NULL
-         );",
+         );
+         CREATE VIEW IF NOT EXISTS directory_cards AS
+             SELECT p.user_id AS id,
+                    coalesce(p.display_name, m.name, p.default_name, p.user_id) AS display_name,
+                    p.avatar_version
+             FROM profiles p LEFT JOIN managed_users m ON m.id = p.user_id;",
     )
 }
 
@@ -122,10 +126,17 @@ impl Db {
     pub fn visible_profile(&self, reader: &str, target: &str) -> anyhow::Result<Option<Profile>> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
-        if !may_see(&tx, reader, target)? {
+        let bio = may_see_bio(&tx, reader, target)?;
+        // Keep the legacy fallback card for a shared-Space member who hasn't
+        // signed in yet. It doesn't make that member a directory entry.
+        if !bio && !may_see_card(&tx, reader, target)? {
             return Ok(None);
         }
-        Ok(Some(profile_in(&tx, target)?))
+        let mut profile = profile_in(&tx, target)?;
+        if !bio {
+            profile.bio = None;
+        }
+        Ok(Some(profile))
     }
 
     /// `target`'s avatar if `reader` may see their profile right now:
@@ -138,7 +149,7 @@ impl Db {
     ) -> anyhow::Result<Option<Option<Vec<u8>>>> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
-        if !may_see(&tx, reader, target)? {
+        if !may_see_card(&tx, reader, target)? && !may_see_bio(&tx, reader, target)? {
             return Ok(None);
         }
         Ok(Some(avatar_in(&tx, target)?))
@@ -174,13 +185,16 @@ impl Db {
     }
 }
 
-/// Whether `reader` may see `target`'s profile: the same person, or both
-/// members of one Space now.
-fn may_see(conn: &Connection, reader: &str, target: &str) -> rusqlite::Result<bool> {
+fn may_see_card(conn: &Connection, reader: &str, target: &str) -> rusqlite::Result<bool> {
+    Ok(reader == target || crate::directory::listed(conn, target)?)
+}
+
+/// Bios are for the person themself, current Space peers and DM peers.
+fn may_see_bio(conn: &Connection, reader: &str, target: &str) -> rusqlite::Result<bool> {
     if reader == target {
         return Ok(true);
     }
-    Ok(conn
+    if conn
         .query_row(
             "SELECT 1 FROM space_members a JOIN space_members b ON a.space_id = b.space_id
              WHERE a.user_id = ?1 AND b.user_id = ?2 LIMIT 1",
@@ -188,7 +202,11 @@ fn may_see(conn: &Connection, reader: &str, target: &str) -> rusqlite::Result<bo
             |_| Ok(()),
         )
         .optional()?
-        .is_some())
+        .is_some()
+    {
+        return Ok(true);
+    }
+    crate::dms::are_peers(conn, reader, target)
 }
 
 fn avatar_in(conn: &Connection, id: &str) -> anyhow::Result<Option<Vec<u8>>> {
@@ -209,7 +227,7 @@ type ProfileRow = (
     Option<String>,
 );
 
-fn profile_in(conn: &Connection, id: &str) -> anyhow::Result<Profile> {
+pub(crate) fn profile_in(conn: &Connection, id: &str) -> anyhow::Result<Profile> {
     let row: Option<ProfileRow> = conn
         .query_row(
             "SELECT display_name, default_name, bio, avatar_version FROM profiles WHERE user_id = ?1",

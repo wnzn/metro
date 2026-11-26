@@ -92,6 +92,7 @@ fn synthetic(id: &str) -> models::ModelRow {
         source: models::Source::Listed,
         position: 0,
         thinking: None,
+        context_tokens: None,
     }
 }
 

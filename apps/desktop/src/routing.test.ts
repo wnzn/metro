@@ -28,7 +28,7 @@ const base = (): RoutingDraft => ({
   classifierId: null,
   embeddingId: null,
   defaultChatId: null,
-  minDirectedness: "0.85",
+  minDirectedness: "0.35",
   minRouteProbability: "0.65",
   cases: [],
 });
@@ -47,7 +47,7 @@ test("thresholds are probabilities from 0 to 1, as decimals or percentages", () 
 
 test("a threshold that can't be saved is explained in percent; the values stay 0 to 1", () => {
   expect(finalize({ ...base(), minRouteProbability: "high" }, usable)).toEqual({ ok: false, error: "The routing confidence must be a whole number from 0 to 100%, such as 65%." });
-  expect(finalize({ ...base(), minDirectedness: "0.4" }, usable)).toEqual({ ok: false, error: "Space classification confidence must be a whole number from 50 to 100%, such as 85%." });
+  expect(finalize({ ...base(), minDirectedness: "0.19" }, usable)).toEqual({ ok: false, error: "Space classification confidence must be a whole number from 20 to 100%, such as 35%." });
   expect(finalizeOk({ ...base(), minRouteProbability: "70%", minDirectedness: "0.9" })).toMatchObject({ minRouteProbability: 0.7, minDirectedness: 0.9 });
 });
 
@@ -67,9 +67,9 @@ test("new use cases get a key from their name, unique, and existing keys never c
   if (done.ok) expect(done.routing.cases.map((c) => c.key)).toEqual(["kept", "kept_2"]);
 });
 
-test("the server's bounds: asking-the-agent at least 0.5, at most 16 use cases", () => {
-  expect(finalize({ ...base(), minDirectedness: "0.4" }, usable).ok).toBe(false);
-  expect(finalize({ ...base(), minDirectedness: "0.5" }, usable).ok).toBe(true);
+test("the server's bounds: asking-the-agent at least 0.2, at most 16 use cases", () => {
+  expect(finalize({ ...base(), minDirectedness: "19%" }, usable).ok).toBe(false);
+  expect(finalizeOk({ ...base(), minDirectedness: "20%" }).minDirectedness).toBe(0.2);
   const many = Array.from({ length: 17 }, (_, i) => ({ uid: `u${i}`, key: null, label: `Case ${i}`, description: "", connectionId: "chat1" }));
   expect(finalize({ ...base(), cases: many }, usable).ok).toBe(false);
   expect(finalize({ ...base(), cases: many.slice(0, 16) }, usable).ok).toBe(true);

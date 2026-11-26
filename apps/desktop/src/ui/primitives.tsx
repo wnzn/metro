@@ -340,6 +340,7 @@ export function Action(
     disabled?: boolean;
     busy?: boolean;
     busyLabel?: string;
+    tooltip?: string;
     /** A disclosure: shows a chevron (right closed, down open) before the label. Say the state in `accessibilityLabel` too. */
     expanded?: boolean;
     /** 28 high instead of 36, tighter padding: in rows, lists and table cells. */
@@ -380,6 +381,7 @@ export function Action(
       onPress={props.onPress}
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel ?? props.label}
+      tooltip={props.tooltip ? <Text class={tooltipClass}>{props.tooltip}</Text> : undefined}
     >
       <If when={props.expanded !== undefined ? iconColor() : null}>
         {(color) => <Icon name={props.expanded ? "chevron-down" : "chevron-right"} color={color()} size={14} />}
@@ -418,10 +420,13 @@ export function NavItem(
     label: string;
     selected: boolean;
     onPress: () => void;
+    disabled?: boolean;
     /** A short glyph before the label ("#", "›"). Ignored when `icon` or `tile` is set. */
     prefix?: string;
     /** An icon of the app's family before the label, in place of `prefix`. */
     icon?: IconName;
+    /** A small avatar in place of an icon or tile. */
+    avatar?: JSX.Element;
     /** A rounded letter tile before the label (a Space), its color fixed by `seed`. */
     tile?: { initial: string; seed: string };
     /** A chevron at the end: the row opens a group (a Space's rooms). */
@@ -440,7 +445,7 @@ export function NavItem(
      * shows on hover and keyboard focus (always on touch screens), and the
      * same items on a secondary click of the row.
      */
-    menu?: { items: readonly ActionsMenuItem[]; accessibilityLabel: string; testID?: string };
+    menu?: { items: readonly ActionsMenuItem[]; accessibilityLabel: string; testID?: string; ref?: (node: ViewRef) => void };
   },
 ) {
   const row = (
@@ -451,10 +456,12 @@ export function NavItem(
         props.menu ? "pr-[40px]" : "pr-(--space-3)",
         focusRing,
         transitionClass,
+        disabledClass,
         indentClass[Math.min(props.depth ?? 0, indentClass.length - 1)],
         props.selected ? "bg-sidebar-accent" : "hover:bg-sidebar-hover active:bg-sidebar-hover",
       )}
       selected={props.selected}
+      disabled={props.disabled}
       onPress={props.onPress}
       testID={props.testID}
       accessibilityLabel={(props.accessibilityLabel ?? props.label) + (props.dot ? `, ${props.dot}` : "")}
@@ -464,7 +471,7 @@ export function NavItem(
         <View class="absolute left-0 top-[9px] bottom-[9px] w-[3px] rounded-full bg-sidebar-indicator" accessibilityElementsHidden />
       </If>
       <View class="w-[20px] shrink-0 items-center justify-center" accessibilityElementsHidden>
-        <If
+        <If when={props.avatar} else={<If
           when={props.tile}
           else={
             <If
@@ -480,7 +487,7 @@ export function NavItem(
           }
         >
           {(t) => <SpaceTile initial={t().initial} seed={t().seed} />}
-        </If>
+        </If>}>{props.avatar}</If>
       </View>
       <Text
         class={cx(
@@ -541,6 +548,7 @@ export function NavItem(
                     transitionClass,
                   )}
                   testID={menu().testID}
+                  ref={menu().ref}
                   accessibilityLabel={menu().accessibilityLabel}
                   tooltip={<Text class={tooltipClass}>More</Text>}
                 >
@@ -579,7 +587,7 @@ export function NavGroup(props: Testable & { children?: JSX.Element }) {
 export function SectionHeader(
   props: Testable & {
     label: string;
-    action?: { icon: IconName; label: string; tooltip?: string; onPress: () => void; testID?: string; shown?: boolean };
+    action?: { icon: IconName; label: string; tooltip?: string; onPress: () => void; testID?: string; shown?: boolean; ref?: (node: ViewRef) => void };
   },
 ) {
   return (
@@ -598,6 +606,7 @@ export function SectionHeader(
             )}
             onPress={a().onPress}
             testID={a().testID}
+            ref={a().ref}
             accessibilityLabel={a().label}
             tooltip={<Text class={tooltipClass}>{a().tooltip ?? a().label}</Text>}
           >
@@ -692,6 +701,8 @@ export function Field(
     masked?: boolean;
     multiline?: boolean;
     disabled?: boolean;
+    /** A validation message the caller also shows near the field. */
+    error?: string | null;
     autoFocus?: boolean;
     /** For handing focus to the field when opening inline content. */
     inputRef?: (node: InputRef) => void;
@@ -723,6 +734,7 @@ export function Field(
         textClass.md,
         controlHeightClass.default,
         disabledClass,
+        props.error && "border-destructive focus:border-destructive focus:ring-destructive",
         props.multiline && "min-h-[72px] max-h-[160px]",
         props.grow && "flex-1",
       )}
@@ -740,6 +752,8 @@ export function Field(
       autoCorrect={props.masked || props.verbatim ? false : undefined}
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel ?? props.placeholder}
+      accessibilityState={props.error ? { invalid: true } : undefined}
+      accessibilityDescription={props.error ?? undefined}
     />
   );
 }
@@ -1081,6 +1095,7 @@ export function Disclosure(
     /** Content at the header's end (a badge). Keep it non-interactive. */
     trailing?: JSX.Element;
     disabled?: boolean;
+    centered?: boolean;
     /** An authored section with a heading and a dividing rule. */
     lined?: boolean;
     children?: JSX.Element;
@@ -1101,6 +1116,7 @@ export function Disclosure(
           focusRing,
           transitionClass,
           disabledClass,
+          props.centered && "self-center max-w-full",
         )}
         role="button"
         focusable={!props.disabled}
@@ -1111,7 +1127,8 @@ export function Disclosure(
         testID={props.testID ? `${props.testID}:toggle` : undefined}
       >
         <Icon name={props.open ? "chevron-down" : "chevron-right"} color="muted" size={14} />
-        <Text class={cx(props.lined ? textClass.md : textClass.sm, "font-semibold text-foreground")} style={props.lined ? undefined : { numberOfLines: 1 }}>
+        <Text class={cx(props.lined ? textClass.md : textClass.sm, "font-semibold text-foreground", props.centered && "shrink min-w-0")}
+          style={props.lined ? undefined : { numberOfLines: props.centered ? 2 : 1 }}>
           {props.title}
         </Text>
         <If when={props.summary}>
@@ -1119,7 +1136,7 @@ export function Disclosure(
             {props.summary}
           </Text>
         </If>
-        <View class="flex-1" />
+        <If when={!props.centered || !!props.trailing}><View class="flex-1" /></If>
         {props.trailing}
       </View>
     </Collapsible>

@@ -77,6 +77,106 @@ pub struct Room {
     /// The parent room of a thread; absent for top-level rooms.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_room_id: Option<String>,
+    /// A reply thread's anchor: the event of the parent room it replies to
+    /// (see [`crate::replies`]). Absent for rooms and agent-made threads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_event_id: Option<i64>,
+}
+
+impl Room {
+    /// A reply thread under one message, not a room or an agent's thread.
+    pub fn is_reply_thread(&self) -> bool {
+        self.anchor_event_id.is_some()
+    }
+}
+
+/// Per-message metadata, stored in the event's JSON metadata column beside
+/// spans (never copied text) and returned flattened on the event. Only
+/// `message` events carry it; it is never model history.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageMeta {
+    /// The event this message replies to: in the same thread, or the
+    /// thread's anchor (see [`crate::replies`]). An id only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<i64>,
+    /// Sent on the author's behalf by something other than their own
+    /// composer: `"metro"` for their personal Chat's meta-agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<Via>,
+    /// A copy of another message, posted by the forwarder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded: Option<Forwarded>,
+    /// Only on a `compaction` event: the range it summarizes and who
+    /// triggered it ([`crate::compaction`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<crate::compaction::Meta>,
+}
+
+impl MessageMeta {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// Each key read on its own: an unreadable key is dropped, never guessed,
+    /// and never hides the others.
+    fn from_object(m: &serde_json::Map<String, serde_json::Value>) -> Self {
+        fn key<T: serde::de::DeserializeOwned>(
+            m: &serde_json::Map<String, serde_json::Value>,
+            k: &str,
+        ) -> Option<T> {
+            m.get(k).and_then(|v| T::deserialize(v).ok())
+        }
+        Self {
+            reply_to: key(m, "reply_to"),
+            via: key(m, "via"),
+            forwarded: key(m, "forwarded"),
+            compaction: key(m, "compaction"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Via {
+    Metro,
+}
+
+/// Where a forwarded message came from, as much as its new readers may know.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Forwarded {
+    /// The source author's display name when it was forwarded.
+    pub author_name: String,
+    pub author_kind: ForwardedAuthor,
+    /// The source's server time, RFC 3339 UTC, or `null` when unknown.
+    pub sent_at: Option<String>,
+    /// Only when the source is in the same Space as the copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub same_space: Option<SameSpace>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ForwardedAuthor {
+    Person,
+    Agent,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SameSpace {
+    pub room_id: String,
+    pub event_id: i64,
+}
+
+/// The reply thread of an anchor event, as hydrated on room event pages.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct Replies {
+    pub room_id: String,
+    /// `message` and `agent` events in the thread.
+    pub count: u64,
+    #[serde(serialize_with = "serialize_event_time")]
+    pub last_at: Option<i64>,
+    /// Up to three people who wrote in it, most recent first.
+    pub participant_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -114,6 +214,12 @@ pub struct Event {
     /// and never filled in for the agent's history.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<crate::attachments::Attachment>,
+    /// `reply_to`, `via` and `forwarded` of a message, each absent when unset.
+    #[serde(flatten)]
+    pub meta: MessageMeta,
+    /// On an anchor event in a room page: its reply thread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replies: Option<Replies>,
 }
 
 /// Earliest stored `created_at` taken as a real time: 2000-01-01T00:00:00Z
@@ -153,6 +259,9 @@ pub struct Activity {
     /// Only on `activity` lifecycle events: one of the [`activity`] phases.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
+    /// Only on a completed Space run's activity event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<RunOutcome>,
     /// Only on an agent turn's `started` event: which model answered and
     /// why ([`crate::model_routing`]). No prompts, no credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -174,6 +283,23 @@ pub struct Activity {
     /// ([`crate::web_tools`]). Never a query result or page text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<crate::web_tools::ToolNote>,
+    /// Only on a Metro-in-Chat tool's `tool_call` / `tool_result` / `error`
+    /// events in personal Chat ([`crate::meta`]): which tool, the Space
+    /// names it touched and a count. Never content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<crate::meta::MetaNote>,
+    /// Only on a personal Chat `space_post` event: where Metro posted the
+    /// person's message ([`crate::meta`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_post: Option<crate::meta::SpacePost>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunOutcome {
+    NoReply,
+    Reaction,
+    Reply,
 }
 
 /// A Space agent as shown on its events: enough to draw its name and
@@ -200,11 +326,14 @@ impl Activity {
             name: name.into(),
             source: activity::AGENT.to_owned(),
             phase: None,
+            outcome: None,
             route: None,
             agent: None,
             pick: None,
             page_draft: None,
             tool: None,
+            meta: None,
+            space_post: None,
         }
     }
 
@@ -228,11 +357,14 @@ impl Activity {
             name: Self::DEMO_NAME.to_owned(),
             source: activity::DEMO.to_owned(),
             phase: None,
+            outcome: None,
             route: None,
             agent: None,
             pick: None,
             page_draft: None,
             tool: None,
+            meta: None,
+            space_post: None,
         }
     }
 
@@ -241,9 +373,12 @@ impl Activity {
     pub fn at(&self, phase: &str) -> Self {
         Self {
             phase: Some(phase.to_owned()),
+            outcome: None,
             route: None,
             pick: None,
             tool: None,
+            meta: None,
+            space_post: None,
             ..self.clone()
         }
     }
@@ -255,6 +390,21 @@ impl Activity {
             route: None,
             pick: None,
             tool: Some(tool),
+            meta: None,
+            space_post: None,
+            ..self.clone()
+        }
+    }
+
+    /// This activity with a Metro-in-Chat tool's note.
+    pub fn with_meta(&self, note: crate::meta::MetaNote) -> Self {
+        Self {
+            phase: None,
+            route: None,
+            pick: None,
+            tool: None,
+            meta: Some(note),
+            space_post: None,
             ..self.clone()
         }
     }
@@ -331,6 +481,16 @@ pub mod kind {
     /// run, as the provider returned it (bounded). Tagged with the run's
     /// activity; never a message, never model history, never indexed.
     pub const REASONING_SUMMARY: &str = "reasoning_summary";
+    /// Personal Chat only: Metro posted the person's message into a Space
+    /// (`activity.space_post`). The text is exactly what was sent. Never
+    /// model history, never indexed, never in any Space.
+    pub const SPACE_POST: &str = "space_post";
+    /// A model-written summary of earlier events of the same room, thread or
+    /// Chat (`compaction` metadata: the range, trigger and who asked; see
+    /// [`crate::compaction`]). Visible to every reader of the place; given
+    /// to later runs as untrusted background, never as an ordinary turn.
+    /// Never indexed, never searched.
+    pub const COMPACTION: &str = "compaction";
 }
 
 /// Actors the server writes for non-human events.
@@ -492,12 +652,14 @@ impl Db {
         )?;
         add_activity_columns(&conn)?;
         add_space_description(&conn)?;
+        add_room_anchor(&conn)?;
         reactions::init(&conn)?;
         crate::runners::init(&conn)?;
         add_runner_queue_floor(&conn)?;
         crate::admin_users::init(&conn)?;
         crate::admin_settings::init(&conn)?;
         crate::profiles::init(&conn)?;
+        crate::dms::init(&conn)?;
         crate::providers::init(&conn)?;
         crate::device_relay::init(&conn)?;
         crate::web_devices::init(&conn)?;
@@ -513,6 +675,9 @@ impl Db {
         // After spaces, members and model routing settings exist.
         crate::space_agents::init(&conn)?;
         crate::space_prefs::init(&conn)?;
+        // After spaces (exclusions reference them).
+        crate::meta::prefs::init(&conn)?;
+        crate::compaction::init(&conn)?;
         // After spaces (Space pages reference them).
         crate::pages::init(&conn)?;
         let version: Option<String> = conn
@@ -638,7 +803,11 @@ impl Db {
 
     /// The Spaces `user_id` belongs to.
     pub fn list_spaces(&self, user_id: &str) -> anyhow::Result<Vec<SpaceView>> {
-        let conn = self.lock();
+        Ok(Self::spaces_in(&self.lock(), user_id)?)
+    }
+
+    /// [`Db::list_spaces`] on the caller's connection or transaction.
+    pub(crate) fn spaces_in(conn: &Connection, user_id: &str) -> rusqlite::Result<Vec<SpaceView>> {
         let mut stmt = conn.prepare_cached(
             "SELECT s.id, s.name, m.role,
                     (s.runner_token_hash IS NOT NULL
@@ -648,25 +817,32 @@ impl Db {
              WHERE m.user_id = ?1 ORDER BY s.created_at, s.rowid",
         )?;
         let rows = stmt.query_map([user_id], row_space)?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        rows.collect()
     }
 
     /// `space_id` as `user_id` sees it, or `None` when they are not a member
     /// (or it does not exist; the two are deliberately indistinguishable).
     pub fn membership(&self, space_id: &str, user_id: &str) -> anyhow::Result<Option<SpaceView>> {
-        let conn = self.lock();
-        Ok(conn
-            .query_row(
-                "SELECT s.id, s.name, m.role,
+        Ok(Self::membership_in(&self.lock(), space_id, user_id)?)
+    }
+
+    /// [`Db::membership`] on the caller's connection or transaction.
+    pub(crate) fn membership_in(
+        conn: &Connection,
+        space_id: &str,
+        user_id: &str,
+    ) -> rusqlite::Result<Option<SpaceView>> {
+        conn.query_row(
+            "SELECT s.id, s.name, m.role,
                     (s.runner_token_hash IS NOT NULL
                      OR EXISTS (SELECT 1 FROM space_runners a WHERE a.space_id = s.id))
                  , s.description
                  FROM space_members m JOIN spaces s ON s.id = m.space_id
                  WHERE m.space_id = ?1 AND m.user_id = ?2",
-                params![space_id, user_id],
-                row_space,
-            )
-            .optional()?)
+            params![space_id, user_id],
+            row_space,
+        )
+        .optional()
     }
 
     pub fn list_members(&self, space_id: &str) -> anyhow::Result<Vec<Member>> {
@@ -742,6 +918,8 @@ impl Db {
                 crate::library_search::hooks::member_removed(&tx, space_id, user_id)?;
                 // Their per-Space preferences go with their membership.
                 crate::space_prefs::member_removed(&tx, space_id, user_id)?;
+                // Their Metro-in-Chat exclusion of it too.
+                crate::meta::prefs::member_removed(&tx, space_id, user_id)?;
                 // Their page preferences, confirmations and drafts there too.
                 crate::pages::hooks::member_removed(&tx, space_id, user_id)?;
                 RemoveMember::Removed
@@ -820,7 +998,10 @@ impl Db {
     /// Whether `space_id` has a runner: a dedicated token or an attached
     /// registered runner.
     pub fn runner_paired(&self, space_id: &str) -> anyhow::Result<bool> {
-        let conn = self.lock();
+        Self::runner_paired_in(&self.lock(), space_id)
+    }
+
+    pub(crate) fn runner_paired_in(conn: &Connection, space_id: &str) -> anyhow::Result<bool> {
         Ok(conn
             .query_row(
                 "SELECT runner_token_hash IS NOT NULL
@@ -887,27 +1068,48 @@ impl Db {
     // ---- Rooms and events ----
 
     pub fn list_rooms(&self, space_id: &str) -> anyhow::Result<Vec<Room>> {
+        self.list_rooms_filtered(space_id, false)
+    }
+
+    pub(crate) fn list_rooms_filtered(
+        &self,
+        space_id: &str,
+        top_level_only: bool,
+    ) -> anyhow::Result<Vec<Room>> {
+        let filter = if top_level_only {
+            " AND parent_room_id IS NULL"
+        } else {
+            ""
+        };
         let conn = self.lock();
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, name, parent_room_id FROM space_rooms WHERE space_id = ?1 ORDER BY created_at, rowid",
-        )?;
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {ROOM_COLUMNS} FROM space_rooms WHERE space_id = ?1{filter} ORDER BY created_at, rowid"
+        ))?;
         let rows = stmt.query_map([space_id], row_room)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub fn get_room(&self, space_id: &str, room_id: &str) -> anyhow::Result<Option<Room>> {
-        let conn = self.lock();
-        Ok(conn
-            .query_row(
-                "SELECT id, name, parent_room_id FROM space_rooms WHERE space_id = ?1 AND id = ?2",
-                params![space_id, room_id],
-                row_room,
-            )
-            .optional()?)
+        Ok(Self::room_in(&self.lock(), space_id, room_id)?)
+    }
+
+    pub(crate) fn room_in(
+        conn: &Connection,
+        space_id: &str,
+        room_id: &str,
+    ) -> rusqlite::Result<Option<Room>> {
+        conn.query_row(
+            &format!("SELECT {ROOM_COLUMNS} FROM space_rooms WHERE space_id = ?1 AND id = ?2"),
+            params![space_id, room_id],
+            row_room,
+        )
+        .optional()
     }
 
     /// Create a top-level room, or with `parent` a thread under that
-    /// top-level room. `max_rooms` bounds the Space, `max_children` the parent.
+    /// top-level room. `max_rooms` bounds the Space, `max_children` the
+    /// parent; reply threads count toward neither (see [`crate::replies`]).
+    /// Names shaped like a reply thread's are taken.
     pub fn create_room(
         &self,
         space_id: &str,
@@ -916,10 +1118,13 @@ impl Db {
         max_rooms: usize,
         max_children: usize,
     ) -> Result<Room, LimitError> {
+        if crate::replies::is_reply_thread_name(name) {
+            return Err(LimitError::Duplicate);
+        }
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         let count: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM space_rooms WHERE space_id = ?1",
+            "SELECT COUNT(*) FROM space_rooms WHERE space_id = ?1 AND anchor_event_id IS NULL",
             [space_id],
             |r| r.get(0),
         )?;
@@ -944,7 +1149,8 @@ impl Db {
                 Some(None) => {}
             }
             let children: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM space_rooms WHERE space_id = ?1 AND parent_room_id = ?2",
+                "SELECT COUNT(*) FROM space_rooms
+                 WHERE space_id = ?1 AND parent_room_id = ?2 AND anchor_event_id IS NULL",
                 params![space_id, parent],
                 |r| r.get(0),
             )?;
@@ -966,6 +1172,7 @@ impl Db {
             id,
             name: name.to_owned(),
             parent_room_id: parent.map(str::to_owned),
+            anchor_event_id: None,
         })
     }
 
@@ -981,9 +1188,26 @@ impl Db {
         name: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<Event>> {
-        let marker: Option<i64> = {
-            let conn = self.lock();
-            conn.query_row(
+        Self::events_before_thread_in(
+            &self.lock(),
+            space_id,
+            parent_room_id,
+            thread_id,
+            name,
+            limit,
+        )
+    }
+
+    pub(crate) fn events_before_thread_in(
+        conn: &Connection,
+        space_id: &str,
+        parent_room_id: &str,
+        thread_id: &str,
+        name: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Event>> {
+        let marker: Option<i64> = conn
+            .query_row(
                 "SELECT id FROM space_events
                  WHERE space_id = ?1 AND room_id = ?2 AND kind = 'thread' AND actor_id IS NULL
                    AND text = ?3
@@ -995,10 +1219,9 @@ impl Db {
                 ],
                 |r| r.get(0),
             )
-            .optional()?
-        };
+            .optional()?;
         match marker {
-            Some(id) => self.events_before(space_id, parent_room_id, id, limit),
+            Some(id) => Self::events_before_in(conn, space_id, parent_room_id, id, limit),
             None => Ok(Vec::new()),
         }
     }
@@ -1064,6 +1287,57 @@ impl Db {
         addressed: &Addressed,
         activity: Option<&Activity>,
     ) -> anyhow::Result<Event> {
+        Self::insert_event_in(
+            conn,
+            space_id,
+            room_id,
+            kind,
+            author,
+            text,
+            addressed,
+            activity,
+            &MessageMeta::default(),
+        )
+    }
+
+    /// Append a person's `message` with its [`MessageMeta`] inside the
+    /// caller's transaction. The caller checks membership, the room and the
+    /// metadata's references (see [`crate::messages`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_message_in(
+        conn: &Connection,
+        space_id: &str,
+        room_id: &str,
+        author: &Author,
+        text: &str,
+        addressed: &Addressed,
+        meta: &MessageMeta,
+    ) -> anyhow::Result<Event> {
+        Self::insert_event_in(
+            conn,
+            space_id,
+            room_id,
+            kind::MESSAGE,
+            author,
+            text,
+            addressed,
+            None,
+            meta,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_event_in(
+        conn: &Connection,
+        space_id: &str,
+        room_id: &str,
+        kind: &str,
+        author: &Author,
+        text: &str,
+        addressed: &Addressed,
+        activity: Option<&Activity>,
+        meta: &MessageMeta,
+    ) -> anyhow::Result<Event> {
         let at = now_ms();
         conn.execute(
             "INSERT INTO space_events (space_id, room_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
@@ -1078,10 +1352,10 @@ impl Db {
                 addressed.mentions.to_string(),
                 addressed.audience,
                 at,
-                event_metadata_json(activity, addressed.spans.as_deref())?,
+                event_metadata_json(activity, addressed.spans.as_deref(), meta)?,
             ],
         )?;
-        Ok(new_event(
+        let mut event = new_event(
             conn.last_insert_rowid(),
             kind,
             author,
@@ -1089,7 +1363,9 @@ impl Db {
             addressed,
             activity,
             at,
-        ))
+        );
+        event.meta = meta.clone();
+        Ok(event)
     }
 
     pub(crate) fn room_member_in(
@@ -1194,11 +1470,20 @@ impl Db {
         before: i64,
         limit: usize,
     ) -> anyhow::Result<Vec<Event>> {
-        let conn = self.lock();
+        Self::events_before_in(&self.lock(), space_id, room_id, before, limit)
+    }
+
+    pub(crate) fn events_before_in(
+        conn: &Connection,
+        space_id: &str,
+        room_id: &str,
+        before: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Event>> {
         let mut stmt = conn.prepare_cached(
             "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at FROM space_events
              WHERE space_id = ?1 AND room_id = ?2 AND id < ?3
-               AND kind NOT IN ('activity', 'reasoning_summary', 'page_draft')
+               AND kind NOT IN ('activity', 'reasoning_summary', 'page_draft', 'compaction')
              ORDER BY id DESC LIMIT ?4",
         )?;
         let rows = stmt.query_map(params![space_id, room_id, before, limit as i64], row_event)?;
@@ -1282,7 +1567,8 @@ impl Db {
         let conn = self.lock();
         let mut stmt = conn.prepare_cached(
             "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at FROM personal_events
-             WHERE user_id = ?1 AND id < ?2 AND kind NOT IN ('activity', 'reasoning_summary')
+             WHERE user_id = ?1 AND id < ?2
+               AND kind NOT IN ('activity', 'reasoning_summary', 'compaction')
              ORDER BY id DESC LIMIT ?3",
         )?;
         let rows = stmt.query_map(params![user_id, before, limit as i64], row_event)?;
@@ -1328,11 +1614,15 @@ fn insert_room(tx: &Transaction<'_>, space_id: &str, id: &str, name: &str) -> ru
     Ok(())
 }
 
-fn row_room(r: &rusqlite::Row<'_>) -> rusqlite::Result<Room> {
+/// The columns [`row_room`] reads, in order.
+pub(crate) const ROOM_COLUMNS: &str = "id, name, parent_room_id, anchor_event_id";
+
+pub(crate) fn row_room(r: &rusqlite::Row<'_>) -> rusqlite::Result<Room> {
     Ok(Room {
         id: r.get(0)?,
         name: r.get(1)?,
         parent_room_id: r.get(2)?,
+        anchor_event_id: r.get(3)?,
     })
 }
 
@@ -1346,22 +1636,25 @@ fn row_space(r: &rusqlite::Row<'_>) -> rusqlite::Result<SpaceView> {
     })
 }
 
-fn row_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
+/// An event row of `SELECT id, kind, actor, actor_id, text, mentions,
+/// audience, activity, created_at`.
+pub(crate) fn row_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
     let mentions: String = r.get(5)?;
     let metadata: Option<String> = r.get(7)?;
     let kind: String = r.get(1)?;
-    let spans = if kind == kind::MESSAGE {
-        metadata.as_deref().and_then(|raw| {
-            // Unknown/malformed spans must not turn into legacy text inference.
+    let (spans, meta) = match metadata.as_deref() {
+        Some(raw) if kind == kind::MESSAGE || kind == kind::COMPACTION => {
             match serde_json::from_str::<serde_json::Value>(raw) {
-                Ok(serde_json::Value::Object(mut m)) => m
-                    .remove("spans")
-                    .map(|v| serde_json::from_value(v).unwrap_or_default()),
-                _ => Some(Vec::new()),
+                Ok(serde_json::Value::Object(mut m)) => (
+                    // Unknown/malformed spans must not turn into legacy text inference.
+                    m.remove("spans")
+                        .map(|v| serde_json::from_value(v).unwrap_or_default()),
+                    MessageMeta::from_object(&m),
+                ),
+                _ => (Some(Vec::new()), MessageMeta::default()),
             }
-        })
-    } else {
-        None
+        }
+        _ => (None, MessageMeta::default()),
     };
     Ok(Event {
         id: r.get(0)?,
@@ -1377,6 +1670,8 @@ fn row_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
         activity: metadata.and_then(|a| serde_json::from_str(&a).ok()),
         created_at: r.get::<_, Option<i64>>(8)?.and_then(event_time),
         attachments: Vec::new(),
+        meta,
+        replies: None,
     })
 }
 
@@ -1387,20 +1682,29 @@ fn activity_json(activity: Option<&Activity>) -> anyhow::Result<Option<String>> 
 /// Space event metadata shares the existing JSON column. Keep the old
 /// activity keys and the mentions array unchanged, including for older
 /// readers. A span-only object has no activity id, so it is not a run event.
-fn event_metadata_json(
+/// Message metadata ([`MessageMeta`]) adds its own keys beside them.
+pub(crate) fn event_metadata_json(
     activity: Option<&Activity>,
     spans: Option<&[crate::mentions::MentionSpan]>,
+    meta: &MessageMeta,
 ) -> anyhow::Result<Option<String>> {
-    let Some(spans) = spans else {
+    if spans.is_none() && meta.is_empty() {
         return activity_json(activity);
-    };
+    }
     #[derive(Serialize)]
     struct Metadata<'a> {
         #[serde(flatten)]
         activity: Option<&'a Activity>,
-        spans: &'a [crate::mentions::MentionSpan],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        spans: Option<&'a [crate::mentions::MentionSpan]>,
+        #[serde(flatten)]
+        meta: &'a MessageMeta,
     }
-    Ok(Some(serde_json::to_string(&Metadata { activity, spans })?))
+    Ok(Some(serde_json::to_string(&Metadata {
+        activity,
+        spans,
+        meta,
+    })?))
 }
 
 /// Additive: older databases gain a `description` column on `spaces`;
@@ -1415,6 +1719,23 @@ fn add_space_description(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch("ALTER TABLE spaces ADD COLUMN description TEXT NOT NULL DEFAULT ''")?;
     }
     Ok(())
+}
+
+/// Additive: rooms gain the nullable `anchor_event_id` of reply threads,
+/// with at most one thread per anchor. Existing rooms stay unanchored.
+fn add_room_anchor(conn: &Connection) -> rusqlite::Result<()> {
+    let has: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('space_rooms') WHERE name = 'anchor_event_id')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has {
+        conn.execute_batch("ALTER TABLE space_rooms ADD COLUMN anchor_event_id INTEGER")?;
+    }
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS space_rooms_anchor
+             ON space_rooms (space_id, anchor_event_id) WHERE anchor_event_id IS NOT NULL",
+    )
 }
 
 fn add_runner_queue_floor(conn: &Connection) -> rusqlite::Result<()> {
@@ -1701,6 +2022,8 @@ pub(crate) fn new_event(
         activity: activity.cloned(),
         created_at: event_time(created_at_ms),
         attachments: Vec::new(),
+        meta: MessageMeta::default(),
+        replies: None,
     }
 }
 
@@ -1946,6 +2269,151 @@ mod tests {
                 .is_none()
         );
         assert_eq!(db.personal_after("alice", 0, 10).unwrap()[0].activity, None);
+    }
+
+    #[test]
+    fn older_databases_gain_room_anchors_and_keep_their_rooms() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v050.sqlite3");
+        let sid = {
+            let db = Db::open(&path).unwrap();
+            let s = db.create_space("alice", "a", 10).unwrap();
+            db.create_room(&s.id, "t", Some(LOBBY_ID), 10, 10).unwrap();
+            // As 0.5 left it: no anchor column, no index.
+            db.lock()
+                .execute_batch(
+                    "DROP INDEX space_rooms_anchor;
+                     ALTER TABLE space_rooms DROP COLUMN anchor_event_id;",
+                )
+                .unwrap();
+            s.id
+        };
+        for _ in 0..2 {
+            let db = Db::open(&path).unwrap();
+            let rooms = db.list_rooms(&sid).unwrap();
+            assert_eq!(rooms.len(), 2);
+            assert!(rooms.iter().all(|r| r.anchor_event_id.is_none()));
+            let index: bool = db
+                .lock()
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'space_rooms_anchor')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(index);
+        }
+    }
+
+    #[test]
+    fn message_metadata_round_trips_beside_spans_and_drops_only_bad_keys() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_space("alice", "a", 10).unwrap();
+        let alice = Author {
+            id: Some("alice".into()),
+            name: "Alice".into(),
+        };
+        let meta = MessageMeta {
+            reply_to: Some(7),
+            via: Some(Via::Metro),
+            forwarded: Some(Forwarded {
+                author_name: "Bob".into(),
+                author_kind: ForwardedAuthor::Agent,
+                sent_at: rfc3339_utc(1_767_225_600_123),
+                same_space: Some(SameSpace {
+                    room_id: "lobby".into(),
+                    event_id: 3,
+                }),
+            }),
+            compaction: None,
+        };
+        let addressed = Addressed {
+            spans: Some(Vec::new()),
+            ..Addressed::room()
+        };
+        let written = {
+            let conn = db.lock();
+            Db::append_message_in(&conn, &s.id, LOBBY_ID, &alice, "hi", &addressed, &meta).unwrap()
+        };
+        let read = db.events_after(&s.id, LOBBY_ID, 0, 10).unwrap().remove(0);
+        assert_eq!(read, written);
+        assert_eq!(read.meta, meta);
+        assert_eq!(read.spans, Some(Vec::new()));
+        assert_eq!(read.activity, None, "metadata is not a run");
+        let wire = serde_json::to_value(&read).unwrap();
+        assert_eq!(wire["reply_to"], 7);
+        assert_eq!(wire["via"], "metro");
+        assert_eq!(wire["forwarded"]["author_kind"], "agent");
+        assert_eq!(wire["forwarded"]["same_space"]["event_id"], 3);
+        // An unreadable key is dropped on its own; spans survive.
+        db.lock()
+            .execute(
+                "UPDATE space_events SET activity = '{\"spans\":[],\"via\":\"elsewhere\",\"reply_to\":7}'",
+                [],
+            )
+            .unwrap();
+        let read = db.events_after(&s.id, LOBBY_ID, 0, 10).unwrap().remove(0);
+        assert_eq!((read.meta.via, read.meta.reply_to), (None, Some(7)));
+        assert_eq!(read.spans, Some(Vec::new()));
+        // Only messages carry it.
+        let agent = db
+            .append_event(
+                &s.id,
+                LOBBY_ID,
+                kind::AGENT,
+                &Author::server(actor::AGENT),
+                "x",
+                &Addressed::room(),
+            )
+            .unwrap();
+        db.lock()
+            .execute(
+                "UPDATE space_events SET activity = '{\"reply_to\":1}' WHERE id = ?1",
+                [agent.id],
+            )
+            .unwrap();
+        let read = db.events_after(&s.id, LOBBY_ID, agent.id - 1, 10).unwrap();
+        assert!(read[0].meta.is_empty());
+    }
+
+    #[test]
+    fn reply_thread_rooms_count_toward_neither_room_limit() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_space("alice", "a", 10).unwrap();
+        let alice = Author {
+            id: Some("alice".into()),
+            name: "Alice".into(),
+        };
+        let m = db
+            .append_event(
+                &s.id,
+                LOBBY_ID,
+                kind::MESSAGE,
+                &alice,
+                "m",
+                &Addressed::room(),
+            )
+            .unwrap();
+        let (thread, created) =
+            crate::replies::get_or_create(&db, &s.id, LOBBY_ID, m.id, "alice", 10)
+                .unwrap()
+                .unwrap();
+        assert!(created && thread.is_reply_thread());
+        // Lobby and one thread fill max_rooms = 2 and max_children = 1.
+        db.create_room(&s.id, "t", Some(LOBBY_ID), 2, 1).unwrap();
+        assert!(matches!(
+            db.create_room(&s.id, "u", None, 2, 1),
+            Err(LimitError::TooMany)
+        ));
+        assert!(matches!(
+            db.create_room(&s.id, "reply-99", None, 9, 9),
+            Err(LimitError::Duplicate)
+        ));
+        // No agent thread under a reply thread.
+        assert!(matches!(
+            db.create_room(&s.id, "deeper", Some(&thread.id), 9, 9),
+            Err(LimitError::Nested)
+        ));
     }
 
     #[test]

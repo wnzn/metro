@@ -3,7 +3,11 @@
 // decide between retrying, stopping, and what to tell the user.
 
 import { discoveryApi } from "./discovery";
+import { directoryApi } from "./directory";
+import { dmsApi } from "./dms";
 import { libraryApi } from "./library";
+import { metaApi, readMetaNote, readSpacePost } from "./meta";
+import type { MetaNote, SpacePost } from "./meta";
 import { monitoringApi } from "./monitoring";
 import { pagesApi } from "./pages";
 import type { PageDraftEvent } from "./pages";
@@ -18,8 +22,8 @@ import { readMentionSpans } from "../features/mentions/sent";
 import { canonicalAddressing, canonicalEventTime, canonicalStableId, readPostedNotes } from "../features/senderNotices/response";
 import type { PostedSenderNotes } from "../features/senderNotices/response";
 
-/** `parentRoomId`: set on a thread an agent delegated from that room. */
-export type Room = { id: string; name: string; parentRoomId?: string };
+/** `anchorEventId` distinguishes a reply thread from a delegated thread. */
+export type Room = { id: string; name: string; parentRoomId?: string; anchorEventId?: number };
 /**
  * Who a message addresses: the Space's agent, or a member by their stable
  * user id. An agent mention with `agentId` names one of the Space's agents
@@ -32,7 +36,7 @@ export type Room = { id: string; name: string; parentRoomId?: string };
 export type Mention = {
   kind: "agent";
   agentId?: string;
-  addressedBy?: "classifier" | "schedule";
+  addressedBy?: "classifier" | "schedule" | "reply" | "metro";
   /** If an old event stored its own spelling; never filled from the live roster. */
   legacyHandle?: string;
 } | { kind: "user"; id: string };
@@ -53,6 +57,7 @@ export type EventActivity = {
   name: string;
   source: ActivitySource;
   phase?: ActivityPhase;
+  outcome?: "reply" | "reaction" | "no_reply";
   route?: ActivityRoute;
   /** The Space agent working this turn, on every event of it (absent in personal Chat, Demo and older history). */
   agent?: EventAgent;
@@ -62,6 +67,8 @@ export type EventActivity = {
   page_draft?: PageDraftEvent;
   /** Public, bounded web tool metadata. Never includes credentials or raw vendor errors. */
   tool?: WebToolNote;
+  meta?: MetaNote;
+  spacePost?: SpacePost;
 };
 /** A Space agent as a run's events show it: enough for its name and avatar. */
 export type EventAgent = { id: string; handle: string; name: string; avatar_version?: string; color: string };
@@ -100,7 +107,13 @@ export type RoomEvent = {
   createdAt?: string;
   /** Library files sent with a message: metadata only, never bytes or URLs. */
   attachments?: EventAttachment[];
+  replyTo?: number;
+  via?: "metro";
+  forwarded?: { authorName: string; authorKind: "person" | "agent"; sentAt?: string; sameSpace?: { roomId: string; eventId: number } };
+  replies?: { roomId: string; count: number; lastAt?: string; participantIds: string[] };
+  compaction?: { events: number; trigger: "auto" | "manual"; byName: string; focus?: string };
 };
+export type ReplyAddress = { eventId: number; askAgent: boolean; agentId?: string };
 /**
  * A Library file attached to a message, or a tombstone for one deleted
  * since (no name, nothing to open). Which library holds a file is the
@@ -117,7 +130,13 @@ export type SpaceRole = "owner" | "member";
 export type Space = { id: string; name: string; role: SpaceRole; runnerPaired: boolean | null };
 export type Member = { userId: string; role: SpaceRole };
 /** An agent run in a Space the user belongs to (GET /v1/runs, newest first). */
-export type Run = { id: string; spaceId: string; roomId: string; status: string; actor: string; task: string };
+export type Run = {
+  id: string; spaceId: string; roomId: string; status: string; actor: string; task: string;
+  kind?: "room"; agentId?: string; triggerEventId?: number; startedAt?: string;
+  compactionFailure?: string;
+};
+
+export type CompactionPrefs = { auto: boolean; at_percent: number };
 
 /** Who is signed in. `isOrgAdmin`: may create and manage organization runners. */
 export type Me = { id: string; canonicalId: string | null; isOrgAdmin: boolean };
@@ -230,6 +249,7 @@ export type ConnectionModel = {
   isDefault: boolean;
   thinking: ModelThinking | null;
   reasoningEfforts: string[];
+  contextTokens?: number | null;
 };
 
 /** A connection's model list as the server answers a change to it. */
@@ -238,8 +258,8 @@ export type ConnectionModelList = { connectionId: string; defaultModel: string |
 /** What a refresh of a connection's model list did. */
 export type ModelRefresh = { models: string[]; added: number; unavailable: number; connection: ProviderConnection | null };
 
-export type NewConnectionModel = { model_id: string; display_name?: string; thinking?: ModelThinking };
-export type ConnectionModelPatch = { model_id: string; display_name?: string | null; enabled?: boolean; thinking?: ModelThinking | null; position?: number; default?: true };
+export type NewConnectionModel = { model_id: string; display_name?: string; thinking?: ModelThinking; context_tokens?: number };
+export type ConnectionModelPatch = { model_id: string; display_name?: string | null; enabled?: boolean; thinking?: ModelThinking | null; position?: number; default?: true; context_tokens?: number | null };
 
 /** A chat model in the grouped picker (GET /v1/models/available `chat_providers`). */
 export type PickerModel = { id: string; displayName: string; reasoningEfforts: string[]; isDefault: boolean; available: boolean };
@@ -432,6 +452,8 @@ export function createClient(options: ClientOptions) {
       });
       checkCancelled();
       const errorDetails = path.startsWith("/v1/pages") ? "pages"
+        : path === "/v1/forward" ? "forward"
+        : method === "POST" && path.endsWith("/compact") ? "compact"
         : method === "PATCH" && /^\/v1\/providers\/[^/]+$/.test(path) && isObject(body) && "base_url" in body ? "endpoint"
         : /^\/v1\/library\/(?:settings|index|search)\/selection$/.test(path) ? "library" : undefined;
       await checkStatus(response, method, path, errorDetails);
@@ -554,6 +576,8 @@ export function createClient(options: ClientOptions) {
 
   return {
     baseUrl: options.baseUrl,
+    ...directoryApi(request),
+    ...dmsApi(request),
     // Search and scheduled prompts (src/api/discovery.ts), on the same transport.
     ...discoveryApi(request),
     // Documents & media (src/api/library.ts): JSON on `request`, bytes on `binary`.
@@ -563,6 +587,7 @@ export function createClient(options: ClientOptions) {
     ...profileApi(request, binary),
     // A Space's settings, agents and the person's own preferences there (src/api/spaces.ts).
     ...spacesApi(request, binary),
+    ...metaApi(request),
     // Monitoring events (src/api/monitoring.ts): one Space, My Chat or the instance; never an aggregate.
     ...monitoringApi(request),
     ...webSearchPrefsApi(request),
@@ -826,8 +851,8 @@ export function createClient(options: ClientOptions) {
       return { token: data.token, revision: data.assignment_revision };
     },
 
-    async listRooms(spaceId: string): Promise<Room[]> {
-      const data = await request("GET", `${sp(spaceId)}/rooms`);
+    async listRooms(spaceId: string, topLevelOnly = false, signal?: AbortSignal): Promise<Room[]> {
+      const data = await request("GET", `${sp(spaceId)}/rooms${topLevelOnly ? "?top_level_only=true" : ""}`, undefined, signal);
       const rooms = isObject(data) ? data.rooms : undefined;
       if (!Array.isArray(rooms)) throw new ApiError("protocol", "GET …/rooms did not return { rooms: [...] }.");
       return rooms.filter(isRoom).map(toRoom);
@@ -836,6 +861,14 @@ export function createClient(options: ClientOptions) {
     async createRoom(spaceId: string, name: string): Promise<Room> {
       const data = await request("POST", `${sp(spaceId)}/rooms`, { name });
       if (!isRoom(data)) throw new ApiError("protocol", "POST …/rooms did not return { id, name }.");
+      return toRoom(data);
+    },
+
+    async replyThread(spaceId: string, roomId: string, eventId: number): Promise<Room> {
+      const data = await request("POST", `${room(spaceId, roomId)}/events/${eventId}/thread`);
+      if (!isRoom(data) || data.anchor_event_id !== eventId || String(data.parent_room_id) !== roomId || String(data.id) === roomId) {
+        throw new ApiError("protocol", "The server did not confirm the reply thread.");
+      }
       return toRoom(data);
     },
 
@@ -854,13 +887,18 @@ export function createClient(options: ClientOptions) {
       addressing: SpaceMessageBody,
       assetIds?: readonly string[],
       choice?: TurnModelChoice,
+      reply?: ReplyAddress,
     ): Promise<PostedSenderNotes | null> {
       const body: Record<string, unknown> = { invoke_agent: false, ...addressing, infer_text_mentions: false, ...turnModelBody(choice) };
       const ids = assetIdsBody(assetIds);
       if (ids) body.asset_ids = ids;
+      if (reply) {
+        body.reply_to = reply.eventId;
+        if (!reply.askAgent) body.reply_to_agent = false;
+      }
       try {
         const data = await request("POST", `${room(spaceId, roomId)}/messages`, body);
-        return readPostedNotes(data, { ...addressing, kind: "space" });
+        return readPostedNotes(data, { ...addressing, kind: "space", reply });
       } catch (error) {
         if (error instanceof ApiError && error.status === 422) {
           throw new ApiError("http", "Update Metro Server to send Space messages with safe addressing. Your draft was kept and was not sent.", 422);
@@ -877,6 +915,22 @@ export function createClient(options: ClientOptions) {
     },
 
     /** The user's personal Chat, outside every Space. */
+    async compact(scope: { kind: "chat" } | { kind: "room"; spaceId: string; roomId: string }, focus: string): Promise<RoomEvent> {
+      const path = scope.kind === "chat" ? "/v1/chat/compact" : `${room(scope.spaceId, scope.roomId)}/compact`;
+      const event = decodeEvent(await request("POST", path, focus ? { focus } : {}, undefined, 610_000));
+      if (!event?.compaction) throw new ApiError("protocol", "The server did not return a summary.");
+      return event;
+    },
+
+    async compactionPrefs(prefs?: CompactionPrefs): Promise<CompactionPrefs> {
+      const data = await request(prefs ? "PUT" : "GET", "/v1/compaction", prefs);
+      if (!isObject(data) || typeof data.auto !== "boolean" || typeof data.at_percent !== "number" ||
+        !Number.isInteger(data.at_percent) || data.at_percent < 40 || data.at_percent > 90) {
+        throw new ApiError("protocol", "The server did not return summary preferences.");
+      }
+      return { auto: data.auto, at_percent: data.at_percent };
+    },
+
     async listChatEvents(after: number): Promise<RoomEvent[]> {
       const data = await request("GET", `/v1/chat/events?after=${encodeURIComponent(String(after))}`);
       const events = isObject(data) ? data.events : undefined;
@@ -911,14 +965,15 @@ export function createClient(options: ClientOptions) {
       const data = await request("GET", "/v1/runs");
       const runs = isObject(data) ? data.runs : undefined;
       if (!Array.isArray(runs)) throw new ApiError("protocol", "GET /v1/runs did not return { runs: [...] }.");
-      return runs.filter(isRun).map((r) => ({
-        id: String(r.id),
-        spaceId: String(r.space_id),
-        roomId: String(r.room_id),
-        status: r.status,
-        actor: r.actor,
-        task: r.task,
-      }));
+      return runs.filter(isRun).map(toRun);
+    },
+
+    async retryRun(runId: string): Promise<Run> {
+      const v = await request("POST", `/v1/runs/${encodeURIComponent(runId)}/retry`, {});
+      if (!isRun(v) || String(v.id) === runId || v.kind !== "room") {
+        throw new ApiError("protocol", "Metro Server did not confirm a new run.");
+      }
+      return toRun(v);
     },
 
     async getRun(id: string, signal?: AbortSignal): Promise<Run> {
@@ -1130,6 +1185,8 @@ function toConnectionModels(value: unknown): ConnectionModel[] {
       isDefault: m.is_default === true,
       thinking: toThinking(m.thinking),
       reasoningEfforts: efforts(m.reasoning_efforts),
+      contextTokens: typeof m.context_tokens === "number" && Number.isInteger(m.context_tokens) &&
+        m.context_tokens >= 1024 && m.context_tokens <= 10_000_000 ? m.context_tokens : null,
     });
   }
   return out;
@@ -1226,15 +1283,24 @@ function toConnection(v: Record<string, unknown> & { id: string | number; name: 
   };
 }
 
-function isRoom(v: unknown): v is { id: string | number; name: string; parent_room_id?: string | number | null } {
-  return isObject(v) && isId(v.id) && typeof v.name === "string" && (v.parent_room_id == null || isId(v.parent_room_id));
+const isEventId = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v > 0;
+type WireRoom = { id: string | number; name: string; parent_room_id?: string | number | null; anchor_event_id?: number | null };
+function isRoom(v: unknown): v is WireRoom {
+  return isObject(v) && isId(v.id) && typeof v.name === "string" && (v.parent_room_id == null || isId(v.parent_room_id)) &&
+    (v.anchor_event_id == null || (isEventId(v.anchor_event_id) && v.parent_room_id != null));
 }
 
-function toRoom(v: { id: string | number; name: string; parent_room_id?: string | number | null }): Room {
-  return v.parent_room_id == null ? { id: String(v.id), name: v.name } : { id: String(v.id), name: v.name, parentRoomId: String(v.parent_room_id) };
+function toRoom(v: WireRoom): Room {
+  return {
+    id: String(v.id), name: v.name,
+    ...(v.parent_room_id != null ? { parentRoomId: String(v.parent_room_id) } : {}),
+    ...(v.anchor_event_id != null ? { anchorEventId: v.anchor_event_id } : {}),
+  };
 }
 
-function isRun(v: unknown): v is { id: string | number; space_id: string | number; room_id: string | number; status: string; actor: string; task: string } {
+type WireRun = { id: string | number; space_id: string | number; room_id: string | number; status: string; actor: string; task: string;
+  kind?: unknown; agent_id?: unknown; trigger_event_id?: unknown; started_at?: unknown; compaction_failure?: unknown };
+function isRun(v: unknown): v is WireRun {
   return (
     isObject(v) &&
     isId(v.id) &&
@@ -1246,14 +1312,39 @@ function isRun(v: unknown): v is { id: string | number; space_id: string | numbe
   );
 }
 
+function toRun(r: WireRun): Run {
+  const startedAt = toCreatedAt(r.started_at);
+  const reason = isObject(r.compaction_failure) && typeof r.compaction_failure.message === "string"
+    ? r.compaction_failure.message.trim().slice(0, 1200) : "";
+  return {
+    id: String(r.id), spaceId: String(r.space_id), roomId: String(r.room_id),
+    status: r.status, actor: r.actor, task: r.task,
+    ...(r.kind === "room" ? { kind: r.kind } : {}),
+    ...(typeof r.agent_id === "string" && r.agent_id ? { agentId: r.agent_id } : {}),
+    ...(isEventId(r.trigger_event_id) ? { triggerEventId: r.trigger_event_id } : {}),
+    ...(startedAt ? { startedAt } : {}),
+    ...(reason ? { compactionFailure: reason } : {}),
+  };
+}
+
 // Leave legacy rendering alone. Private receipt corroboration additionally
 // requires canonical raw identity, time, and addressing, before coercion.
 const canonicalMessageRows = new WeakSet<RoomEvent>();
 export const isCanonicalMessageRow = (event: RoomEvent) => canonicalMessageRows.has(event);
 
+/** Normalize an untrusted event from another conversation endpoint (e.g. a DM). */
+export const decodeEvent = (value: unknown): RoomEvent | null => isEvent(value) ? toEvent(value) : null;
+
 function toEvent(v: RoomEvent): RoomEvent {
   const raw = v as unknown as Record<string, unknown>;
   const event: RoomEvent = { id: v.id, kind: v.kind, actor: v.actor, text: v.text };
+  const summary = raw.compaction;
+  if (event.kind === "compaction" && event.actor === "system" && isObject(summary) &&
+    isEventId(summary.events) && (summary.trigger === "auto" || summary.trigger === "manual") &&
+    typeof summary.by_name === "string" && summary.by_name.trim()) {
+    event.compaction = { events: summary.events, trigger: summary.trigger, byName: summary.by_name,
+      ...(typeof summary.focus === "string" && summary.focus ? { focus: summary.focus } : {}) };
+  }
   const indexes = new Map<number, number>();
   if (Array.isArray(raw.mentions)) {
     const mentions: Mention[] = [];
@@ -1266,7 +1357,7 @@ function toEvent(v: RoomEvent): RoomEvent {
         if (mention.agentId && typeof m.handle === "string" && /^[a-z0-9_-]{1,32}$/i.test(m.handle)) {
           mention.legacyHandle = m.handle;
         }
-        if (m.addressed_by === "classifier" || m.addressed_by === "schedule") mention.addressedBy = m.addressed_by;
+        if (m.addressed_by === "classifier" || m.addressed_by === "schedule" || m.addressed_by === "reply" || m.addressed_by === "metro") mention.addressedBy = m.addressed_by;
       } else if (isObject(m) && m.kind === "user" && isId(m.id)) mention = { kind: "user", id: String(m.id) };
       if (mention) {
         if (mention.kind !== "agent" || !mention.addressedBy) indexes.set(index, mentions.length);
@@ -1279,6 +1370,12 @@ function toEvent(v: RoomEvent): RoomEvent {
   if (raw.audience === "room" || raw.audience === "agent" || raw.audience === "users" || raw.audience === "mixed") event.audience = raw.audience;
   const activity = toActivity(raw.activity);
   if (activity) {
+    if (activity.source === "agent" && isObject(raw.activity)) {
+      if (event.kind === "space_post") activity.spacePost = readSpacePost(raw.activity.space_post);
+      if (event.kind === "tool_call" || event.kind === "tool_result" || event.kind === "error") {
+        activity.meta = readMetaNote(raw.activity.meta);
+      }
+    }
     if (event.kind === "page_draft" && event.actor === "agent" && activity.source === "agent" && isObject(raw.activity)) {
       const draft = toPageDraftCard(raw.activity.page_draft);
       if (draft) activity.page_draft = draft;
@@ -1292,6 +1389,24 @@ function toEvent(v: RoomEvent): RoomEvent {
     canonicalAddressing(raw.audience, raw.mentions)) canonicalMessageRows.add(event);
   const attachments = toAttachments(raw.attachments);
   if (attachments.length) event.attachments = attachments;
+  if (isEventId(raw.reply_to)) event.replyTo = raw.reply_to;
+  if (raw.via === "metro") event.via = raw.via;
+  const f = raw.forwarded;
+  if (isObject(f) && typeof f.author_name === "string" && (f.author_kind === "person" || f.author_kind === "agent")) {
+    const link = f.same_space;
+    event.forwarded = {
+      authorName: f.author_name, authorKind: f.author_kind, sentAt: toCreatedAt(f.sent_at),
+      sameSpace: isObject(link) && canonicalStableId(link.room_id) && isEventId(link.event_id)
+        ? { roomId: link.room_id, eventId: link.event_id } : undefined,
+    };
+  }
+  const r = raw.replies;
+  if (isObject(r) && canonicalStableId(r.room_id) && typeof r.count === "number" && Number.isSafeInteger(r.count) && r.count >= 0) {
+    event.replies = {
+      roomId: r.room_id, count: r.count, lastAt: toCreatedAt(r.last_at),
+      participantIds: Array.isArray(r.participant_ids) ? r.participant_ids.filter(canonicalStableId).slice(0, 3) : [],
+    };
+  }
   return event;
 }
 
@@ -1371,6 +1486,9 @@ export function toActivity(v: unknown): EventActivity | undefined {
   if (v.source !== "agent" && v.source !== "demo") return undefined;
   const activity: EventActivity = { id, name: typeof v.name === "string" ? v.name.trim() : "", source: v.source };
   if (typeof v.phase === "string" && ACTIVITY_PHASES.includes(v.phase)) activity.phase = v.phase as ActivityPhase;
+  if (activity.phase === "completed" && (v.outcome === "reply" || v.outcome === "reaction" || v.outcome === "no_reply")) {
+    activity.outcome = v.outcome;
+  }
   const route = toRoute(v.route);
   if (route) activity.route = route;
   const agent = toEventAgent(v.agent);
@@ -1446,9 +1564,22 @@ function endpointRefusal(data: unknown, status: number): EndpointPatchError | nu
 }
 
 /** Maps a non-2xx response to its ApiError. */
-async function checkStatus(response: Response, method: string, path: string, errorDetails?: "pages" | "endpoint" | "library"): Promise<void> {
+async function checkStatus(response: Response, method: string, path: string, errorDetails?: "pages" | "endpoint" | "library" | "forward" | "compact"): Promise<void> {
   if (response.status === 401) {
     throw new ApiError("auth", "The server rejected the access token (HTTP 401). Check the token and connect again.", 401);
+  }
+  if (errorDetails === "compact" && (response.status === 409 || response.status === 502)) {
+    const data: unknown = await response.json().catch(() => undefined);
+    const code = isObject(data) ? data.code : undefined;
+    const reason = response.status === 502 && code === "summary_failed" &&
+      isObject(data) && typeof data.error === "string" ? data.error.trim().slice(0, 400) : "";
+    throw new ApiError("http", reason || "The server could not summarize this conversation.", response.status, code);
+  }
+  if (errorDetails === "forward" && response.status === 404) {
+    const body: unknown = await response.json().catch(() => undefined);
+    const code = isObject(body) ? body.code : undefined;
+    throw new ApiError("not_found", "Forwarding is unavailable.", 404,
+      code === "forward_source_not_found" || code === "forward_destination_not_found" ? { code } : undefined);
   }
   if (errorDetails === "endpoint" && !response.ok) {
     const data: unknown = await response.json().catch(() => undefined);

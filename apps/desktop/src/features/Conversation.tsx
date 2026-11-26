@@ -19,7 +19,7 @@
 // the composer has separate Ask agent and Send actions; explicit recipients
 // still decide who a Space message reaches.
 
-import { Clipboard, announce, cleanup, computed, localeSettings, signal } from "nsh";
+import { Clipboard, announce, cleanup, computed, effect, keymap, localeSettings, signal } from "nsh";
 import type { CaretEvent, InputRef, JSX, ViewRef } from "nsh";
 import {
   activeEvents,
@@ -27,15 +27,28 @@ import {
   activeReactions,
   activeSpace,
   actionError,
+  commandHint,
+  composerCommandPlace,
   composerScope,
+  compacting,
+  eventsInRoom,
+  focusTarget,
   draft,
   isReactable,
   me,
   notice,
   mainPlace,
+  openLocation,
+  openingReply,
   REACTION_EMOJI,
   reactionPending,
+  reactionsInRoom,
+  replyPane,
+  roomEventsLoaded,
+  roomEventScope,
+  rooms,
   retryNow,
+  runComposerCommand,
   saveChatNote,
   send,
   sending,
@@ -43,7 +56,7 @@ import {
   status,
   toggleReaction,
 } from "../store";
-import type { RoomEvent } from "../store";
+import type { Reactions as ReactionMap, RoomEvent } from "../store";
 import { choiceForTurn, ComposerModelControls } from "./composerModels";
 import type { AttachedFile, EventAgent } from "../api/client";
 import { agentById } from "./space/agents";
@@ -63,6 +76,7 @@ import {
   ComposerBar,
   ComposerBox,
   ComposerField,
+  ComposerHint,
   DaySeparator,
   DraftSuggestion,
   EmojiChoice,
@@ -70,6 +84,7 @@ import {
   EmptyConversation,
   FeedList,
   HeaderNote,
+  InlineLink,
   Label,
   MessageFileCard,
   RemovedFileCard,
@@ -77,11 +92,14 @@ import {
   MessageFrame,
   MessageHeader,
   MessageToolbar,
+  PopoverNote,
   ReactionChip,
   RecipientTag,
   Row,
   SendButton,
   StagedFileChip,
+  SuggestionList,
+  SuggestionOption,
   Timestamp,
   ToolbarIconButton,
 } from "../ui";
@@ -92,7 +110,8 @@ import { failureText } from "./activity/failure";
 import { disclosureKey, disclosureScope } from "./activity/disclosure";
 import { DEFAULT_AGENT_NAME, groupTranscript } from "./activity/group";
 import { PageDraftCard } from "./pages/PageDraftCard";
-import { clockFor } from "./chatTime";
+import { SpacePostRow } from "./meta/SpacePostRow";
+import { clockFor, stampOf } from "./chatTime";
 import type { Stamp } from "./chatTime";
 import { PersonAvatar } from "./profile/PersonAvatar";
 import { profileName } from "./profile/profileState";
@@ -108,12 +127,24 @@ import { MentionedBody, localMentionIdentity, sentMentionLabel } from "./mention
 import { verifiedAgents } from "./mentions/roster";
 import { copyMentionText, leadingMentionsCoverRecipients, sentMentions } from "./mentions/sent";
 import { SenderNotice } from "./senderNotices/SenderNotice";
+import { openForward } from "./forward/state";
+import { ReplySummary } from "./replies/ReplySummary";
+import { commandSuggestions, parseCommand } from "./commands/registry";
+import { CompactionMarker } from "./commands/CompactionMarker";
 
-/** The active place's transcript, with each agent turn folded into one group. */
-const transcriptItems = computed(() => groupTranscript(activeEvents()));
 /** The user's zone and hour cycle; follows the system's settings as they change. */
 const clock = computed(() => clockFor(localeSettings()));
-const rows = computed(() => transcriptRows(transcriptItems(), activeEvents(), clock()));
+type ReplyControl = (event: RoomEvent, opener?: ViewRef) => void;
+type DirectTranscript = {
+  id: string; events: () => readonly RoomEvent[]; loaded: () => boolean;
+  reactions: () => ReactionMap; pending: () => string | null; react: (eventId: number, emoji: string) => void;
+};
+type TranscriptActions = {
+  roomId?: string; direct?: DirectTranscript; onReply?: ReplyControl; replyAnchor?: RoomEvent | null; readOnly?: boolean;
+};
+
+export const messageAuthorName = (event: RoomEvent) => authorOf(event, me()).name;
+export const replyExcerpt = (event: RoomEvent) => event.text.trim().replace(/\s+/g, " ").slice(0, 180) || "Message";
 
 // ------------------------------------------------------------------ the composer's field
 
@@ -164,18 +195,34 @@ export function ConnectionBanner() {
 /** A suggestion of the empty transcript: it fills the draft (and may add recipients), never sends. */
 export type DraftIdea = { id: string; label: string; apply: () => void };
 
-export function Transcript(props: { emptyText: string; emptyTitle?: string; ideas?: DraftIdea[] }) {
+export function Transcript(props: TranscriptActions & { emptyText: string; emptyTitle?: string; ideas?: DraftIdea[]; testID?: string }) {
   const chat = () => mainPlace() === "chat";
+  const events = computed(() => (props.direct?.events() ?? (props.roomId ? eventsInRoom(props.roomId) : activeEvents()))
+    .filter(e => e.kind !== "compaction" || !props.direct && e.compaction));
+  const rows = computed(() => transcriptRows(groupTranscript(events()), events(), clock()));
   const ideas = () => props.ideas ?? [];
-  const glyph = (): ChatGlyphName => (chat() ? "chat" : "hash");
+  const glyph = (): ChatGlyphName => (chat() || props.direct ? "chat" : "hash");
+  let feed: import("nsh").ListRef | undefined;
+  let reached: ReturnType<typeof focusTarget> = null;
+  effect(() => {
+    const target = focusTarget();
+    if (!target) reached = null;
+    if (!target || reached === target || target.scope !== (props.roomId ? roomEventScope(props.roomId) : composerScope())) return;
+    const index = rows().findIndex(row => row.type === "event" && row.event.id === target.eventId);
+    if (index >= 0) {
+      reached = target;
+      queueMicrotask(() => feed?.scrollToIndex({ index, viewPosition: 0.5, animated: false }));
+    }
+  });
   return (
     <FeedList
-      testID="transcript"
+      testID={props.testID ?? "transcript"}
+      ref={node => { feed = node; }}
       each={rows()}
       keyOf={(row) => row.key}
       empty={
         <If
-          when={activeLoaded()}
+          when={props.direct?.loaded() ?? (props.roomId ? roomEventsLoaded(props.roomId) : activeLoaded())}
           else={
             <Column grow align="center" justify="center" pad={6}>
               <Label color="muted">Loading…</Label>
@@ -195,7 +242,7 @@ export function Transcript(props: { emptyText: string; emptyTitle?: string; idea
         </If>
       }
     >
-      {(row) => <TranscriptRowView row={row} />}
+      {(row) => <TranscriptRowView row={row} actions={props} />}
     </FeedList>
   );
 }
@@ -207,25 +254,37 @@ type Of<T extends TranscriptRow["type"]> = Extract<TranscriptRow, { type: T }>;
  * one collapsed group; people's messages, the agent's replies, errors and
  * status stay in full.
  */
-function TranscriptRowView(props: { row: () => TranscriptRow }) {
+function TranscriptRowView(props: { row: () => TranscriptRow; actions: TranscriptActions }) {
   const row = props.row;
   const as = <T extends TranscriptRow["type"]>(type: T) => (row().type === type ? (row() as Of<T>) : null);
+  const card = () => {
+    const entry = as("event"), where = mainPlace();
+    if (!entry) return null;
+    if (entry.event.compaction) return entry;
+    if (entry.event.kind === "page_draft" && (where === "space" || where === "chat")) return entry;
+    return where === "chat" && entry.event.kind === "space_post" && entry.event.activity?.spacePost ? entry : null;
+  };
   return (
     <If
       when={as("day")}
       else={
         <If when={as("group")} else={
-          <If when={mainPlace() === "space" && as("event")?.event.kind === "page_draft" ? as("event") : null}
-            else={<MessageRow row={() => row() as Of<"event">} />}>
-            {entry => <MessageFrame gutter={<StampGutter stamp={entry().stamp} id={entry().event.id} />} continued>
-              <PageDraftCard event={entry().event} />
-            </MessageFrame>}
+          <If when={card()} else={<MessageRow row={() => row() as Of<"event">} actions={props.actions} />}>
+            {entry => <If when={entry().event.compaction} else={
+              <MessageFrame gutter={<StampGutter stamp={entry().stamp} id={entry().event.id} />} continued>
+                <If when={entry().event.kind === "space_post"} else={<PageDraftCard event={entry().event} />}>
+                  <SpacePostRow event={entry().event} />
+                </If>
+              </MessageFrame>
+            }><CompactionMarker event={entry().event} stamp={entry().stamp}
+              scope={props.actions.roomId ? roomEventScope(props.actions.roomId) : composerScope()} /></If>}
           </If>
         }>
           {(g) => (
             <MessageFrame gutter={<StampGutter stamp={g().stamp} id={g().key} />} continued>
               <ActivityGroupRow
                 group={g().group}
+                roomId={props.actions.roomId}
                 agentName={g().group.agent?.name}
                 agentAvatar={g().group.agent && activeSpace()?.id ? <SpaceAgentAvatar spaceId={activeSpace()!.id} agent={g().group.agent!} size="sm" /> : undefined}
               />
@@ -280,7 +339,8 @@ function recipientText(m: NonNullable<RoomEvent["mentions"]>[number], myId: stri
   if (m.kind === "agent" && !m.addressedBy && mainPlace() === "chat") return "to the agent";
   if (m.kind === "agent" && m.addressedBy && (m.agentId || mainPlace() === "space")) {
     const a = recipientAgent(m.agentId);
-    return `${a?.name ?? "agent"} · ${m.addressedBy === "classifier" ? "detected by System One" : "scheduled prompt"}`;
+    const reason = { classifier: "detected by System One", schedule: "scheduled prompt", reply: "reply", metro: "via Metro" };
+    return `${a?.name ?? "agent"} · ${reason[m.addressedBy]}`;
   }
   if (mainPlace() === "space") {
     const sid = activeSpace()?.id;
@@ -312,7 +372,14 @@ function recipientDescription(m: NonNullable<RoomEvent["mentions"]>[number], myI
   return name && name !== m.id ? `Addressed to ${name} (@${m.id})` : `Addressed to @${m.id}`;
 }
 
-function MessageRow(props: { row: () => Of<"event"> }) {
+export function ThreadAnchor(props: { event: RoomEvent }) {
+  return <MessageRow row={() => ({
+    type: "event", key: `anchor:${props.event.id}`, event: props.event,
+    stamp: stampOf(props.event.createdAt, clock()), continued: false,
+  })} actions={{ readOnly: true }} />;
+}
+
+function MessageRow(props: { row: () => Of<"event">; actions: TranscriptActions }) {
   const event = () => props.row().event;
   const spaceId = () => mainPlace() === "space" ? activeSpace()?.id : undefined;
   const pieces = computed(() => spaceId() ? sentMentions(event()) : []);
@@ -323,7 +390,7 @@ function MessageRow(props: { row: () => Of<"event"> }) {
   const forMe = () => mentionsMe(event().mentions, me());
   const audience = () => headerAudience(event().audience, event().mentions);
   const hasRecipients = () => audience().agentBadge || audience().peopleNote || (event().mentions?.length ?? 0) > 0;
-  const continued = () => props.row().continued;
+  const continued = () => props.row().continued && !event().via;
   /**
    * A follow-up's recipients: in a slim line level with the time in the
    * gutter. In a Space only actual leading bindings can stand in for it.
@@ -348,11 +415,39 @@ function MessageRow(props: { row: () => Of<"event"> }) {
     const a = author();
     return a.kind === "agent" && a.badge && activeSpace()?.id ? a.badge : null;
   };
-  const reactable = () => isReactable(event());
-  const copyable = () => event().text.trim().length > 0;
+  const roomId = () => props.actions.roomId;
+  const reactable = () => !props.actions.readOnly && isReactable(event());
+  const copyable = () => !props.actions.readOnly && event().text.trim().length > 0;
+  const replyable = () => !!props.actions.onReply && (event().kind === "message" || event().kind === "agent" || event().kind === "thread");
+  const forwardable = () => !props.actions.readOnly && (event().kind === "message" || event().kind === "agent");
+  const direct = () => props.actions.direct;
+  const nearby = () => direct()?.events() ?? (roomId() ? eventsInRoom(roomId()!) : activeEvents());
+  const bodyScope = () => direct() ? `${disclosureScope()}\u0001dm:${direct()!.id}` : disclosureScope();
+  const showQuote = () => !!event().replyTo && props.actions.replyAnchor?.id !== event().replyTo;
+  const quoted = () => nearby().find(e => e.id === event().replyTo);
+  const forwarded = () => event().forwarded;
+  const forwardedTime = () => stampOf(forwarded()?.sentAt, clock());
+  const sourceRoom = () => rooms().find(r => r.id === forwarded()?.sameSpace?.roomId);
+  // A thread opened without a reply yet shows nothing under its message.
+  const replies = () => props.actions.onReply && !props.actions.readOnly && event().replies?.count
+    ? event().replies : undefined;
   const palette = signal(false);
   const copied = signal(false);
   let reactButton: ViewRef | null = null;
+  let replyButton: ViewRef | undefined;
+  let forwardButton: ViewRef | undefined;
+  let frame: ViewRef | undefined;
+  const reply = () => { if (!openingReply()) props.actions.onReply?.(event(), replyButton); };
+  const forward = (opener?: ViewRef) => {
+    const sid = spaceId(), rid = roomId(), id = event().id;
+    const dm = direct();
+    if (dm) openForward({ kind: "dm", dm_id: dm.id, event_id: id }, event(), opener,
+      () => direct()?.id === dm.id && dm.events().some(e => e.id === id));
+    else if (sid && rid) openForward({ kind: "space", space_id: sid, room_id: rid, event_id: id }, event(), opener,
+      () => spaceId() === sid && eventsInRoom(rid).some(e => e.id === id) &&
+        (!rooms().some(r => r.id === rid && r.anchorEventId !== undefined) || replyPane()?.roomId === rid));
+    else if (mainPlace() === "chat") openForward({ kind: "chat", event_id: event().id }, event(), opener);
+  };
   const closePalette = () => {
     palette.set(false);
     reactButton?.focus();
@@ -371,12 +466,14 @@ function MessageRow(props: { row: () => Of<"event"> }) {
   };
   return (
     <MessageFrame
-      testID={`event:${event().id}`}
+      testID={`${props.actions.readOnly ? "anchor" : "event"}:${event().id}`}
+      viewRef={node => { frame = node; }}
+      shortcuts={{ ...(replyable() ? { r: reply } : {}), ...(forwardable() ? { f: () => forward(frame) } : {}) }}
       highlight={forMe()}
       continued={continued()}
       selectable
       toolbar={
-        <If when={reactable() || copyable()}>
+        <If when={reactable() || copyable() || replyable() || forwardable()}>
           <MessageToolbar open={palette()} testID={`toolbar:${event().id}`}>
             <If when={reactable()}>
               <ToolbarIconButton
@@ -389,6 +486,14 @@ function MessageRow(props: { row: () => Of<"event"> }) {
                 onPress={() => palette.set(!palette())}
               />
             </If>
+            <If when={replyable()}>
+              <ToolbarIconButton testID={`reply:${event().id}`} icon="reply" tooltip="Reply" accessibilityLabel={`Reply to ${author().name}`}
+                ref={node => { replyButton = node; }} onPress={reply} />
+            </If>
+            <If when={forwardable()}>
+              <ToolbarIconButton testID={`forward:${event().id}`} icon="forward" tooltip="Forward" accessibilityLabel="Forward this message"
+                ref={node => { forwardButton = node; }} onPress={() => forward(forwardButton)} />
+            </If>
             <If when={copyable()}>
               <ToolbarIconButton
                 testID={`copy:${event().id}`}
@@ -400,7 +505,7 @@ function MessageRow(props: { row: () => Of<"event"> }) {
             </If>
           </MessageToolbar>
           <If when={palette()}>
-            <ReactionPopover eventId={event().id} anchor={reactButton} onClose={closePalette} />
+            <ReactionPopover eventId={event().id} roomId={roomId()} direct={direct()} anchor={reactButton} onClose={closePalette} />
           </If>
         </If>
       }
@@ -441,6 +546,9 @@ function MessageRow(props: { row: () => Of<"event"> }) {
             <If when={person()?.mine}>
               <AuthorTag testID={`you:${event().id}`} label="you" tone="neutral" />
             </If>
+            <If when={event().via === "metro"}>
+              <AuthorTag testID={`via-metro:${event().id}`} label="via Metro" tooltip={`Sent from ${author().name}'s Chat by Metro`} />
+            </If>
             <If when={server()}>{(a) => <Badge tone={a().tone} label={a().label} testID={`kind:${event().id}`} />}</If>
             <If when={props.row().stamp}>
               {(s) => <Timestamp text={s().short} full={s().full} testID={`time:${event().id}`} />}
@@ -472,13 +580,30 @@ function MessageRow(props: { row: () => Of<"event"> }) {
           </Each>
         </MessageHeader>
       </If>
+      <If when={showQuote()}>
+        <Label variant="caption" color="muted" lines={2} testID={`reply-quote:${event().id}`}>
+          {quoted() ? `Reply to ${messageAuthorName(quoted()!)} · ${replyExcerpt(quoted()!)}` : "Reply to an earlier message"}
+        </Label>
+      </If>
+      <If when={forwarded()}>
+        {f => <Row gap={1} align="center" wrap testID={`forwarded:${event().id}`}>
+          <If when={f().sameSpace && sourceRoom() && spaceId() && !props.actions.readOnly}
+            else={<Label variant="caption" color="muted">Forwarded from {f().authorName}</Label>}>
+            <InlineLink label={`Forwarded from ${f().authorName} in ${sourceRoom()?.anchorEventId ? "Thread" : `#${sourceRoom()?.name}`}`}
+              onPress={() => { const s = f().sameSpace; if (s) void openLocation({ spaceId: spaceId()!, roomId: s.roomId, eventId: s.eventId }); }} />
+          </If>
+          <If when={forwardedTime()}>
+            {s => <Timestamp text={`· ${s().short}`} full={s().full} testID={`forwarded-time:${event().id}`} />}
+          </If>
+        </Row>}
+      </If>
       <If
         when={failure()}
         else={
           <If when={event().text.trim().length > 0}>
-            <If when={pieces().length > 0 ? spaceId() : undefined}
+            <If when={event().kind === "message" || event().kind === "agent"}
               else={<FoldableText text={event().text} mono={tone() === "runner"} stateKey={disclosureKey(disclosureScope(), event().id, "all")} />}>
-              {(sid) => <MentionedBody event={event()} sid={sid()} pieces={pieces()} stateKey={disclosureKey(disclosureScope(), event().id, "all")} />}
+              <MentionedBody event={event()} sid={spaceId()} pieces={pieces()} stateKey={disclosureKey(bodyScope(), event().id, "all")} />
             </If>
           </If>
         }
@@ -507,9 +632,13 @@ function MessageRow(props: { row: () => Of<"event"> }) {
         )}
       </If>
       <If when={reactable()}>
-        <Reactions eventId={event().id} />
+        <Reactions eventId={event().id} roomId={roomId()} direct={direct()} />
       </If>
-      <SenderNotice event={event} focusComposer={focusComposer} />
+      <If when={replies()}>
+        {r => <ReplySummary eventId={event().id} summary={r()} last={stampOf(r().lastAt, clock())?.short}
+          onOpen={opener => { if (!openingReply()) props.actions.onReply?.(event(), opener); }} />}
+      </If>
+      <If when={!props.actions.readOnly && !direct()}><SenderNotice event={event} focusComposer={focusComposer} /></If>
     </MessageFrame>
   );
 }
@@ -536,12 +665,18 @@ function openFile(f: AttachedFile) {
  * the first emoji; Left and Right move, Return or Space picks, Escape or a
  * press outside closes and gives the focus back to the button.
  */
-function ReactionPopover(props: { eventId: number; anchor: ViewRef | null; onClose: () => void }) {
-  const byEmoji = () => activeReactions()[props.eventId] ?? {};
+type ReactionTarget = { eventId: number; roomId?: string; direct?: DirectTranscript };
+const reactionsFor = (target: ReactionTarget) =>
+  (target.direct?.reactions() ?? (target.roomId ? reactionsInRoom(target.roomId) : activeReactions()))[target.eventId] ?? {};
+const reactTo = (target: ReactionTarget, emoji: string) =>
+  target.direct ? target.direct.react(target.eventId, emoji) : void toggleReaction(target.eventId, emoji, target.roomId);
+
+function ReactionPopover(props: ReactionTarget & { anchor: ViewRef | null; onClose: () => void }) {
+  const byEmoji = () => reactionsFor(props);
   const mine = (emoji: string) => (byEmoji()[emoji] ?? []).includes(`user:${me()}`);
   const pick = (emoji: string) => {
     props.onClose();
-    void toggleReaction(props.eventId, emoji);
+    reactTo(props, emoji);
   };
   return (
     <AnchoredPopover
@@ -574,10 +709,10 @@ function ReactionPopover(props: { eventId: number; anchor: ViewRef | null; onClo
 }
 
 /** The reactions so far; nothing when there are none. */
-function Reactions(props: { eventId: number }) {
-  const byEmoji = () => activeReactions()[props.eventId] ?? {};
+function Reactions(props: ReactionTarget) {
+  const byEmoji = () => reactionsFor(props);
   const emojis = () => Object.keys(byEmoji()).filter((e) => (byEmoji()[e]?.length ?? 0) > 0);
-  const pending = (emoji: string) => reactionPending() === `${props.eventId}|${emoji}`;
+  const pending = (emoji: string) => (props.direct ? props.direct.pending() : reactionPending()) === `${props.eventId}|${emoji}`;
   return (
     <If when={emojis().length > 0}>
       <Row gap={1} wrap align="center" testID={`reactions:${props.eventId}`}>
@@ -593,7 +728,7 @@ function Reactions(props: { eventId: number }) {
                 agent={summary().agent}
                 busy={pending(emoji())}
                 accessibilityLabel={`${emoji()} ${summary().description}. ${summary().mine ? "Remove yours" : "Add yours"}`}
-                onPress={() => void toggleReaction(props.eventId, emoji())}
+                onPress={() => reactTo(props, emoji())}
               />
             );
           }}
@@ -701,23 +836,55 @@ export function Composer(props: {
   onFocusChange?: (focused: boolean) => void;
   /** The agent Ask agent asks (a Space with several agents); none: the default (or the classifier's pick). */
   askAgentId?: string;
+  replyAgentId?: string;
   /** Ask agent's label when it names the chosen agent ("Ask Coder"). */
   askLabel?: string;
   /** The chosen agent's picture on Ask agent. */
   askPicture?: JSX.Element;
   /** The agent chooser joined to Ask agent. */
   askChooser?: JSX.Element;
+  /** Replaces Chat Send while a reply is running; saving a note remains separate. */
+  stopReply?: JSX.Element;
 }) {
   const hasFiles = () => stagedFor(composerScope()).length > 0;
-  const ready = () => !props.disabled && status().phase !== "signedOut" && !sending();
+  const ready = () => !props.disabled && status().phase !== "signedOut" && !sending() && !compacting();
   const canSend = () => ready() && (draft().trim().length > 0 || hasFiles());
   // A Space Ask needs a typed question; Chat Send can start a turn with files alone.
   const canAsk = () => ready() && draft().trim().length > 0;
   const personal = () => mainPlace() === "chat";
+  const parsed = computed(() => parseCommand(draft(), composerCommandPlace()));
+  const command = () => parsed() !== null;
+  const focused = signal(false);
+  const dismissed = signal<string | null>(null);
+  const selected = signal(0);
+  const suggestions = computed(() => ready() && !hasFiles() ? commandSuggestions(draft(), composerCommandPlace()) : []);
+  const suggestionKey = () => `${composerScope()}:${draft()}`;
+  const listOpen = () => suggestions().length > 0 && dismissed() !== suggestionKey();
+  const choose = (index: number) => {
+    const item = suggestions()[index];
+    if (!listOpen() || !item) return false;
+    setDraft(`/${item.name} `);
+    focusComposer();
+    return true;
+  };
+  effect(() => {
+    if (!listOpen() || !focused()) return;
+    const move = (by: number) => () => {
+      const options = suggestions();
+      if (!options.length) return;
+      const i = (selected() + by + options.length) % options.length;
+      selected.set(i);
+      announce(`/${options[i].name}, ${i + 1} of ${options.length}`);
+    };
+    return keymap.bind({
+      down: move(1), up: move(-1), tab: () => { choose(selected()); },
+      escape: () => dismissed.set(suggestionKey()),
+    }, { when: "always", repeat: true });
+  });
   const post = (ask: boolean) => {
-    if (!(ask && !personal() ? canAsk() : canSend())) return;
+    if ((personal() && props.stopReply) || !(ask && !personal() ? canAsk() : canSend())) return;
     if (!personal()) {
-      void send(ask, choiceForTurn, ask ? props.askAgentId : undefined);
+      void send(ask, choiceForTurn, ask ? props.askAgentId : undefined, props.replyAgentId);
     } else if (ask) {
       const { error, choice } = choiceForTurn();
       if (error) { actionError.set(error); return; }
@@ -725,6 +892,10 @@ export function Composer(props: {
     } else void send(false);
   };
   const submit = () => {
+    if (command()) {
+      if (!choose(selected()) && ready()) void runComposerCommand();
+      return;
+    }
     if (props.onSubmitIntercept?.()) return;
     post(personal());
   };
@@ -734,19 +905,40 @@ export function Composer(props: {
       <ComposerBox testID="composer-box">
         {props.above}
         <StagedFiles />
+        <If when={listOpen()}>
+          <Column padX={3} padY={2}>
+            <SuggestionList accessibilityLabel="Commands" testID="command-suggestions">
+              <PopoverNote text="Commands" />
+              <Each of={suggestions()} key={item => item.name}>
+                {(item, index) => <SuggestionOption title={`/${item().name} ${item().args}`} detail={item().description}
+                  accessibilityLabel={`/${item().name} ${item().args} — ${item().description}`}
+                  testID={`command-option:${item().name}`} active={index() === selected()} onPress={() => { choose(index()); }} />}
+              </Each>
+            </SuggestionList>
+          </Column>
+        </If>
         <ComposerField
           testID="composer"
           ref={(node) => (composerInput = node)}
           accessibilityLabel={mainPlace() === "chat" ? "Message your Chat" : "Message"}
           value={draft()}
-          onChange={setDraft}
+          onChange={(text) => { dismissed.set(null); selected.set(0); setDraft(text); }}
           onSubmit={submit}
-          onFocusChange={(f) => props.onFocusChange?.(f)}
+          onFocusChange={(f) => { focused.set(f); props.onFocusChange?.(f); }}
           onCaretMove={props.onCaretMove}
           onSelectionChange={props.onSelectionChange}
           placeholder={props.placeholder}
           disabled={props.disabled}
         />
+        <If when={command()}>
+          <Column padX={3} gap={1}>
+            <If when={commandHint()} else={
+              <If when={parsed()?.command?.privacy(composerCommandPlace())}>
+                {hint => <ComposerHint text={hint()} />}
+              </If>
+            }>{hint => <ComposerHint text={hint()} testID="command-hint" />}</If>
+          </Column>
+        </If>
         <ComposerBar
           leading={
             <>
@@ -760,11 +952,11 @@ export function Composer(props: {
                 onPress={() => void pickAttachments()}
               />
               {props.tools}
-              <ComposerModelControls />
+              <If when={!command()}><ComposerModelControls /></If>
             </>
           }
           trailing={
-            <If when={personal()} else={
+            <If when={command()} else={<If when={personal()} else={
               <>
                 <AskAgentButton
                   testID="ask-agent"
@@ -797,14 +989,17 @@ export function Composer(props: {
                 disabled={!canSend()}
                 onPress={() => void saveChatNote()}
               />
-              <SendButton
+              {props.stopReply ?? <SendButton
                 testID="send"
                 accessibilityLabel={hasFiles() ? "Send to your agent. The agent cannot read attached files." : "Send to your agent"}
                 tooltip="Send to your agent (Return)"
                 busy={sending() === "agent"}
                 disabled={!canSend()}
                 onPress={() => post(true)}
-              />
+              />}
+            </If>}>
+              <Action compact variant="primary" testID="run-command" label="Run command" busyLabel="Summarizing…"
+                busy={compacting()} disabled={!ready()} onPress={submit} />
             </If>
           }
         />

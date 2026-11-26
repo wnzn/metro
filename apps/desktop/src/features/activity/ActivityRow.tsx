@@ -17,7 +17,7 @@
 
 import { Clipboard, announce, signal } from "nsh";
 import type { JSX } from "nsh";
-import { isActiveRun, me, runBusy, runs, stopRun } from "../../store";
+import { activeRoom, activeSpaceId, isActiveRun, mainPlace, me, runBusy, runs, stopRun } from "../../store";
 import { webSearchSettingsAction } from "../../webSearch";
 import { WEB_PROVIDERS } from "../../api/webSearch";
 import type { WebToolNote } from "../../api/webSearch";
@@ -27,7 +27,7 @@ import { stepPhase } from "./classify";
 import { disclosureKey, disclosureScope, isOpen, toggle } from "./disclosure";
 import { failureText } from "./failure";
 import type { ActivityGroup, Step, TimelineItem } from "./group";
-import { groupAccessibleLabel, liveTitle, groupOutcomeText, routeText, summaryParts, timeline } from "./group";
+import { COMPACTION_MISS, groupAccessibleLabel, liveTitle, groupOutcomeText, routeText, summaryParts, timeline } from "./group";
 import { FOLD_LINES, outputView } from "./output";
 import { webAttemptRows, webFailureText } from "./web";
 
@@ -36,6 +36,7 @@ const ownWebFailure = (note: WebToolNote) => !!note.starterId && note.starterId 
 
 export function ActivityGroupRow(props: {
   group: ActivityGroup;
+  roomId?: string;
   /** The agent working this turn, once events name one per agent; else the group's own name. */
   agentName?: string;
   /** Its picture (an avatar element); else the agent glyph. */
@@ -47,11 +48,11 @@ export function ActivityGroupRow(props: {
   const id = () => g().key;
   const name = () => (g().source === "agent" ? props.agentName || g().name : "Runner activity");
   /** Something to open: its steps, or the route it took. */
-  const hasDetails = () => g().steps.length > 0 || !!g().route || !!g().pick;
+  const hasDetails = () => g().steps.length > 0 || !!g().route || !!g().pick || !!privateCompactionReason();
   /** Still working, and nothing has failed: the live line shows. */
   const working = () => g().outcome === "live" && !g().failed;
   const failed = () => groupOutcomeText(g()) === "failed";
-  const title = () => (working() ? liveTitle(g(), name()) : name());
+  const title = () => g().noReply && g().outcome === "completed" ? `${name()} chose not to reply` : working() ? liveTitle(g(), name()) : name();
   const parts = () => {
     if (working()) return [];
     const p = summaryParts(g());
@@ -74,6 +75,9 @@ export function ActivityGroupRow(props: {
   const label = () => groupAccessibleLabel(g(), name());
   const mark = () => (g().source === "agent" ? <AgentMark picture={props.agentAvatar} /> : undefined);
   const webFailure = () => g().steps.find((s) => s.activity.web?.note.failure)?.activity.web;
+  const privateCompactionReason = () => g().compactionMiss && mainPlace() === "space" && runs().find(r =>
+    r.id === g().activityId && r.actor === me() && r.spaceId === activeSpaceId() &&
+    r.roomId === (props.roomId ?? activeRoom()?.id))?.compactionFailure;
   return (
     <Column gap={2} padY={1} testID={`activity:${id()}`}>
       <Row align="center" gap={2}>
@@ -124,6 +128,9 @@ export function ActivityGroupRow(props: {
           )}
         </If>
       </Row>
+      <If when={g().compactionMiss}>
+        <Label variant="caption" color="muted" testID={`activity-compaction:${id()}`}>{COMPACTION_MISS}</Label>
+      </If>
       <If when={expanded() ? null : webFailure()}>
         {(f) => <Label variant="caption" color="danger" testID={`activity-web-failure:${id()}`}>
           {webFailureText(f().note, ownWebFailure(f().note), f().offlineOwner)}
@@ -131,6 +138,9 @@ export function ActivityGroupRow(props: {
       </If>
       <If when={hasDetails() && expanded()}>
         <Column gap={0} selectable testID={`activity-details:${id()}`}>
+          <If when={privateCompactionReason()}>
+            {reason => <Label variant="caption" color="muted" testID={`activity-compaction-private:${id()}`}>{reason()}</Label>}
+          </If>
           <If when={g().pick}>
             {(p) => (
               <TimelineEntry phase="progress" last={g().steps.length === 0 && !g().route}>
@@ -171,6 +181,7 @@ function TimelineView(props: { groupKey: string; item: TimelineItem; last: boole
 function ToolView(props: { groupKey: string; item: Extract<TimelineItem, { type: "tool" }>; last: boolean }) {
   const first = () => (props.item.call ?? props.item.result)!;
   const phase = () => (props.item.failed ? "failed" : props.item.result ? "complete" : "called");
+  const metaResult = () => props.item.result?.activity.details;
   const stateKey = (s: Step) => disclosureKey(disclosureScope(), props.groupKey, `all:${s.eventId}`);
   return (
     <TimelineEntry
@@ -179,7 +190,7 @@ function ToolView(props: { groupKey: string; item: Extract<TimelineItem, { type:
       last={props.last}
       testID={`activity-step:${first().eventId}`}
     >
-      <If when={first().activity.web} else={<>
+      <If when={first().activity.meta} else={<If when={first().activity.web} else={<>
       <Row align="center" gap={2} wrap>
         <Label variant="strong">{props.item.name}</Label>
         <If when={props.item.args}>
@@ -209,6 +220,10 @@ function ToolView(props: { groupKey: string; item: Extract<TimelineItem, { type:
       </If>
       </>}>
         <WebToolView item={props.item} groupKey={props.groupKey} />
+      </If>}>
+        <Label variant="caption" color={props.item.failed ? "danger" : "default"} testID={`activity-meta:${first().eventId}`}>
+          {props.item.failed ? `${props.item.name}: ${metaResult() || "failed"}` : metaResult() || props.item.name}
+        </Label>
       </If>
     </TimelineEntry>
   );

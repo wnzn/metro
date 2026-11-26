@@ -67,12 +67,13 @@ test("Model routing is off by default and says nothing is sent", async () => {
   await app.waitFor("id:routing-dataflow");
   // Confidence is a whole percentage.
   expect(app.value("id:routing-min-route")).toBe("65");
-  expect(app.value("id:routing-min-directed")).toBe("85");
+  expect(app.value("id:routing-min-directed")).toBe("35");
   expect(text(app)).toContain("Off: nothing is sent to pick a model.");
   expect(text(app)).toContain("Personal Chat sends directly to your agent.");
   expect(app.shows("id:dataflow-chat-send >> text:/Send starts your Chat agent directly/")).toBe(true);
   expect(app.shows("id:dataflow-chat-note >> text:/without starting an agent or routing a request/")).toBe(true);
-  expect(text(app)).toContain("Messages that mention only people, and other members' messages for routing or classification.");
+  expect(text(app)).toContain("Messages addressed only to people don't start routing or classification.");
+  expect(text(app)).toContain("up to three recent messages or agent replies from that room");
   expect(app.enabled("id:routing-save")).toBe(false); // nothing changed
   // Section headers are one sentence; the rest is under Learn more, closed until asked.
   // The routing opt-in explains what it sends beside its toggle.
@@ -146,7 +147,7 @@ test("pickers offer only models of their capability that I can use, mine and sha
     classifier_id: s1.id,
     embedding_id: emb.id,
     default_chat_id: null,
-    min_directedness: 0.85,
+    min_directedness: 0.35,
     min_route_probability: 0.7,
     cases: [{ key: "code_review", label: "Code review", description: "Reviewing a diff or a pull request", connection_id: shared.id }],
   });
@@ -174,7 +175,7 @@ test("the legacy Chat opt-in is hidden and round-trips; Space classification con
   await app.clear("id:routing-min-directed");
   await app.type("id:routing-min-directed", "2");
   await app.waitFor("id:routing-min-directed-error");
-  expect(app.shows("text:Enter a whole number from 50 to 100.")).toBe(true);
+  expect(app.shows("text:Enter a whole number from 20 to 100.")).toBe(true);
   expect(app.enabled("id:routing-save")).toBe(false);
   await app.clear("id:routing-min-directed");
   await app.type("id:routing-min-directed", "0.9");
@@ -259,7 +260,7 @@ test("a late routing answer never lands in the next user's session", async () =>
   await settings(app, "routing");
   await app.waitFor("id:routing-min-directed");
   await app.wait(800);
-  expect(app.value("id:routing-min-directed")).toBe("85");
+  expect(app.value("id:routing-min-directed")).toBe("35");
 });
 
 // ------------------------------------------------------------------ capabilities and sharing

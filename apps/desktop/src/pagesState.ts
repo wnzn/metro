@@ -7,7 +7,7 @@ import { ApiError, apiClient, describe, disconnect, isAborted, mainPlace, onSess
 export type PagesRoute =
   | { kind: "home"; spaceId?: string; afterDelete?: boolean }
   | { kind: "page"; id: string; spaceId?: string }
-  | { kind: "draft"; id: string; spaceId?: string; returnPage?: string; returnRoom?: string };
+  | { kind: "draft"; id: string; spaceId?: string; returnPage?: string; returnRoom?: string; returnChat?: boolean };
 
 const route = signal<PagesRoute>({ kind: "home" });
 /** A primitive key for NSH's keyed view, not a new object on each evaluation. */

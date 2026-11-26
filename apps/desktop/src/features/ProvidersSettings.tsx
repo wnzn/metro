@@ -26,6 +26,7 @@
 // and may pay for them). Feedback shows in the page's fixed footer.
 
 import { cleanup, effect, signal } from "nsh";
+import { contextTokensError, ContextTokensField } from "./commands/ContextTokensField";
 import {
   closeSharing,
   isSubscription,
@@ -751,6 +752,7 @@ function ModelsSection(props: { connection: ProviderConnection }) {
           <ModelDraftForm
             testID={`model-add:${c().id}`}
             thinking={c().customThinking}
+            contextSize={connectionCapability(c()) === "chat"}
             submitLabel="Add model"
             busy={providerBusy() === `model:${c().id}`}
             onCancel={() => addOpen.set(false)}
@@ -773,9 +775,17 @@ function ModelRow(props: { connection: ProviderConnection; model: ConnectionMode
   /** The name is being edited in place (pencil or a press on it): Return saves, Escape cancels. */
   const editingName = signal(false);
   const editingThinking = signal(false);
+  const editingContext = signal(false);
+  const context = signal("");
   const busy = () => !!providerBusy();
   const key = () => `${c().id}:${m().modelId}`;
   const changed = () => name().trim() !== (m().customName ?? "");
+  const contextChanged = () => (context().trim() ? Number(context()) : null) !== (m().contextTokens ?? null);
+  const saveContext = async () => {
+    if (busy() || !contextChanged() || contextTokensError(context())) return;
+    const ok = await patchConnectionModel(c().id, { model_id: m().modelId, context_tokens: context().trim() ? Number(context()) : null });
+    if (ok) editingContext.set(false);
+  };
   const startEditName = () => {
     name.set(m().customName ?? "");
     editingName.set(true);
@@ -857,6 +867,9 @@ function ModelRow(props: { connection: ProviderConnection; model: ConnectionMode
                 </Label>
               )}
             </If>
+            <If when={m().contextTokens}>
+              {tokens => <Label variant="caption" color="muted">{`${tokens().toLocaleString()} context tokens`}</Label>}
+            </If>
           </>
         }
         actions={
@@ -874,6 +887,13 @@ function ModelRow(props: { connection: ProviderConnection; model: ConnectionMode
             <If when={c().customThinking}>
               <Action testID={`model-thinking:${key()}`} label="Thinking…" variant="ghost" compact expanded={editingThinking()} onPress={() => editingThinking.set(!editingThinking())} />
             </If>
+            <If when={connectionCapability(c()) === "chat"}>
+              <Action testID={`model-context:${key()}`} label="Context size…" variant="ghost" compact
+                disabled={busy()} expanded={editingContext()} onPress={() => {
+                  context.set(m().contextTokens == null ? "" : String(m().contextTokens));
+                  editingContext.set(!editingContext());
+                }} />
+            </If>
             <If when={m().source === "manual" && !m().isDefault}>
               <Action
                 testID={`model-remove:${key()}`}
@@ -888,6 +908,17 @@ function ModelRow(props: { connection: ProviderConnection; model: ConnectionMode
           </>
         }
       />
+      <If when={editingContext()}>
+        <Column padX={4} padY={2} gap={2}>
+          <ContextTokensField testID={`model-context-input:${key()}`} value={context()} onChange={context.set}
+            disabled={busy()} onSubmit={() => void saveContext()} onCancel={() => editingContext.set(false)} />
+          <ActionBar>
+            <Action label="Cancel" variant="ghost" compact onPress={() => editingContext.set(false)} />
+            <Action testID={`model-context-save:${key()}`} label="Save context size" compact
+              disabled={busy() || !contextChanged() || !!contextTokensError(context())} onPress={() => void saveContext()} />
+          </ActionBar>
+        </Column>
+      </If>
       <If when={editingThinking()}>
         <Column padX={4} padY={2}>
           <ThinkingForm
@@ -1014,6 +1045,7 @@ function ThinkingForm(props: { testID: string; initial: ModelThinking | null; bu
 function ModelDraftForm(props: {
   testID: string;
   thinking: boolean;
+  contextSize?: boolean;
   submitLabel: string;
   busy?: boolean;
   onSubmit: (draft: NewConnectionModel) => Promise<boolean> | boolean;
@@ -1021,18 +1053,21 @@ function ModelDraftForm(props: {
 }) {
   const id = signal("");
   const name = signal("");
+  const context = signal("");
   const thinking = signal<ModelThinking>({ efforts: [], wire: "none" });
   const showThinking = signal(false);
   const submit = async () => {
     const model_id = id().trim();
-    if (!model_id) return;
+    if (!model_id || props.busy || contextTokensError(context())) return;
     const draft: NewConnectionModel = { model_id };
     if (name().trim()) draft.display_name = name().trim();
+    if (props.contextSize && context().trim()) draft.context_tokens = Number(context());
     const t = thinking();
     if (t.efforts.length && t.wire !== "none") draft.thinking = t;
     if (await props.onSubmit(draft)) {
       id.set("");
       name.set("");
+      context.set("");
       thinking.set({ efforts: [], wire: "none" });
       showThinking.set(false);
     }
@@ -1043,6 +1078,10 @@ function ModelDraftForm(props: {
         <Field testID={`${props.testID}-id`} accessibilityLabel="Model ID" value={id()} onChange={id.set} placeholder="Model ID, as the provider documents it" maxLength={200} grow onSubmit={() => void submit()} />
         <Field testID={`${props.testID}-name`} accessibilityLabel="Name shown in pickers (optional)" value={name()} onChange={name.set} placeholder="Name shown (optional)" maxLength={128} grow onSubmit={() => void submit()} />
       </Row>
+      <If when={props.contextSize}>
+        <ContextTokensField testID={`${props.testID}-context`} value={context()} onChange={context.set}
+          disabled={props.busy} onSubmit={() => void submit()} />
+      </If>
       <If when={props.thinking}>
         <Disclosure testID={`${props.testID}-thinking`} title="Thinking options" summary="Optional" open={showThinking()} onToggle={showThinking.set}>
           <ThinkingFields testID={`${props.testID}-thinking-fields`} value={thinking()} onChange={thinking.set} />
@@ -1052,7 +1091,7 @@ function ModelDraftForm(props: {
         <If when={props.onCancel}>
           <Action label="Cancel" variant="ghost" compact onPress={() => props.onCancel?.()} />
         </If>
-        <Action testID={`${props.testID}-save`} label={props.submitLabel} busyLabel="Adding…" busy={props.busy} compact disabled={!id().trim()} onPress={() => void submit()} />
+        <Action testID={`${props.testID}-save`} label={props.submitLabel} busyLabel="Adding…" busy={props.busy} compact disabled={!id().trim() || !!contextTokensError(context())} onPress={() => void submit()} />
       </ActionBar>
     </Column>
   );

@@ -26,7 +26,7 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 
-use crate::db::{Addressed, Author, Db, Event, kind};
+use crate::db::{Addressed, Author, Db, Event, MessageMeta, kind};
 use crate::library::AssetKind;
 
 /// Files one message may carry, at most.
@@ -121,10 +121,15 @@ pub enum Append {
     NoRecipient,
     /// A file is missing, deleted, or not one this place may attach.
     NoAsset,
+    /// `reply_to` is not an event this message may reply to.
+    NoReplyTarget,
 }
 
-/// Write a person's message with its attachments, in one transaction with
-/// every check (see the module docs). Nothing is written unless all pass.
+/// Write a person's message with its attachments and metadata, in one
+/// transaction with every check (see the module docs). A `reply_to` in
+/// `meta` is checked there too ([`crate::replies::reply_target_in`]).
+/// Nothing is written unless all pass.
+#[allow(clippy::too_many_arguments)]
 pub fn append_message(
     db: &Db,
     place: &Place,
@@ -133,19 +138,30 @@ pub fn append_message(
     addressed: &Addressed,
     asset_ids: &[String],
     recipients: &[crate::mentions::Mention],
+    meta: &MessageMeta,
 ) -> anyhow::Result<Append> {
     let Some(sender) = author.id.as_deref() else {
         return Ok(Append::NoRoom);
     };
     let mut conn = db.lock();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if let Place::Space { space_id, room_id } = place {
-        if !Db::room_member_in(&tx, space_id, room_id, sender)? {
-            return Ok(Append::NoRoom);
+    match place {
+        Place::Space { space_id, room_id } => {
+            if !Db::room_member_in(&tx, space_id, room_id, sender)? {
+                return Ok(Append::NoRoom);
+            }
+            if !Db::recipients_current_in(&tx, space_id, recipients)? {
+                return Ok(Append::NoRecipient);
+            }
+            if let Some(id) = meta.reply_to
+                && crate::replies::reply_target_in(&tx, space_id, room_id, id)?.is_err()
+            {
+                return Ok(Append::NoReplyTarget);
+            }
         }
-        if !Db::recipients_current_in(&tx, space_id, recipients)? {
-            return Ok(Append::NoRecipient);
-        }
+        // Personal Chat has no Reply.
+        Place::Personal { .. } if meta.reply_to.is_some() => return Ok(Append::NoReplyTarget),
+        Place::Personal { .. } => {}
     }
     let mut attachments = Vec::with_capacity(asset_ids.len());
     if !asset_ids.is_empty() {
@@ -177,7 +193,7 @@ pub fn append_message(
             tx.execute(
                 "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, \
                  mentions, audience, created_at, activity) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     user_id,
                     kind::MESSAGE,
@@ -187,9 +203,10 @@ pub fn append_message(
                     addressed.mentions.to_string(),
                     addressed.audience,
                     at,
+                    crate::db::event_metadata_json(None, None, meta)?,
                 ],
             )?;
-            crate::db::new_event(
+            let mut event = crate::db::new_event(
                 tx.last_insert_rowid(),
                 kind::MESSAGE,
                 author,
@@ -197,18 +214,13 @@ pub fn append_message(
                 addressed,
                 None,
                 at,
-            )
+            );
+            event.meta = meta.clone();
+            event
         }
-        Place::Space { space_id, room_id } => Db::append_event_in(
-            &tx,
-            space_id,
-            room_id,
-            kind::MESSAGE,
-            author,
-            text,
-            addressed,
-            None,
-        )?,
+        Place::Space { space_id, room_id } => {
+            Db::append_message_in(&tx, space_id, room_id, author, text, addressed, meta)?
+        }
     };
     for (position, a) in attachments.iter().enumerate() {
         tx.execute(

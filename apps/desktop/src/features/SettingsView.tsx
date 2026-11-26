@@ -19,6 +19,7 @@ import { MonitoringSettings } from "./MonitoringSettings";
 import { ProfileSettings } from "./profile/ProfileSettings";
 import { ProvidersSettings } from "./ProvidersSettings";
 import { ModelChoicesSettings } from "./ModelChoicesSettings";
+import { MetaSettings } from "./meta/MetaSettings";
 import { RunnersSettings } from "./RunnersSettings";
 
 type Page = { section: SettingsSection; label: string; icon: IconName; hook?: string };
@@ -35,6 +36,7 @@ const GROUPS: readonly { id: string; label: string; pages: readonly Page[] }[] =
     { section: "profile", label: "Profile", icon: "person" },
     { section: "connections", label: "Model connections", icon: "providers", hook: "providers" },
     { section: "models", label: "Model choices", icon: "routing", hook: "routing" },
+    { section: "metro-chat", label: "Metro in Chat", icon: "chat" },
     { section: "runners", label: "Runners", icon: "runner" },
   ] },
   { id: "computer", label: "This computer", pages: [
@@ -178,6 +180,9 @@ function SettingsPage() {
       </If>
       <If when={settingsSection() === "models"}>
         <ModelChoicesSettings />
+      </If>
+      <If when={settingsSection() === "metro-chat"}>
+        <MetaSettings />
       </If>
       <If when={settingsSection() === "monitoring"}>
         <MonitoringSettings />

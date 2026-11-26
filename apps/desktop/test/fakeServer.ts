@@ -22,11 +22,11 @@ type Capability = "chat" | "system_one" | "embeddings";
 type Share = { visibility: "personal" | "spaces" | "organization"; space_ids: string[] };
 type Thinking = { efforts: string[]; wire: "none" | "reasoning_effort" | "reasoning" };
 /** One model of a connection's own list (provider_connection_models). */
-type ConnModel = { model_id: string; display_name: string | null; listed_name: string | null; enabled: boolean; available: boolean; source: "listed" | "manual"; position: number; thinking: Thinking | null };
+type ConnModel = { model_id: string; display_name: string | null; listed_name: string | null; enabled: boolean; available: boolean; source: "listed" | "manual"; position: number; thinking: Thinking | null; context_tokens?: number | null };
 type Conn = { id: string; owner: string; name: string; provider_id: string; base_url: string | null; model: string | null; is_default: boolean; key: string | null; deviceToken: string | null; capability: Capability; share: Share; models: ConnModel[] };
 type RoutingCase = { key: string; label: string; description: string; connection_id: string | null };
 type Routing = { enabled: boolean; infer_addressing: boolean; classifier_id: string | null; embedding_id: string | null; default_chat_id: string | null; min_directedness: number; min_route_probability: number; cases: RoutingCase[] };
-const DEFAULT_ROUTING: Routing = { enabled: false, infer_addressing: false, classifier_id: null, embedding_id: null, default_chat_id: null, min_directedness: 0.85, min_route_probability: 0.65, cases: [] };
+const DEFAULT_ROUTING: Routing = { enabled: false, infer_addressing: false, classifier_id: null, embedding_id: null, default_chat_id: null, min_directedness: 0.35, min_route_probability: 0.65, cases: [] };
 
 /** The catalog this double offers: chat, System One and embeddings adapters, on devices and on the server. */
 export const CATALOG: { providers: { id: string; name: string; requires_key: boolean; allow_custom_url: boolean; default_base_url?: string; execution: string; capability: Capability; lists_models: boolean }[]; allowed_base_urls: string[] } = {
@@ -170,6 +170,7 @@ export function fakeServer() {
       model_id: m.model_id, display_name: m.display_name ?? m.listed_name ?? m.model_id, custom_name: m.display_name, listed_name: m.listed_name,
       enabled: m.enabled, available: m.available, source: m.source, position: m.position, is_default: m.model_id === c.model,
       thinking: m.thinking, reasoning_efforts: m.thinking?.efforts ?? [],
+      ...(m.context_tokens !== undefined ? { context_tokens: m.context_tokens } : {}),
     }));
   const endpointRev = (c: Conn) => state.endpointRevisions.get(c.id) ?? 0;
   const bumpEndpointRev = (c: Conn) => state.endpointRevisions.set(c.id, endpointRev(c) + 1);
@@ -377,7 +378,7 @@ export function fakeServer() {
       if (req.method === "PUT") {
         const b = body as Routing;
         const p = (n: unknown) => typeof n === "number" && n >= 0 && n <= 1;
-        if (!p(b.min_directedness) || b.min_directedness < 0.5 || !p(b.min_route_probability)) return err(400, "min_directedness must be 0.5..=1, min_route_probability 0..=1");
+        if (!p(b.min_directedness) || b.min_directedness < 0.2 || !p(b.min_route_probability)) return err(400, "min_directedness must be 0.2..=1, min_route_probability 0..=1");
         if ((b.cases ?? []).length > 16 || (b.cases ?? []).some((c) => !/^[a-z][a-z0-9_]{0,31}$/.test(c.key))) return err(400, "bad cases");
         if (b.classifier_id && !usableAs(b.classifier_id, "system_one", user)) return err(400, "classifier_id is not a System One connection you can use");
         if (b.embedding_id && !usableAs(b.embedding_id, "embeddings", user)) return err(400, "embedding_id is not an embeddings connection you can use");
@@ -437,11 +438,13 @@ export function fakeServer() {
         if (req.method === "GET") return ok(listView(c));
         const id = req.method === "DELETE" ? url.searchParams.get("model_id") : body?.model_id;
         if (typeof id !== "string" || !id.trim()) return err(400, "model_id is required");
+        const tokens = body?.context_tokens;
+        if (tokens != null && (!Number.isInteger(tokens) || tokens < 1024 || tokens > 10_000_000)) return err(400, "bad context_tokens");
         const entry = c.models.find((x) => x.model_id === id);
         if (req.method === "POST") {
           if (entry) return err(409, "that connection already has this model");
           if (body.thinking && !customThinking(c)) return err(422, "thinking options can be set only on self-hosted OpenAI-compatible connections");
-          c.models.push({ model_id: id, display_name: body.display_name ?? null, listed_name: null, enabled: body.enabled ?? true, available: true, source: "manual", position: c.models.length, thinking: body.thinking ?? null });
+          c.models.push({ model_id: id, display_name: body.display_name ?? null, listed_name: null, enabled: body.enabled ?? true, available: true, source: "manual", position: c.models.length, thinking: body.thinking ?? null, context_tokens: tokens });
           if (body.default) c.model = id;
           settle(c);
           return ok(listView(c), 201);
@@ -451,6 +454,7 @@ export function fakeServer() {
           if (body.enabled === false && c.model === id) return err(409, "this is the connection's default model; choose another default model first");
           if (body.display_name !== undefined) entry.display_name = body.display_name || null;
           if (body.enabled !== undefined) entry.enabled = body.enabled;
+          if (tokens !== undefined) entry.context_tokens = tokens;
           if (body.thinking !== undefined) {
             if (body.thinking && !customThinking(c)) return err(422, "thinking options can be set only on self-hosted OpenAI-compatible connections");
             entry.thinking = body.thinking;

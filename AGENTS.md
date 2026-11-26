@@ -71,6 +71,13 @@ see [New in Metro 0.5.0](docs/released-0.5.0.md); for later changes, see
   default agent.
 - A server has one organization. Org admins are the stable user ids in
   `METRO_ORG_ADMINS`, a JSON array. There's no other admin role.
+- The **directory** lets signed-in people find others who have signed in
+  to this server, by display name or exact stable id. It exposes id, display
+  name and avatar; bios are for the person and their Space or DM peers.
+  **DMs** are one-to-one and participant-only, with no admin bypass,
+  agents, attachments, mentions, search or Chat-agent access. Hiding a DM
+  hides history for the caller; when both hide all events Metro purges
+  the conversation.
 - There are two kinds of runner, and they never stand in for each other:
   - A **dedicated** runner uses a Space's own runner token. That token is
     issued by the Space owner, shown once, stored only as a hash, rotated on
@@ -175,12 +182,14 @@ see [New in Metro 0.5.0](docs/released-0.5.0.md); for later changes, see
   shared.
 - **In Spaces, explicit recipients always decide who a message is
   addressed to.** A Space message falls into exactly one of these cases:
-  - **People only** (`@bob`, with no agent and not sent with Ask agent).
+  - **People only** (`@bob`, without an agent recipient from any source).
     It never starts agent work, and it's never sent to System One for an
     addressing or routing decision.
-  - **To a named agent** (its `@handle`, or Ask agent with that agent
-    chosen). That agent runs, with no classification. Several agents
-    mentioned start one run each.
+  - **To a named agent** (its `@handle`, Ask agent with that agent chosen,
+    or a text reply to that agent in a thread unless the sender opts out).
+    That recipient bypasses classification. Deduplicate it with other
+    explicit recipients. A separate generic mention still resolves normally.
+    A deleted reply agent is not replaced; the sender gets a private notice.
   - **To the generic agent** (`@agent` or Ask agent without an agent,
     including mixed `@bob @agent`). It starts agent work, with no "was this
     for an agent?" decision. The default agent runs, unless the sender opted
@@ -188,16 +197,16 @@ see [New in Metro 0.5.0](docs/released-0.5.0.md); for later changes, see
     agents (with no "no agent" option) picks it. An unsure answer runs the
     default agent. A failed decision shows a visible error, and no agent
     runs for `@agent`.
-  - **Unaddressed** (no mention, and not sent with Ask agent). By default it's
-    ordinary conversation. Only the sender's opt-in classification (below)
-    can start an agent from it.
+  - **Unaddressed** (no mention, Ask agent or agent reply target). By
+    default it's ordinary conversation. Only the sender's opt-in
+    classification (below) can start an agent from it.
 
   The same routing below still applies to choose each run's answering
   model. The agent's history shows each message's author and recipients.
 - The desktop sends verified Space mentions as stable IDs and validated
   text ranges. Never silently retarget an ambiguous, changed or stale
-  mention; keep the original draft when send is refused. Dispatch from
-  Chat is an explicit generic request to the verified room or thread,
+  mention; keep the original draft when send is refused. Manual Dispatch
+  from Chat is an explicit generic request to the verified room or thread,
   with no implicit recipients from its text. Follow up checks the exact
   destination and doesn't silently change it. Generic `@agent` isn't an
   identity card. Don't fall back to legacy text inference on a server
@@ -207,16 +216,18 @@ see [New in Metro 0.5.0](docs/released-0.5.0.md); for later changes, see
   Space**, only while they have a System One connection usable in that
   Space. It's one typed System One Choice over the Space's agents plus
   "No agent" for an unaddressed message (without "No agent" for the
-  generic `@agent`). The
-  options are keyed internally, so model text never becomes an agent id.
-  For an unaddressed message, "No agent", low confidence or a failure
-  starts nothing (for `@agent`, see above). A failed decision on
-  unaddressed text returns an unstored `addressing_note` to the sender
-  only; don't turn it into a room event. The run's
-  activity shows the decision ("Picked by classifier: X"). A message it
-  starts runs as that person. It's never used on people-only messages,
-  messages to a named agent or other people's messages. With it off, which
-  is the default, unaddressed text is ordinary conversation.
+  generic `@agent`). The options are keyed internally, so model text
+  never becomes an agent id. For unaddressed text, send the new text,
+  Space and room names, Space description and up to three preceding
+  human or agent excerpts to the sender's System One connection. Lean
+  toward a useful agent: below the directedness threshold or on failure,
+  start nothing; at or above it, "No agent" uses the strongest agent
+  option. Default is 0.35 (range 0.2–1); migrate stored 0.85 values once.
+  Failure on unaddressed text returns an unstored `addressing_note` to
+  the sender only, not a room event. The selected run acts as the sender
+  and shows "Picked by classifier: X". Never classify people-only or
+  explicitly named recipients. With classification off (the default),
+  unaddressed text is ordinary conversation.
 - Sender-only notice details are POST metadata, never a polled event,
   search result or model history. Either or both fields may be present.
   Bind them to the originating authenticated sender, destination and
@@ -231,6 +242,19 @@ see [New in Metro 0.5.0](docs/released-0.5.0.md); for later changes, see
   remains accepted for compatibility and the existing one-time Space
   migration, but doesn't control Chat dispatch. Use-case routing remains
   separate and can choose the answering connection.
+- **Metro in Chat** can read and act as the user in their eligible
+  Spaces. The per-account switch is on by default but gated on showing
+  the notice, with per-Space exclusions and live access checks. Space
+  content read goes to the model answering Chat, visible to a shared
+  connection's owner. Posts go directly as the user, marked `via Metro`,
+  only to a Space named in the user's own text. Address exactly one
+  agent: the named one, else the agent whose message the post replies
+  to, else the default agent. Don't infer recipients from text. A
+  schedule Metro creates may name only Spaces the user named. The
+  receipt is Chat-only, never indexed or model history. Metro doesn't
+  change settings or apply Page drafts. Chat stop doesn't stop delegated
+  runs; only their initiators can retry eligible failed or cancelled
+  runs, with fresh routing. The runs registry is memory-only.
 - **Use-case routing** is a separate opt-in, and it decides only which of a
   person's usable chat connections answers. It can run on any run that
   starts for that person: a named agent, `@agent`, Ask agent, or one
@@ -247,9 +271,8 @@ see [New in Metro 0.5.0](docs/released-0.5.0.md); for later changes, see
   own personal Chat, and the rooms and threads of Spaces they're a member of
   now. It retrieves with embeddings, then reranks a bounded shortlist with a
   real System One call. Results are never labelled reranked unless a System
-  One call ranked them. Search is the person's own feature. It doesn't widen
-  the personal Chat agent's tools. Message search stays as it is. The
-  Documents & media library below is a separate, additional corpus.
+  One call ranked them. Chat's Space search also checks the Metro in Chat
+  grant. The Documents & media library below is a separate corpus.
 - **Documents & media** ([docs/library.md](docs/library.md)) holds only files
   a person **explicitly uploads**, either to their personal library (only
   the uploader sees it, with no admin bypass) or to a Space they're a member
@@ -324,17 +347,32 @@ see [New in Metro 0.5.0](docs/released-0.5.0.md); for later changes, see
   are live through the token-authenticated `/v1/admin/settings` API used
   by `/admin`; they don't grant access to page data.
 - Reactions never start agent work and never imply that work is complete.
+- **Space agents** get bounded Space, room, member and agent context;
+  user-written names and descriptions are data. A run may reply, react,
+  or complete with no agent message (including an empty final answer).
+  Mark its outcome in activity; don't turn silence into a chat message.
+- **Messages** render bounded Markdown without live HTML or remote
+  images. Forward copies text, not recipients, attachments, reactions
+  or replies; verify both ends and never dispatch an agent from a forward
+  or its comment.
+- **Compaction** keeps the saved transcript intact. Chat, Space rooms
+  and threads can use a model-written summary as untrusted history
+  (never DMs or Page conversations). Auto is per initiator, on by default
+  at 70% of estimated input budget, and uses the run's resolved model.
+  Manual `/compact` uses the caller's default Chat route or route for
+  the Space's default agent. No fallback after model failure. Summary
+  and focus are visible to readers of that conversation, not indexed.
+  A slash command starts at the beginning of a draft and is not a message.
 - A `reasoning_summary` event carries only the reasoning summary text a
   provider returned (bounded), never encrypted, raw or redacted reasoning
   and never text Metro made up. It's never a message, never model history
   and never indexed.
-- Threads stay one level deep and bounded, inherit their Space's members
-  and runner, and keep the agent and connection of the run that created
-  them. The personal Chat agent gets the scoped `react_to_message`
-  acknowledgment and, only with the account opt-in, the web tools above.
-  It has no runner, workspace or thread tools, and can't read Space
-  transcripts. Cross-Space run controls are for the human, and they check
-  membership.
+- Threads stay one level deep and inherit Space membership and runner.
+  Agent-created threads keep their original agent and connection.
+  Anchored reply threads have their own limit, include the anchor in
+  agent history and do not mirror to the parent. Personal Chat has no
+  direct runner, workspace or agent-thread tools; reactions and web
+  tools keep their separate rules.
 - The database is pinned to one identity namespace. Never assign legacy or
   foreign history to anyone.
 - Desktop startup can show the Shell after verifying identity and
@@ -359,13 +397,15 @@ see [New in Metro 0.5.0](docs/released-0.5.0.md); for later changes, see
     Documents & media gate (497 Rust tests, the 83 hardened media-service
     tests, `nsh test` 106/106) and the earlier 403-test gate are historical
     milestones.
-  - **Metro 0.5.0 is published**: stable GitHub release `v0.5.0`
-    (2026-11-25T20:56:24Z), tag on `6a038f1` (PR #17), made by CI run
-    45692417663, with 18 assets, Sigstore-signed `SHA256SUMS`, unsigned
-    Windows files and signed GHCR images (see [release record](docs/acceptance.md#published-metro-050-2026-11-25-github-release-v050)).
+  - **Metro 0.5.1 is published**: stable GitHub release `v0.5.1`
+    (2026-11-26T00:41:30Z), tag on `5120c52` (PR #18), made by CI run
+    45725172627, with 18 assets, Sigstore-signed `SHA256SUMS`, unsigned
+    Windows files and signed GHCR images (see [release record](docs/acceptance.md#published-metro-051-2026-11-26-github-release-v051)).
     Native Windows by a person, real vendor accounts and real sign-ins
-    remain unverified. Pages work after `6a038f1` is not released.
-  - The previous release, Metro 0.4.0: GitHub release `v0.4.0` (2026-11-25),
+    remain unverified. [Pages work for 0.5.1](docs/released-0.5.1.md) is
+    released; [0.6.0 work](docs/next-source.md) is not.
+  - The previous release was [Metro 0.5.0](docs/acceptance.md#published-metro-050-2026-11-25-github-release-v050).
+    Before it, Metro 0.4.0: GitHub release `v0.4.0` (2026-11-25),
     tag on `1a743e5`, made by CI run 45560122825, with Sigstore-signed
     `SHA256SUMS`, unsigned Windows files and GHCR images signed by the release workflow
     (`docs/acceptance.md`). Metro 0.3.2 (`v0.3.2` on `d943797`, CI run
@@ -388,16 +428,16 @@ see [New in Metro 0.5.0](docs/released-0.5.0.md); for later changes, see
   sidecar next to the desktop app. Source builds live only in
   [docs/development.md](docs/development.md). Docs point to the published
   release by the names and URLs recorded in `docs/acceptance.md`: the
-  current one is **Metro 0.5.0**
-  (https://github.com/wnzn/metro/releases/tag/v0.5.0, tag `v0.5.0` on
-  `6a038f1`), with `Metro-0.5.0-linux-x64.tar.gz`,
-  `Metro-0.5.0-windows-x64.zip`,
-  `Metro-0.5.0-windows-x64.unsigned-preview.msi`,
-  `Metro-runner-0.5.0-linux-x64.tar.gz` (each with `.sha256`), the
+  current one is **Metro 0.5.1**
+  (https://github.com/wnzn/metro/releases/tag/v0.5.1, tag `v0.5.1` on
+  `5120c52`), with `Metro-0.5.1-linux-x64.tar.gz`,
+  `Metro-0.5.1-windows-x64.zip`,
+  `Metro-0.5.1-windows-x64.unsigned-preview.msi`,
+  `Metro-runner-0.5.1-linux-x64.tar.gz` (each with `.sha256`), the
   installer scripts, `SHA256SUMS` with its Sigstore bundle, `IMAGES.txt`,
-  and the images `ghcr.io/wnzn/metro-server:v0.5.0`,
-  `ghcr.io/wnzn/metro-runner:v0.5.0` and
-  `ghcr.io/wnzn/metro-embeddinggemma2:v0.5.0` (pinned by digest). Windows
+  and the images `ghcr.io/wnzn/metro-server:v0.5.1`,
+  `ghcr.io/wnzn/metro-runner:v0.5.1` and
+  `ghcr.io/wnzn/metro-embeddinggemma2:v0.5.1` (pinned by digest). Windows
   files are **unsigned** (no Authenticode). Docs never present source
   that came after a release's commit as part of that release; label it
   "in the source, not released". A newer release is named in docs only

@@ -34,6 +34,8 @@ import { PersonAvatar } from "./profile/PersonAvatar";
 import { profileName } from "./profile/profileState";
 import { openSpaceSettings } from "./space/spaceSettingsState";
 import { CreateSpaceForm } from "./CreateSpaceForm";
+import { DirectMessagesSection } from "./dms/DirectMessages";
+import { activeDm, dmUnread, openMessages } from "./dms/state";
 
 /**
  * The app's navigation: Chat, Library, Scheduled tasks, the Spaces and their
@@ -69,6 +71,7 @@ export function Sidebar(props: { mode: "full" | "rail" | "hidden" }) {
           <NavItem testID="nav-pages" label="Pages" icon="file" selected={selectedPages()} onPress={() => goPages()} />
           <PinnedPages />
           <NavItem testID="nav-schedules" label="Scheduled tasks" icon="clock" selected={mainPlace() === "schedules"} onPress={() => openPlace("schedules")} />
+          <DirectMessagesSection visible={props.mode === "full"} />
           <SpacesSection visible={props.mode === "full"} />
         </ScrollArea>
 
@@ -102,6 +105,9 @@ function SidebarRail() {
       <RailButton testID="rail-library" label="Library" icon="library" selected={mainPlace() === "library"} onPress={() => openPlace("library")} />
       <RailButton testID="rail-pages" label="Pages" icon="file" selected={mainPlace() === "pages"} onPress={() => goPages()} />
       <RailButton testID="rail-schedules" label="Scheduled tasks" icon="clock" selected={mainPlace() === "schedules"} onPress={() => openPlace("schedules")} />
+      <RailButton testID="rail-messages" label="Messages" icon="chat" selected={mainPlace() === "dm"}
+        dot={dmUnread() ? `${dmUnread()} unread` : undefined}
+        onPress={() => { if (mainPlace() !== "dm" || activeDm()) openMessages(); }} />
       <ScrollArea gap={1} align="center" padY={2}>
         <Each of={spaces()} key={(space) => space.id}>
           {(space) => (
@@ -275,6 +281,7 @@ type TreeRow = { room: Room; depth: number };
 
 /** Rooms in server order, each thread right under the room it was delegated from. */
 export function roomTree(list: readonly Room[]): TreeRow[] {
+  list = list.filter(room => room.anchorEventId === undefined);
   const ids = new Set(list.map((r) => r.id));
   const children = new Map<string, Room[]>();
   const roots: Room[] = [];

@@ -23,7 +23,9 @@ import chatIcon from "./icons/chat.svg";
 import checkIcon from "./icons/check.svg";
 import copyIcon from "./icons/copy.svg";
 import hashIcon from "./icons/hash.svg";
+import forwardIcon from "./icons/forward.svg";
 import reactionIcon from "./icons/reaction.svg";
+import replyIcon from "./icons/reply.svg";
 import runnerIcon from "./icons/runner.svg";
 import sendIcon from "./icons/send.svg";
 import serverIcon from "./icons/server.svg";
@@ -48,7 +50,9 @@ const GLYPHS = {
   check: checkIcon,
   copy: copyIcon,
   hash: hashIcon,
+  forward: forwardIcon,
   reaction: reactionIcon,
+  reply: replyIcon,
   runner: runnerIcon,
   send: sendIcon,
   server: serverIcon,
@@ -362,12 +366,12 @@ export function ComposerBox(props: Testable & { children?: JSX.Element }) {
   );
 }
 
-/** The bottom bar of the composer: tools on the left, the send controls on the right. */
+/** Tools on the left, send controls on the right or on their own line if needed. */
 export function ComposerBar(props: { leading?: JSX.Element; trailing?: JSX.Element }) {
   return (
-    <View class="flex-row items-center gap-(--space-2) px-(--space-2) pb-(--space-2)">
-      <View class="flex-1 min-w-0 flex-row items-center gap-(--space-1)">{props.leading}</View>
-      <View class="shrink-0 flex-row items-center gap-(--space-2)">{props.trailing}</View>
+    <View class="flex-row flex-wrap items-center gap-(--space-2) px-(--space-2) pb-(--space-2)">
+      <View class="min-w-0 max-w-full flex-row items-center gap-(--space-1)">{props.leading}</View>
+      <View class="ml-auto shrink-0 flex-row items-center gap-(--space-2)">{props.trailing}</View>
     </View>
   );
 }
@@ -398,26 +402,34 @@ export function ComposerField(
 ) {
   // Grows with its text (one empty line's height while empty), then scrolls.
   const height = signal(FIELD_MIN);
+  const focused = signal(false);
   return (
-    <Input
-      class="w-full bg-transparent px-(--space-3) pt-(--space-3) pb-(--space-1) text-(length:--text-md) text-foreground placeholder:text-muted-foreground disabled:opacity-60"
-      style={{ height: height() + FIELD_PAD }}
-      ref={props.ref as never}
-      value={props.value}
-      onChange={({ value }) => props.onChange(value)}
-      onSubmit={() => props.onSubmit()}
-      submitBehavior="submit"
-      multiline
-      placeholder={props.placeholder}
-      disabled={props.disabled}
-      onFocus={() => props.onFocusChange?.(true)}
-      onBlur={() => props.onFocusChange?.(false)}
-      onCaretMove={props.onCaretMove}
-      onSelectionChange={props.onSelectionChange}
-      onContentSizeChange={({ size }) => height.set(Math.max(FIELD_MIN, Math.min(FIELD_MAX, Math.ceil(size.height))))}
-      testID={props.testID}
-      accessibilityLabel={props.accessibilityLabel ?? props.placeholder}
-    />
+    <>
+      <Input
+        class="w-full bg-transparent px-(--space-3) pt-(--space-3) pb-(--space-1) text-(length:--text-md) text-foreground placeholder:text-muted-foreground disabled:opacity-60"
+        style={{ height: height() + FIELD_PAD }}
+        ref={props.ref as never}
+        value={props.value}
+        onChange={({ value }) => props.onChange(value)}
+        onSubmit={() => props.onSubmit()}
+        submitBehavior="submit"
+        multiline
+        placeholder={props.placeholder}
+        disabled={props.disabled}
+        onFocus={() => { focused.set(true); props.onFocusChange?.(true); }}
+        onBlur={() => { focused.set(false); props.onFocusChange?.(false); }}
+        onCaretMove={props.onCaretMove}
+        onSelectionChange={props.onSelectionChange}
+        onContentSizeChange={({ size }) => height.set(Math.max(FIELD_MIN, Math.min(FIELD_MAX, Math.ceil(size.height))))}
+        testID={props.testID}
+        accessibilityLabel={props.accessibilityLabel ?? props.placeholder}
+      />
+      <If when={focused()}>
+        <Text class="px-(--space-3) pb-(--space-1) text-(length:--text-xs) text-muted-foreground" testID="composer-markdown-hint">
+          Markdown supported
+        </Text>
+      </If>
+    </>
   );
 }
 
@@ -432,6 +444,15 @@ export function ComposerHint(props: Testable & { text: string }) {
     >
       {props.text}
     </Text>
+  );
+}
+
+/** Context above the field, inset like the recipients: the message a reply quotes. */
+export function ComposerContext(props: Testable & { children?: JSX.Element }) {
+  return (
+    <View class="flex-row items-center gap-(--space-1) px-(--space-3) pt-(--space-2)" testID={props.testID}>
+      {props.children}
+    </View>
   );
 }
 
@@ -784,14 +805,16 @@ export function DraftSuggestion(props: Testable & { label: string; onPress: () =
 // ---------------------------------------------------------------- header
 
 /** A link-sized button that sits on a caption's baseline ("Thread from # lobby"). */
-export function InlineLink(props: Testable & { label: string; onPress: () => void }) {
+export function InlineLink(props: Testable & { label: string; onPress: () => void; ref?: (node: ViewRef) => void; leading?: JSX.Element }) {
   return (
     <Button
-      class={cx("rounded-[3px] px-[2px] hover:bg-muted", focusRing)}
+      class={cx("flex-row self-start items-center gap-(--space-1) rounded-[3px] px-[2px] hover:bg-muted", focusRing)}
+      ref={props.ref}
       onPress={props.onPress}
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel ?? props.label}
     >
+      {props.leading}
       <Text class="text-(length:--text-xs) font-medium text-accent-foreground">{props.label}</Text>
     </Button>
   );

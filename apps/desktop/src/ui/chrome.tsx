@@ -139,10 +139,11 @@ const ICON_TOKEN = {
 } as const;
 
 /** A decorative icon: screen readers skip it; say what it means in the control's label. */
-export function Icon(props: { name: IconName; color?: IconColor; size?: 12 | 14 | 16 | 20 }) {
+export function Icon(props: { name: IconName; color?: IconColor; size?: 12 | 14 | 16 | 20; testID?: string }) {
   const size = () => props.size ?? 16;
   return (
     <Image
+      testID={props.testID}
       src={ICONS[props.name]}
       fadeDuration={0}
       style={{
@@ -545,7 +546,7 @@ export const modalOpen = () => openModals() > 0;
  * gets a narrower margin. With reduced motion it appears without a fade.
  */
 export function Modal(props: Testable & {
-  open: boolean; title: string; onClose: () => void; children?: JSX.Element; size?: "large" | "compact" | "form";
+  open: boolean; title: string; onClose: () => void; children?: JSX.Element; size?: "large" | "compact" | "form" | "full-height";
   /** Report a dismissal attempt without closing natively, e.g. to review unsaved edits. */
   guardDismiss?: boolean;
 }) {
@@ -559,6 +560,7 @@ export function Modal(props: Testable & {
     const margin = compactWidth() ? 16 : 48;
     // A compact modal (a short form, a question) is as tall as its content.
     if (props.size === "compact") return { width: Math.max(300, Math.min(460, w.width - margin)), maxHeight: w.height - margin };
+    if (props.size === "full-height") return { width: Math.max(320, w.width - 16), height: w.height - 16 };
     if (props.size === "form") return { width: Math.max(300, Math.min(640, w.width - margin)), height: Math.min(500, w.height - margin) };
     return { width: Math.max(320, Math.min(1080, w.width - margin)), height: Math.max(360, Math.min(800, w.height - margin)) };
   };

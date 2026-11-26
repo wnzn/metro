@@ -91,6 +91,20 @@ test("the task form is folded behind New task, never covers the runs, and foldin
   expect(f.posts().some((p) => p.path.endsWith("/messages"))).toBe(false);
 });
 
+test("a leading slash is ordinary text in Dispatch", async () => {
+  const f = world();
+  f.state.runs.push({ id: "run1", space_id: "acme", room_id: "lobby", status: "completed", actor: "alice", task: "Audit the build" });
+  const app = await inChat(f);
+  await app.press("id:dispatch-new");
+  await app.press("id:dispatch-space:acme");
+  await app.waitFor("text:To: agent in Acme › #lobby");
+  await app.type("id:dispatch-text", "/compact");
+  expect(app.shows("id:command-suggestions")).toBe(false);
+  await app.press("id:dispatch-send");
+  await app.waitUntil(() => f.posts().some(p => p.path === "/v1/spaces/acme/rooms/lobby/messages" && p.body.text === "/compact"));
+  expect(f.posts().some(p => p.path.endsWith("/compact"))).toBe(false);
+});
+
 test("Follow up opens the folded form, aimed at the run's room", async () => {
   const f = world();
   f.state.runs.push({ id: "run1", space_id: "acme", room_id: "lobby", status: "completed", actor: "alice", task: "Audit the build" });

@@ -98,6 +98,35 @@ pub struct RunInfo {
     /// The task, cut to [`MAX_TASK_PREVIEW_CHARS`] characters.
     pub task: String,
     pub status: RunStatus,
+    /// Every registered run answers a message in a Space room or thread.
+    pub kind: RunKind,
+    /// The Space agent working the run, when known.
+    pub agent_id: Option<String>,
+    /// The stored event the run answers, when known: what a retry answers.
+    pub trigger_event_id: Option<i64>,
+    /// When the run was registered, RFC 3339 UTC.
+    #[serde(serialize_with = "rfc3339_ms")]
+    pub started_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunKind {
+    Room,
+}
+
+/// What a room run works for: its agent and the event it answers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RunOrigin {
+    pub agent_id: Option<String>,
+    pub trigger_event_id: Option<i64>,
+}
+
+fn rfc3339_ms<S: serde::Serializer>(ms: &i64, s: S) -> Result<S::Ok, S::Error> {
+    match crate::db::rfc3339_utc(*ms) {
+        Some(t) => s.serialize_str(&t),
+        None => s.serialize_none(),
+    }
 }
 
 struct Entry {
@@ -111,6 +140,9 @@ struct Entry {
     /// ([`RunRegistry::finish_with`]). A stopped run stays in the history
     /// until then, so its worker always learns that the stop won.
     settled: bool,
+    /// Turns `true` once the worker is gone and everything it publishes is
+    /// stored ([`Registration`] drop). Dropped with the entry on eviction.
+    done: watch::Sender<bool>,
 }
 
 /// The full reason a run failed, kept in memory with the run (never
@@ -222,6 +254,18 @@ impl RunRegistry {
         actor: &str,
         task: &str,
     ) -> Result<(RunInfo, watch::Receiver<bool>), String> {
+        self.start_for(space_id, room_id, actor, task, RunOrigin::default())
+    }
+
+    /// [`start`](Self::start) recording the run's agent and trigger event.
+    pub fn start_for(
+        &self,
+        space_id: &str,
+        room_id: &str,
+        actor: &str,
+        task: &str,
+        origin: RunOrigin,
+    ) -> Result<(RunInfo, watch::Receiver<bool>), String> {
         for (what, v) in [
             ("space_id", space_id),
             ("room_id", room_id),
@@ -256,6 +300,10 @@ impl RunRegistry {
             actor: actor.to_owned(),
             task: preview(task, MAX_TASK_PREVIEW_CHARS),
             status: RunStatus::Running,
+            kind: RunKind::Room,
+            agent_id: origin.agent_id,
+            trigger_event_id: origin.trigger_event_id,
+            started_at: crate::db::now_ms(),
         };
         let (tx, rx) = watch::channel(false);
         inner.entries.push_back(Entry {
@@ -263,6 +311,7 @@ impl RunRegistry {
             cancel: Some(tx),
             failure: None,
             settled: false,
+            done: watch::channel(false).0,
         });
         Ok((info, rx))
     }
@@ -336,6 +385,17 @@ impl RunRegistry {
             .collect()
     }
 
+    /// Resolves (`Ok` or `Err`) once run `id`'s worker is gone and all it
+    /// published is stored, or the registry forgot the run. `None` for an
+    /// unknown run.
+    pub fn done(&self, id: &str) -> Option<watch::Receiver<bool>> {
+        self.lock()
+            .entries
+            .iter()
+            .find(|e| e.info.id == id)
+            .map(|e| e.done.subscribe())
+    }
+
     pub fn get(&self, id: &str) -> Option<RunInfo> {
         self.lock()
             .entries
@@ -384,6 +444,9 @@ impl Drop for Registration {
     fn drop(&mut self) {
         // A no-op beyond settling when the worker already ended the run.
         self.runs.finish_with(&self.id, RunStatus::Failed, None);
+        if let Some(e) = self.runs.lock().find(&self.id) {
+            e.done.send_replace(true);
+        }
     }
 }
 

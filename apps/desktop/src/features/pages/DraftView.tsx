@@ -5,7 +5,7 @@ import type { Draft, Page, PageDiagnostic, PageValues } from "../../api/pages";
 import { isPageStatus, pageFailure, targetOf } from "../../api/pages";
 import { forgetPageDraft, goPages, pageDraftModel, pageDraftUnavailable, pageGuard, pagesProblem, rememberPageDraftModel, sameSpaceGrants, scopeVisible, spaceGrants } from "../../pagesState";
 import type { PagesRoute } from "../../pagesState";
-import { apiClient, openExactRoom, sessionGuard } from "../../store";
+import { apiClient, openChat, openExactRoom, sessionGuard } from "../../store";
 import { Action, ActionBar, Banner, Column, Label, modalOpen, PageHeader, PageLayout, Row, SegmentedControl } from "../../ui";
 import { PageCode, PageDiff } from "../../ui/pageBlocks";
 import { Diagnostics, DraftPrompt, PagesError, scopeAudience, showDraft, showPage } from "./controls";
@@ -149,7 +149,8 @@ export function DraftView(props: { route: DraftRoute }) {
 
   function back() {
     if (!valid() || busy()) return;
-    if (route.returnRoom && route.spaceId) {
+    if (route.returnChat) openChat();
+    else if (route.returnRoom && route.spaceId) {
       void openExactRoom(route.spaceId, route.returnRoom, valid).then(opened => {
         if (!opened && valid()) error.set("The room where this draft was proposed is no longer available. Use All pages to leave this review.");
       }, e => { if (valid()) error.set(pagesProblem(e)); });
@@ -211,7 +212,7 @@ export function DraftView(props: { route: DraftRoute }) {
       // if that fails it remains private and expires on the server.
       void client.discardPageDraft(review.id).catch(() => {});
       forgetPageDraft(review.id);
-      if (route.returnRoom) {
+      if (route.returnRoom || route.returnChat) {
         rememberPageDraftModel(next.id, choice);
         goPages({ ...route, id: next.id });
       } else showDraft(next, choice);
@@ -259,9 +260,9 @@ export function DraftView(props: { route: DraftRoute }) {
   return <PageLayout inset={6} gap={4} testID="page-draft-view" footer={readable() && draft() ? footer(draft()!) : undefined}>
     <Column gap={2}>
       <Row gap={2} wrap>
-        <Action compact testID="page-draft-back" label={route.returnRoom ? "‹ Back to room" : route.returnPage ? "‹ Back to page" : "‹ Back to pages"}
+        <Action compact testID="page-draft-back" label={route.returnChat ? "‹ Back to Chat" : route.returnRoom ? "‹ Back to room" : route.returnPage ? "‹ Back to page" : "‹ Back to pages"}
           variant="ghost" disabled={busy()} onPress={back} />
-        <If when={route.returnRoom || route.returnPage}><Action compact variant="ghost" label="All pages" onPress={() => goPages()} /></If>
+        <If when={route.returnChat || route.returnRoom || route.returnPage}><Action compact variant="ghost" label="All pages" onPress={() => goPages()} /></If>
       </Row>
       <PageHeader title={title()} eyebrow="Draft · not published" subtitle={readable() && draft()
         ? `After publishing: ${scopeAudience(route.spaceId)}` : undefined} focusTitle testID="page-draft-heading" />

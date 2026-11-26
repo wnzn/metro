@@ -1,19 +1,20 @@
 // The personal Chat (outside every Space) and the human's meta controls: the
 // agent runs in the user's Spaces, and sending a task to an explicitly chosen
-// Space and room. The Chat's own agent can't see Spaces; these controls are
-// the user's, and the server checks membership for each.
+// Space and room. These controls are the user's, and the server checks access
+// for each, including when Metro uses Spaces on the user's behalf.
 //
 // An empty Chat offers a few suggested drafts. Pressing one only fills an
 // empty message box: it never sends, and never replaces what the user typed.
 // The task form stays folded behind "New task" until the user opens it (or
 // presses Follow up), and it scrolls with the runs, so it never covers them.
 
-import { cleanup, effect, keymap, signal } from "nsh";
+import { announce, cleanup, effect, keymap, signal } from "nsh";
 import type { ViewRef } from "nsh";
 import {
   activeEvents,
   activeLoaded,
   chatUnavailable,
+  canRetryRun,
   dispatchDraft,
   dispatchError,
   dispatching,
@@ -27,7 +28,9 @@ import {
   openRun,
   place,
   roomsOf,
+  retryRun,
   runBusy,
+  runRetryBusy,
   runs,
   runScope,
   runsError,
@@ -44,15 +47,17 @@ import type { Run } from "../store";
 import { Action, ActionBar, Badge, Banner, Chip, Column, Field, Icon, IconButton, Label, Modal, modalOpen, PanelToggle, ResizeHandle, Row, runsPanel, ScrollArea, Spacer, Surface } from "../ui";
 import { EmptyState, sidePanelFits, SuggestionChip } from "../ui/activity";
 import { runStatusLabel, runTitle, runTone } from "./activity/runs";
-import { Composer, ConnectionBanner, Transcript } from "./Conversation";
+import { Composer, ConnectionBanner, focusComposer, Transcript } from "./Conversation";
 import { CreateSpaceForm } from "./CreateSpaceForm";
 import { ModelOnboarding, needsChatModel } from "./ModelOnboarding";
 import { roomTree } from "./Sidebar";
+import { ChatNotice } from "./meta/ChatNotice";
+import { chatStopBusy, chatStopError, runningChatTurn, stopChatReply } from "./meta/state";
 
 /** The task form is open (folded behind "New task" otherwise). */
 const dispatchOpen = signal(false);
 
-/** Drafts the empty Chat suggests. The personal agent has no tools, so none asks for any. */
+/** Drafts the empty Chat suggests without relying on any tool being available. */
 export const CHAT_SUGGESTIONS: readonly { label: string; draft: string }[] = [
   { label: "Plan my day", draft: "Help me plan my day. Here's what I need to get done: " },
   { label: "Draft a status update", draft: "Help me write a short status update about: " },
@@ -75,7 +80,7 @@ export function ChatView() {
               Chat
             </Label>
             <Label variant="caption" color="muted" lines={2}>
-              Only you see this chat, and its agent can't see your Spaces.
+              Only you can open this chat in Metro.
             </Label>
           </Column>
           <PanelToggle side="right" name="agent runs" testID="runs-toggle"
@@ -101,7 +106,16 @@ export function ChatView() {
             </Column>
           )}
         </If>
-        <Composer placeholder="Message your Chat" agentHint="No runner, workspace or thread tools here." disabled={!!chatUnavailable()} />
+        <ChatNotice />
+        <If when={runningChatTurn() && chatStopError()}><Banner tone="danger" message={chatStopError()} /></If>
+        <Composer placeholder="Message your Chat" agentHint="No runner or workspace tools here." disabled={!!chatUnavailable()}
+          stopReply={runningChatTurn() ? <Action testID="chat-stop" compact variant="destructive" label="Stop"
+            accessibilityLabel="Stop Metro's reply" busy={!!chatStopBusy()} busyLabel="Stopping…" onPress={() => {
+              const id = runningChatTurn();
+              if (!id) return;
+              focusComposer();
+              void stopChatReply(id);
+            }} /> : undefined} />
       </Surface>
       {/* Wide windows keep the runs beside the Chat; narrower ones open them
           in a dialog, so the Chat (and its draft) keeps its full width. */}
@@ -166,6 +180,7 @@ function Onboarding() {
 
 /** The runs list and task form: in the side panel, or in the dialog (with `onClose`). */
 function RunsPanel(props: { visible: boolean; onClose?: () => void }) {
+  const retried = signal(false);
   type Move = NonNullable<ReturnType<typeof followUp>>;
   const choice = signal<{ run: Run; decision: Move; opener?: ViewRef } | null>(null);
   const resolving = signal<Move | null>(null);
@@ -246,8 +261,16 @@ function RunsPanel(props: { visible: boolean; onClose?: () => void }) {
             </Label>
           )}
         </If>
+        <If when={retried()}><Label variant="caption" color="muted">Retried as a new run</Label></If>
         <Each of={runs()} key={(run) => run.id}>
-          {(run) => <RunCard run={run} onFollow={(next, opener) => void follow(next, opener)} onLeave={props.onClose} />}
+          {(run) => <RunCard run={run} onFollow={(next, opener) => void follow(next, opener)} onLeave={props.onClose}
+            onRetry={async next => {
+              retried.set(false);
+              if (await retryRun(next)) {
+                retried.set(true);
+                announce("Retried as a new run");
+              }
+            }} />}
         </Each>
         <If when={runsLoaded() && runs().length === 0 && !runsError()}>
           <RunsEmpty />
@@ -337,7 +360,7 @@ function runDestination(run: Run) {
   return space && room ? `${space} › #${room}` : undefined;
 }
 
-function RunCard(props: { run: () => Run; onFollow: (run: Run, opener?: ViewRef) => void; /** Opening the run leaves the Chat: close the dialog first. */ onLeave?: () => void }) {
+function RunCard(props: { run: () => Run; onFollow: (run: Run, opener?: ViewRef) => void; onRetry: (run: Run) => void; /** Opening the run leaves the Chat: close the dialog first. */ onLeave?: () => void }) {
   const run = () => props.run();
   const scope = () => runScope(run());
   const destination = () => runDestination(run());
@@ -390,6 +413,12 @@ function RunCard(props: { run: () => Run; onFollow: (run: Run, opener?: ViewRef)
             accessibilityLabel="Stop this run"
             onPress={() => void stopRun(run())}
           />
+        </If>
+        <If when={canRetryRun(run())}>
+          <Action compact testID={`run-retry:${run().id}`} label="Retry" accessibilityLabel="Retry this run"
+            busyLabel="Retrying…" busy={runRetryBusy() === run().id}
+            disabled={!!runRetryBusy() && runRetryBusy() !== run().id}
+            onPress={() => props.onRetry(run())} />
         </If>
       </Row>
     </Surface>

@@ -11,13 +11,19 @@ pub mod agent_dispatch;
 pub mod api;
 pub mod attachments;
 pub mod auth;
+pub mod compaction;
 pub mod config;
 pub mod db;
 pub mod device_relay;
+mod directory;
+mod dms;
+mod forward;
 pub mod jobs;
 pub mod library;
 pub mod library_search;
 pub mod mentions;
+pub mod messages;
+pub mod meta;
 pub mod model_routing;
 pub mod monitoring;
 pub mod orchestration;
@@ -25,11 +31,14 @@ pub mod pages;
 pub mod profiles;
 pub mod providers;
 pub mod quick_search;
+pub mod replies;
+pub mod run_retry;
 pub mod runner_pairing;
 pub mod runners;
 pub mod schedules;
 pub mod search;
 pub mod space_agents;
+mod space_context;
 pub mod space_prefs;
 pub mod spaces;
 pub mod tools;
@@ -78,10 +87,18 @@ pub struct AppState {
     pub managed: crate::admin_users::Managed,
     /// Avatar re-encodes running at once (see [`crate::profiles`]).
     pub avatar_encodes: Arc<Semaphore>,
+    directory_limit: directory::RateLimit,
     /// Release check, runner presence and runner update requests (memory only).
     pub updates: crate::updates::Updates,
     /// Page builder model turns at once, apart from agent runs.
     pub page_builds: Arc<Semaphore>,
+    /// Running personal Chat turns, so their owner can stop them.
+    pub chat_runs: Arc<crate::meta::ChatTurns>,
+    /// Chat turns waiting on a delegated Space run at once (half the agent
+    /// slots), so waiting turns can't starve the runs they wait for.
+    pub meta_waits: Arc<Semaphore>,
+    /// Compaction locks, the auto rate limit and failure notes (memory only).
+    pub compaction: Arc<crate::compaction::Compaction>,
 }
 
 impl AppState {
@@ -123,7 +140,11 @@ impl AppState {
                 }
             },
             avatar_encodes: Arc::new(Semaphore::new(crate::profiles::MAX_AVATAR_ENCODES)),
+            directory_limit: directory::RateLimit::default(),
             page_builds: Arc::new(Semaphore::new(crate::pages::generate::MAX_PAGE_BUILDS)),
+            chat_runs: Arc::default(),
+            compaction: Arc::default(),
+            meta_waits: Arc::new(Semaphore::new((limits.max_agent_runs / 2).max(1))),
             managed,
             library,
             providers,
@@ -241,11 +262,16 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/spaces/{sid}/rooms/{rid}/demo", post(api::demo))
         .route(
+            "/v1/spaces/{sid}/rooms/{rid}/events/{eid}/thread",
+            post(api::reply_thread),
+        )
+        .route(
             "/v1/spaces/{sid}/rooms/{rid}/events/{eid}/reactions",
             put(api::put_space_reaction).delete(api::delete_space_reaction),
         )
         .route("/v1/chat/events", get(api::chat_events))
         .route("/v1/chat/messages", post(api::chat_message))
+        .route("/v1/forward", post(forward::post))
         .route(
             "/v1/chat/events/{eid}/reactions",
             put(api::put_chat_reaction).delete(api::delete_chat_reaction),
@@ -253,6 +279,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runs", get(api::list_runs))
         .route("/v1/runs/{id}", get(api::get_run))
         .route("/v1/runs/{id}/stop", post(api::stop_run))
+        .route("/v1/runs/{id}/retry", post(run_retry::retry_run))
         .route(
             "/v1/runners",
             get(runners::list_runners).post(runners::create_runner),
@@ -308,6 +335,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::admin_settings::router())
         // Personal profiles and avatars; the avatar upload sets its own limit.
         .merge(crate::profiles::router())
+        .merge(directory::router().merge(dms::router()))
         // `GET /v1/monitoring/events`: Space owners and org admins.
         .merge(crate::monitoring::router())
         // Space edit/delete/leave, Space agents and per-Space preferences.
@@ -318,6 +346,10 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::updates::router())
         // Pages; routes that carry page source set their own limit.
         .merge(crate::pages::router())
+        // Metro in Chat: Spaces access and stopping a Chat turn.
+        .merge(crate::meta::router())
+        // Conversation compaction: the auto setting and `/compact`.
+        .merge(crate::compaction::router())
         .layer(DefaultBodyLimit::max(HUMAN_BODY_LIMIT));
     // Room for the largest result plus JSON escaping.
     let runner_limit = state.config.limits.max_result_bytes * 2 + 1024;
