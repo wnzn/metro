@@ -1,5 +1,6 @@
 import { announce, batch, computed, effect, lifecycle, signal, untracked } from "nsh";
 import type { DirectMessage } from "../../api/dms";
+import { parseDeletion } from "../../api/client";
 import {
   ApiError, apiClient, isAborted, mainPlace, me, onSessionEnd, onTransientClear, openPlace,
   readHostedAccess, registerDmPoll, requestDmPoll, settingsOpen, startupReadGuard,
@@ -14,6 +15,8 @@ export const dmSending = signal(false);
 export const dmStarting = signal(false);
 export const dmHiding = signal<string | null>(null);
 export const dmReactionPending = signal<string | null>(null);
+/** The DM message being deleted. */
+export const dmDeleting = signal<number | null>(null);
 export const dmDraft = signal("");
 export const dmReply = signal<RoomEvent | null>(null);
 export const dmEvents = signal<readonly RoomEvent[]>([]);
@@ -194,6 +197,14 @@ function adoptPage(page: { events: RoomEvent[]; reactions: Reactions }) {
   const rows = new Map(dmEvents().map(e => [e.id, e]));
   const reactions = { ...dmReactions() };
   for (const event of page.events) {
+    const gone = parseDeletion(event);
+    if (gone) {
+      // A deletion, in cursor order: the message and its reactions go.
+      rows.delete(gone.targetEventId);
+      delete reactions[gone.targetEventId];
+      if (dmReply()?.id === gone.targetEventId) dmReply.set(null);
+      continue;
+    }
     if (!rows.has(event.id)) rows.set(event.id, event);
     if (page.reactions[event.id]) reactions[event.id] = page.reactions[event.id]!;
     else delete reactions[event.id];
@@ -202,7 +213,8 @@ function adoptPage(page: { events: RoomEvent[]; reactions: Reactions }) {
   const oldest = events[0]?.id ?? 0;
   for (const id of Object.keys(reactions)) if (Number(id) < oldest) delete reactions[Number(id)];
   batch(() => {
-    if (events.length !== dmEvents().length || events.at(-1)?.id !== dmEvents().at(-1)?.id) dmEvents.set(events);
+    const before = dmEvents();
+    if (events.length !== before.length || events.some((e, i) => e !== before[i])) dmEvents.set(events);
     dmReactions.set(reactions);
     dmLoaded.set(true);
   });
@@ -219,7 +231,7 @@ async function pollActive(api: NonNullable<ReturnType<typeof apiClient>>) {
     // API supplies reactions only for the messages in each returned page.
     const head = await page(0);
     if (!current()) return;
-    const first = head.events[0]?.id ?? 0;
+    const first = head.events.find(e => e.kind === "message")?.id ?? 0;
     if (firstId && first !== firstId) {
       clearTranscript();
       dmProblem.set("");
@@ -243,10 +255,12 @@ async function pollActive(api: NonNullable<ReturnType<typeof apiClient>>) {
         reactionOffset += Math.max(1, refresh.events.length);
       }
     }
-    if (tail > readThrough && lifecycle() === "active" && !settingsOpen()) {
-      await readHostedAccess(api, () => api.readDm(id, tail));
+    // Read receipts name a message; a deletion's id is only a cursor.
+    const lastMessage = dmEvents().at(-1)?.id ?? 0;
+    if (lastMessage > readThrough && lifecycle() === "active" && !settingsOpen()) {
+      await readHostedAccess(api, () => api.readDm(id, lastMessage));
       if (!current()) return;
-      readThrough = tail;
+      readThrough = lastMessage;
       dms.set(dms().map(dm => dm.id === id && dm.lastId <= readThrough ? { ...dm, unread: 0 } : dm));
     }
   } catch (error) {
@@ -302,6 +316,32 @@ export async function sendDm() {
     }
   } finally {
     if (current()) dmSending.set(false);
+  }
+}
+
+/** Deletes the signed-in person's own DM message (after they confirmed). */
+export async function deleteDmMessage(event: RoomEvent): Promise<boolean> {
+  const api = apiClient(), v = visit(), myId = me();
+  if (!api || !v || !myId || event.kind !== "message" || event.actorId !== myId || dmDeleting() !== null || dmHiding() === v.dm.id) return false;
+  const current = () => apiClient() === api && visit() === v;
+  dmDeleting.set(event.id);
+  dmProblem.set("");
+  try {
+    const markers = await readHostedAccess(api, () => api.deleteDm(v.dm.id, event.id));
+    if (!current()) return false;
+    adoptPage({ events: markers, reactions: {} });
+    announce("Message deleted");
+    requestDmPoll();
+    refreshDmListIfCurrent(api);
+    return true;
+  } catch {
+    if (current()) {
+      dmProblem.set("Couldn't delete the message. Try again.");
+      requestDmPoll();
+    }
+    return false;
+  } finally {
+    if (apiClient() === api) dmDeleting.set(null);
   }
 }
 

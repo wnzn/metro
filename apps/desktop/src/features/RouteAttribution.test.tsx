@@ -39,7 +39,7 @@ function turn(f: F, id: string, route: unknown, withTool: boolean) {
 
 const text = (app: App) => app.texts().join(" | ");
 
-test("a classifier-started, use-case-routed turn: detected label, one row with a badge, the reason only when opened", async () => {
+test("a classifier-started, use-case-routed turn: the agent shown plainly, one row with a badge, the reason only when opened", async () => {
   const f = world();
   const ask = post(f, {
     kind: "message",
@@ -61,10 +61,10 @@ test("a classifier-started, use-case-routed turn: detected label, one row with a
   const app = await inAcme(f);
   await app.waitFor("text:reply for r1");
 
-  // Not an "@agent" the sender typed.
-  expect(app.shows(`id:recipient:${ask.id}:agent >> text:agent · detected by System One`)).toBe(true);
-  expect(app.shows(`id:event:${ask.id} >> text:@agent`)).toBe(false);
-  expect(app.shows(`id:event:${ask.id} >> text:to the agent`)).toBe(false); // the detected pill already says it
+  // The agent the classifier picked, shown like any agent recipient, with no "detected" label.
+  expect(app.shows(`id:recipient:${ask.id}:agent`)).toBe(true);
+  expect(app.shows("text:agent · detected by System One")).toBe(false);
+  expect(app.shows(`id:event:${ask.id} >> text:to the agent`)).toBe(false); // the recipient pill already says it
 
   // One collapsed row with a compact badge; no sentence, model or connection id in the transcript.
   expect(app.count("id:activity:agent:r1")).toBe(1);

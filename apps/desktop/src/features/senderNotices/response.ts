@@ -188,7 +188,11 @@ export function readPostedNotes(data: unknown, sent: SendIntent): PostedSenderNo
     if (addressing?.kind === "classification_failed" &&
       (!unaddressed || !text || routing || !explicitMatch)) return null;
     if (addressing?.kind === "generic_agent_unavailable" && (!generic || (routing && !named))) return null;
-    const classified = unaddressed && !!text && echoed.length === 1 && echoed[0]?.[0] === "agent" && echoed[0][2] === "classifier";
+    // A decision made after the message was stored never edits its
+    // recipients; its POST says whether the classifier picked an agent.
+    const classified = unaddressed && !!text && (
+      (echoed.length === 1 && echoed[0]?.[0] === "agent" && echoed[0][2] === "classifier") ||
+      (echoed.length === 0 && data.classified === true));
     if (!explicitMatch && !replied && !(routing && !addressing && classified)) return null;
     if (routing && !generic && !named && !classified) return null;
   } else if (!explicitMatch) return null;

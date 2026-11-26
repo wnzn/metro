@@ -45,7 +45,16 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
              user_id TEXT NOT NULL, emoji TEXT NOT NULL,
              PRIMARY KEY (event_id, user_id, emoji)
          );
-         CREATE INDEX IF NOT EXISTS dm_reactions_dm ON dm_reactions (dm_id);",
+         CREATE INDEX IF NOT EXISTS dm_reactions_dm ON dm_reactions (dm_id);
+         -- A deleted DM message. `id` comes from dm_events' own sequence, so
+         -- the deletion arrives through the same `after` cursor.
+         CREATE TABLE IF NOT EXISTS dm_deletions (
+             id INTEGER PRIMARY KEY NOT NULL,
+             dm_id TEXT NOT NULL REFERENCES dms (id) ON DELETE CASCADE,
+             event_id INTEGER NOT NULL,
+             actor TEXT NOT NULL, actor_id TEXT NOT NULL, created_at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS dm_deletions_dm ON dm_deletions (dm_id, id);",
     )
 }
 
@@ -308,7 +317,8 @@ pub(crate) fn append_message(
 
 fn hide(tx: &Transaction<'_>, id: &str, user: &str) -> rusqlite::Result<()> {
     let last: i64 = tx.query_row(
-        "SELECT coalesce(max(id), 0) FROM dm_events WHERE dm_id = ?1",
+        "SELECT max(coalesce((SELECT max(id) FROM dm_events WHERE dm_id = ?1), 0),
+                    coalesce((SELECT max(id) FROM dm_deletions WHERE dm_id = ?1), 0))",
         [id],
         |row| row.get(0),
     )?;
@@ -366,6 +376,10 @@ async fn create(
 #[derive(Deserialize)]
 struct After {
     after: Option<i64>,
+    /// `1`: include `message_deleted` events. Older clients accept only
+    /// messages here, so deletions are sent only to clients that ask.
+    #[serde(default)]
+    deletions: Option<u8>,
 }
 
 #[derive(Serialize)]
@@ -388,12 +402,20 @@ async fn events(
         if after < 0 {
             return Err(ApiError::bad_request("after must be a non-negative integer").into());
         }
+        // Deletions share the cursor: `message_deleted` events, as in rooms.
         let mut stmt = tx.prepare_cached(
             "SELECT id, kind, actor, actor_id, text, '[]', 'room', activity, created_at FROM dm_events
-             WHERE dm_id = ?1 AND id > ?2 ORDER BY id LIMIT ?3",
+             WHERE dm_id = ?1 AND id > ?2
+             UNION ALL
+             SELECT id, 'message_deleted', actor, actor_id,
+                    json_object('target_event_id', event_id, 'tombstone', json('false')),
+                    '[]', 'room', NULL, created_at FROM dm_deletions
+             WHERE dm_id = ?1 AND id > ?2 AND ?4
+             ORDER BY id LIMIT ?3",
         )?;
+        let deletions = query.deletions == Some(1);
         let events = stmt
-            .query_map(params![id, after.max(floor), page], event_row)?
+            .query_map(params![id, after.max(floor), page, deletions], event_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let start = events.first().map(|e| e.id);
         let end = events.last().map(|e| e.id);
@@ -553,11 +575,75 @@ async fn delete_reaction(
     react(state, who, path, body, false).await
 }
 
+/// `DELETE /v1/dms/{id}/events/{eid}`: a participant deletes their own
+/// message (see [`crate::deletion`]). 404 for a DM or message the caller
+/// can't see, 403 for the other person's message.
+async fn delete_message(
+    State(state): State<AppState>,
+    who: Human,
+    Path((id, eid)): Path<(String, i64)>,
+) -> ApiResult<Json<Value>> {
+    transact(&state, TransactionBehavior::Immediate, move |tx| {
+        hidden_before(tx, &id, &who.id)?;
+        let Some(event) = visible_event(tx, &id, &who.id, eid)? else {
+            return Err(no_message().into());
+        };
+        if event.actor_id.as_deref() != Some(who.id.as_str()) {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "you can delete only your own messages here",
+            )
+            .into());
+        }
+        tx.execute(
+            "DELETE FROM dm_reactions WHERE dm_id = ?1 AND event_id = ?2",
+            params![id, eid],
+        )?;
+        tx.execute(
+            "DELETE FROM dm_events WHERE dm_id = ?1 AND id = ?2",
+            params![id, eid],
+        )?;
+        // The row just deleted was inserted under AUTOINCREMENT, so the
+        // sequence row exists; taking the next id keeps the cursor order.
+        let marker: i64 = tx.query_row(
+            "UPDATE sqlite_sequence SET seq = seq + 1 WHERE name = 'dm_events' RETURNING seq",
+            [],
+            |row| row.get(0),
+        )?;
+        let at = now_ms();
+        tx.execute(
+            "INSERT INTO dm_deletions (id, dm_id, event_id, actor, actor_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![marker, id, eid, who.name, who.id, at],
+        )?;
+        let payload = crate::deletion::DeletionPayload {
+            target_event_id: eid,
+            tombstone: false,
+        };
+        let mut event = crate::db::new_event(
+            marker,
+            kind::MESSAGE_DELETED,
+            &crate::db::Author {
+                id: Some(who.id.clone()),
+                name: who.name.clone(),
+            },
+            &serde_json::to_string(&payload)?,
+            &crate::db::Addressed::room(),
+            None,
+            at,
+        );
+        event.spans = Some(Vec::new());
+        Ok(Json(json!({"deleted": true, "events": [event]})))
+    })
+    .await
+}
+
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/v1/dms", get(list).post(create))
         .route("/v1/dms/{id}", delete(hide_for_me))
         .route("/v1/dms/{id}/events", get(events))
+        .route("/v1/dms/{id}/events/{eid}", delete(delete_message))
         .route("/v1/dms/{id}/messages", axum::routing::post(post))
         .route("/v1/dms/{id}/read", put(read))
         .route(

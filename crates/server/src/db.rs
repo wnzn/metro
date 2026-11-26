@@ -491,6 +491,13 @@ pub mod kind {
     /// to later runs as untrusted background, never as an ordinary turn.
     /// Never indexed, never searched.
     pub const COMPACTION: &str = "compaction";
+    /// A message or agent reply was deleted ([`crate::deletion`]). Its text
+    /// is a [`crate::deletion::DeletionPayload`] in JSON; clients replay it
+    /// like a `reaction` event. Never model history, never indexed.
+    pub const MESSAGE_DELETED: &str = "message_deleted";
+    /// What remains of a deleted message that anchors a reply thread with
+    /// replies: no text, recipients or metadata. Never model history.
+    pub const DELETED: &str = "deleted";
 }
 
 /// Actors the server writes for non-human events.

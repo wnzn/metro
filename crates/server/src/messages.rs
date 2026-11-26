@@ -50,6 +50,11 @@ pub struct Outgoing {
     pub reply_to_agent: bool,
     /// `Some(Via::Metro)` when the person's Chat posts for them.
     pub via: Option<Via>,
+    /// Store the message first and make any System One decision (opt-in
+    /// classification, the generic agent's pick, use-case routing) and the
+    /// runs it starts afterwards, in the background. The sender collects
+    /// the sender-only notes with [`crate::decisions`].
+    pub defer_decisions: bool,
 }
 
 impl Outgoing {
@@ -68,6 +73,7 @@ impl Outgoing {
             reply_to: None,
             reply_to_agent: true,
             via: None,
+            defer_decisions: false,
         }
     }
 }
@@ -97,6 +103,10 @@ pub struct Posted {
     pub routing_note: Option<AddressingNote>,
     /// The agent runs the message started.
     pub runs: Vec<RunInfo>,
+    /// The decisions and runs were deferred ([`Outgoing::defer_decisions`]):
+    /// the notes and runs above are empty, and the sender collects the notes
+    /// from `POST .../messages/{eid}/decisions`.
+    pub decisions_pending: bool,
 }
 
 /// Post `msg` as `who` in room or thread `rid` of Space `sid` and start
@@ -211,23 +221,32 @@ pub async fn post_room_message(
                 .map_err(ApiError::internal)?,
         )
     };
-    let plan = crate::agent_dispatch::plan(
-        state,
-        &who.id,
-        &space.id,
-        &room.id,
-        &text,
-        &resolved,
-        addressing,
-        &settings,
-        &prefs,
-        &agents,
-        reply_agent.as_ref(),
-    )
-    .await;
+    let deferred = msg.defer_decisions
+        && needs_system_one(
+            addressing, &text, &resolved, &settings, &prefs, &agents, &chosen,
+        );
+    let plan = if deferred {
+        crate::agent_dispatch::Plan::default()
+    } else {
+        crate::agent_dispatch::plan(
+            state,
+            &who.id,
+            &space.id,
+            &room.id,
+            &text,
+            &resolved,
+            addressing,
+            &settings,
+            &prefs,
+            &agents,
+            reply_agent.as_ref(),
+        )
+        .await
+    };
     // Only an unaddressed message can acquire a recipient here. Explicit
     // spans keep their canonical indices even if @agent's target is picked
     // by the classifier (that choice is run activity, not an edit to To:).
+    // A deferred decision never edits the stored message.
     let mut addressed = plan
         .classified
         .clone()
@@ -245,11 +264,11 @@ pub async fn post_room_message(
         via: msg.via,
         ..MessageMeta::default()
     };
-    let (writer, ids) = (author.clone(), msg.asset_ids);
+    let (writer, ids, stored_text) = (author.clone(), msg.asset_ids, text.clone());
     // Include targets derived from classification, @agent or a reply as
     // well as stored explicit recipients. A refusal reveals no classifier
     // result.
-    let mut recipients = resolved;
+    let mut recipients = resolved.clone();
     recipients.extend(plan.targets.iter().map(|target| Mention::AgentId {
         agent_id: target.agent.id.clone(),
     }));
@@ -258,7 +277,7 @@ pub async fn post_room_message(
             db,
             &place,
             &writer,
-            &text,
+            &stored_text,
             &addressed,
             &ids,
             &recipients,
@@ -277,10 +296,105 @@ pub async fn post_room_message(
             ));
         }
     };
+    if deferred {
+        let decided = crate::decisions::Key::new(&who.id, &space.id, &room.id, event.id);
+        let done = state.decisions.register(decided, event.clone());
+        let job = Deferred {
+            state: state.clone(),
+            user: who.id.clone(),
+            space: space.id.clone(),
+            room,
+            author,
+            event: event.clone(),
+            text,
+            resolved,
+            addressing,
+            settings,
+            prefs,
+            reply_agent,
+            chosen,
+        };
+        tokio::spawn(async move {
+            let outcome = job.run().await;
+            // Nobody may be waiting; the registry keeps it briefly.
+            let _ = done.send(Some(outcome.into()));
+        });
+        return Ok(Posted {
+            event,
+            addressing_note: reply_note,
+            routing_note: None,
+            runs: Vec::new(),
+            decisions_pending: true,
+        });
+    }
+    let started = finish(
+        state, &space.id, &room, &author, &event, plan, chosen, &settings, &prefs,
+    )
+    .await;
+    Ok(Posted {
+        event,
+        addressing_note: reply_note.or(started.addressing_note),
+        routing_note: started.routing_note,
+        runs: started.runs,
+        decisions_pending: false,
+    })
+}
+
+/// Whether a message would wait on a System One call before its runs
+/// start: opt-in classification of unaddressed text, the classifier's pick
+/// for the generic `@agent`, or use-case routing. People-only messages never.
+fn needs_system_one(
+    addressing: Addressing,
+    text: &str,
+    resolved: &[Mention],
+    settings: &RoutingSettings,
+    prefs: &crate::space_prefs::SpacePrefs,
+    agents: &[SpaceAgent],
+    chosen: &Option<crate::model_routing::Route>,
+) -> bool {
+    match addressing {
+        Addressing::PeopleOnly => false,
+        Addressing::Unaddressed => !text.is_empty() && prefs.classify_unaddressed,
+        Addressing::Agent => {
+            let picks = resolved.contains(&Mention::Agent)
+                && prefs.classify_unaddressed
+                && settings.classifier_id.is_some()
+                && agents.len() >= 2;
+            let routes = chosen.is_none()
+                && settings.enabled
+                && prefs.routing
+                && prefs.default_model.is_none();
+            picks || routes
+        }
+    }
+}
+
+/// The sender-only outcome of a message's decisions and runs.
+pub(crate) struct Finished {
+    pub addressing_note: Option<SenderNote>,
+    pub routing_note: Option<AddressingNote>,
+    pub runs: Vec<RunInfo>,
+    /// The classifier picked an agent for an unaddressed message.
+    pub classified: bool,
+}
+
+/// Post the plan's room errors, then start its runs answering `event`.
+#[allow(clippy::too_many_arguments)]
+async fn finish(
+    state: &AppState,
+    space: &str,
+    room: &crate::db::Room,
+    author: &Author,
+    event: &Event,
+    plan: crate::agent_dispatch::Plan,
+    chosen: Option<crate::model_routing::Route>,
+    settings: &RoutingSettings,
+    prefs: &crate::space_prefs::SpacePrefs,
+) -> Finished {
     for reason in &plan.errors {
         state
             .append(
-                &space.id,
+                space,
                 &room.id,
                 kind::ERROR,
                 &Author::server(actor::SYSTEM),
@@ -288,25 +402,108 @@ pub async fn post_room_message(
             )
             .await;
     }
+    let classified = plan.classified.is_some()
+        || plan
+            .targets
+            .iter()
+            .any(|t| t.addressed_by == crate::model_routing::AddressedBy::Classifier);
     // Mentioning only people never starts agent work.
     let started = crate::agent_dispatch::start_runs(
         state,
-        &space.id,
-        &room,
-        &author,
-        &event,
+        space,
+        room,
+        author,
+        event,
         plan.targets,
         chosen,
-        &settings,
-        &prefs,
+        settings,
+        prefs,
     )
     .await;
-    Ok(Posted {
-        event,
-        addressing_note: reply_note.or(plan.addressing_note.map(SenderNote::Addressing)),
+    Finished {
+        addressing_note: plan.addressing_note.map(SenderNote::Addressing),
         routing_note: started.note,
         runs: started.runs,
-    })
+        classified,
+    }
+}
+
+/// A message's decisions, made after it was stored.
+struct Deferred {
+    state: AppState,
+    user: String,
+    space: String,
+    room: crate::db::Room,
+    author: Author,
+    event: Event,
+    text: String,
+    resolved: Vec<Mention>,
+    addressing: Addressing,
+    settings: RoutingSettings,
+    prefs: crate::space_prefs::SpacePrefs,
+    reply_agent: Option<SpaceAgent>,
+    chosen: Option<crate::model_routing::Route>,
+}
+
+impl Deferred {
+    async fn run(self) -> Finished {
+        let nothing = || Finished {
+            addressing_note: None,
+            routing_note: None,
+            runs: Vec::new(),
+            classified: false,
+        };
+        // The Space's agents as they are now: one deleted since the post is
+        // never picked or started. A message deleted meanwhile starts nothing.
+        let (space, room, eid) = (self.space.clone(), self.room.id.clone(), self.event.id);
+        let agents = match self
+            .state
+            .db
+            .call(move |db| {
+                let present = crate::replies::event_in(&db.lock(), &space, &room, eid)?
+                    .is_some_and(|e| e.kind == kind::MESSAGE);
+                present.then(|| db.space_agents(&space)).transpose()
+            })
+            .await
+        {
+            Ok(Some(agents)) => agents,
+            Ok(None) => return nothing(),
+            Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), "loading agents for a deferred decision");
+                return nothing();
+            }
+        };
+        let reply_agent = self
+            .reply_agent
+            .as_ref()
+            .and_then(|r| agents.iter().find(|a| a.id == r.id).cloned());
+        let plan = crate::agent_dispatch::plan(
+            &self.state,
+            &self.user,
+            &self.space,
+            &self.room.id,
+            &self.text,
+            &self.resolved,
+            self.addressing,
+            &self.settings,
+            &self.prefs,
+            &agents,
+            reply_agent.as_ref(),
+        )
+        .await;
+        finish(
+            &self.state,
+            &self.space,
+            &self.room,
+            &self.author,
+            &self.event,
+            plan,
+            self.chosen,
+            &self.settings,
+            &self.prefs,
+        )
+        .await
+    }
 }
 
 /// The stored recipients: `resolved`, then the replied agent unless it was

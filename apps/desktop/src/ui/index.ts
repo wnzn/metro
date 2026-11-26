@@ -12,6 +12,7 @@ export * from "./chrome";
 export * from "./media";
 export * from "./chat";
 export * from "./agentAvatar";
+export * from "./messageDelete";
 export type { Space, Tone } from "./tokens";
 export * from "./settings";
 export { ConnectionItem, MoreMenu, ProblemNote } from "./providers";

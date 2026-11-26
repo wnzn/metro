@@ -638,6 +638,10 @@ pub struct PostMessage {
     /// `false`: replying to an agent's message doesn't ask that agent.
     #[serde(default = "default_true")]
     reply_to_agent: bool,
+    /// Store the message first; make any System One decision afterwards
+    /// (see [`crate::decisions`]).
+    #[serde(default)]
+    defer_decisions: bool,
 }
 
 fn default_true() -> bool {
@@ -716,6 +720,10 @@ pub struct PostedMessage {
     addressing_note: Option<crate::messages::SenderNote>,
     /// Sender-only: why their use-case routing could not choose a model.
     routing_note: Option<AddressingNote>,
+    /// The System One decisions for this message come afterwards; collect
+    /// their notes from `POST .../messages/{eid}/decisions`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    decisions_pending: bool,
 }
 
 pub async fn post_message(
@@ -742,6 +750,7 @@ pub async fn post_message(
             asset_ids: body.asset_ids,
             reply_to: body.reply_to,
             reply_to_agent: body.reply_to_agent,
+            defer_decisions: body.defer_decisions,
             ..crate::messages::Outgoing::new(body.text)
         },
     )
@@ -752,6 +761,7 @@ pub async fn post_message(
             event: posted.event,
             addressing_note: posted.addressing_note,
             routing_note: posted.routing_note,
+            decisions_pending: posted.decisions_pending,
         }),
     ))
 }
@@ -1054,27 +1064,30 @@ pub async fn chat_message(
     };
     // With a choice: only that connection. Otherwise routing, if the sender
     // turned it on, or their default; a connection that cannot be used fails
-    // the reply. Notes have neither a choice nor routing settings.
-    let route = if let Some(settings) = settings {
-        Some(
-            routing::route_turn(
-                &state,
-                &who.id,
-                None,
-                &settings,
-                &text,
-                AddressedBy::Explicit,
-                None,
-            )
-            .await,
-        )
-    } else {
-        chosen
-    };
-    if let Some(route) = route {
+    // the reply. Notes have neither a choice nor routing settings. Routing
+    // (a System One call) runs after the response: the message is already
+    // stored and shown, and a turn that cannot start says why in the Chat.
+    if settings.is_some() || chosen.is_some() {
         let event = event.clone();
         tokio::spawn(async move {
-            // A turn that cannot start says why in the Chat.
+            let route = match settings {
+                Some(settings) => {
+                    routing::route_turn(
+                        &state,
+                        &who.id,
+                        None,
+                        &settings,
+                        &event.text,
+                        AddressedBy::Explicit,
+                        None,
+                    )
+                    .await
+                }
+                None => match chosen {
+                    Some(route) => route,
+                    None => return,
+                },
+            };
             let _ = start_personal_run(&state, &who.id, &event, route).await;
         });
     }
@@ -1084,6 +1097,7 @@ pub async fn chat_message(
             event,
             addressing_note: None,
             routing_note: None,
+            decisions_pending: false,
         }),
     ))
 }

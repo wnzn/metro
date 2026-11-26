@@ -200,7 +200,7 @@ test("both notices can coexist; generic failure does not claim named agents did 
   const id = w.sent.get(text)!.id;
   await app.waitFor(`id:event:${id} >> ${note(id)}`);
   expect(w.messages()[0]!.body).toEqual({
-    text, invoke_agent: false, infer_text_mentions: false,
+    text, invoke_agent: false, infer_text_mentions: false, defer_decisions: true,
     mentions: [{ kind: "agent" }, { kind: "agent", agent_id: coder.id }],
     spans: [{ start: 7, end: 13, index: 0 }, { start: 14, end: 20, index: 1 }],
   });
@@ -780,7 +780,7 @@ test("a held positive Follow up cannot resurrect a thread after a newer authorit
   expect(posts()).toHaveLength(4);
   const posted = posts()[3]!;
   expect(new URL(posted.url).pathname).toBe(path);
-  expect(JSON.parse(posted.body!)).toEqual({ text, invoke_agent: true, infer_text_mentions: false });
+  expect(JSON.parse(posted.body!)).toEqual({ text, invoke_agent: true, infer_text_mentions: false, defer_decisions: true });
   await app.press("id:space:side");
   await app.press("id:room:lobby");
   await app.waitFor(note(lobby));
@@ -1182,4 +1182,55 @@ test("oldest uncorroborated receipts are evicted across rooms without starving a
   await app.waitFor(`id:event:${oldest}`);
   await app.waitFor(note(retained));
   expect(app.shows(note(oldest))).toBe(false);
+});
+
+test("a deferred decision: the message shows and the composer frees at once; the private note follows from its decisions POST", async () => {
+  const w = fixture();
+  const text = "decide after posting";
+  w.reply(text, { decisions_pending: true, addressing_note: null, routing_note: null });
+  const decisions: string[] = [];
+  const base = w.network[post]!;
+  w.network[post] = req => {
+    const path = new URL(req.url).pathname;
+    if (/\/rooms\/lobby\/messages\/\d+\/decisions$/.test(path)) {
+      decisions.push(path);
+      const ev = w.sent.get(text)!;
+      return { status: 200, delay: 2_000, body: { ...ev, addressing_note: pickup, routing_note: null, classified: false } };
+    }
+    return base(req);
+  };
+  const app = await launch(w);
+  await space(app);
+  await send(app, text);
+  await app.waitUntil(() => w.sent.has(text));
+  const id = w.sent.get(text)!.id;
+  // Shown and the draft retired before System One answers.
+  await app.waitFor(`id:event:${id}`);
+  await app.waitUntil(() => decisions.length === 1);
+  expect(decisions[0]).toBe(`/v1/spaces/acme/rooms/lobby/messages/${id}/decisions`);
+  expect(app.value("id:composer")).toBe("");
+  expect(app.enabled("id:send")).toBe(false); // empty draft, not busy
+  expect(app.shows(note(id))).toBe(false);
+  await app.clock!.runFor(2_000);
+  await app.waitFor(`id:event:${id} >> ${note(id)}`);
+  expect(app.shows("text:Only you see this")).toBe(true);
+  expect(decisions.length).toBe(1);
+});
+
+test("a deferred decision that is already gone (404) shows nothing and keeps the message", async () => {
+  const w = fixture();
+  const text = "nothing to collect";
+  w.reply(text, { decisions_pending: true, addressing_note: null, routing_note: null });
+  const base = w.network[post]!;
+  w.network[post] = req => /\/decisions$/.test(new URL(req.url).pathname)
+    ? { status: 404, body: { error: "no pending decisions for this message" } } : base(req);
+  const app = await launch(w);
+  await space(app);
+  await send(app, text);
+  await app.waitUntil(() => w.sent.has(text));
+  const id = w.sent.get(text)!.id;
+  await app.waitFor(`id:event:${id}`);
+  await app.clock!.runFor(1_000);
+  expect(app.shows(note(id))).toBe(false);
+  expect(app.shows("id:action-error")).toBe(false);
 });

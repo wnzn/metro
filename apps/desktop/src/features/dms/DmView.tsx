@@ -11,7 +11,7 @@ import { personState } from "../profile/profileState";
 import { DirectMessagesSection } from "./DirectMessages";
 import {
   activeDm, dmDraft, dmEvents, dmHiding, dmListError, dmListLoaded, dmLoaded, dmProblem, dmReactionPending,
-  dmReactions, dmReply, dmSending, dms, openMessages, reactDm, refreshDmList, sendDm,
+  dmReactions, dmReply, dmSending, dms, openMessages, reactDm, deleteDmMessage, dmDeleting, refreshDmList, sendDm,
 } from "./state";
 
 export function DmHeader() {
@@ -75,7 +75,8 @@ export function DmView() {
         </Row>
         <Transcript testID="dm-transcript" emptyTitle="Start the conversation"
           emptyText={`This is the start of your conversation with ${dm().peer.name}.`}
-          direct={{ id: dm().id, events: dmEvents, loaded: dmLoaded, reactions: dmReactions, pending: dmReactionPending, react: reactDm }}
+          direct={{ id: dm().id, events: dmEvents, loaded: dmLoaded, reactions: dmReactions, pending: dmReactionPending, react: reactDm,
+            deleting: dmDeleting, remove: deleteDmMessage }}
           onReply={(event, opener) => {
             if (!dmEvents().includes(event)) return;
             dmReply.set(event);

@@ -416,3 +416,106 @@ async fn dms_grant_bio_access_without_changing_legacy_chat_and_space_messages() 
         assert!(page["events"][0].get("reply_to").is_none());
     }
 }
+
+#[tokio::test]
+async fn only_the_author_deletes_a_dm_message_and_the_peer_sees_it_go() {
+    let s = Server::start().await;
+    let dm = s.pair().await;
+    let first = s.send(ALICE, &dm, json!({"text": "from alice"})).await;
+    let second = s.send(BOB, &dm, json!({"text": "from bob"})).await;
+    let (a, b) = (
+        first["id"].as_i64().unwrap(),
+        second["id"].as_i64().unwrap(),
+    );
+    let (status, _) = s
+        .call(
+            Method::PUT,
+            BOB,
+            &format!("{dm}/events/{a}/reactions"),
+            json!({"emoji": "👀"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    // The peer's message: 403. No admin bypass and no outsiders: 404.
+    for (user, eid, want) in [
+        (BOB, a, StatusCode::FORBIDDEN),
+        (ALICE, b, StatusCode::FORBIDDEN),
+        (ADMIN, a, StatusCode::NOT_FOUND),
+        (ALICE, 999_999, StatusCode::NOT_FOUND),
+    ] {
+        let (status, body) = s
+            .call(
+                Method::DELETE,
+                user,
+                &format!("{dm}/events/{eid}"),
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, want, "{user} {eid}: {body}");
+    }
+    let before = s.get(BOB, &format!("{dm}/events")).await;
+    let cursor = before["events"].as_array().unwrap().last().unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let (status, deleted) = s
+        .call(
+            Method::DELETE,
+            ALICE,
+            &format!("{dm}/events/{a}"),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{deleted}");
+    let marker = &deleted["events"][0];
+    assert_eq!(marker["kind"], "message_deleted");
+    let payload: Value = serde_json::from_str(marker["text"].as_str().unwrap()).unwrap();
+    assert_eq!(payload, json!({"target_event_id": a, "tombstone": false}));
+    // Gone twice over: a second delete is 404, and the peer's poll from its
+    // cursor carries the deletion (page size 2 in this harness).
+    assert_eq!(
+        s.call(
+            Method::DELETE,
+            ALICE,
+            &format!("{dm}/events/{a}"),
+            Value::Null
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let after = s
+        .get(BOB, &format!("{dm}/events?after={cursor}&deletions=1"))
+        .await;
+    assert_eq!(after["events"], json!([marker.clone()]), "{after}");
+    // A client that didn't ask gets messages only.
+    let legacy = s.get(BOB, &format!("{dm}/events?after={cursor}")).await;
+    assert_eq!(legacy["events"], json!([]), "{legacy}");
+    let all = s.get(BOB, &format!("{dm}/events?deletions=1")).await;
+    let ids: Vec<i64> = all["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_i64().unwrap())
+        .collect();
+    assert!(!ids.contains(&a), "{all}");
+    assert!(ids.contains(&b), "{all}");
+    assert_eq!(all["reactions"], json!([]));
+    // The DM's preview moves on; reacting to the deleted message is 404.
+    let list = s.get(BOB, "/v1/dms").await;
+    assert_eq!(list["dms"][0]["last"]["id"], b);
+    assert_eq!(
+        s.call(
+            Method::PUT,
+            BOB,
+            &format!("{dm}/events/{a}/reactions"),
+            json!({"emoji": "👀"})
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    // Hiding still purges everything once both hid it, deletions included.
+    s.hide(ALICE, &dm).await;
+    s.hide(BOB, &dm).await;
+    assert_eq!(s.get(ALICE, "/v1/dms").await, json!({"dms": []}));
+}

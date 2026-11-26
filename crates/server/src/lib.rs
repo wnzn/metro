@@ -14,6 +14,8 @@ pub mod auth;
 pub mod compaction;
 pub mod config;
 pub mod db;
+pub mod decisions;
+pub mod deletion;
 pub mod device_relay;
 mod directory;
 mod dms;
@@ -99,6 +101,8 @@ pub struct AppState {
     pub meta_waits: Arc<Semaphore>,
     /// Compaction locks, the auto rate limit and failure notes (memory only).
     pub compaction: Arc<crate::compaction::Compaction>,
+    /// Outcomes of decisions made after a message was stored (memory only).
+    pub decisions: Arc<crate::decisions::Pending>,
 }
 
 impl AppState {
@@ -144,6 +148,7 @@ impl AppState {
             page_builds: Arc::new(Semaphore::new(crate::pages::generate::MAX_PAGE_BUILDS)),
             chat_runs: Arc::default(),
             compaction: Arc::default(),
+            decisions: Arc::default(),
             meta_waits: Arc::new(Semaphore::new((limits.max_agent_runs / 2).max(1))),
             managed,
             library,
@@ -260,6 +265,10 @@ pub fn router(state: AppState) -> Router {
             "/v1/spaces/{sid}/rooms/{rid}/messages",
             post(api::post_message),
         )
+        .route(
+            "/v1/spaces/{sid}/rooms/{rid}/messages/{eid}/decisions",
+            post(crate::decisions::post_decisions),
+        )
         .route("/v1/spaces/{sid}/rooms/{rid}/demo", post(api::demo))
         .route(
             "/v1/spaces/{sid}/rooms/{rid}/events/{eid}/thread",
@@ -350,6 +359,8 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::meta::router())
         // Conversation compaction: the auto setting and `/compact`.
         .merge(crate::compaction::router())
+        // Deleting a message: Space rooms and threads, personal Chat, DMs.
+        .merge(crate::deletion::router())
         .layer(DefaultBodyLimit::max(HUMAN_BODY_LIMIT));
     // Room for the largest result plus JSON escaping.
     let runner_limit = state.config.limits.max_result_bytes * 2 + 1024;
