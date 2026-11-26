@@ -39,7 +39,7 @@ impl HumanAuth for FakeAuth {
 
 // ---- Scripted model ----
 
-/// A script reply that never arrives (within the test).
+/// A script reply that never arrives.
 const HANG: &str = "__hang__";
 
 type Script = Arc<dyn Fn(&Value, usize) -> String + Send + Sync>;
@@ -67,7 +67,7 @@ async fn model(script: impl Fn(&Value, usize) -> String + Send + Sync + 'static)
                 };
                 let text = script(&body, n);
                 if text == HANG {
-                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    std::future::pending::<()>().await;
                 }
                 Json(json!({
                     "id": "chatcmpl-1", "object": "chat.completion", "created": 0, "model": "mock",
@@ -1471,7 +1471,15 @@ async fn renames_and_restores_dont_count_as_reviewing_buttons() {
 
 #[tokio::test]
 async fn deleting_a_generating_draft_keeps_its_slot() {
-    let m = model(|_, _| HANG.to_owned()).await;
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
+    let m = model({
+        let started = started.clone();
+        move |_, _| {
+            started.add_permits(1);
+            HANG.to_owned()
+        }
+    })
+    .await;
     let s = Server::start(Some(m.config.clone())).await;
     let mut ids = Vec::new();
     for _ in 0..2 {
@@ -1485,6 +1493,13 @@ async fn deleting_a_generating_draft_keeps_its_slot() {
         assert_eq!(st, StatusCode::ACCEPTED);
         ids.push(d["id"].as_str().unwrap().to_owned());
     }
+    // If DELETE wins before a builder calls the model, that job can stop
+    // immediately and free its slot. Hold both jobs in the model instead.
+    tokio::time::timeout(Duration::from_secs(30), started.acquire_many(2))
+        .await
+        .expect("both builders should reach the model")
+        .unwrap()
+        .forget();
     let (st, _) = s
         .delete(ALICE, &format!("/v1/pages/drafts/{}", ids[0]))
         .await;
@@ -1492,14 +1507,14 @@ async fn deleting_a_generating_draft_keeps_its_slot() {
     let (st, _) = s.get(ALICE, &format!("/v1/pages/drafts/{}", ids[0])).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
     // Its job still runs, so the slot is still taken.
-    let (st, _) = s
+    let (st, v) = s
         .post(
             ALICE,
             "/v1/pages/drafts",
             json!({"scope": "personal", "prompt": "x"}),
         )
         .await;
-    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
 }
 
 #[tokio::test]
