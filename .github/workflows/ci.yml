@@ -68,6 +68,8 @@ jobs:
         run: python3 tests/e2e/smoke.py --timeout 60
       - name: End-to-end Chat and Threads test with a local model double
         run: python3 tests/e2e/threads.py --timeout 60
+      - name: End-to-end runner write and shell test with a local model double
+        run: python3 tests/e2e/shell.py --timeout 60
       - name: End-to-end messaging test with loopback models
         run: python3 tests/e2e/messaging.py --bin-dir target/debug --timeout 60
       - name: End-to-end Metro in Chat test with a local model double
