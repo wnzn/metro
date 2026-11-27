@@ -1707,24 +1707,39 @@ async function refreshChatThreads() {
     const open = activeChatThreadId();
     setChatThreads(list);
     // Deleted elsewhere (another device): leave it.
-    if (open && !list.some(t => t.id === open)) forgetChatThread(open);
+    if (open && !list.some(t => t.id === open)) forgetChatThread(open, true);
   } catch (error) {
     if (!ok()) return;
     if (error instanceof ApiError && error.kind === "not_found") chatThreadsSupported.set(false);
   }
 }
 
-/** Forgets everything cached for Chat thread `id`; leaves it for the main Chat if it is open. */
-function forgetChatThread(id: string) {
+/**
+ * Forgets everything cached for Chat thread `id`; leaves it for the main Chat
+ * if it is open. Deleted `elsewhere` (not by this app), its unsent draft moves
+ * to the main Chat's and a notice says why.
+ */
+function forgetChatThread(id: string, elsewhere = false) {
   const key = chatScopeOf(id);
   cursors.delete(key);
   inflight.delete(key);
   pollAgain.delete(key);
   batch(() => {
     forgetSenderNotices(key);
+    // Its draft: in the composer while it's on screen, else stashed.
+    const live = activeScope() === key;
+    const left = live ? { text: draft(), mention: mentionDraft(), directory: editDirectory() } : stashedDrafts()[key];
+    if (elsewhere && left?.text.trim()) {
+      const main = stashedDrafts()[CHAT];
+      const both = !!main?.text.trim();
+      stashedDrafts.set({ ...stashedDrafts(), [CHAT]: both
+        ? { text: `${main!.text}\n\n${left.text}`, mention: EMPTY_MENTION_DRAFT, directory: null }
+        : left });
+    }
     if (activeChatThreadId() === id) {
-      // Its unsent draft goes with it.
-      draft.set("");
+      if (elsewhere && live) notice.set("That thread was deleted.");
+      // Moved to the main Chat (above), or it goes with the thread.
+      if (live) draft.set("");
       navigationGeneration++;
       activeChatThreadId.set(null);
     }
@@ -3396,7 +3411,7 @@ async function pollChat(): Promise<void> {
     if (!ok()) return;
     // A thread deleted elsewhere: only it is gone, never the whole Chat.
     if (thread && error instanceof ApiError && error.kind === "not_found") {
-      forgetChatThread(thread);
+      forgetChatThread(thread, true);
       return;
     }
     if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found" || error.kind === "protocol")) {

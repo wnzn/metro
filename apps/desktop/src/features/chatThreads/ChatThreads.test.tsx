@@ -194,3 +194,24 @@ test("Queue and Steer work in a thread, and a reply running there leaves the mai
   expect(app.shows("id:chat-stop")).toBe(false);
   expect(app.shows(`id:queued:${queued}`)).toBe(false);
 });
+
+test("a thread deleted elsewhere keeps the unsent draft in the main Chat and says so", async () => {
+  const f = world();
+  f.state.chatThreads.set("alice", [{ id: "ct-1", title: "Side" }]);
+  f.state.events.set("chat:alice:ct-1", []);
+  const app = await inChat(f);
+  await app.type("id:composer", "main words");
+  await app.waitFor("id:chat-thread:ct-1");
+  await app.press("id:chat-thread:ct-1");
+  await app.waitFor("id:chat-view >> text:Side");
+  await app.waitUntil(() => app.value("id:composer") === "");
+  await app.type("id:composer", "not sent yet");
+  // Another device deletes it.
+  f.state.chatThreads.set("alice", []);
+  await app.waitFor("text:That thread was deleted.");
+  await app.waitFor("id:chat-thread:ct-1", { state: "gone" });
+  await app.waitFor("text:Only you can open this chat in Metro.");
+  // Neither draft is lost.
+  expect(app.value("id:composer")).toBe("main words\n\nnot sent yet");
+  expect(f.posts().some(p => p.path.startsWith("/v1/chat/messages"))).toBe(false);
+});
