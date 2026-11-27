@@ -17,7 +17,8 @@ use crate::http::read_capped;
 
 pub const PROTOCOL_HEADER: &str = "X-Metro-Runner-Protocol";
 const MAX_BODY: usize = 256 * 1024;
-pub const MAX_CLAIM_BODY: usize = 1024 * 1024;
+/// Room for a `workspace.write` job: 1 MiB of content, JSON-escaped.
+pub const MAX_CLAIM_BODY: usize = 8 * 1024 * 1024;
 
 /// A failure, with short text safe to show the person.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -448,15 +449,9 @@ impl Hosted {
             definite: false,
             error,
         };
+        let mut body = json!({"name": name, "visibility": "personal", "built_in": true});
         let (s, _, mut v) = self
-            .send(
-                reqwest::Method::POST,
-                "/v1/runners",
-                session,
-                &[],
-                Some(&json!({"name": name, "visibility": "personal"})),
-                MAX_BODY,
-            )
+            .with_built_in(reqwest::Method::POST, "/v1/runners", session, &mut body)
             .await
             .map_err(lost)?;
         if s != 201 && s != 200 {
@@ -485,19 +480,65 @@ impl Hosted {
             return Err(CallError::NotFound("no such runner".into()));
         }
         let (s, _, mut v) = self
-            .send(
+            .with_built_in(
                 reqwest::Method::POST,
                 &format!("/v1/runners/{id}/token"),
                 session,
-                &[],
-                Some(&json!({})),
-                MAX_BODY,
+                &mut json!({"built_in": true}),
             )
             .await?;
         if s != 200 {
             return Err(Self::classify(s, &v));
         }
         take_registered_token(&mut v)
+    }
+
+    /// Send `body`, which marks the runner as this app's built-in one
+    /// (`"built_in": true`). A server from before that field refuses it with
+    /// 400 or 422 and changes nothing; then the same request goes once
+    /// without it.
+    async fn with_built_in(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        session: &Secret,
+        body: &mut Value,
+    ) -> Result<(u16, reqwest::header::HeaderMap, Value), CallError> {
+        let r = self
+            .send(method.clone(), path, session, &[], Some(body), MAX_BODY)
+            .await?;
+        if !matches!(r.0, 400 | 422) {
+            return Ok(r);
+        }
+        if let Some(o) = body.as_object_mut() {
+            o.remove("built_in");
+        }
+        self.send(method, path, session, &[], Some(body), MAX_BODY)
+            .await
+    }
+
+    /// `POST /v1/runner/jobs/{id}/heartbeat` while a job runs: `false` when
+    /// the server says the job is over (the run stopped, the lease ran out,
+    /// the Space's runner changed, or it isn't this runner's job). A
+    /// transport or other error is not an answer: `true`.
+    pub async fn heartbeat(&self, token: &Secret, id: &str) -> bool {
+        if !valid_job_id(id) {
+            return false;
+        }
+        match self
+            .send(
+                reqwest::Method::POST,
+                &format!("/v1/runner/jobs/{id}/heartbeat"),
+                token,
+                &[(PROTOCOL_HEADER, "2")],
+                Some(&json!({})),
+                MAX_BODY,
+            )
+            .await
+        {
+            Ok((s, _, _)) => !matches!(s, 401 | 404 | 409 | 410),
+            Err(_) => true,
+        }
     }
 
     /// `DELETE /v1/runners/{id}`.
@@ -667,4 +708,103 @@ pub fn parse_claim(v: &Value) -> Claim {
         arguments,
         space_id,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::routing::post;
+    use std::sync::{Arc, Mutex};
+
+    /// `old`: a server from before `built_in`, refusing unknown fields.
+    async fn fake(old: bool) -> (Hosted, Arc<Mutex<Vec<Value>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let answer = move |seen: Arc<Mutex<Vec<Value>>>, b: Value, ok: Value| {
+            seen.lock().unwrap().push(b.clone());
+            if old && b.get("built_in").is_some() {
+                // As axum's JSON rejection (create) or the `{}`-only check
+                // (rotate) answer.
+                let s = if b.get("name").is_some() { 422 } else { 400 };
+                let s = reqwest::StatusCode::from_u16(s).unwrap();
+                return (s, axum::Json(json!({"error": "x"})));
+            }
+            (reqwest::StatusCode::OK, axum::Json(ok))
+        };
+        let tok = "metro_rt_v2_abc";
+        let (s1, s2) = (seen.clone(), seen.clone());
+        let app = axum::Router::new()
+            .route(
+                "/v1/runners",
+                post(move |axum::Json(b): axum::Json<Value>| async move {
+                    answer(
+                        s1,
+                        b,
+                        json!({"token": tok, "runner": {"id": "rn-1", "name": "n",
+                        "visibility": "personal", "can_manage": true}}),
+                    )
+                }),
+            )
+            .route(
+                "/v1/runners/{id}/token",
+                post(move |axum::Json(b): axum::Json<Value>| async move {
+                    answer(s2, b, json!({"token": tok}))
+                }),
+            )
+            .route(
+                "/v1/runner/jobs/{id}/heartbeat",
+                post(
+                    |axum::extract::Path(id): axum::extract::Path<String>| async move {
+                        match id.as_str() {
+                            "live" => reqwest::StatusCode::OK,
+                            "gone" => reqwest::StatusCode::GONE,
+                            "other" => reqwest::StatusCode::NOT_FOUND,
+                            _ => reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                        }
+                    },
+                ),
+            );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (Hosted::new(&format!("http://{addr}")).unwrap(), seen)
+    }
+
+    #[tokio::test]
+    async fn marks_the_runner_built_in_and_still_works_with_older_servers() {
+        let s = Secret::new("sess");
+        for old in [false, true] {
+            let (h, seen) = fake(old).await;
+            let (info, _) = h.create_personal_runner(&s, "n").await.unwrap();
+            assert_eq!(info.id, "rn-1");
+            h.rotate_runner(&s, "rn-1").await.unwrap();
+            let seen = seen.lock().unwrap().clone();
+            let want: Vec<Value> = if old {
+                vec![
+                    json!({"name": "n", "visibility": "personal", "built_in": true}),
+                    json!({"name": "n", "visibility": "personal"}),
+                    json!({"built_in": true}),
+                    json!({}),
+                ]
+            } else {
+                vec![
+                    json!({"name": "n", "visibility": "personal", "built_in": true}),
+                    json!({"built_in": true}),
+                ]
+            };
+            assert_eq!(seen, want, "old server: {old}");
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_ends_the_job_only_when_the_server_says_so() {
+        let (h, _) = fake(false).await;
+        let t = Secret::new("metro_rt_v2_abc");
+        assert!(h.heartbeat(&t, "live").await);
+        assert!(!h.heartbeat(&t, "gone").await);
+        assert!(!h.heartbeat(&t, "other").await);
+        // A server error or no answer is not a cancellation.
+        assert!(h.heartbeat(&t, "boom").await);
+        let unreachable = Hosted::new("http://127.0.0.1:9").unwrap();
+        assert!(unreachable.heartbeat(&t, "live").await);
+    }
 }
