@@ -73,7 +73,7 @@ test("Model routing is off by default and says nothing is sent", async () => {
   expect(app.shows("id:dataflow-chat-send >> text:/Send starts your Chat agent directly/")).toBe(true);
   expect(app.shows("id:dataflow-chat-note >> text:/without starting an agent or routing a request/")).toBe(true);
   expect(text(app)).toContain("Messages addressed only to people don't start routing or classification.");
-  expect(text(app)).toContain("up to eight recent messages or agent replies from that room");
+  expect(text(app)).toContain("up to eight recent messages or agent replies from the room or thread, including the message that started a reply thread unless deleted");
   expect(app.enabled("id:routing-save")).toBe(false); // nothing changed
   // Section headers are one sentence; the rest is under Learn more, closed until asked.
   // The routing opt-in explains what it sends beside its toggle.
