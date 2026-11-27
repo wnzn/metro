@@ -1316,24 +1316,18 @@ async fn live_chat_message(state: &AppState, user: &str, id: i64) -> Option<Even
         })
 }
 
-/// Start a Chat turn left pending at shutdown ([`crate::decisions::resume`]).
+/// Start a Chat turn left pending at shutdown ([`crate::decisions::resume`]),
+/// in its conversation `thread` (`None`: the main Chat).
 pub(crate) async fn resume_chat_turn(
     state: AppState,
     row: crate::decisions::Stored,
+    thread: Option<String>,
     ticket: crate::decisions::Ticket,
 ) {
     use crate::decisions::{Scope, forget};
     let Some(event) = live_chat_message(&state, &row.user_id, row.event_id).await else {
         return forget(&state, Scope::Personal, row.event_id).await;
     };
-    let (user, eid) = (row.user_id.clone(), row.event_id);
-    let thread = state
-        .db
-        .call(move |db| Ok(crate::chat_threads::thread_of_in(&db.lock(), &user, eid)?))
-        .await
-        .ok()
-        .flatten()
-        .flatten();
     let turn_id = row
         .turn_id
         .clone()

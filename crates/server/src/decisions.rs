@@ -794,15 +794,30 @@ pub async fn resume(state: AppState) -> anyhow::Result<usize> {
             // Taken in order now, so the Chat's turns keep their send order.
             Scope::Personal => {
                 // Its own conversation's line: the main Chat or its thread.
-                let thread =
-                    crate::chat_threads::thread_of_in(&state.db.lock(), &row.user_id, row.event_id)
-                        .ok()
-                        .flatten()
-                        .flatten();
+                let (user, eid) = (row.user_id.clone(), row.event_id);
+                let thread = match state
+                    .db
+                    .call(move |db| Ok(crate::chat_threads::thread_of_in(&db.lock(), &user, eid)?))
+                    .await
+                {
+                    Ok(Some(thread)) => thread,
+                    // Its message is gone: nothing to start.
+                    Ok(None) => {
+                        forget(&state, Scope::Personal, eid).await;
+                        continue;
+                    }
+                    // Never guessed: it waits, stored, for the next start.
+                    Err(e) => {
+                        tracing::error!(error = %format!("{e:#}"), "finding a pending Chat turn's conversation");
+                        continue;
+                    }
+                };
                 let ticket = state
                     .decisions
                     .chat_ticket(&chat_line(&row.user_id, thread.as_deref()));
-                tokio::spawn(async move { crate::api::resume_chat_turn(state, row, ticket).await });
+                tokio::spawn(async move {
+                    crate::api::resume_chat_turn(state, row, thread, ticket).await
+                });
             }
         }
     }
