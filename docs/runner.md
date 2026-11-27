@@ -26,9 +26,9 @@ With `METRO_SANDBOX=none`, `workspace.check` and the MCP tools return an
 error. With `docker`, they run in a container that mounts only the claiming
 Space's root.
 
-`workspace.shell` (in the source, not released) is different: it runs on
+`workspace.shell` (since 0.6.3) is different: it runs on
 every runner, dedicated or registered, with or without the sandbox, and the
-server's [shell policy](#shell-commands-in-the-source-not-released) decides
+server's [shell policy](#shell-commands) decides
 whether a command may run.
 
 Running the runner itself in a container (the `runner` image) is packaging,
@@ -48,8 +48,8 @@ Containers use the host kernel, so this applies to them too.
 | `workspace.read` | Reads a UTF-8 text file beneath the workspace | 1 MiB (truncated beyond) |
 | `workspace.check` | Runs `METRO_CHECK_ARGV`; reports an error if unset | [Time limits](#time-limits), output capped |
 | MCP tools | From the stdio server in `METRO_MCP_ARGV`, if set | [Time limits](#time-limits) |
-| `workspace.write` | Creates or replaces one UTF-8 text file beneath the workspace (in the source, not released) | 1 MiB |
-| `workspace.shell` | Runs one command through the shell in the workspace (in the source, not released) | Command at most 16 KiB; 120 s default, 600 s max; 64 KiB per output stream |
+| `workspace.write` | Creates or replaces one UTF-8 text file beneath the workspace (since 0.6.3) | 1 MiB |
+| `workspace.shell` | Runs one command through the shell in the workspace (since 0.6.3) | Command at most 16 KiB; 120 s default, 600 s max; 64 KiB per output stream |
 
 `workspace.write` uses the same path rules as read: the path is relative to
 the Space's root, and absolute paths, `..` and symlinks anywhere in the path
@@ -71,7 +71,7 @@ invalid or contradictory value. Empty values count as unset.
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `METRO_RUNNER_TOKEN` | **required** | A dedicated Space token, or a registered runner credential (`metro_rt_v2_…`) |
-| `METRO_WORKSPACE` | the current directory (in the source, not released; required in 0.6.2) | An existing directory, canonicalized at startup. Registered runners need it writable, and refuse `/`. Unset, the runner refuses a current directory of `/`. The runner image sets `/workspace`. |
+| `METRO_WORKSPACE` | the current directory (since 0.6.3; required in 0.6.2) | An existing directory, canonicalized at startup. Registered runners need it writable, and refuse `/`. Unset, the runner refuses a current directory of `/`. The runner image sets `/workspace`. |
 | `METRO_SERVER_URL` | `http://127.0.0.1:8787` | Set it explicitly for any runner that isn't on the server's machine. Plain `http://` is allowed only for loopback hosts. |
 | `METRO_ALLOW_INSECURE_HTTP` | `0` | Accepted for compatibility; not needed in 0.5.0. The runner warns on plain HTTP outside loopback and recognized Tailscale hosts. Prefer HTTPS or an SSH forward. |
 | `METRO_POLL_INTERVAL_MS` | `1000` | 50 – 600000 |
@@ -105,7 +105,7 @@ export METRO_CHECK_ARGV='["./check.sh"]'
 export METRO_MCP_ARGV='["/usr/local/bin/my-mcp-server","--stdio"]'
 ```
 
-## Shell commands (in the source, not released)
+## Shell commands
 
 `workspace.shell` is the only tool that runs a shell, and the agent writes
 the command, at most 16 KiB with no NUL character. The runner runs
@@ -203,7 +203,7 @@ agent's history, and never indexed or searchable.
 - Time spent waiting for approval, and running a shell command, doesn't
   count against the run's own time limit.
 
-The API is in [runners.md](runners.md#shell-policy-api-in-the-source-not-released).
+The API is in [runners.md](runners.md#shell-policy-api).
 
 ## Job semantics
 
@@ -218,7 +218,7 @@ person runs the action again. Stopping a run (`POST /v1/runs/{id}/stop`)
 halts the agent, but a job the runner has already claimed runs until it ends
 or hits its time limit.
 
-In the source, not released: while a `workspace.shell` job runs, both
+Since 0.6.3, while a `workspace.shell` job runs, both
 `metro-runner` and the desktop's built-in runner send
 `POST /v1/runner/jobs/{id}/heartbeat` about every 2 seconds. Both kill the
 command on `401` (credential revoked or rotated), `404` (job not found),
@@ -247,8 +247,8 @@ accepted. To give a check more time, lower the HTTP timeout to match. For
 example, `METRO_CHECK_TIMEOUT_SECS=110` with `METRO_HTTP_TIMEOUT_SECS=10` is
 allowed.
 
-A `workspace.shell` job (in the source, not released) has its own limit: the
-agent may ask for 1 to 600 seconds (default 120), the runner kills the
+A `workspace.shell` job has its own limit: the agent may ask for
+1 to 600 seconds (default 120), the runner kills the
 command at that time, and the server's lease is that time plus 60 seconds.
 
 These limits don't cover everything:
@@ -265,10 +265,10 @@ runner image or the Linux runner binary. Either needs Linux ≥ 5.6
 (`openat2`). The remote runner must reach the server over `https://`, so
 expose the server through a TLS reverse proxy (see [deploy.md](deploy.md)).
 
-> **Published in [Metro 0.6.2](https://github.com/wnzn/metro/releases/tag/v0.6.2):**
-> the image `ghcr.io/wnzn/metro-runner:v0.6.2` (`linux/amd64`,
+> **Published in [Metro 0.6.3](https://github.com/wnzn/metro/releases/tag/v0.6.3):**
+> the image `ghcr.io/wnzn/metro-runner:v0.6.3` (`linux/amd64`,
 > `linux/arm64`; pin the digest from the release's `IMAGES.txt`) and the
-> binary archive `Metro-runner-0.6.2-linux-x64.tar.gz` with its `.sha256`
+> binary archive `Metro-runner-0.6.3-linux-x64.tar.gz` with its `.sha256`
 > ([deploy.md](deploy.md#release-files-and-images)). Building them yourself
 > is contributor tooling ([development.md](development.md#images-and-binaries)).
 
@@ -341,8 +341,8 @@ docker run --rm --label dev.metro.runner=1 --pull=never --network=none
 - **No host fallback.** If Docker or the image is unavailable, the command
   fails. It never runs on the host.
 - **Read-only workspace, no network.** Only `/tmp` (tmpfs) is writable.
-  The exception is `workspace.shell` (in the source, not released): its
-  container mounts the Space's root read-write and runs the image's
+  The exception is `workspace.shell`: its container mounts the Space's
+  root read-write and runs the image's
   `/bin/sh`, with the same other limits.
 - **One Space per container.** On a registered runner, the mounted workspace
   is the claiming Space's `spaces/<sid>/` root, never the base or a sibling.

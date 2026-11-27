@@ -37,7 +37,7 @@ don't affect which model Metro calls at runtime.
 ## Rules
 
 The rules below describe the current source. For the published changes,
-see [New in Metro 0.6.2](docs/released-0.6.2.md); for later changes, see
+see [New in Metro 0.6.3](docs/released-0.6.3.md); for later changes, see
 [In the source, not released](docs/next-source.md).
 
 - Stay inside the files you were assigned. Don't edit another lane's files;
@@ -545,14 +545,16 @@ see [New in Metro 0.6.2](docs/released-0.6.2.md); for later changes, see
     Documents & media gate (497 Rust tests, the 83 hardened media-service
     tests, `nsh test` 106/106) and the earlier 403-test gate are historical
     milestones.
-  - **Metro 0.6.2 is published**: stable GitHub release `v0.6.2`
-    (2026-11-27T10:59:03Z), tag on `3c0e4d1` (PR #21), made by CI run
-    45980066265, with 18 assets, Sigstore-signed `SHA256SUMS`, unsigned
-    Windows files and signed GHCR images (see [release record](docs/acceptance.md#published-metro-062-2026-11-27-github-release-v062)).
+  - **Metro 0.6.3 is published**: stable GitHub release `v0.6.3`
+    (2026-11-27T21:39:56Z), tag on `f5c0cf2` (PR #22), made by CI run
+    46065803816, with 18 assets, Sigstore-signed `SHA256SUMS`, unsigned
+    Windows files and signed GHCR images (see [release record](docs/acceptance.md#published-metro-063-2026-11-27-github-release-v063)).
     Native Windows by a person, real vendor accounts and real sign-ins
-    remain unverified. [0.6.2 work](docs/released-0.6.2.md) is
-    released; [0.6.3 work](docs/next-source.md) is not.
-  - The previous release was [Metro 0.6.1](docs/acceptance.md#published-metro-061-2026-11-27-github-release-v061)
+    remain unverified. [0.6.3 work](docs/released-0.6.3.md) is
+    released; [0.6.4 work](docs/next-source.md) is not.
+  - The previous release was [Metro 0.6.2](docs/acceptance.md#published-metro-062-2026-11-27-github-release-v062)
+    (`v0.6.2` on `3c0e4d1`, CI run 45980066265), and before it
+    [Metro 0.6.1](docs/acceptance.md#published-metro-061-2026-11-27-github-release-v061)
     (`v0.6.1` on `5384e8a`, CI run 45949761195), and before it
     [Metro 0.6.0](docs/acceptance.md#published-metro-060-2026-11-26-github-release-v060)
     (`v0.6.0` on `430c835`, CI run 45737693549),
@@ -582,23 +584,23 @@ see [New in Metro 0.6.2](docs/released-0.6.2.md); for later changes, see
   sidecar next to the desktop app. Source builds live only in
   [docs/development.md](docs/development.md). Docs point to the published
   release by the names and URLs recorded in `docs/acceptance.md`: the
-  current one is **Metro 0.6.2**
-  (https://github.com/wnzn/metro/releases/tag/v0.6.2, tag `v0.6.2` on
-  `3c0e4d1`), with `Metro-0.6.2-linux-x64.tar.gz`,
-  `Metro-0.6.2-windows-x64.zip`,
-  `Metro-0.6.2-windows-x64.unsigned-preview.msi`,
-  `Metro-runner-0.6.2-linux-x64.tar.gz` (each with `.sha256`), the
+  current one is **Metro 0.6.3**
+  (https://github.com/wnzn/metro/releases/tag/v0.6.3, tag `v0.6.3` on
+  `f5c0cf2`), with `Metro-0.6.3-linux-x64.tar.gz`,
+  `Metro-0.6.3-windows-x64.zip`,
+  `Metro-0.6.3-windows-x64.unsigned-preview.msi`,
+  `Metro-runner-0.6.3-linux-x64.tar.gz` (each with `.sha256`), the
   installer scripts, `SHA256SUMS` with its Sigstore bundle, `IMAGES.txt`,
-  and the images `ghcr.io/wnzn/metro-server:v0.6.2`,
-  `ghcr.io/wnzn/metro-runner:v0.6.2` and
-  `ghcr.io/wnzn/metro-embeddinggemma2:v0.6.2` (pinned by digest). Windows
+  and the images `ghcr.io/wnzn/metro-server:v0.6.3`,
+  `ghcr.io/wnzn/metro-runner:v0.6.3` and
+  `ghcr.io/wnzn/metro-embeddinggemma2:v0.6.3` (pinned by digest). Windows
   files are **unsigned** (no Authenticode). Docs never present source
   that came after a release's commit as part of that release; label it
   "in the source, not released". A newer release is named in docs only
   once its publication is recorded in `docs/acceptance.md`. The desktop app's **Use locally**
   runs a bundled local server with no token, and its owner-only, per-Space,
   read-only local tools (`workspace.list`/`workspace.read`, still list
-  and read only in 0.6.3 source) never stand in
+  and read only in 0.6.3) never stand in
   for an operator's separately installed runner or for the app's built-in
   runner. It and the other features
   checked in the 0.2.0 Linux candidate are described as verified in that

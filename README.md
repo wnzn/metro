@@ -26,12 +26,12 @@ server yourself, or let the desktop app run one just for you. Each person
 brings their own model, and each Space can give the agent tools over its
 own files.
 
-The guide below is for [Metro 0.6.2](docs/released-0.6.2.md), which builds
-on [Metro 0.6.1](docs/released-0.6.1.md), [Metro 0.6.0](docs/released-0.6.0.md),
+The guide below is for [Metro 0.6.3](docs/released-0.6.3.md), which builds
+on [Metro 0.6.2](docs/released-0.6.2.md), [Metro 0.6.1](docs/released-0.6.1.md),
+[Metro 0.6.0](docs/released-0.6.0.md),
 [Metro 0.5.1](docs/released-0.5.1.md)
 and the [Metro 0.5.0 features](docs/released-0.5.0.md).
-For later changes, such as file writes and shell commands for agents in
-0.6.3, see [In the source, not released](docs/next-source.md).
+For later changes, see [In the source, not released](docs/next-source.md).
 
 ## Features
 
@@ -83,20 +83,20 @@ Prefer HTTPS or an SSH port forward for remote servers. The desktop asks
 before sending a token over ordinary plain HTTP; see
 [transport and proxy rules](docs/released-0.5.0.md#http-tailscale-and-proxies).
 
-> **Latest release: [Metro 0.6.2](https://github.com/wnzn/metro/releases/tag/v0.6.2)**
-> (2026-11-27). Downloads: `Metro-0.6.2-linux-x64.tar.gz`,
-> `Metro-0.6.2-windows-x64.zip`, `Metro-0.6.2-windows-x64.unsigned-preview.msi`
-> and `Metro-runner-0.6.2-linux-x64.tar.gz` (each with a `.sha256`), the
+> **Latest release: [Metro 0.6.3](https://github.com/wnzn/metro/releases/tag/v0.6.3)**
+> (2026-11-27). Downloads: `Metro-0.6.3-linux-x64.tar.gz`,
+> `Metro-0.6.3-windows-x64.zip`, `Metro-0.6.3-windows-x64.unsigned-preview.msi`
+> and `Metro-runner-0.6.3-linux-x64.tar.gz` (each with a `.sha256`), the
 > installer scripts, and `SHA256SUMS` with its Sigstore bundle. Images,
-> listed by digest in the release's [`IMAGES.txt`](https://github.com/wnzn/metro/releases/download/v0.6.2/IMAGES.txt):
-> `ghcr.io/wnzn/metro-server:v0.6.2` and `ghcr.io/wnzn/metro-runner:v0.6.2`
-> (`linux/amd64`, `linux/arm64`), and `ghcr.io/wnzn/metro-embeddinggemma2:v0.6.2`
+> listed by digest in the release's [`IMAGES.txt`](https://github.com/wnzn/metro/releases/download/v0.6.3/IMAGES.txt):
+> `ghcr.io/wnzn/metro-server:v0.6.3` and `ghcr.io/wnzn/metro-runner:v0.6.3`
+> (`linux/amd64`, `linux/arm64`), and `ghcr.io/wnzn/metro-embeddinggemma2:v0.6.3`
 > (`linux/amd64`, no weights). There's no macOS build for now. Windows
 > files are **unsigned** (no Authenticode signature), so expect SmartScreen
 > warnings and check them against the Sigstore-signed `SHA256SUMS`
 > ([docs/install.md](docs/install.md#check-a-download)). The desktop app
 > hasn't been tried by a person on native Windows. Real vendor accounts and
-> sign-ins remain unverified. See the [release record](docs/acceptance.md#published-metro-062-2026-11-27-github-release-v062).
+> sign-ins remain unverified. See the [release record](docs/acceptance.md#published-metro-063-2026-11-27-github-release-v063).
 
 ## Repository layout
 

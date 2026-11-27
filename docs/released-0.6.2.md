@@ -51,4 +51,4 @@ For the API, see [Chat threads](messages.md#chat-threads-1) and
 [Queue and steer](messages.md#queue-and-steer) under
 [Messaging API](messages.md#messaging-api).
 
-Later changes are [in the source, not released](next-source.md).
+The [0.6.3 changes](released-0.6.3.md) came in the next release.
