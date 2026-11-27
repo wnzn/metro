@@ -2743,6 +2743,35 @@ async fn execute_personal_run(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn waiting_on_a_shell_command_does_not_use_up_the_run_time() {
+        let ms = Duration::from_millis;
+        let clock = RunClock::default();
+        let c = clock.clone();
+        let work = async move {
+            tokio::time::sleep(ms(100)).await;
+            {
+                let _outer = c.pause();
+                let _nested = c.pause();
+                tokio::time::sleep(ms(500)).await;
+            }
+            tokio::time::sleep(ms(100)).await;
+            "done"
+        };
+        assert_eq!(within(ms(300), Some(clock), work).await, Ok("done"));
+        let work = tokio::time::sleep(ms(500));
+        assert!(
+            within(ms(200), Some(RunClock::default()), work)
+                .await
+                .is_err()
+        );
+        assert!(
+            within(ms(200), None, tokio::time::sleep(ms(500)))
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
     fn web_tool_events_never_become_model_history() {
         let key = TurnKey::new();

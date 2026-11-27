@@ -882,6 +882,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_long_lease_outlives_the_default_and_the_heartbeat_follows_the_job() {
+        // Default run timeout 300 ms; this job may take 2 s.
+        let q = queue();
+        let v = RunnerVersion {
+            generation: 1,
+            drop_before: 0,
+        };
+        let waiter = q
+            .enqueue_leased(
+                "s",
+                v,
+                "workspace.shell",
+                json!({}),
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap();
+        let task = tokio::spawn(waiter);
+        let job = claim_wait(&q, D, &sp("s", 1)).await;
+        let beat = |who: &str, spaces: &[(String, u64)]| {
+            q.heartbeat_at(who, &test_versions(spaces), &job.id)
+        };
+        assert_eq!(beat(D, &sp("s", 1)), Ok(()));
+        assert_eq!(beat("runner:x", &sp("s", 1)), Err(CompleteError::Unknown));
+        assert_eq!(beat(D, &sp("other", 1)), Err(CompleteError::Unknown));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(beat(D, &sp("s", 1)), Ok(()), "still inside its own lease");
+        q.complete(D, &sp("s", 1), &job.id, ok("done")).unwrap();
+        assert_eq!(task.await.unwrap().unwrap().output, "done");
+        assert_eq!(beat(D, &sp("s", 1)), Err(CompleteError::Expired));
+        assert_eq!(beat(D, &[]), Err(CompleteError::Unknown));
+    }
+
+    #[tokio::test]
+    async fn abandoning_or_revoking_tells_the_heartbeat_to_stop() {
+        let q = JobQueue::new(4, Duration::from_secs(5), Duration::from_secs(5));
+        let mut revoked = q.subscribe_revoked();
+        let task = tokio::spawn({
+            let q = q.clone();
+            async move { q.run("s", 1, "workspace.shell", json!({})).await }
+        });
+        let job = claim_wait(&q, D, &sp("s", 1)).await;
+        // The run stopped: its waiter is dropped.
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            q.heartbeat_at(D, &test_versions(&sp("s", 1)), &job.id),
+            Err(CompleteError::Expired)
+        );
+        let task = tokio::spawn({
+            let q = q.clone();
+            async move { q.run("s", 1, "workspace.shell", json!({})).await }
+        });
+        let job = claim_wait(&q, D, &sp("s", 1)).await;
+        q.revoke("s", 2);
+        assert_eq!(revoked.recv().await.unwrap(), "s");
+        assert_eq!(task.await.unwrap(), Err(JobError::CredentialChanged));
+        assert_eq!(
+            q.heartbeat_at(D, &test_versions(&sp("s", 2)), &job.id),
+            Err(CompleteError::Expired)
+        );
+    }
+
+    #[tokio::test]
     async fn unclaimed_job_fails_and_is_withdrawn() {
         let q = queue();
         assert_eq!(

@@ -375,11 +375,6 @@ impl Approvals {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
-
-    #[cfg(test)]
-    pub(crate) fn pending_ids(&self) -> Vec<String> {
-        self.lock().keys().cloned().collect()
-    }
 }
 
 /// One `workspace_shell` call, as the agent made it.
@@ -833,7 +828,7 @@ enum Decided {
     Unknown,
     Forbidden,
     Gone,
-    Won(Pending),
+    Won(Box<Pending>),
 }
 
 async fn decide(
@@ -914,7 +909,7 @@ async fn decide(
             Some(&p.activity),
         )?;
         tx.commit()?;
-        Ok(Decided::Won(p))
+        Ok(Decided::Won(Box::new(p)))
     })
     .await?;
     match outcome {
@@ -954,8 +949,19 @@ struct PolicyBody {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OverrideBody {
+    #[serde(deserialize_with = "required_nullable")]
     shell_mode: Option<Mode>,
+    #[serde(deserialize_with = "required_nullable")]
     approver: Option<Approver>,
+}
+
+/// A key that must be present but may be `null`.
+fn required_nullable<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d)
 }
 
 async fn put_dedicated(
@@ -1027,7 +1033,8 @@ async fn runner_view(state: &AppState, rid: &str, who: &Human) -> ApiResult<Valu
              LEFT JOIN runner_space_shell o ON o.runner_id = a.runner_id AND o.space_id = a.space_id
              WHERE a.runner_id = ?1 ORDER BY a.space_id",
         )?;
-        let rows: Vec<(String, String, bool, Option<String>, Option<String>)> = stmt
+        type Row = (String, String, bool, Option<String>, Option<String>);
+        let rows: Vec<Row> = stmt
             .query_map(params![rid, uid], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })?
@@ -1152,3 +1159,170 @@ async fn put_space_override(
 /// Shared with [`crate::AppState`].
 pub type SharedApprovals = Arc<Approvals>;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runners::Visibility;
+
+    fn choice(choice: &str, p: Option<f64>) -> Decision<protocol::Answer> {
+        Decision::Answered(protocol::Answer::Choice {
+            choice: choice.to_owned(),
+            confidence: Some(0.5),
+            probabilities: p.map(|p| (choice.to_owned(), p)).into_iter().collect(),
+        })
+    }
+
+    #[test]
+    fn only_a_confident_safe_skips_approval() {
+        assert_eq!(verdict(choice("safe", Some(0.95))), Verdict::Safe);
+        assert_eq!(verdict(choice("safe", Some(0.8))), Verdict::Safe);
+        assert_eq!(verdict(choice("safe", Some(0.79))), Verdict::Unsure);
+        assert_eq!(verdict(choice("safe", None)), Verdict::Unsure);
+        assert_eq!(verdict(choice("unsafe", Some(0.99))), Verdict::Unsafe);
+        assert!(matches!(
+            verdict(choice("yes", Some(1.0))),
+            Verdict::Failed(_)
+        ));
+        assert!(matches!(
+            verdict(Decision::Failed(
+                crate::model_routing::DecisionFailure::Timeout
+            )),
+            Verdict::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn built_in_allow_needs_exactly_one_space_and_org_never_classifies() {
+        let me = Manager::Personal("alice".into());
+        assert_eq!(effective(&me, true, 1, Mode::Allow), (Mode::Allow, None));
+        for n in [0, 2, 5] {
+            assert_eq!(
+                effective(&me, true, n, Mode::Allow),
+                (Mode::Approve, Some(BUILT_IN_MULTIPLE_SPACES))
+            );
+        }
+        assert_eq!(effective(&me, false, 3, Mode::Allow), (Mode::Allow, None));
+        assert_eq!(effective(&me, true, 3, Mode::Off), (Mode::Off, None));
+        assert_eq!(
+            effective(&Manager::Organization, false, 1, Mode::Classify),
+            (Mode::Approve, Some(CLASSIFY_UNAVAILABLE))
+        );
+        assert_eq!(Mode::parse("garbage"), Mode::Approve);
+        assert_eq!(Approver::parse("garbage"), Approver::Owner);
+    }
+
+    #[test]
+    fn eligibility_follows_the_manager_and_needs_membership() {
+        let db = Db::open_in_memory().unwrap();
+        let sid = db.create_space("alice", "S", 4).unwrap().id;
+        db.add_member(&sid, "bob", 8).unwrap();
+        db.add_member(&sid, "carol", 8).unwrap();
+        let conn = db.lock();
+        let base = SpacePolicy {
+            runner_name: "r".into(),
+            manager: Manager::Dedicated,
+            mode: Mode::Approve,
+            approver: Approver::Owner,
+            source: "dedicated",
+            effective: Mode::Approve,
+            downgraded: None,
+            fence: 0,
+        };
+        let check = |p: &SpacePolicy, user: &str, admin: bool| {
+            eligible_in(&conn, p, &sid, user, admin).unwrap()
+        };
+        assert_eq!(check(&base, "alice", false), Some(true));
+        assert_eq!(check(&base, "bob", true), Some(false));
+        assert_eq!(check(&base, "dave", true), None);
+        let personal = SpacePolicy {
+            manager: Manager::Personal("bob".into()),
+            ..base.clone()
+        };
+        assert_eq!(check(&personal, "bob", false), Some(true));
+        assert_eq!(check(&personal, "alice", false), Some(false));
+        let org = SpacePolicy {
+            manager: Manager::Organization,
+            ..base.clone()
+        };
+        assert_eq!(check(&org, "carol", true), Some(true));
+        assert_eq!(check(&org, "alice", false), Some(false));
+        assert_eq!(check(&org, "dave", true), None, "no admin bypass");
+        let members = SpacePolicy {
+            approver: Approver::Members,
+            ..org
+        };
+        assert_eq!(check(&members, "bob", false), Some(true));
+        assert_eq!(check(&members, "dave", true), None);
+    }
+
+    #[test]
+    fn overrides_inherit_and_go_with_the_assignment() {
+        let db = Db::open_in_memory().unwrap();
+        let sid = db.create_space("alice", "S", 4).unwrap().id;
+        assert_eq!(policy_in(&db.lock(), &sid).unwrap(), None);
+        let r = db
+            .create_runner_marked("alice", "laptop", Visibility::Personal, b"h", 5, true)
+            .unwrap();
+        db.attach_runner(&sid, &r.id, "alice").unwrap();
+        let p = policy_in(&db.lock(), &sid).unwrap().unwrap();
+        assert_eq!(
+            (p.mode, p.approver, p.source, p.effective),
+            (
+                Mode::Approve,
+                Approver::Owner,
+                "runner_default",
+                Mode::Approve
+            )
+        );
+        let fence = p.fence;
+        {
+            let conn = db.lock();
+            conn.execute(
+                "UPDATE runners SET shell_mode = 'allow', shell_approver = 'members' WHERE id = ?1",
+                [&r.id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO runner_space_shell (runner_id, space_id, shell_mode, shell_approver, updated_at)
+                 VALUES (?1, ?2, NULL, 'owner', 0)",
+                params![r.id, sid],
+            )
+            .unwrap();
+        }
+        let p = policy_in(&db.lock(), &sid).unwrap().unwrap();
+        assert_eq!(
+            (p.mode, p.approver, p.source, p.effective, p.downgraded),
+            (
+                Mode::Allow,
+                Approver::Owner,
+                "space_override",
+                Mode::Allow,
+                None
+            )
+        );
+        db.detach_runner(&sid).unwrap();
+        db.attach_runner(&sid, &r.id, "alice").unwrap();
+        let p = policy_in(&db.lock(), &sid).unwrap().unwrap();
+        assert_eq!(
+            (p.source, p.approver),
+            ("runner_default", Approver::Members)
+        );
+        assert_ne!(p.fence, fence, "reattaching moves the fence");
+        db.delete_runner(&r.id).unwrap();
+        assert_eq!(policy_in(&db.lock(), &sid).unwrap(), None);
+    }
+
+    #[test]
+    fn approval_ids_are_checked_before_lookup() {
+        assert!(valid_approval_id(&format!("sa-{}", short_id())));
+        for bad in [
+            "",
+            "sa-",
+            "sa-XYZ0000000000000",
+            "ab-0123456789abcdef",
+            "sa-0123456789abcdef0",
+        ] {
+            assert!(!valid_approval_id(bad), "{bad}");
+        }
+    }
+}

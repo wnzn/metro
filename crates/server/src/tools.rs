@@ -464,6 +464,56 @@ mod tests {
     }
 
     #[test]
+    fn write_and_shell_arguments() {
+        assert_eq!(
+            RunnerTool::Shell
+                .runner_arguments(&json!({"command": "ls"}))
+                .unwrap(),
+            json!({"command": "ls", "timeout_secs": SHELL_DEFAULT_TIMEOUT_SECS})
+        );
+        assert_eq!(
+            RunnerTool::Shell
+                .runner_arguments(&json!({"command": "ls", "timeout_secs": 600}))
+                .unwrap()["timeout_secs"],
+            600
+        );
+        for bad in [
+            json!({}),
+            json!({"command": " "}),
+            json!({"command": "a\u{0}b"}),
+            json!({"command": "ls", "timeout_secs": 0}),
+            json!({"command": "ls", "timeout_secs": 601}),
+            json!({"command": "ls", "timeout_secs": 1.5}),
+            json!({"command": "ls", "cwd": "/"}),
+            json!({"command": "x".repeat(MAX_COMMAND_BYTES + 1)}),
+        ] {
+            assert!(RunnerTool::Shell.runner_arguments(&bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            RunnerTool::Write
+                .runner_arguments(&json!({"path": "a.md", "content": ""}))
+                .unwrap(),
+            json!({"path": "a.md", "content": ""})
+        );
+        for bad in [
+            json!({"path": "a.md"}),
+            json!({"content": "x"}),
+            json!({"path": "a.md", "content": 3}),
+            json!({"path": "a.md", "content": "x".repeat(MAX_WRITE_BYTES + 1)}),
+        ] {
+            assert!(RunnerTool::Write.runner_arguments(&bad).is_err());
+        }
+        // Write and shell are offered but never on by default.
+        assert!(!RunnerTool::DEFAULT.contains(&RunnerTool::Shell));
+        assert!(!RunnerTool::DEFAULT.contains(&RunnerTool::Write));
+        assert!(
+            RunnerTool::DEFAULT
+                .iter()
+                .all(|t| RunnerTool::ALL.contains(t))
+        );
+    }
+
+    #[test]
     fn truncates_on_char_boundary() {
         assert_eq!(truncate("abc", 5), "abc");
         let t = truncate("ééé", 3);
