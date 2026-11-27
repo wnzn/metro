@@ -73,6 +73,9 @@ use worker::WorkerState;
 #[derive(Clone)]
 pub struct BoundSession {
     server_url: String,
+    /// The URL as earlier builds keyed it (only trailing slashes trimmed),
+    /// when that differs: its runner record is still this server's.
+    legacy_url: Option<String>,
     token: Secret,
     account_id: String,
     hosted: bool,
@@ -108,6 +111,15 @@ fn is_local_server_url(raw: &str) -> bool {
         && !raw.ends_with('/')
 }
 
+/// One spelling per server: lowercase scheme and host, no default port,
+/// no trailing slash. Unparsable input only loses its trailing slashes.
+fn canonical_server_url(raw: &str) -> String {
+    match url::Url::parse(raw) {
+        Ok(u) => u.as_str().trim_end_matches('/').to_owned(),
+        Err(_) => raw.trim_end_matches('/').to_owned(),
+    }
+}
+
 impl BoundSession {
     /// `Some` only when the local server manager reports a running server
     /// (`local_url`, `local_token` from its `LocalWorkspace`) and the bound
@@ -136,6 +148,7 @@ impl BoundSession {
         }
         Some(BoundSession {
             server_url: session_url.to_owned(),
+            legacy_url: None,
             token: session_token.clone(),
             account_id: account_id.to_owned(),
             hosted: true,
@@ -151,8 +164,11 @@ impl BoundSession {
         if session_url.is_empty() || t.is_empty() || !valid_account(account_id) {
             return None;
         }
+        let legacy = session_url.trim_end_matches('/');
+        let server_url = canonical_server_url(session_url);
         Some(BoundSession {
-            server_url: session_url.trim_end_matches('/').to_owned(),
+            legacy_url: (legacy != server_url).then(|| legacy.to_owned()),
+            server_url,
             token: session_token.clone(),
             account_id: account_id.to_owned(),
             hosted: false,
@@ -166,6 +182,11 @@ impl BoundSession {
 
     pub fn server_url(&self) -> &str {
         &self.server_url
+    }
+
+    /// The URL an earlier build keyed this server's runner by, if different.
+    pub(crate) fn legacy_url(&self) -> Option<&str> {
+        self.legacy_url.as_deref()
     }
 
     pub fn account_id(&self) -> &str {

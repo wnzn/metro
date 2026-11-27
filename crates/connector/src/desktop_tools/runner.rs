@@ -401,10 +401,22 @@ pub fn identity_dir(server_url: &str, account_id: &str) -> String {
         .collect()
 }
 
-/// `<root>/runner/<identity>/`, created private when `create`.
+/// `<root>/runner/<identity>/`, created private when `create`. A folder an
+/// earlier build made under the server's other spelling
+/// ([`BoundSession::legacy_url`]) is renamed to it first, with its Space
+/// folders: one server never gets a second runner.
 fn identity_handle(root: &File, h: &BoundSession, create: bool) -> io::Result<File> {
     let r = subdir(root, RUNNER_DIR, create)?;
-    subdir(&r, &identity_dir(&h.server_url, &h.account_id), create)
+    let name = identity_dir(&h.server_url, &h.account_id);
+    if let Some(old) = h.legacy_url() {
+        let old = identity_dir(old, &h.account_id);
+        let missing =
+            |n: &str| matches!(subdir(&r, n, false), Err(e) if e.kind() == io::ErrorKind::NotFound);
+        if missing(&name) && !missing(&old) {
+            cap_primitives::fs::rename(&r, Path::new(&old), &r, Path::new(&name))?;
+        }
+    }
+    subdir(&r, &name, create)
 }
 
 /// Where the Space folders of this (server, account) are, for showing.
@@ -431,7 +443,18 @@ pub fn load(root: &File, h: &BoundSession) -> io::Result<Option<Record>> {
     };
     let rec = Record::from_json(&bytes);
     bytes.zeroize();
-    Ok(rec.filter(|r| r.server_url == h.server_url && r.account_id == h.account_id))
+    let Some(mut rec) = rec.filter(|r| {
+        r.account_id == h.account_id
+            && (r.server_url == h.server_url || h.legacy_url() == Some(r.server_url.as_str()))
+    }) else {
+        return Ok(None);
+    };
+    // Written by an earlier build under the other spelling: now this one's.
+    if rec.server_url != h.server_url {
+        rec.server_url = h.server_url.clone();
+        save(root, h, &rec)?;
+    }
+    Ok(Some(rec))
 }
 
 /// Write this identity's record atomically, mode 600.
@@ -1406,6 +1429,67 @@ mod tests {
         assert_eq!(a.len(), 32);
         assert_ne!(a, identity_dir("http://127.0.0.1:2", "local"));
         assert_ne!(a, identity_dir("http://127.0.0.1:1", "other"));
+    }
+
+    #[test]
+    fn one_server_spelled_differently_keeps_one_runner_record() {
+        let t = tempfile::tempdir().unwrap();
+        let root = crate::desktop_tools::store::open_root(&t.path().join("tools")).unwrap();
+        let tok = Secret::new("bearer");
+        let session = |url: &str| BoundSession::signed_in(url, &tok, "alice").unwrap();
+        // An earlier build keyed it by the URL as typed.
+        let old = "https://Metro.Example:443/";
+        let earlier = BoundSession {
+            server_url: old.trim_end_matches('/').into(),
+            legacy_url: None,
+            ..session(old)
+        };
+        let rec = Record {
+            server_url: earlier.server_url.clone(),
+            account_id: "alice".into(),
+            name: "n".into(),
+            state: RecordState::Active,
+            runner_id: Some("rn-1".into()),
+            token: Some(Secret::new("metro_rt_v2_secret")),
+        };
+        save(&root, &earlier, &rec).unwrap();
+        std::fs::create_dir_all(
+            spaces_path(
+                t.path().join("tools").as_path(),
+                &earlier.server_url,
+                "alice",
+            )
+            .join("s-1"),
+        )
+        .unwrap();
+        // Now every spelling is the same server: the old record is found,
+        // moved under the one name with its folders, and rewritten.
+        for url in [old, "https://metro.example", "HTTPS://METRO.EXAMPLE/"] {
+            let h = session(url);
+            assert_eq!(h.server_url(), "https://metro.example");
+            let back = load(&root, &h).unwrap().expect("the earlier record");
+            assert_eq!(back.runner_id.as_deref(), Some("rn-1"));
+            assert_eq!(back.server_url, "https://metro.example");
+        }
+        let tools = t.path().join("tools");
+        assert!(
+            spaces_path(&tools, "https://metro.example", "alice")
+                .join("s-1")
+                .is_dir()
+        );
+        assert_eq!(
+            std::fs::read_dir(tools.join(RUNNER_DIR)).unwrap().count(),
+            1
+        );
+        // A path keeps its case; only the trailing slash goes.
+        assert_eq!(
+            session("http://10.0.0.2:8080/Metro/").server_url(),
+            "http://10.0.0.2:8080/Metro"
+        );
+        assert_ne!(
+            session("https://metro.example:8443").server_url(),
+            "https://metro.example"
+        );
     }
 
     #[test]
