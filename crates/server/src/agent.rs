@@ -396,6 +396,16 @@ fn event_message(e: &Event, key: &TurnKey) -> Option<Message> {
     }
 }
 
+/// A reply thread's anchor as its history's first turn: as
+/// [`event_message`] says, any other kind as a user turn. An
+/// attachment-only message gives nothing.
+fn anchor_message(anchor: &Event, key: &TurnKey) -> Option<Message> {
+    match anchor.kind.as_str() {
+        kind::MESSAGE => event_message(anchor, key),
+        _ => Some(event_message(anchor, key).unwrap_or_else(|| user_turn(anchor, key))),
+    }
+}
+
 /// A random key for one run, stated in its system prompt and carried in
 /// each of its real context parts. Providers may merge adjacent user turns
 /// (or flatten their parts into one string), so the part boundary alone
@@ -986,6 +996,7 @@ fn steer_hook(
     inbox: &Arc<crate::steering::Inbox>,
     turn: &Activity,
     key: &TurnKey,
+    provenance: Option<Arc<crate::web_tools::Provenance>>,
 ) -> crate::steering::Steer {
     let key = key.clone();
     crate::steering::Steer::new(
@@ -993,6 +1004,7 @@ fn steer_hook(
         inbox.clone(),
         turn,
         Arc::new(move |e| user_turn(e, &key)),
+        provenance,
     )
 }
 
@@ -1410,6 +1422,8 @@ async fn execute_room_run(
             }
             // Web tools: only when the agent may use them, and only on the
             // computer of the person who started the run.
+            // Steered messages add theirs ([`crate::steering::Steer`]).
+            let mut web_provenance = None;
             let (search, fetch) = (
                 agent.allows(crate::web_tools::WEB_SEARCH),
                 agent.allows(crate::web_tools::WEB_FETCH),
@@ -1418,13 +1432,14 @@ async fn execute_room_run(
                 let user = initiator.id.clone().unwrap_or_default();
                 let paired = crate::web_devices::has_device(state, &user).await;
                 if matches!(paired, Ok(true)) {
-                    let provenance = crate::web_tools::Provenance::from_messages(
+                    let provenance = Arc::new(crate::web_tools::Provenance::from_messages(
                         parent_events
                             .iter()
                             .chain(anchor.iter())
                             .chain(earlier.iter())
                             .chain(std::iter::once(trigger)),
-                    );
+                    ));
+                    web_provenance = Some(provenance.clone());
                     let ctx = crate::web_tools::WebContext {
                         state: state.clone(),
                         scope: crate::web_tools::WebScope::Room {
@@ -1433,7 +1448,7 @@ async fn execute_room_run(
                         },
                         initiator: initiator.clone(),
                         turn: turn.clone(),
-                        provenance: Arc::new(provenance),
+                        provenance,
                         agent_id: Some(agent.id.clone()),
                     };
                     builder = builder
@@ -1488,7 +1503,7 @@ async fn execute_room_run(
                 });
             }
             if let Some(inbox) = &inbox {
-                builder = builder.add_hook(steer_hook(state, inbox, turn, &key));
+                builder = builder.add_hook(steer_hook(state, inbox, turn, &key, web_provenance));
             }
             let prompt = user_turn(trigger, &key);
             let mut window = window;
@@ -1496,11 +1511,8 @@ async fn execute_room_run(
                 .events
                 .extend(late_replies(state, late, agent, initiator));
             let mut history = history(&window.events, &key);
-            if let Some(anchor) = &anchor {
-                history.insert(
-                    0,
-                    event_message(anchor, &key).unwrap_or_else(|| user_turn(anchor, &key)),
-                );
+            if let Some(anchor) = anchor.as_ref().and_then(|a| anchor_message(a, &key)) {
+                history.insert(0, anchor);
             }
             drive(
                 state,
@@ -2464,9 +2476,18 @@ async fn execute_personal_run(
              Ask what the user needs and invite them to paste the relevant text.",
         );
     }
+    // Steered messages add theirs ([`crate::steering::Steer`]).
+    let mut web_provenance = None;
     if web {
         let paired = crate::web_devices::has_device(&state, &user_id).await;
         if matches!(paired, Ok(true)) {
+            let provenance = Arc::new(crate::web_tools::Provenance::from_messages(
+                anchor
+                    .iter()
+                    .chain(earlier.iter())
+                    .chain(std::iter::once(&trigger)),
+            ));
+            web_provenance = Some(provenance.clone());
             let ctx = crate::web_tools::WebContext {
                 state: state.clone(),
                 scope: crate::web_tools::WebScope::PersonalChat {
@@ -2477,12 +2498,7 @@ async fn execute_personal_run(
                     name: String::new(),
                 },
                 turn: turn.clone(),
-                provenance: Arc::new(crate::web_tools::Provenance::from_messages(
-                    anchor
-                        .iter()
-                        .chain(earlier.iter())
-                        .chain(std::iter::once(&trigger)),
-                )),
+                provenance: provenance.clone(),
                 agent_id: None,
             };
             builder = builder
@@ -2519,15 +2535,12 @@ async fn execute_personal_run(
             turn: turn.clone(),
         });
     if let Some(inbox) = &inbox {
-        builder = builder.add_hook(steer_hook(&state, inbox, &turn, &key));
+        builder = builder.add_hook(steer_hook(&state, inbox, &turn, &key, web_provenance));
     }
     let prompt = user_turn(&trigger, &key);
     let mut history = history(&window.events, &key);
-    if let Some(anchor) = &anchor {
-        history.insert(
-            0,
-            event_message(anchor, &key).unwrap_or_else(|| user_turn(anchor, &key)),
-        );
+    if let Some(anchor) = anchor.as_ref().and_then(|a| anchor_message(a, &key)) {
+        history.insert(0, anchor);
     }
     let phase = match drive(
         &state,
@@ -2656,6 +2669,20 @@ mod tests {
         assert_eq!(ctx["speaker_id"], "alice");
         assert_eq!(ctx["event_id"], 7);
         assert_eq!(texts(&m)[1], "hi");
+    }
+
+    #[test]
+    fn an_attachment_only_anchor_adds_no_turn() {
+        let key = TurnKey::new();
+        assert!(anchor_message(&event(kind::MESSAGE, " ", Some(1)), &key).is_none());
+        assert_eq!(
+            texts(&anchor_message(&event(kind::MESSAGE, "q", Some(1)), &key).unwrap())[1],
+            "q"
+        );
+        assert!(matches!(
+            anchor_message(&event(kind::AGENT, "a", Some(1)), &key),
+            Some(Message::Assistant { .. })
+        ));
     }
 
     #[test]

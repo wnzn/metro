@@ -157,17 +157,26 @@ pub struct Steer {
     /// The running turn, as its `steered` markers name it.
     turn: Activity,
     render: Render,
+    /// The run's fetch provenance: a delivered message's URLs join it.
+    provenance: Option<Arc<crate::web_tools::Provenance>>,
     /// Delivered so far: where in the model's history each goes, and what.
     delivered: tokio::sync::Mutex<Vec<(usize, Arc<Message>)>>,
 }
 
 impl Steer {
-    pub fn new(state: &AppState, inbox: Arc<Inbox>, turn: &Activity, render: Render) -> Self {
+    pub fn new(
+        state: &AppState,
+        inbox: Arc<Inbox>,
+        turn: &Activity,
+        render: Render,
+        provenance: Option<Arc<crate::web_tools::Provenance>>,
+    ) -> Self {
         Self {
             state: state.clone(),
             inbox,
             turn: turn.clone(),
             render,
+            provenance,
             delivered: Default::default(),
         }
     }
@@ -192,11 +201,15 @@ impl Steer {
             .call(move |db| deliver(db, &place, &epoch, id, planned, &marker))
             .await
             .unwrap_or_else(|e| {
-                tracing::error!(error = %format!("{e:#}"), "delivering a steered message");
+                // A Chat thread deleted meanwhile is no error.
+                crate::db::log_append_error(&e, "delivering a steered message");
                 None
             });
         let event = accepted?;
         let _ = offer.taken.send(());
+        if let Some(p) = &self.provenance {
+            p.add_text(&event.text);
+        }
         Some(event)
     }
 }
@@ -283,6 +296,9 @@ fn with_delivered(
     history: &[Arc<Message>],
     delivered: &[(usize, Arc<Message>)],
 ) -> Vec<Arc<Message>> {
+    // The model's history only grows during a run, and each delivery is
+    // recorded at the length it had then: positions never decrease.
+    debug_assert!(delivered.windows(2).all(|w| w[0].0 <= w[1].0));
     let mut out = history.to_vec();
     for (i, (at, message)) in delivered.iter().enumerate() {
         out.insert((at + i).min(out.len()), message.clone());
