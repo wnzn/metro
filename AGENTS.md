@@ -243,13 +243,15 @@ see [New in Metro 0.6.1](docs/released-0.6.1.md); for later changes, see
   total, newest kept), each with its author's name, whether a person or
   an agent, and the names it explicitly addressed, to the sender's
   System One connection. In a reply thread the anchor (unless deleted)
-  is the first excerpt, within those bounds and always kept. Lean strongly toward a useful agent; "No agent"
-  is for text directed at or about another person, or that says no
-  agent should answer. Below the directedness threshold or on failure,
-  start nothing; at or above it, "No agent" uses the strongest agent
-  option. Default is 0.35 (range 0.2–1); migrate stored 0.85 values once.
-  Failure on unaddressed text returns an unstored `addressing_note` to
-  the sender only, not a room event. The selected run acts as the sender.
+  is the first excerpt, within those bounds and always kept. Lean
+  strongly toward a useful agent, including for a request to the room
+  about another person; "No agent" is for text that talks to another
+  person, is only conversation about someone with no request for the
+  room, or says no agent should answer. Below the directedness threshold
+  or on failure, start nothing; at or above it, "No agent" uses the
+  strongest agent option. Default is 0.35 (range 0.2–1); migrate
+  stored 0.85 values once. Failure on unaddressed text returns an
+  unstored `addressing_note` to the sender only, not a room event. The selected run acts as the sender.
   With `defer_decisions` (what the desktop sends), the message is stored
   and shown first and the decision follows; the pick is run activity and
   is never written into the stored recipients (in no path: the POST says

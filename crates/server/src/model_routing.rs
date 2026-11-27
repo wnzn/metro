@@ -1115,8 +1115,9 @@ fn agent_question(agents: &[(String, String)], with_none: bool) -> Question {
     if with_none {
         criteria.insert(
             NO_AGENT_KEY.to_owned(),
-            json!({"label": "No agent", "description": "`message` is directed at or about another \
-                   person (not the sender, not an agent), or the sender says no agent should answer it."}),
+            json!({"label": "No agent", "description": "`message` talks to another person (not the \
+                   sender, not an agent), is only conversation about someone with no request for the room, \
+                   or the sender says no agent should answer it."}),
         );
     }
     Question::Choice {
@@ -1124,11 +1125,13 @@ fn agent_question(agents: &[(String, String)], with_none: bool) -> Question {
             "`sender` wrote `message` in a shared room without addressing anyone. Decide whether one \
              agent should answer it. Lean strongly toward an agent: any question, request, task or remark \
              to the room, and any follow-up to an agent in `previous`, gets the agent that fits it best. \
-             Pick No agent in only two cases: (1) another person is the addressee or the subject of \
-             `message`, for example it talks to someone by name, replies to or continues a conversation \
-             with another person in `previous` (see each excerpt's `speaker` and `to`), or is about what a \
-             person in `people` said or did; (2) the sender says an agent shouldn't respond (for example \
-             \"just noting\", \"not for the bot\", \"agent, don't reply\"). When unsure, pick an agent."
+             A question or request to the room still gets an agent when it mentions or is about another \
+             person (for example \"can someone summarize what Bob said?\"). Pick No agent only when: \
+             (1) `message` talks to another person, addressing them by name or replying to or continuing a \
+             conversation with another person in `previous` (see each excerpt's `speaker` and `to`); \
+             (2) it is only conversation about someone in `people`, with no question or request for the \
+             room; or (3) the sender says an agent shouldn't respond (for example \"just noting\", \
+             \"not for the bot\", \"agent, don't reply\"). When unsure, pick an agent."
         } else {
             "`message` asks an agent to answer or do something. Which agent fits it best?"
         }),
@@ -1996,8 +1999,9 @@ mod tests {
         let text = instructions.as_str().unwrap();
         for needle in [
             "Lean strongly toward an agent",
-            "another person",
-            "subject",
+            "talks to another person",
+            "still gets an agent",
+            "no question or request for the",
             "`to`",
             "shouldn't respond",
             "When unsure, pick an agent.",

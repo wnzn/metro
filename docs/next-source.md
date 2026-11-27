@@ -29,8 +29,9 @@ for what has been tested.
   member display names, and up to eight earlier messages in that room or
   thread (400 characters each, 2,400 in total, with who wrote them and
   whom they addressed). In a reply thread, the message it started from
-  comes first. *No agent* is now only for a message to or about another
-  person, or one that says no agent should answer. See
+  comes first. *No agent* is now only for a message that talks to another
+  person, is only conversation about someone, or says no agent should
+  answer; a request to the room about someone still gets an agent. See
   [Classification in 0.6.2](system-one.md#classification-in-062).
 - **Write while an agent replies.** The Chat composer stays usable while
   Metro replies: **Queue** (the default) sends the message after the

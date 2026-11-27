@@ -233,11 +233,12 @@ are. There are still no stable participant IDs or agent instructions.
 
 The prompt leans strongly toward an agent: a question, request, task or
 remark to the room, or a follow-up to an agent, gets the agent that fits
-it best. *No agent* is for two cases only: another person is the
-addressee or the subject of the message (it talks to someone by name,
-continues a conversation with another person, or is about what someone
-said or did), or the sender says an agent shouldn't respond (for example
-"just noting" or "not for the bot"). The threshold and its handling
+it best, even when it mentions or is about another person ("can someone
+summarize what Bob said?"). *No agent* is only for a message that talks
+to another person (addresses them by name, or continues a conversation
+with them), one that is only conversation about someone with no question
+or request for the room, or one where the sender says an agent shouldn't
+respond (for example "just noting" or "not for the bot"). The threshold and its handling
 above are unchanged. Messages that mention only people (`@bob`) still
 never reach System One.
 
