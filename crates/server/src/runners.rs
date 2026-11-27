@@ -92,6 +92,8 @@ pub struct RegisteredRunner {
     pub visibility: Visibility,
     /// Stable user id of the creator.
     pub owner_id: String,
+    /// Marked by its owner as the desktop app's built-in runner.
+    pub built_in: bool,
 }
 
 impl RegisteredRunner {
@@ -168,10 +170,11 @@ fn row_runner(r: &rusqlite::Row<'_>) -> rusqlite::Result<RegisteredRunner> {
         name: r.get(1)?,
         visibility: Visibility::parse(&r.get::<_, String>(2)?)?,
         owner_id: r.get(3)?,
+        built_in: r.get(4)?,
     })
 }
 
-const RUNNER_COLUMNS: &str = "id, name, visibility, owner_id";
+const RUNNER_COLUMNS: &str = "id, name, visibility, owner_id, built_in";
 
 /// Bump the runner generation of every Space `runner_id` is attached to.
 fn bump_attached(conn: &Connection, runner_id: &str, removing: bool) -> rusqlite::Result<Bumped> {
@@ -196,6 +199,19 @@ impl Db {
         token_hash: &[u8],
         max: usize,
     ) -> Result<RegisteredRunner, LimitError> {
+        self.create_runner_marked(owner_id, name, visibility, token_hash, max, false)
+    }
+
+    /// [`Db::create_runner`], marked as the desktop's built-in runner or not.
+    pub fn create_runner_marked(
+        &self,
+        owner_id: &str,
+        name: &str,
+        visibility: Visibility,
+        token_hash: &[u8],
+        max: usize,
+        built_in: bool,
+    ) -> Result<RegisteredRunner, LimitError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         let count: i64 = match visibility {
@@ -218,17 +234,19 @@ impl Db {
             name: name.to_owned(),
             visibility,
             owner_id: owner_id.to_owned(),
+            built_in,
         };
         tx.execute(
-            "INSERT INTO runners (id, name, visibility, owner_id, token_hash, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO runners (id, name, visibility, owner_id, token_hash, created_at, built_in)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 runner.id,
                 runner.name,
                 visibility.as_str(),
                 runner.owner_id,
                 token_hash,
-                now_ms()
+                now_ms(),
+                built_in
             ],
         )?;
         tx.commit()?;
@@ -265,11 +283,21 @@ impl Db {
         id: &str,
         token_hash: &[u8],
     ) -> anyhow::Result<Option<Bumped>> {
+        self.rotate_runner_token_marked(id, token_hash, None)
+    }
+
+    /// [`Db::rotate_runner_token`]; `built_in` sets the marker when given.
+    pub fn rotate_runner_token_marked(
+        &self,
+        id: &str,
+        token_hash: &[u8],
+        built_in: Option<bool>,
+    ) -> anyhow::Result<Option<Bumped>> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         if tx.execute(
-            "UPDATE runners SET token_hash = ?2 WHERE id = ?1",
-            params![id, token_hash],
+            "UPDATE runners SET token_hash = ?2, built_in = COALESCE(?3, built_in) WHERE id = ?1",
+            params![id, token_hash, built_in],
         )? == 0
         {
             return Ok(None);
@@ -294,6 +322,7 @@ impl Db {
             return Ok(None);
         }
         let bumped = bump_attached(&tx, id, true)?;
+        crate::shell::runner_deleted(&tx, id)?;
         tx.execute("DELETE FROM space_runners WHERE runner_id = ?1", [id])?;
         tx.execute("DELETE FROM runners WHERE id = ?1", [id])?;
         tx.commit()?;
@@ -345,7 +374,7 @@ impl Db {
         let conn = self.lock();
         let registered = conn
             .query_row(
-                "SELECT r.id, r.name, r.visibility, r.owner_id
+                "SELECT r.id, r.name, r.visibility, r.owner_id, r.built_in
                  FROM space_runners a JOIN runners r ON r.id = a.runner_id
                  WHERE a.space_id = ?1",
                 [space_id],
@@ -380,8 +409,8 @@ impl Db {
         Ok(self
             .lock()
             .query_row(
-                "SELECT r.id, r.name, r.visibility, r.owner_id, s.runner_token_hash IS NOT NULL,
-                        m.role = 'owner', s.runner_generation
+                "SELECT r.id, r.name, r.visibility, r.owner_id, r.built_in,
+                        s.runner_token_hash IS NOT NULL, m.role = 'owner', s.runner_generation
                  FROM spaces s JOIN space_members m ON m.space_id = s.id
                  LEFT JOIN space_runners a ON a.space_id = s.id
                  LEFT JOIN runners r ON r.id = a.runner_id
@@ -390,12 +419,12 @@ impl Db {
                 |row| {
                     let runner = if row.get::<_, Option<String>>(0)?.is_some() {
                         SpaceRunner::Registered(row_runner(row)?)
-                    } else if row.get::<_, bool>(4)? {
+                    } else if row.get::<_, bool>(5)? {
                         SpaceRunner::Dedicated
                     } else {
                         SpaceRunner::None
                     };
-                    Ok((runner, row.get(5)?, row.get(6)?))
+                    Ok((runner, row.get(6)?, row.get(7)?))
                 },
             )
             .optional()?)
@@ -480,6 +509,7 @@ impl Db {
         if current.as_deref() == Some(runner_id) {
             return Ok(Attach::Unchanged(runner));
         }
+        crate::shell::assignment_removed(&tx, space_id)?;
         tx.execute(
             "INSERT INTO space_runners (space_id, runner_id, attached_by, attached_at)
              VALUES (?1, ?2, ?3, ?4)
@@ -600,6 +630,7 @@ impl Db {
     }
 
     fn remove_assignment(tx: &Connection, space_id: &str) -> anyhow::Result<Option<u64>> {
+        crate::shell::assignment_removed(tx, space_id)?;
         let detached = tx.execute("DELETE FROM space_runners WHERE space_id = ?1", [space_id])?;
         let revoked = tx.execute(
             "UPDATE spaces SET runner_token_hash = NULL
@@ -628,6 +659,7 @@ fn view(runner: &RegisteredRunner, who: &Human, state: &AppState) -> serde_json:
         "id": runner.id,
         "name": runner.name,
         "visibility": runner.visibility,
+        "built_in": runner.built_in,
         "can_manage": runner.manageable_by(&who.id, state.config.is_org_admin(&who.id)),
         "presence": presence,
         "update": update,
@@ -745,6 +777,9 @@ pub async fn list_runners(
 pub struct CreateRunner {
     name: String,
     visibility: Visibility,
+    /// The desktop app's own runner (personal only).
+    #[serde(default)]
+    built_in: bool,
 }
 
 pub async fn create_runner(
@@ -765,11 +800,16 @@ pub async fn create_runner(
         Visibility::Organization => limits.max_org_runners,
         Visibility::Personal => limits.max_personal_runners,
     };
+    if body.built_in && body.visibility != Visibility::Personal {
+        return Err(ApiError::bad_request(
+            "only a personal runner can be marked built_in",
+        ));
+    }
     let token = new_registered_token().map_err(ApiError::internal)?;
     let hash = runner_token_hash(&token);
-    let (owner, visibility) = (who.id.clone(), body.visibility);
+    let (owner, visibility, built_in) = (who.id.clone(), body.visibility, body.built_in);
     match api::db(&state, move |db| {
-        Ok(db.create_runner(&owner, &name, visibility, &hash, max))
+        Ok(db.create_runner_marked(&owner, &name, visibility, &hash, max, built_in))
     })
     .await?
     {
@@ -792,20 +832,41 @@ pub async fn create_runner(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RotateBody {
+    /// Present: set the built-in marker (personal runners only).
+    #[serde(default)]
+    built_in: Option<bool>,
+}
+
 pub async fn rotate_runner_token(
     State(state): State<AppState>,
     who: Human,
     Path(id): Path<String>,
     body: axum::body::Bytes,
 ) -> ApiResult<Response> {
-    api::empty_object(&body)?;
+    let body: RotateBody = if body.iter().all(u8::is_ascii_whitespace) {
+        RotateBody { built_in: None }
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|_| ApiError::bad_request("body must be {} or {\"built_in\": bool}"))?
+    };
     let runner = managed_runner(&state, &id, &who).await?;
+    if body.built_in == Some(true) && runner.visibility != Visibility::Personal {
+        return Err(ApiError::bad_request(
+            "only a personal runner can be marked built_in",
+        ));
+    }
     let token = new_registered_token().map_err(ApiError::internal)?;
     let hash = runner_token_hash(&token);
     let rid = runner.id.clone();
-    let bumped = api::db(&state, move |db| db.rotate_runner_token(&rid, &hash))
-        .await?
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, NO_RUNNER))?;
+    let built_in = body.built_in;
+    let bumped = api::db(&state, move |db| {
+        db.rotate_runner_token_marked(&rid, &hash, built_in)
+    })
+    .await?
+    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, NO_RUNNER))?;
     // Same runner, new token: claimed jobs fail, queued ones wait for it.
     for (space, generation) in &bumped {
         state.jobs.rotate(space, *generation);
@@ -846,6 +907,14 @@ pub async fn get_space_runner(
             .await?
             .ok_or_else(|| ApiError::not_found("no such Space"))?;
     let mut body = json!({"runner": space_view(&state, &sid, &runner)});
+    let space_id = sid.clone();
+    let shell = api::db(&state, move |db| {
+        Ok(crate::shell::policy_in(&db.lock(), &space_id)?)
+    })
+    .await?;
+    if let Some(policy) = shell {
+        body["shell"] = policy.view();
+    }
     if owner {
         body["guarded_token_changes"] = json!(true);
         if runner != SpaceRunner::None {

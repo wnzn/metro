@@ -681,7 +681,8 @@ async fn organization_runners_are_managed_by_admins_and_attachable_by_space_owne
     let (_, body) = s.get(ALICE, "/v1/runners").await;
     assert_eq!(
         without_update_fields(&body["runners"]),
-        json!([{"id": org, "name": "build farm", "visibility": "organization", "can_manage": false}])
+        json!([{"id": org, "name": "build farm", "visibility": "organization", "can_manage": false,
+                "built_in": false}])
     );
     assert_eq!(
         s.post(ALICE, &format!("/v1/runners/{org}/token"), json!({}))

@@ -517,6 +517,13 @@ pub mod kind {
     /// (`activity.steered` names it; [`crate::steering`]). Empty text.
     /// Never a message, never model history, never indexed.
     pub const STEERED: &str = "steered";
+    /// A `workspace.shell` command waits for approval ([`crate::shell`]).
+    /// The text is JSON. Run activity: never a message, never model
+    /// history, never indexed or searched.
+    pub const SHELL_APPROVAL: &str = "shell_approval";
+    /// A shell approval was decided, expired or cancelled. JSON text; run
+    /// activity like [`SHELL_APPROVAL`].
+    pub const SHELL_APPROVAL_RESOLVED: &str = "shell_approval_resolved";
 }
 
 /// Actors the server writes for non-human events.
@@ -683,6 +690,7 @@ impl Db {
         reactions::init(&conn)?;
         crate::runners::init(&conn)?;
         add_runner_queue_floor(&conn)?;
+        crate::shell::init(&conn)?;
         crate::admin_users::init(&conn)?;
         crate::admin_settings::init(&conn)?;
         crate::profiles::init(&conn)?;
