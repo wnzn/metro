@@ -5,10 +5,36 @@ hasn't been demonstrated.
 
 ## Source only: Metro 0.6.2 lanes (2026-11-27, local)
 
-Per-lane results on each lane branch, on local Linux builds, as each
-lane reported them. They are not an integrated gate on `release/062`,
-release files, a native desktop check by a person or a publication
-record. **The integrated gate on the merged branch is pending.**
+Local Linux builds only. This is not a release, release files, a
+native desktop check by a person or a publication record.
+
+**Integrated gate** on `release/062` at
+`6b7e4f7e9de8ebc3a325794d0475f176bf5c5530`, with every lane merged and
+review fixes in:
+
+- `cargo fmt`, `cargo clippy -D warnings` and `cargo build` passed.
+- `cargo test --workspace`: 1,294 passed, 0 failed, 3 ignored, across 78
+  suites.
+- E2e 17/17 passed: `agent_pages`, `attachments`, `compaction`,
+  `device_connector`, `intelligence`, `library`, `library_reference`,
+  `message_lifecycle`, `messaging`, `meta_agent`, `pages`, `schedules`,
+  `settings`, `smoke`, `threads`, `updates` and `web_search`.
+- Packaging: 206 passed, 63 skipped.
+- Desktop: `nsh check` passed; full `nsh test` 992/992 (12m50s).
+- Reviews: the Opus 5.5 review found no blockers, 1 major, 5 minor and
+  some nits, all fixed in `c52a569..6b7e4f7`; the Opus re-review
+  accepted them.
+
+**After the gate**, `cd75165` changed only the classification guidance:
+a question or request to the room still gets an agent when it mentions
+or is about another person. `metro-server` lib 419 passed, 1 ignored;
+`model_routing` 24 and `model_routing_http` 3 passed; e2e `messaging.py`
+and `intelligence.py` passed; `cargo fmt --check` and `cargo clippy
+--workspace --all-targets -D warnings` passed. The full gate was not
+rerun.
+
+Per-lane results below were reported on each lane branch before
+integration.
 
 - **Colours lane** (`lane/062-colors`: dropdown text in dark and light).
   99/99 targeted desktop tests and `nsh check` passed; before and after
@@ -40,9 +66,9 @@ record. **The integrated gate on the merged branch is pending.**
 - **Version bump** (`a1169fd`, 0.6.2). Packaging 206 passed, 63
   skipped; `cargo check` passed.
 
-**Not verified:** the desktop on native Windows by a person, any Windows
-run of the built-in runner in this cycle, and real vendor accounts and
-sign-ins.
+**Not verified:** any native Windows run in this cycle (including the
+desktop by a person and the built-in runner), and any real vendor run,
+account or sign-in.
 
 ## Published: Metro 0.6.1 (2026-11-27, GitHub release v0.6.1)
 
