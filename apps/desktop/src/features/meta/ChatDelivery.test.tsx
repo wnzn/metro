@@ -93,6 +93,29 @@ test("Steer sends into the running reply and marks the message once it was deliv
   expect(f.sent[1]!.delivery).toBe("steer");
 });
 
+test("a steer the running reply never took shows as queued behind the next turn", async () => {
+  const f = setup();
+  const app = await launch(f);
+  await app.waitFor("id:chat-delivery");
+  await app.type("id:composer", "queued first");
+  await app.submit("id:composer");
+  await app.waitUntil(() => f.sent.length === 1);
+  const first = (f.state.events.get("chat:alice")!.at(-1) as { id: number }).id;
+  await app.press("id:chat-delivery:steer");
+  await app.type("id:composer", "steer late");
+  await app.submit("id:composer");
+  await app.waitUntil(() => f.sent.length === 2);
+  const steer = (f.state.events.get("chat:alice")!.at(-1) as { id: number }).id;
+  await app.waitFor(`id:queued:${first}`);
+  expect(app.shows(`id:queued:${steer}`)).toBe(false);
+  // The reply ends without taking it; the queued turn starts, and the
+  // steer now waits its turn.
+  f.addChat({ kind: "activity", actor: "agent", text: "", activity: turn(liveId, "completed") });
+  f.addChat({ kind: "activity", actor: "agent", text: "", activity: turn("chat_sent1", "started") });
+  await app.waitFor(`id:queued:${steer}`);
+  await app.waitFor(`id:queued:${first}`, { state: "gone" });
+});
+
 test("with nothing running there is no Queue or Steer choice", async () => {
   const f = setup(false);
   const app = await launch(f);

@@ -109,7 +109,9 @@ export const runningChatTurn = computed(() => {
 
 /**
  * Queued Chat turns this session sent, by message id: sent with Queue while
- * another turn runs, not started, stopped or ended yet.
+ * another turn runs, not started, stopped or ended yet. A Steer the turn it
+ * was sent into never took waits in the queue too: the turn running now
+ * started after it was sent (or hasn't started).
  */
 export const queuedChatTurns = computed(() => {
   const queued = new Map<number, string>();
@@ -121,8 +123,10 @@ export const queuedChatTurns = computed(() => {
     if (e.kind === "activity" && e.activity?.id) done.add(e.activity.id);
     if (e.kind === "error" && e.turnId) done.add(e.turnId);
   }
+  const started = events.find(e => e.kind === "activity" && e.activity?.id === running && e.activity.phase === "started")?.id;
   for (const p of pendingChatTurns()) {
-    if (p.delivery === "queue" && p.id !== running && !done.has(p.id) && events.some(e => e.id === p.eventId)) queued.set(p.eventId, p.id);
+    const waits = p.delivery === "queue" || (p.delivery === "steer" && (started === undefined || started > p.eventId));
+    if (waits && p.id !== running && !done.has(p.id) && events.some(e => e.id === p.eventId)) queued.set(p.eventId, p.id);
   }
   return queued;
 });
