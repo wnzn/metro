@@ -45,11 +45,18 @@ const DOCKER_RM_TIMEOUT: Duration = Duration::from_secs(30);
 
 static CONTAINER_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Variables a `workspace.shell` command keeps from the runner's own
+/// environment. `TERM=dumb` and `METRO_SPACE_ROOT` are added.
+pub const SHELL_ENV_ALLOWLIST: &[&str] = &["PATH", "HOME", "LANG"];
+/// Bound on each of a shell command's stdout and stderr.
+pub const SHELL_CAPTURE_BYTES: usize = 64 * 1024;
+
 #[derive(Debug)]
 pub enum ExecError {
     Spawn(String),
     TimedOut,
     Shutdown,
+    Cancelled,
     Io(io::Error),
 }
 
@@ -59,6 +66,9 @@ impl std::fmt::Display for ExecError {
             ExecError::Spawn(m) => write!(f, "failed to start process: {m}"),
             ExecError::TimedOut => f.write_str("process timed out and was killed"),
             ExecError::Shutdown => f.write_str("runner is shutting down; process was killed"),
+            ExecError::Cancelled => f.write_str(
+                "the server cancelled the job (run stopped or runner changed); process was killed",
+            ),
             ExecError::Io(e) => write!(f, "I/O error: {e}"),
         }
     }
@@ -109,12 +119,7 @@ pub fn prepare(
             })
         }
         Sandbox::Docker(d) => {
-            let name = format!(
-                "metro-runner-{}-{}-{:08x}",
-                std::process::id(),
-                CONTAINER_SEQ.fetch_add(1, Ordering::Relaxed),
-                crate::util::random_u64() as u32
-            );
+            let name = container_name();
             let mut c = Command::new(&d.docker_bin);
             c.env_clear().envs(filtered_env(DOCKER_CLI_ENV_ALLOWLIST));
             // The docker CLI's cwd is irrelevant to the container; use "/".
@@ -131,6 +136,75 @@ pub fn prepare(
     }
 }
 
+/// `/bin/sh -c command` for `workspace.shell`, in `workspace`. The only
+/// place the runner uses a shell. On the host it runs as the runner user
+/// with a minimal environment; with docker it runs in the locked-down
+/// container with only `workspace` mounted, read-write.
+pub fn prepare_shell(
+    command: &str,
+    workspace: &Path,
+    sandbox: &Sandbox,
+) -> Result<Prepared, ExecError> {
+    let args = ["-c".to_owned(), command.to_owned()];
+    match sandbox {
+        Sandbox::None => {
+            let mut c = Command::new("/bin/sh");
+            c.args(args)
+                .current_dir(workspace)
+                .env_clear()
+                .envs(filtered_env(SHELL_ENV_ALLOWLIST))
+                .env("TERM", "dumb")
+                .env("METRO_SPACE_ROOT", workspace);
+            Ok(Prepared {
+                command: c,
+                container: None,
+            })
+        }
+        Sandbox::Docker(d) => {
+            let name = container_name();
+            let mut c = Command::new(&d.docker_bin);
+            c.env_clear().envs(filtered_env(DOCKER_CLI_ENV_ALLOWLIST));
+            c.current_dir("/");
+            c.args(docker_args(
+                d,
+                &name,
+                workspace,
+                "/bin/sh",
+                &args,
+                Mount {
+                    interactive: false,
+                    writable: true,
+                    env: &["TERM=dumb", "METRO_SPACE_ROOT=/workspace"],
+                },
+            ));
+            Ok(Prepared {
+                command: c,
+                container: Some(ContainerRef {
+                    docker_bin: d.docker_bin.clone(),
+                    name,
+                }),
+            })
+        }
+    }
+}
+
+fn container_name() -> String {
+    format!(
+        "metro-runner-{}-{}-{:08x}",
+        std::process::id(),
+        CONTAINER_SEQ.fetch_add(1, Ordering::Relaxed),
+        crate::util::random_u64() as u32
+    )
+}
+
+/// How a sandbox container gets its workspace and environment.
+pub struct Mount<'a> {
+    pub interactive: bool,
+    /// Only `workspace.shell` mounts the Space root read-write.
+    pub writable: bool,
+    pub env: &'a [&'a str],
+}
+
 /// The exact `docker run` argument list. Public for tests/docs.
 pub fn docker_run_args(
     d: &DockerSandbox,
@@ -140,6 +214,29 @@ pub fn docker_run_args(
     args: &[String],
     interactive: bool,
 ) -> Vec<String> {
+    docker_args(
+        d,
+        name,
+        workspace,
+        exe,
+        args,
+        Mount {
+            interactive,
+            writable: false,
+            env: &[],
+        },
+    )
+}
+
+pub fn docker_args(
+    d: &DockerSandbox,
+    name: &str,
+    workspace: &Path,
+    exe: &str,
+    args: &[String],
+    mount: Mount<'_>,
+) -> Vec<String> {
+    let interactive = mount.interactive;
     let mut v: Vec<String> = vec!["run".into(), "--rm".into()];
     if interactive {
         v.push("-i".into());
@@ -171,8 +268,9 @@ pub fn docker_run_args(
             &format!("/tmp:rw,nosuid,nodev,size={}", d.tmpfs_size),
             "--mount",
             &format!(
-                "type=bind,source={},target={CONTAINER_WORKDIR},readonly",
-                workspace.display()
+                "type=bind,source={},target={CONTAINER_WORKDIR}{}",
+                workspace.display(),
+                if mount.writable { "" } else { ",readonly" }
             ),
             "--workdir",
             CONTAINER_WORKDIR,
@@ -180,13 +278,15 @@ pub fn docker_run_args(
             "HOME=/tmp",
             "--env",
             "TMPDIR=/tmp",
-            "--entrypoint",
-            exe,
-            &d.image,
         ]
         .iter()
         .map(|s| s.to_string()),
     );
+    for e in mount.env {
+        v.push("--env".into());
+        v.push((*e).to_owned());
+    }
+    v.extend(["--entrypoint".into(), exe.to_owned(), d.image.clone()]);
     v.extend(args.iter().cloned());
     v
 }
@@ -246,6 +346,10 @@ impl ChildGuard {
             if crate::shutdown_requested() {
                 self.terminate();
                 return Err(ExecError::Shutdown);
+            }
+            if crate::job_cancelled() {
+                self.terminate();
+                return Err(ExecError::Cancelled);
             }
             if Instant::now() >= deadline {
                 self.terminate();
@@ -357,27 +461,50 @@ pub struct Completed {
     pub stderr_total: u64,
 }
 
+/// What a command printed, kept even when it was killed.
+#[derive(Debug, Default)]
+pub struct Captured {
+    pub stdout: Vec<u8>,
+    pub stdout_total: u64,
+    pub stderr: Vec<u8>,
+    pub stderr_total: u64,
+}
+
 /// Run a non-interactive command to completion with a timeout.
 pub fn run_bounded(p: Prepared, timeout: Duration) -> Result<Completed, ExecError> {
+    let (status, c) = run_capped(p, timeout, MAX_CAPTURE_BYTES)?;
+    Ok(Completed {
+        status: status?,
+        stdout: c.stdout,
+        stdout_total: c.stdout_total,
+        stderr: c.stderr,
+        stderr_total: c.stderr_total,
+    })
+}
+
+/// Like [`run_bounded`], keeping at most `cap` bytes of each stream, and
+/// the output so far when the wait fails (timeout, cancel, shutdown). The
+/// outer error is a failure to start.
+pub fn run_capped(
+    p: Prepared,
+    timeout: Duration,
+    cap: usize,
+) -> Result<(Result<ExitStatus, ExecError>, Captured), ExecError> {
     let mut g = ChildGuard::spawn(p, Stdio::null())?;
-    let out = spawn_capture(
-        g.child_mut().stdout.take().expect("piped"),
-        MAX_CAPTURE_BYTES,
-    );
-    let err = spawn_capture(
-        g.child_mut().stderr.take().expect("piped"),
-        MAX_CAPTURE_BYTES,
-    );
-    let status = g.wait_until(Instant::now() + timeout)?;
+    let out = spawn_capture(g.child_mut().stdout.take().expect("piped"), cap);
+    let err = spawn_capture(g.child_mut().stderr.take().expect("piped"), cap);
+    let status = g.wait_until(Instant::now() + timeout);
     let (stdout, stdout_total) = collect(&out, Duration::from_secs(2));
     let (stderr, stderr_total) = collect(&err, Duration::from_secs(2));
-    Ok(Completed {
+    Ok((
         status,
-        stdout,
-        stdout_total,
-        stderr,
-        stderr_total,
-    })
+        Captured {
+            stdout,
+            stdout_total,
+            stderr,
+            stderr_total,
+        },
+    ))
 }
 
 /// Line-oriented interactive process (used for stdio MCP).
@@ -680,6 +807,47 @@ mod tests {
         assert!(
             docker_run_args(&d, "n", Path::new("/w"), "x", &[], true).contains(&"-i".to_string())
         );
+    }
+
+    #[test]
+    fn shell_container_mounts_the_root_read_write_and_keeps_hardening() {
+        let d = DockerSandbox {
+            docker_bin: "docker".into(),
+            image: "img@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .into(),
+            memory: "512m".into(),
+            cpus: "1".into(),
+            pids: 64,
+            user: "65534:65534".into(),
+            tmpfs_size: "64m".into(),
+        };
+        let p = prepare_shell("echo hi", Path::new("/w"), &Sandbox::Docker(d.clone())).unwrap();
+        let a: Vec<String> = p
+            .command
+            .get_args()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        let j = a.join(" ");
+        assert!(j.contains("type=bind,source=/w,target=/workspace "), "{j}");
+        assert!(!j.contains("readonly"), "{j}");
+        for must in [
+            "--network=none",
+            "--read-only",
+            "--cap-drop=ALL",
+            "--user 65534:65534",
+            "--env TERM=dumb",
+            "--env METRO_SPACE_ROOT=/workspace",
+            "--entrypoint /bin/sh",
+        ] {
+            assert!(j.contains(must), "missing {must}: {j}");
+        }
+        assert_eq!(
+            &a[a.len() - 3..],
+            &[d.image.clone(), "-c".into(), "echo hi".into()]
+        );
+        // Check and MCP stay read-only.
+        let ro = docker_run_args(&d, "n", Path::new("/w"), "x", &[], false).join(" ");
+        assert!(ro.contains("target=/workspace,readonly"));
     }
 
     #[test]

@@ -174,14 +174,18 @@ impl Config {
                 .unwrap_or(DEFAULT_SERVER_URL),
         )?;
 
-        let workspace = match get(env::WORKSPACE) {
-            Some(w) => w,
-            None => {
-                return err(format!(
-                    "{} is required (directory the tools operate on)",
-                    env::WORKSPACE
-                ));
-            }
+        // Unset: the current directory, which must not be `/`.
+        let (workspace, from_cwd) = match get(env::WORKSPACE) {
+            Some(w) => (PathBuf::from(w), false),
+            None => match std::env::current_dir() {
+                Ok(d) => (d, true),
+                Err(e) => {
+                    return err(format!(
+                        "{} is unset and the current directory can't be read: {e}",
+                        env::WORKSPACE
+                    ));
+                }
+            },
         };
         let workspace = std::fs::canonicalize(&workspace).map_err(|e| {
             ConfigError(format!(
@@ -192,6 +196,14 @@ impl Config {
         if !workspace.is_dir() {
             return err(format!(
                 "{}: {workspace:?} is not a directory",
+                env::WORKSPACE
+            ));
+        }
+        if from_cwd && workspace == Path::new("/") {
+            return err(format!(
+                "{} is unset and the current directory is /; set {} or start the runner in a \
+                 project directory",
+                env::WORKSPACE,
                 env::WORKSPACE
             ));
         }

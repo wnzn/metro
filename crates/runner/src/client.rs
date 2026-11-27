@@ -96,6 +96,15 @@ pub struct ResultBody<'a> {
     pub output: &'a str,
 }
 
+/// What a heartbeat says about a running job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    Live,
+    /// The server no longer wants the job (404/410): stop it.
+    Gone,
+}
+
+#[derive(Clone)]
 pub struct ServerClient {
     agent: ureq::Agent,
     base: String,
@@ -206,6 +215,28 @@ impl ServerClient {
             Ok(())
         } else {
             Err(status_error("result", status, &mut resp))
+        }
+    }
+}
+
+impl ServerClient {
+    /// POST /v1/runner/jobs/{id}/heartbeat {} -> 200 live, 404/410 gone.
+    /// Anything else is an error, never a cancellation.
+    pub fn heartbeat(&self, id: &str) -> Result<Liveness, ClientError> {
+        if !valid_job_id(id) {
+            return Err(fatal(format!("invalid job id {id:?}")));
+        }
+        let mut resp = self.post(&format!("/v1/runner/jobs/{id}/heartbeat"), "{}".into())?;
+        let status = resp.status().as_u16();
+        let _ = resp
+            .body_mut()
+            .with_config()
+            .limit(MAX_ERROR_BODY)
+            .read_to_vec();
+        match status {
+            200..=299 => Ok(Liveness::Live),
+            404 | 410 => Ok(Liveness::Gone),
+            _ => Err(retryable(format!("heartbeat: HTTP {status}"))),
         }
     }
 }

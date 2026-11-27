@@ -87,7 +87,9 @@ impl Registry {
         });
         let mut r = Registry::new();
         r.register(Box::new(ListTool { ws: ws.clone() }));
-        r.register(Box::new(ReadTool { ws }));
+        r.register(Box::new(ReadTool { ws: ws.clone() }));
+        r.register(Box::new(WriteTool { ws }));
+        r.register(Box::new(ShellTool { ctx: ctx.clone() }));
         r.register(Box::new(CheckTool { ctx: ctx.clone() }));
         r.register(Box::new(McpListTool { ctx: ctx.clone() }));
         r.register(Box::new(McpCallTool { ctx }));
@@ -161,6 +163,12 @@ impl ExecCtx {
         if let SubprocessPolicy::Disabled(why) = &self.policy {
             return Err(ToolResult::err(format!("{tool} {why}")));
         }
+        self.verified_root(tool)
+    }
+
+    /// The root path, re-verified. `workspace.shell` uses this directly: the
+    /// server's shell policy gates it, not [`SubprocessPolicy`].
+    fn verified_root(&self, tool: &str) -> Result<&std::path::Path, ToolResult> {
         self.ws.verify_root_path().map_err(|e| {
             ToolResult::err(format!(
                 "{tool}: workspace root changed or is not a plain directory ({e}); refusing to run"
@@ -244,6 +252,112 @@ impl Tool for ReadTool {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WriteArgs {
+    path: String,
+    content: String,
+}
+
+pub struct WriteTool {
+    pub ws: Arc<Workspace>,
+}
+
+impl Tool for WriteTool {
+    fn name(&self) -> &'static str {
+        "workspace.write"
+    }
+    fn call(&self, args: &Map<String, Value>) -> ToolResult {
+        let a: WriteArgs = match parse_args(args) {
+            Ok(a) => a,
+            Err(e) => return e,
+        };
+        match self.ws.write(&a.path, a.content.as_bytes()) {
+            Ok(n) => ToolResult::ok(format!("wrote {n} bytes to {}", a.path)),
+            Err(e) => ToolResult::err(format!("workspace.write {:?}: {e}", a.path)),
+        }
+    }
+}
+
+pub const SHELL_DEFAULT_TIMEOUT_SECS: u64 = 120;
+pub const SHELL_MAX_TIMEOUT_SECS: u64 = 600;
+const SHELL_MAX_COMMAND_BYTES: usize = 16 * 1024;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShellArgs {
+    command: String,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+pub struct ShellTool {
+    pub ctx: Arc<ExecCtx>,
+}
+
+impl Tool for ShellTool {
+    fn name(&self) -> &'static str {
+        "workspace.shell"
+    }
+    fn call(&self, args: &Map<String, Value>) -> ToolResult {
+        let a: ShellArgs = match parse_args(args) {
+            Ok(a) => a,
+            Err(e) => return e,
+        };
+        if a.command.trim().is_empty()
+            || a.command.len() > SHELL_MAX_COMMAND_BYTES
+            || a.command.contains('\0')
+        {
+            return ToolResult::err(format!(
+                "invalid arguments: `command` must be 1..={SHELL_MAX_COMMAND_BYTES} bytes without NUL"
+            ));
+        }
+        let secs = a.timeout_secs.unwrap_or(SHELL_DEFAULT_TIMEOUT_SECS);
+        if !(1..=SHELL_MAX_TIMEOUT_SECS).contains(&secs) {
+            return ToolResult::err(format!(
+                "invalid arguments: `timeout_secs` must be 1..={SHELL_MAX_TIMEOUT_SECS}"
+            ));
+        }
+        let dir = match self.ctx.verified_root("workspace.shell") {
+            Ok(d) => d,
+            Err(e) => return e,
+        };
+        let p = match exec::prepare_shell(&a.command, dir, &self.ctx.cfg.sandbox) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::err(e.to_string()),
+        };
+        let (status, c) = match exec::run_capped(
+            p,
+            std::time::Duration::from_secs(secs),
+            exec::SHELL_CAPTURE_BYTES,
+        ) {
+            Ok(r) => r,
+            Err(e) => return ToolResult::err(format!("workspace.shell: {e}")),
+        };
+        let (ok, mut out) = match status {
+            Ok(s) => (s.success(), format!("exit: {}\n", exit_text(&s))),
+            Err(exec::ExecError::TimedOut) => (
+                false,
+                format!("workspace.shell: timed out after {secs}s and was killed\n"),
+            ),
+            Err(e) => (false, format!("workspace.shell: {e}\n")),
+        };
+        section(&mut out, "stdout", &c.stdout, c.stdout_total);
+        section(&mut out, "stderr", &c.stderr, c.stderr_total);
+        ToolResult { ok, output: out }
+    }
+}
+
+fn exit_text(status: &std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(n) => n.to_string(),
+        None => format!(
+            "signal {}",
+            std::os::unix::process::ExitStatusExt::signal(status).unwrap_or(0)
+        ),
+    }
+}
+
 pub struct CheckTool {
     pub ctx: Arc<ExecCtx>,
 }
@@ -272,14 +386,7 @@ impl Tool for CheckTool {
         };
         match exec::run_bounded(p, cfg.check_timeout) {
             Ok(c) => {
-                let code = match c.status.code() {
-                    Some(n) => n.to_string(),
-                    None => format!(
-                        "signal {}",
-                        std::os::unix::process::ExitStatusExt::signal(&c.status).unwrap_or(0)
-                    ),
-                };
-                let mut out = format!("exit: {code}\n");
+                let mut out = format!("exit: {}\n", exit_text(&c.status));
                 section(&mut out, "stdout", &c.stdout, c.stdout_total);
                 section(&mut out, "stderr", &c.stderr, c.stderr_total);
                 ToolResult {
@@ -374,5 +481,174 @@ impl Tool for McpCallTool {
             }
             Err(e) => ToolResult::err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn registry(dir: &std::path::Path, token: &str) -> Registry {
+        let ws = std::fs::canonicalize(dir).unwrap();
+        let w = ws.to_string_lossy().into_owned();
+        let cfg = Config::from_lookup(|k| match k {
+            "METRO_RUNNER_TOKEN" => Some(token.to_owned()),
+            "METRO_WORKSPACE" => Some(w.clone()),
+            _ => None,
+        })
+        .unwrap();
+        let ws = Arc::new(Workspace::open(&ws).unwrap());
+        match cfg.credential {
+            Credential::Dedicated => Registry::standard(Arc::new(cfg), ws),
+            Credential::Reusable => Registry::for_space(Arc::new(cfg), ws),
+        }
+    }
+
+    fn shell(r: &Registry, args: Value) -> ToolResult {
+        r.dispatch("workspace.shell", &args)
+    }
+
+    #[test]
+    fn offers_write_and_shell() {
+        let d = tempfile::tempdir().unwrap();
+        let names = registry(d.path(), "tok").names();
+        assert!(names.contains(&"workspace.write") && names.contains(&"workspace.shell"));
+    }
+
+    #[test]
+    fn shell_runs_in_root_with_scrubbed_env() {
+        let _spawning = crate::test_gate::spawning();
+        let d = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        // SAFETY: test-only; read by the child through the allowlist filter.
+        unsafe { std::env::set_var("METRO_RUNNER_TOKEN", "leak-me") };
+        let r = registry(d.path(), "tok");
+        let out = shell(&r, json!({"command": "pwd; env"}));
+        assert!(out.ok, "{}", out.output);
+        assert!(
+            out.output.starts_with("exit: 0\n--- stdout ---\n"),
+            "{}",
+            out.output
+        );
+        assert!(out.output.contains(&format!("{}\n", root.display())));
+        assert!(out.output.contains("TERM=dumb"));
+        assert!(
+            out.output
+                .contains(&format!("METRO_SPACE_ROOT={}", root.display()))
+        );
+        assert!(!out.output.contains("leak-me"), "{}", out.output);
+        for gone in ["METRO_RUNNER_TOKEN", "USER=", "LOGNAME=", "TMPDIR="] {
+            assert!(!out.output.contains(gone), "{gone}: {}", out.output);
+        }
+    }
+
+    #[test]
+    fn shell_reports_exit_codes_and_stderr() {
+        let _spawning = crate::test_gate::spawning();
+        let d = tempfile::tempdir().unwrap();
+        let r = registry(d.path(), "tok");
+        let out = shell(&r, json!({"command": "echo oops >&2; exit 3"}));
+        assert!(!out.ok);
+        assert!(out.output.starts_with("exit: 3\n"), "{}", out.output);
+        assert!(
+            out.output.contains("--- stderr ---\noops\n"),
+            "{}",
+            out.output
+        );
+        // It can write in the root (the server's policy gates it).
+        let out = shell(&r, json!({"command": "echo hi > made.txt"}));
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("made.txt")).unwrap(),
+            "hi\n"
+        );
+    }
+
+    #[test]
+    fn shell_timeout_kills_and_keeps_output() {
+        let _spawning = crate::test_gate::spawning();
+        let d = tempfile::tempdir().unwrap();
+        let r = registry(d.path(), "tok");
+        let t = std::time::Instant::now();
+        let out = shell(
+            &r,
+            json!({"command": "echo before; sleep 30", "timeout_secs": 1}),
+        );
+        assert!(t.elapsed() < std::time::Duration::from_secs(10));
+        assert!(!out.ok);
+        assert!(
+            out.output
+                .starts_with("workspace.shell: timed out after 1s"),
+            "{}",
+            out.output
+        );
+        assert!(out.output.contains("before"), "{}", out.output);
+    }
+
+    #[test]
+    fn shell_output_is_bounded_per_stream() {
+        let _spawning = crate::test_gate::spawning();
+        let d = tempfile::tempdir().unwrap();
+        let r = registry(d.path(), "tok");
+        let out = shell(
+            &r,
+            json!({"command": "head -c 100000 /dev/zero | tr '\\000' a; head -c 70000 /dev/zero | tr '\\000' b >&2"}),
+        );
+        assert!(out.ok, "{}", out.output);
+        assert!(
+            out.output
+                .contains("[metro-runner: stdout truncated, 100000 bytes total]")
+        );
+        assert!(
+            out.output
+                .contains("[metro-runner: stderr truncated, 70000 bytes total]")
+        );
+        let kept = out.output.matches('a').count();
+        // The notes add a few more.
+        assert!((exec::SHELL_CAPTURE_BYTES..exec::SHELL_CAPTURE_BYTES + 20).contains(&kept));
+    }
+
+    #[test]
+    fn shell_rejects_bad_arguments() {
+        let d = tempfile::tempdir().unwrap();
+        let r = registry(d.path(), "tok");
+        for args in [
+            json!({"command": ""}),
+            json!({"command": "  "}),
+            json!({"command": "ls", "timeout_secs": 0}),
+            json!({"command": "ls", "timeout_secs": 601}),
+            json!({"command": "ls", "cwd": "/"}),
+            json!({}),
+        ] {
+            assert!(!shell(&r, args.clone()).ok, "{args}");
+        }
+    }
+
+    #[test]
+    fn registered_runner_without_sandbox_runs_shell_but_not_check() {
+        let _spawning = crate::test_gate::spawning();
+        let d = tempfile::tempdir().unwrap();
+        let r = registry(d.path(), "metro_rt_v2_test");
+        assert!(shell(&r, json!({"command": "true"})).ok);
+        let check = r.dispatch("workspace.check", &json!({}));
+        assert!(!check.ok);
+    }
+
+    #[test]
+    fn write_tool_reports_and_confines() {
+        let d = tempfile::tempdir().unwrap();
+        let r = registry(d.path(), "tok");
+        let ok = r.dispatch(
+            "workspace.write",
+            &json!({"path": "a/b.txt", "content": "é"}),
+        );
+        assert_eq!(ok.output, "wrote 2 bytes to a/b.txt");
+        assert!(ok.ok);
+        assert!(
+            !r.dispatch("workspace.write", &json!({"path": "../x", "content": ""}))
+                .ok
+        );
+        assert!(!r.dispatch("workspace.write", &json!({"path": "x"})).ok);
     }
 }
