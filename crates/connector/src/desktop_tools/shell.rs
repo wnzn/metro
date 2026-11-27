@@ -32,7 +32,8 @@ use tokio::sync::watch;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 pub const MAX_TIMEOUT_SECS: u64 = 600;
 pub const MAX_STREAM_BYTES: usize = 64 * 1024;
-pub const MAX_COMMAND_BYTES: usize = 32 * 1024;
+/// The server's limit too.
+pub const MAX_COMMAND_BYTES: usize = 16 * 1024;
 /// How long output is still read after the process group was killed.
 const DRAIN: Duration = Duration::from_secs(2);
 
