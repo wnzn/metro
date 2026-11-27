@@ -177,6 +177,12 @@ impl Db {
             [sid],
         )?;
         tx.execute("DELETE FROM space_events WHERE space_id = ?1", [sid])?;
+        // Nothing pending for its messages may run or replay later.
+        tx.execute(
+            "DELETE FROM pending_decisions WHERE scope = 'space' AND space_id = ?1",
+            [sid],
+        )?;
+        tx.execute("DELETE FROM pending_targets WHERE space_id = ?1", [sid])?;
         tx.execute(
             "DELETE FROM space_rooms WHERE space_id = ?1 AND parent_room_id IS NOT NULL",
             [sid],

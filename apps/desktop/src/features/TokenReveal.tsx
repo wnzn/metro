@@ -283,7 +283,7 @@ export function deviceState(connectionId: string): { tone: Tone; label: string }
   if (!st) return { tone: "neutral", label: "Checking…" };
   if ("error" in st) return { tone: "warning", label: "Status unknown" };
   if (!st.paired) return { tone: "neutral", label: "Not paired" };
-  return st.online ? { tone: "success", label: "Online" } : { tone: "warning", label: "Paired · offline" };
+  return st.online ? { tone: "success", label: "Connected" } : { tone: "warning", label: "Paired · disconnected" };
 }
 
 export function deviceStatusText(connectionId: string): string {

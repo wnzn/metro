@@ -37,7 +37,7 @@ don't affect which model Metro calls at runtime.
 ## Rules
 
 The rules below describe the current source. For the published changes,
-see [New in Metro 0.5.0](docs/released-0.5.0.md); for later changes, see
+see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
 [In the source, not released](docs/next-source.md).
 
 - Stay inside the files you were assigned. Don't edit another lane's files;
@@ -224,12 +224,43 @@ see [New in Metro 0.5.0](docs/released-0.5.0.md); for later changes, see
   start nothing; at or above it, "No agent" uses the strongest agent
   option. Default is 0.35 (range 0.2–1); migrate stored 0.85 values once.
   Failure on unaddressed text returns an unstored `addressing_note` to
-  the sender only, not a room event. The selected run acts as the sender
-  and shows "Picked by classifier: X". Never classify people-only or
-  explicitly named recipients. With classification off (the default),
-  unaddressed text is ordinary conversation.
+  the sender only, not a room event. The selected run acts as the sender.
+  With `defer_decisions` (what the desktop sends), the message is stored
+  and shown first and the decision follows; the pick is run activity and
+  is never written into the stored recipients (in no path: the POST says
+  `classified`). Nothing labels it "Picked by classifier" or "detected by
+  System One"; a weak pick's fallback marker names no guess or score. The
+  pending decision is a `pending_decisions` row written with the message
+  (with any explicit model choice) and claimed by the storing process;
+  once made it becomes one `pending_targets` row per run, each claimed in
+  the transaction that registers that run and writes its `started`
+  marker, which also checks the message still exists. Startup claims
+  everything left (`UPDATE ... RETURNING`) and enqueues it before
+  accepting requests; only the claimant dispatches. Work rereads the live
+  message after each wait and before each System One call, so a deleted
+  message reaches no model. Classification context is only events before
+  the message. Deferred System One calls are bounded per server and per
+  person and wait rather than drop; a slot is held only for the call.
+  Failed pending work (any error path or panic, via a drop guard; a Chat
+  turn's guard disarms only once its `started` marker is written) is
+  dropped with a visible room or Chat note (Chat notes carry the
+  `turn_id`); work older than an hour at recovery is noted as
+  unanswered, never run. For unaddressed messages both drops are silent
+  in the room (a note would reveal the opt-in). After graceful shutdown
+  begins, guards drop and note nothing; the rows wait for the next start.
+  Deleting a Space deletes its pending rows. A resumed choice's refusal is
+  a generic room note. One `metro-server` process per database (no lock:
+  the dev supervisor and desktop hand over a listening socket and overlap
+  briefly); work an overlapping older process stored is recovered at the
+  next restart. Never classify people-only or explicitly named recipients.
+  With classification off (the default), unaddressed text is ordinary
+  conversation.
 - Sender-only notice details are POST metadata, never a polled event,
   search result or model history. Either or both fields may be present.
+  Deferred decisions hand them out once, in memory only (lost on
+  restart, while the decision itself still runs), through the
+  sender-only `POST .../messages/{eid}/decisions`, which rechecks
+  membership and that the message still exists as the sender's message.
   Bind them to the originating authenticated sender, destination and
   matching transcript row. Don't replay them after dismissal, session
   reset or access loss, or expose private model details in a shared
@@ -241,7 +272,12 @@ see [New in Metro 0.5.0](docs/released-0.5.0.md); for later changes, see
   text mentions and the legacy `invoke_agent` flag. `infer_addressing`
   remains accepted for compatibility and the existing one-time Space
   migration, but doesn't control Chat dispatch. Use-case routing remains
-  separate and can choose the answering connection.
+  separate and can choose the answering connection. The POST returns
+  first, with the turn's `turn_id`; the turn is saved as a pending
+  decision, registered before it routes, started in storage order, and
+  never started if its message was deleted. Stop works before it starts:
+  it's saved in the pending row before it's acknowledged, so a restart
+  doesn't start it.
 - **Metro in Chat** can read and act as the user in their eligible
   Spaces. The per-account switch is on by default but gated on showing
   the notice, with per-Space exclusions and live access checks. Space
@@ -350,11 +386,25 @@ see [New in Metro 0.5.0](docs/released-0.5.0.md); for later changes, see
 - **Space agents** get bounded Space, room, member and agent context;
   user-written names and descriptions are data. A run may reply, react,
   or complete with no agent message (including an empty final answer).
-  Mark its outcome in activity; don't turn silence into a chat message.
+  The outcome stays in run activity metadata, but silence shows nothing
+  in the transcript; never turn it into a chat message.
 - **Messages** render bounded Markdown without live HTML or remote
   images. Forward copies text, not recipients, attachments, reactions
   or replies; verify both ends and never dispatch an agent from a forward
   or its comment.
+- **Deleting a message** is permanent: anyone may delete their own
+  messages; a Space owner any message or agent reply in their Space; a
+  personal Chat's owner anything in it; DMs only your own. No admin
+  bypass; unreadable or unknown is 404, not allowed is 403, not a message
+  or agent reply is 409. One transaction removes its reactions,
+  attachment links, everyone's search vectors and covering summaries, so
+  it never reaches a model again. A thread anchor (even of an empty
+  thread) stays as a `deleted` tombstone, kept out of model history and
+  the thread preamble. A `message_deleted` event tells readers. Deleting
+  never starts or cancels a started run; a run not yet registered for it
+  never starts. Run task previews are resolved from the live trigger
+  when read (runs API, Pages, Metro in Chat): a deleted trigger shows no
+  text, status kept.
 - **Compaction** keeps the saved transcript intact. Chat, Space rooms
   and threads can use a model-written summary as untrusted history
   (never DMs or Page conversations). Auto is per initiator, on by default
@@ -397,15 +447,17 @@ see [New in Metro 0.5.0](docs/released-0.5.0.md); for later changes, see
     Documents & media gate (497 Rust tests, the 83 hardened media-service
     tests, `nsh test` 106/106) and the earlier 403-test gate are historical
     milestones.
-  - **Metro 0.5.1 is published**: stable GitHub release `v0.5.1`
-    (2026-11-26T00:41:30Z), tag on `5120c52` (PR #18), made by CI run
-    45725172627, with 18 assets, Sigstore-signed `SHA256SUMS`, unsigned
-    Windows files and signed GHCR images (see [release record](docs/acceptance.md#published-metro-051-2026-11-26-github-release-v051)).
+  - **Metro 0.6.0 is published**: stable GitHub release `v0.6.0`
+    (2026-11-26T03:13:02Z), tag on `430c835` (PR #19), made by CI run
+    45737693549, with 18 assets, Sigstore-signed `SHA256SUMS`, unsigned
+    Windows files and signed GHCR images (see [release record](docs/acceptance.md#published-metro-060-2026-11-26-github-release-v060)).
     Native Windows by a person, real vendor accounts and real sign-ins
-    remain unverified. [Pages work for 0.5.1](docs/released-0.5.1.md) is
-    released; [0.6.0 work](docs/next-source.md) is not.
-  - The previous release was [Metro 0.5.0](docs/acceptance.md#published-metro-050-2026-11-25-github-release-v050).
-    Before it, Metro 0.4.0: GitHub release `v0.4.0` (2026-11-25),
+    remain unverified. [0.6.0 work](docs/released-0.6.0.md) is
+    released; [0.6.1 work](docs/next-source.md) is not.
+  - The previous release was [Metro 0.5.1](docs/acceptance.md#published-metro-051-2026-11-26-github-release-v051)
+    (`v0.5.1` on `5120c52`, CI run 45725172627), and before it
+    [Metro 0.5.0](docs/acceptance.md#published-metro-050-2026-11-25-github-release-v050).
+    Before them, Metro 0.4.0: GitHub release `v0.4.0` (2026-11-25),
     tag on `1a743e5`, made by CI run 45560122825, with Sigstore-signed
     `SHA256SUMS`, unsigned Windows files and GHCR images signed by the release workflow
     (`docs/acceptance.md`). Metro 0.3.2 (`v0.3.2` on `d943797`, CI run
@@ -428,16 +480,16 @@ see [New in Metro 0.5.0](docs/released-0.5.0.md); for later changes, see
   sidecar next to the desktop app. Source builds live only in
   [docs/development.md](docs/development.md). Docs point to the published
   release by the names and URLs recorded in `docs/acceptance.md`: the
-  current one is **Metro 0.5.1**
-  (https://github.com/wnzn/metro/releases/tag/v0.5.1, tag `v0.5.1` on
-  `5120c52`), with `Metro-0.5.1-linux-x64.tar.gz`,
-  `Metro-0.5.1-windows-x64.zip`,
-  `Metro-0.5.1-windows-x64.unsigned-preview.msi`,
-  `Metro-runner-0.5.1-linux-x64.tar.gz` (each with `.sha256`), the
+  current one is **Metro 0.6.0**
+  (https://github.com/wnzn/metro/releases/tag/v0.6.0, tag `v0.6.0` on
+  `430c835`), with `Metro-0.6.0-linux-x64.tar.gz`,
+  `Metro-0.6.0-windows-x64.zip`,
+  `Metro-0.6.0-windows-x64.unsigned-preview.msi`,
+  `Metro-runner-0.6.0-linux-x64.tar.gz` (each with `.sha256`), the
   installer scripts, `SHA256SUMS` with its Sigstore bundle, `IMAGES.txt`,
-  and the images `ghcr.io/wnzn/metro-server:v0.5.1`,
-  `ghcr.io/wnzn/metro-runner:v0.5.1` and
-  `ghcr.io/wnzn/metro-embeddinggemma2:v0.5.1` (pinned by digest). Windows
+  and the images `ghcr.io/wnzn/metro-server:v0.6.0`,
+  `ghcr.io/wnzn/metro-runner:v0.6.0` and
+  `ghcr.io/wnzn/metro-embeddinggemma2:v0.6.0` (pinned by digest). Windows
   files are **unsigned** (no Authenticode). Docs never present source
   that came after a release's commit as part of that release; label it
   "in the source, not released". A newer release is named in docs only

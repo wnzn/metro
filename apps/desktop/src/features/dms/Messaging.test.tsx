@@ -19,7 +19,7 @@ async function fixture(width = 1280) {
   const original = f.post("acme/lobby", { kind: "message", actor: "bob", text: "**Source Markdown**",
     attachments: [{ removed: true }] } as any);
   const calls: { method: string; path: string; body: any }[] = [];
-  const events: ReturnType<typeof message>[] = [];
+  const events: (ReturnType<typeof message> | { id: number; kind: string; actor: string; actor_id: string; text: string; reply_to?: number; created_at: string })[] = [];
   let started = false, floor = 0, read = 0, nextId = 20, gone = false;
   let forwardError: string | null = null;
   let directoryLimited = false;
@@ -65,6 +65,17 @@ async function fixture(width = 1280) {
         }
         if (path === `${dmPath}/read`) read = Math.max(read, body.last_read);
         if (path === dmPath && method === "DELETE") floor = events.at(-1)?.id ?? 0;
+        const doomed = path.match(/\/events\/(\d+)$/);
+        if (doomed && method === "DELETE") {
+          const ev = events.find(e => e.id === Number(doomed[1]) && e.kind === "message");
+          if (!ev) return { status: 404, body: {} };
+          if (ev.actor_id !== "alice") return { status: 403, body: { error: "you can delete only your own messages here" } };
+          events.splice(events.indexOf(ev), 1);
+          const marker = { id: nextId++, kind: "message_deleted", actor: "Alice", actor_id: "alice", created_at: date,
+            text: JSON.stringify({ target_event_id: ev.id, tombstone: false }) };
+          events.push(marker);
+          return { status: 200, body: { deleted: true, events: [marker] } };
+        }
         const target = path.match(/\/events\/(\d+)\/reactions$/);
         if (target) {
           reactions = reactions.filter(r => r.target_event_id !== Number(target[1]) || r.emoji !== body.emoji);
@@ -283,4 +294,48 @@ test("collapsed navigation exposes unread messages; a DM can forward to a Space 
     destination: { kind: "space", space_id: "side", room_id: "work" },
   });
   expect(app.value("id:dm-composer")).toBe("Keep this draft");
+});
+
+test("only your own DM messages offer Delete; a confirmed delete removes it for both", async () => {
+  const { app, calls, events, incoming } = await fixture();
+  const theirs = incoming("From Dana");
+  await app.waitFor("id:dm:dm-one", { timeout: 9000 });
+  await app.press("id:dm:dm-one");
+  await app.waitFor("text:From Dana");
+  await app.type("id:dm-composer", "mine to delete");
+  await app.keyboard.press("enter");
+  await app.waitFor("text:mine to delete");
+  const mine = events.find(e => e.text === "mine to delete")!;
+  await app.waitFor(`id:event:${mine.id}`);
+  expect(app.shows(`id:delete:${theirs.id}`)).toBe(false);
+  await app.press(`id:delete:${mine.id}`);
+  await app.waitFor(`id:confirm-delete:${mine.id}`);
+  expect(app.shows("text:/removed for both of you/")).toBe(true);
+  await app.press(`id:delete-dialog:${mine.id}:confirm`);
+  await app.waitFor(`id:event:${mine.id}`, { state: "gone" });
+  expect(calls.filter(c => c.method === "DELETE").map(c => c.path)).toEqual([`${dmPath}/events/${mine.id}`]);
+  expect(app.shows("text:From Dana")).toBe(true);
+  expect(app.shows("text:/target_event_id/")).toBe(false);
+});
+
+test("deleting the oldest DM message keeps the transcript and a reply in progress", async () => {
+  const { app, incoming } = await fixture();
+  // Alice's message is the oldest one (the fixture's pages hold two).
+  const oldest = incoming("oldest of mine");
+  Object.assign(oldest, { actor_id: "alice", actor: "Alice" });
+  const later = incoming("Second from Dana");
+  incoming("Third from Dana");
+  await app.waitFor("id:dm:dm-one", { timeout: 9000 });
+  await app.press("id:dm:dm-one");
+  await app.waitFor("text:Third from Dana", { timeout: 9000 });
+  await app.press(`id:reply:${later.id}`);
+  await app.waitFor("id:dm-reply-context");
+  await app.press(`id:delete:${oldest.id}`);
+  await app.press(`id:delete-dialog:${oldest.id}:confirm`);
+  await app.waitFor("text:oldest of mine", { state: "gone" });
+  // Several polls later: no reload of the transcript, the reply stays.
+  await app.wait(6000);
+  expect(app.shows("id:dm-reply-context")).toBe(true);
+  expect(app.shows("text:Second from Dana")).toBe(true);
+  expect(app.shows("text:Third from Dana")).toBe(true);
 });

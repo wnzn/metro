@@ -12,7 +12,7 @@ export const BASE = "http://127.0.0.1:8787";
 export const TOKENS: Record<string, string> = { alice: "tok-alice", bob: "tok-bob", carol: "tok-carol" };
 
 type Activity = { id: string; name: string; source: "agent" | "demo"; phase?: string };
-type Ev = { id: number; kind: string; actor: string; text: string; mentions?: unknown[]; spans?: unknown; audience?: string; activity?: Activity };
+type Ev = { id: number; kind: string; actor: string; actor_id?: string; text: string; mentions?: unknown[]; spans?: unknown; audience?: string; activity?: Activity };
 type Req = { method: string; url: string; headers: unknown; body?: string | null };
 type Space = { id: string; name: string; owner: string; members: Set<string>; runnerToken: string | null };
 type Room = { id: string; name: string; parent_room_id?: string };
@@ -148,6 +148,23 @@ export function fakeServer() {
   };
   const react = (key: string, target: number, emoji: string, present: boolean, kind: "user" | "agent", id: string) =>
     post(key, { kind: "reaction", actor: kind === "agent" ? "agent" : id, text: JSON.stringify({ target_event_id: target, emoji, present, reactor_kind: kind, reactor_id: id }) });
+
+  /**
+   * Deletes event `target` of `key` as the server does: the author's own
+   * message, or (`owner`) any message or reply; a `message_deleted` event
+   * tells the stream. Tombstones aren't modelled.
+   */
+  const remove = (key: string, target: number, user: string, owner: boolean) => {
+    const list = state.events.get(key)!;
+    const ev = list.find((e) => e.id === target);
+    if (!ev) return err(404, "no such message");
+    if (ev.kind !== "message" && ev.kind !== "agent") return err(409, "only messages and agent replies can be deleted");
+    const mine = ev.kind === "message" && (ev.actor_id ?? ev.actor) === user;
+    if (!mine && !owner) return err(403, "you can delete only your own messages here");
+    list.splice(list.indexOf(ev), 1);
+    const marker = post(key, { kind: "message_deleted", actor: user, actor_id: user, text: JSON.stringify({ target_event_id: target, tombstone: false }) });
+    return ok({ deleted: true, events: [marker] });
+  };
 
   const userOf = (req: Req) => {
     const auth = header(req, "authorization") ?? "";
@@ -556,6 +573,7 @@ export function fakeServer() {
         if (asks) post(key, { kind: "agent", actor: "agent", text: `(agent) re: ${body.text}` });
         return ok({}, 202);
       }
+      if ((r = m(/^\/v1\/chat\/events\/(\d+)$/)) && req.method === "DELETE") return remove(key, Number(r[1]), user, true);
       if ((r = m(/^\/v1\/chat\/events\/(\d+)\/reactions$/))) {
         react(key, Number(r[1]), body.emoji, req.method === "PUT", "user", user);
         return ok({});
@@ -652,6 +670,14 @@ export function fakeServer() {
         const room = { id: `r${nextId++}`, name: body.name };
         addRoom(space.id, room);
         return ok(room, 201);
+      }
+      const one = /^\/rooms\/([^/]+)\/(events|messages)\/(\d+)(\/decisions)?$/.exec(rest);
+      if (one) {
+        const key = `${space.id}/${decodeURIComponent(one[1])}`;
+        if (!state.events.has(key)) return err(404, "no such room");
+        if (one[2] === "events" && !one[4] && req.method === "DELETE") return remove(key, Number(one[3]), user, owner);
+        // This double decides before answering a POST: nothing is ever pending.
+        if (one[2] === "messages" && one[4] && req.method === "POST") return err(404, "no pending decisions for this message");
       }
       const rr = /^\/rooms\/([^/]+)\/(events|messages|demo)(?:\/(\d+)\/reactions)?$/.exec(rest);
       if (rr) {

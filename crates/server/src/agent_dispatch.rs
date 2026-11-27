@@ -20,7 +20,8 @@
 //!   asked and the sender alone is told.
 //!
 //! Each run records how its agent was chosen on its `started` marker
-//! (`activity.pick`). A chat model's free text is never used as a System
+//! (`activity.pick`), except when the classifier picked it: the run then
+//! simply shows its agent. A chat model's free text is never used as a System
 //! One answer.
 
 use serde_json::json;
@@ -39,7 +40,9 @@ use crate::space_prefs::SpacePrefs;
 #[derive(Clone, Debug)]
 pub struct Target {
     pub agent: SpaceAgent,
-    pub pick: String,
+    /// How it was chosen, for the run's `started` marker; none when the
+    /// classifier picked it (the run simply shows its agent).
+    pub pick: Option<String>,
     pub addressed_by: AddressedBy,
 }
 
@@ -71,7 +74,7 @@ fn options(agents: &[SpaceAgent]) -> Vec<(String, String)> {
 
 /// Whether the sender opted in to classification here and has a System
 /// One connection set.
-fn classifies(prefs: &SpacePrefs, settings: &RoutingSettings) -> bool {
+pub(crate) fn classifies(prefs: &SpacePrefs, settings: &RoutingSettings) -> bool {
     prefs.classify_unaddressed && settings.classifier_id.is_some()
 }
 
@@ -93,6 +96,7 @@ pub async fn plan(
     prefs: &SpacePrefs,
     agents: &[SpaceAgent],
     reply: Option<&SpaceAgent>,
+    before: Option<i64>,
 ) -> Plan {
     let mut plan = Plan::default();
     let Some(default) = agents.iter().find(|a| a.is_default).or(agents.first()) else {
@@ -113,7 +117,7 @@ pub async fn plan(
                 settings,
                 text,
                 &options(agents),
-                Some(room),
+                Some((room, before.unwrap_or(i64::MAX))),
             )
             .await;
             if let Decision::Failed(why) = answer {
@@ -131,7 +135,7 @@ pub async fn plan(
                     spans: None,
                 });
                 plan.targets.push(Target {
-                    pick: format!("Picked by classifier: {}", agent.name),
+                    pick: None,
                     agent,
                     addressed_by: AddressedBy::Classifier,
                 });
@@ -146,7 +150,7 @@ pub async fn plan(
                             push(
                                 &mut plan.targets,
                                 Target {
-                                    pick: format!("Addressed: @{}", agent.handle),
+                                    pick: Some(format!("Addressed: @{}", agent.handle)),
                                     agent: agent.clone(),
                                     addressed_by: AddressedBy::Explicit,
                                 },
@@ -189,7 +193,7 @@ pub async fn plan(
         push(
             &mut plan.targets,
             Target {
-                pick: format!("Reply to @{}", agent.handle),
+                pick: Some(format!("Reply to @{}", agent.handle)),
                 agent: agent.clone(),
                 addressed_by: AddressedBy::Explicit,
             },
@@ -212,7 +216,7 @@ async fn generic(
 ) -> Result<Target, DecisionFailure> {
     let default_target = |pick: String| Target {
         agent: default.clone(),
-        pick,
+        pick: Some(pick),
         addressed_by: AddressedBy::Explicit,
     };
     if !classifies(prefs, settings) || agents.len() < 2 {
@@ -222,13 +226,11 @@ async fn generic(
         Decision::Answered(a) => match a.index {
             Some(i) if a.probability >= settings.min_route_probability => Ok(Target {
                 agent: agents[i].clone(),
-                pick: format!("Picked by classifier: {}", agents[i].name),
+                pick: None,
                 addressed_by: AddressedBy::Explicit,
             }),
-            Some(i) => Ok(default_target(format!(
-                "Default agent (the classifier was unsure: best {} at {:.2})",
-                agents[i].name, a.probability
-            ))),
+            // The room sees this marker: no names or scores of the guess.
+            Some(_) => Ok(default_target("Default agent".to_owned())),
             None => Ok(default_target("Default agent".to_owned())),
         },
         Decision::Failed(why) => Err(why),
@@ -282,18 +284,13 @@ pub async fn start_runs(
             }
         };
         match crate::agent::start_room_run(
-            state,
-            space,
-            room,
-            author,
-            event,
-            route,
-            &t.agent,
-            Some(t.pick),
+            state, space, room, author, event, route, &t.agent, t.pick,
         )
         .await
         {
             Ok(run) => started.runs.push(run),
+            // The message was deleted meanwhile: silently nothing.
+            Err(refusal) if refusal.shown.is_empty() => {}
             Err(refusal) => {
                 state
                     .append(

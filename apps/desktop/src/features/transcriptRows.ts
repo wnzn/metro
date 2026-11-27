@@ -28,8 +28,8 @@ type MentionOf = NonNullable<RoomEvent["mentions"]>[number];
 
 /**
  * What a message header adds beside its explicit recipients. The recipient
- * pills (@person, @agent, "agent · detected by System One", "agent ·
- * scheduled prompt") already say who it is for, so no audience phrase repeats
+ * pills (@person, @agent, "agent · scheduled prompt") already say who it
+ * is for, so no audience phrase repeats
  * them. Only what no pill says is shown: `agentBadge` when the agent was
  * asked without an agent mention (Ask agent), `peopleNote` when people were
  * addressed but no person is listed (older events without recipients). The
@@ -94,8 +94,8 @@ export function transcriptRows(items: readonly TranscriptItem[], events: readonl
 /**
  * The message's text already starts by naming every explicit recipient
  * ("@bob @agent can you…"), so a follow-up message needs no recipient line
- * of its own. Only typed mentions count: an agent detected by System One or
- * started by a schedule was never written in the text.
+ * of its own. Only typed mentions count: an agent the classifier picked or
+ * a schedule started was never written in the text.
  */
 export function textNamesRecipients(text: string, mentions: readonly MentionOf[] | undefined): boolean {
   if (!mentions?.length) return false;

@@ -1,6 +1,6 @@
 import { announce, batch, computed, signal } from "nsh";
 import type { SpacesAccess } from "../../api/meta";
-import { ApiError, apiClient, chatEvents, chatUnavailable, describe, mainPlace, onSessionEnd, readHostedAccess, refreshChatEvents, sessionGuard, spaces } from "../../store";
+import { ApiError, apiClient, chatEvents, chatUnavailable, describe, mainPlace, onSessionEnd, pendingChatTurns, readHostedAccess, refreshChatEvents, sessionGuard, spaces } from "../../store";
 
 export const spaceAccess = signal<SpacesAccess | null>(null);
 export const spaceAccessBusy = signal(false);
@@ -78,16 +78,31 @@ const acknowledgedStops = signal<ReadonlySet<string>>(new Set());
 export const chatStopBusy = signal<string | null>(null);
 export const chatStopError = signal("");
 
-/** Use the most recent unfinished turn; ordinary notes and tool failures aren't lifecycle markers. */
+/**
+ * Use the most recent unfinished turn; ordinary notes and tool failures
+ * aren't lifecycle markers. A turn this session sent that hasn't started
+ * yet (it waits for routing or an earlier turn) counts too, so Stop works
+ * before its `started` marker arrives.
+ */
 export const runningChatTurn = computed(() => {
   if (!spaceAccess() || chatUnavailable()) return null;
   const done = new Set(acknowledgedStops());
   const events = chatEvents();
+  const seen = new Set<string>();
+  for (const e of events) if (e.kind === "activity" && e.activity?.id) seen.add(e.activity.id);
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i]!, a = e.activity;
     if (e.kind !== "activity" || a?.source !== "agent" || !a.id.startsWith("chat_") || !a.phase || done.has(a.id)) continue;
     if (a.phase === "started") return a.id;
     done.add(a.id);
+  }
+  const pending = pendingChatTurns();
+  for (let i = pending.length - 1; i >= 0; i--) {
+    const p = pending[i]!;
+    if (done.has(p.id) || seen.has(p.id)) continue;
+    // Not shown yet, or ended by the Chat error that names this turn.
+    if (!events.some(e => e.id === p.eventId) || events.some(e => e.kind === "error" && e.turnId === p.id)) continue;
+    return p.id;
   }
   return null;
 });

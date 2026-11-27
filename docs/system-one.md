@@ -134,7 +134,7 @@ Spaces it's a setting **per Space** (`classify_unaddressed` in
 [your preferences for that Space](spaces.md#your-preferences-in-a-space)).
 It can be turned on only while the person has a System One connection
 usable in that Space. It is off by default. The rules below are for
-0.5.0; see [source changes](#classification-in-the-source-not-released).
+0.5.0; see [source changes](#classification-since-060).
 
 **In a Space room**, it decides two things for the sender's messages:
 
@@ -150,17 +150,24 @@ usable in that Space. It is off by default. The rules below are for
   one agent: the same `choice`, without *No agent*. A pick at or above
   `min_route_probability` runs that agent; a weaker one runs the default
   agent. A failed decision posts an error in the room and runs nothing for
-  `@agent`.
+  `@agent`. In the source, not released, the room's marker for a weak pick
+  says only *Default agent*, without the guessed agent or its score.
 
 For these decisions:
 
 - Only that one new message, never the room's history, ids or the agents'
   instructions, goes to the sender's System One connection (`classifier_id`),
-  cut to 4,000 characters.
+  cut to 4,000 characters. (For unaddressed text, the room context below
+  is only messages from before it, even when the decision is made later.)
 - The run belongs to the sender and uses the sender's connections.
 - An unaddressed message that started a run this way is stored with
   `addressed_by: "classifier"`, which no client can send. The run's activity
   shows how its agent was chosen, for example *Picked by classifier: Coder*.
+  In the source, not released, the classifier's output is never stored in
+  a message's recipients, whether the decision is
+  [deferred](#decisions-after-posting) or not: the POST says
+  `classified: true`, and the run shows only as the picked agent's run,
+  with no label.
 - It never sees a people-only message, which never starts an agent.
 - It never sees a message to a named agent (`@coder`, or Ask agent with an
   agent chosen).
@@ -171,7 +178,7 @@ When the per-Space setting was introduced, everyone who had
 `classify_unaddressed` on in each Space they were a member of then. That
 happened once; Spaces joined later start with it off.
 
-### Classification in the source, not released
+### Classification since 0.6.0
 
 Classification is still opt-in per Space and still uses one typed System
 One Choice for unaddressed text. The prompt now tells the classifier to
@@ -198,6 +205,101 @@ to equal the old default; all other values stay as they were. This
 doesn't turn classification on. [Replying to a specific agent](messages.md#reply)
 addresses it directly and bypasses the unaddressed classifier, as does
 a named agent mention.
+
+### Decisions after posting
+
+**In the source, not released (0.6.1).** A Space message POST with
+`"defer_decisions": true` (the desktop always sends it) stores and
+returns the message at once. If it would otherwise wait on System One
+(the sender's opt-in classification, the classifier's pick for `@agent`,
+or use-case routing), the response has `decisions_pending: true`; the
+server then makes those decisions and starts the runs they choose,
+whether or not anyone collects the result. People-only messages and
+messages to a named agent are still never classified. A model chosen for
+the turn (`provider_connection_id`) is saved with the decision, so such a
+message defers too; after a restart the choice is checked again, and one
+that can no longer be used runs nothing (see below for what the room
+reads).
+
+- **It survives a restart.** The pending decision is saved in the same
+  transaction as the message, claimed by the server process that stores
+  it. When the decision is made, one transaction replaces it with one
+  saved entry per agent run it starts, plus any room error it posts. Each
+  run's entry is claimed in the same transaction that registers the run,
+  writes its `started` marker and checks the message still exists, so a
+  run starts at most once. If the server stops after that, the next start
+  closes the run as `interrupted`, in the room; if it stops before, the
+  next start begins it. Runs a decision planned start one by one, so a
+  restart between them starts the rest.
+- **Recovery comes first.** At startup, before accepting any request, the
+  server claims every decision and planned run that another process
+  left, in one transaction, and queues them in message order. Only the
+  claimant dispatches, so nothing runs twice. This assumes
+  [one server process per database](deploy.md#after-install); work a
+  briefly overlapping older process stored is picked up at the next
+  restart.
+- **Old or failed work is said, not replayed.** Work stored more than an
+  hour before a restart isn't started: the room (or the sender's Chat)
+  reads *Metro restarted; this message wasn't answered.* If pending work
+  fails instead (an error, or its task panics or ends, including a Chat
+  turn whose start fails before its `started` marker is written), it's
+  dropped at once with a note in the room or the sender's Chat, so it
+  can't run at a later restart. A Chat note names the turn (`turn_id` on
+  the `error` event), so only that turn's pending **Stop** clears. A model
+  chosen for the turn that can't be used after a restart gets *Metro
+  restarted and couldn't start this message's agent run.*, with no reason
+  or connection details in the room.
+- **Unaddressed messages stay quiet.** Only the sender's own opt-in
+  classification can start anything for an unaddressed message, so
+  dropping its work (old or failed) posts nothing in the room; that would
+  reveal the opt-in. Work for `@agent`, a named agent or a reply to an
+  agent is noted as above.
+- **A clean shutdown keeps everything.** Once the server begins shutting
+  down, work it doesn't finish is left as it is, with no note, and the
+  next start picks it up.
+- **A deleted message reaches no model.** The message is read again after
+  every wait and before every System One call (the classification, and
+  each run's use-case routing). Once it's deleted, nothing more is sent
+  or started, and deleting it drops what's pending for it. An agent
+  deleted meanwhile isn't picked or started either.
+- **Bounded.** At most 8 System One calls for deferred work run at once
+  on a server, and 2 per person; more wait their turn and none is
+  dropped. A slot is held only during the call itself, never while runs
+  start, so many messages at once can't block each other.
+- The decision never edits the stored message: a classifier's pick isn't
+  added to its recipients. It appears only as the run of that agent; the
+  server writes no *Picked by classifier* label and the desktop shows no
+  *detected by System One* pill.
+- `POST /v1/spaces/{sid}/rooms/{rid}/messages/{eid}/decisions` with `{}`
+  returns the sender-only `addressing_note` and `routing_note`, as POST
+  metadata shaped like the message response. Only the message's
+  authenticated sender gets them, once, while still a member and while
+  the message still exists as their message (a deleted message's
+  tombstone doesn't count). Membership is checked when the call arrives
+  and again after the wait. The notes are kept in memory only, for up to
+  10 minutes after the decision finished: anyone else, a second call, a
+  deleted message, a decision whose task ended without an outcome, or a
+  decision made again after a restart gets `404` (the decision itself
+  still runs). If the decisions are still running after 90 seconds, the
+  call returns `202 {decisions_pending: true}`; ask again.
+- For an unaddressed message, if its pending work is dropped (a failure,
+  or work gone stale after a restart), the sender gets no notice. That's
+  deliberate: a note would reveal that they opted in to classification.
+- Without `defer_decisions`, the POST waits for the decisions as before.
+- **Personal Chat** returns the message first too, with the `turn_id` of
+  the turn it starts, then routes and starts the turn, saved and claimed
+  the same way so a restart still starts it. A person's Chat turns start
+  in the order their messages were stored. **Stop**
+  (`POST /v1/chat/turns/{turn_id}/stop`) works before the turn starts:
+  the desktop offers it as soon as the message is sent, and the stop is
+  saved before the call answers, so the turn doesn't start, not even
+  after a restart. A turn whose message was deleted never starts. A turn
+  that can't start says why in the Chat; after a restart, a turn whose
+  chosen model can no longer be used says so and doesn't run.
+
+In a local test with a scripted System One taking 1,000 ms, the message
+was visible to another member 1–2 ms after the POST, against about
+1,022 ms before ([record](acceptance.md#source-only-metro-061-lanes-2026-11-27-local)).
 
 ## Use-case routing
 
@@ -249,7 +351,7 @@ Each person has their own settings. Use-case routing is off by default.
 | `classifier_id` | Your System One connection. Used for routing, per-Space classification and the search rerank. |
 | `embedding_id` | Your embeddings connection, used for [search](#semantic-search) |
 | `default_chat_id` | The chat connection to use on `no_match`. Leave it out to keep your default. |
-| `min_directedness` | In 0.5.0: 0.5 to 1, default 0.85. In the source, not released: 0.2 to 1, default 0.35 (see [migration](#classification-in-the-source-not-released)). |
+| `min_directedness` | In 0.5.x: 0.5 to 1, default 0.85. Since 0.6.0: 0.2 to 1, default 0.35 (see [migration](#classification-since-060)). |
 | `min_route_probability` | 0 to 1, default 0.65 |
 | `cases` | Up to 16 entries of `{"key", "label", "description", "connection_id"}`. Keys match `[a-z][a-z0-9_]*`, up to 32 characters, are unique, and can't be `no_match`. Labels are up to 64 characters, and descriptions, the criterion System One judges, up to 500. |
 
@@ -286,8 +388,8 @@ Only people's messages and the agent's final replies are indexed. Tool calls,
 tool output, activity, status, errors, thread mirrors and reactions are
 never indexed, and neither are runner files or workspaces. A message that
 contains a Metro credential prefix (`metro_rt_`, `metro_pc_`) is skipped.
-Search is your own feature. In 0.5.0 it doesn't give the Chat agent access
-to Space transcripts. **In the source, not released:** [Metro in Chat](next-source.md#metro-in-chat)
+Search is your own feature. In 0.5.x it doesn't give the Chat agent access
+to Space transcripts. **Since 0.6.0,** [Metro in Chat](released-0.6.0.md#metro-in-chat)
 has a separate access setting and notice before it can search your
 Spaces. DMs, Chat posting receipts and compaction markers aren't
 indexed. Uploaded files are a separate corpus with its own search; see

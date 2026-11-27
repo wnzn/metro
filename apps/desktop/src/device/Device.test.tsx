@@ -136,7 +136,7 @@ test("packaged: an endpoint connection is set up in-app with consent; the UI nev
   // Done: its details, which say this computer serves it, with the models it listed by itself.
   await app.press("id:device-setup-done");
   await app.waitFor(`id:connection-details:${c.id}`);
-  await app.waitFor(`id:connection-heading:${c.id}:status >> text:/Online · this computer/`);
+  await app.waitFor(`id:connection-heading:${c.id}:status >> text:/Connected · this computer/`);
   await app.waitUntil(() => app.texts().some((s) => s.startsWith("This computer serves it")));
   expectNoSecrets(app);
 });

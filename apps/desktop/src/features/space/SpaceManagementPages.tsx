@@ -117,7 +117,7 @@ export function RunnerPage() {
           <SettingsGroup title="Status" testID="runner-card">
             <SettingRow label="Runner" testID="runner-status-row" description={
               runnerError() ? "Metro couldn't confirm the assignment." : runner() === undefined ? "Checking this Space's runner." :
-                runner() ? "This Space sends jobs to this runner. The assignment doesn't mean it's online." :
+                runner() ? "This Space sends jobs to this runner. The assignment doesn't mean it's connected." :
                   "Agents can still answer, but without runner workspace tools."
             }>
               <Badge testID="space-runner-status" tone={badge().tone} label={badge().label} />
@@ -213,7 +213,7 @@ function AttachRunner(props: { runner: RegisteredRunner }) {
   const name = () => installed() ? "This computer's runner" : r().name;
   return (
     <ConnectionItem testID={`attachable:${r().id}`} name={name()} tags={installed() ? [{ label: "Recommended", tone: "info" }, visibilityTag(r())] : [visibilityTag(r())]}
-      status={{ tone: "neutral", text: r().presence ? (r().presence?.online ? "Online" : "Offline") : "Online status unknown" }}
+      status={{ tone: "neutral", text: r().presence ? (r().presence?.online ? "Connected" : "Disconnected") : "Connection status unknown" }}
       trailing={
         <Action testID={`space-runner-attach:${r().id}`} label="Attach" accessibilityLabel={`Attach ${name()}`}
           busyLabel="Attaching…" busy={runnerBusy() === `attach:${r().id}`} disabled={busy()} variant="secondary"

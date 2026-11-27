@@ -109,7 +109,7 @@ test("@ suggestions: Return picks the highlighted one and sends nothing", async 
   await app.waitFor("id:mention-chip:agent");
   await app.submit("id:composer");
   await app.waitUntil(() => messages(f).length === before + 1);
-  expect(messages(f).at(-1)!.body).toEqual({ text: "ping @bob @agent ", invoke_agent: false, infer_text_mentions: false,
+  expect(messages(f).at(-1)!.body).toEqual({ text: "ping @bob @agent ", invoke_agent: false, infer_text_mentions: false, defer_decisions: true,
     mentions: [{ kind: "user", id: "bob" }, { kind: "agent" }], spans: [{ start: 5, end: 9, index: 0 }, { start: 10, end: 16, index: 1 }] });
 });
 
@@ -322,4 +322,117 @@ test("@ suggestions: Tab inserts the highlighted one like Return; Return sends o
   expect(messages(f).length).toBe(before);
   await app.keyboard.press("enter");
   await app.waitUntil(() => messages(f).length === before + 1);
+});
+
+// ---- Deleting messages ----
+
+const deletes = (f: F) => f.posts().filter((p) => p.method === "DELETE" && /\/events\/\d+$/.test(p.path));
+
+test("the owner deletes any message after confirming; Cancel and Escape keep it", async () => {
+  const f = world();
+  const app = await inAcme(f);
+  const ev = f.state.events.get("acme/lobby")![0]!;
+  await app.hover(`id:event:${ev.id}`);
+  expect(app.shows(`id:delete:${ev.id}`)).toBe(true);
+  await app.press(`id:delete:${ev.id}`);
+  await app.waitFor(`id:confirm-delete:${ev.id}`);
+  expect(app.shows("text:Delete this message?")).toBe(true);
+  expect(app.shows("text:/removed for everyone in this Space.*can't be undone/")).toBe(true);
+  await app.press(`id:delete-dialog:${ev.id}:cancel`);
+  await app.waitFor(`id:confirm-delete:${ev.id}`, { state: "gone" });
+  await app.press(`id:delete:${ev.id}`);
+  await app.waitFor(`id:confirm-delete:${ev.id}`);
+  await app.keyboard.press("escape");
+  await app.waitFor(`id:confirm-delete:${ev.id}`, { state: "gone" });
+  expect(deletes(f)).toEqual([]);
+  expect(app.shows("text:hello from bob in acme")).toBe(true);
+
+  await app.press(`id:delete:${ev.id}`);
+  await app.press(`id:delete-dialog:${ev.id}:confirm`);
+  await app.waitFor(`id:event:${ev.id}`, { state: "gone" });
+  expect(deletes(f).map((p) => p.path)).toEqual([`/v1/spaces/acme/rooms/lobby/events/${ev.id}`]);
+  expect(app.shows("text:hello from bob in acme")).toBe(false);
+  // The marker is never a line of its own.
+  expect(app.shows("text:/target_event_id/")).toBe(false);
+});
+
+test("a member deletes only their own messages; agent replies and others' messages offer no Delete", async () => {
+  const f = world();
+  const mine = f.post("side/lobby", { kind: "message", actor: "alice", actor_id: "alice", text: "alice in side" });
+  const theirs = f.post("side/lobby", { kind: "message", actor: "bob", actor_id: "bob", text: "bob in side" });
+  const reply = f.post("side/lobby", { kind: "agent", actor: "agent", text: "agent in side" });
+  const app = await inAcme(f);
+  await app.press("id:space:side");
+  await app.waitFor("text:alice in side");
+  expect(app.shows(`id:delete:${mine.id}`)).toBe(true);
+  expect(app.shows(`id:delete:${theirs.id}`)).toBe(false);
+  expect(app.shows(`id:delete:${reply.id}`)).toBe(false);
+  await app.press(`id:delete:${mine.id}`);
+  await app.press(`id:delete-dialog:${mine.id}:confirm`);
+  await app.waitFor("text:alice in side", { state: "gone" });
+  expect(app.shows("text:bob in side")).toBe(true);
+});
+
+test("another member's deletion arrives through the normal poll", async () => {
+  const f = world();
+  const app = await inAcme(f);
+  const ev = f.state.events.get("acme/lobby")![0]!;
+  const list = f.state.events.get("acme/lobby")!;
+  list.splice(list.indexOf(ev), 1);
+  f.post("acme/lobby", { kind: "message_deleted", actor: "bob", actor_id: "bob", text: JSON.stringify({ target_event_id: ev.id, tombstone: false }) });
+  await app.waitFor("text:hello from bob in acme", { state: "gone" });
+  expect(deletes(f)).toEqual([]);
+});
+
+test("a deleted thread anchor stays as one quiet 'Message deleted' line", async () => {
+  const f = world();
+  const app = await inAcme(f);
+  const ev = f.state.events.get("acme/lobby")![0]!;
+  f.post("acme/lobby", { kind: "message_deleted", actor: "bob", actor_id: "bob", text: JSON.stringify({ target_event_id: ev.id, tombstone: true }) });
+  await app.waitFor(`id:deleted:${ev.id}`);
+  expect(app.shows("text:hello from bob in acme")).toBe(false);
+  expect(app.shows(`id:delete:${ev.id}`)).toBe(false);
+  expect(app.shows(`id:react:${ev.id}`)).toBe(false);
+});
+
+test("a refused delete keeps the message and says why", async () => {
+  const f = world();
+  const base = f.network[`DELETE ${BASE}/v1/*`]!;
+  f.network[`DELETE ${BASE}/v1/*`] = (req: any) => /\/events\/\d+$/.test(new URL(req.url).pathname)
+    ? { status: 409, body: { error: "only messages and agent replies can be deleted" } } : base(req);
+  const app = await inAcme(f);
+  const ev = f.state.events.get("acme/lobby")![0]!;
+  await app.press(`id:delete:${ev.id}`);
+  await app.press(`id:delete-dialog:${ev.id}:confirm`);
+  await app.waitFor("id:action-error");
+  expect(app.shows("text:hello from bob in acme")).toBe(true);
+});
+
+test("losing the session mid-delete releases the pending delete, so the next session can delete", async () => {
+  const f = world();
+  f.post("acme/lobby", { kind: "message", actor: "bob", actor_id: "bob", text: "a second message from bob" } as any);
+  const app = await inAcme(f);
+  const [first, second] = f.state.events.get("acme/lobby")!.filter((e) => e.kind === "message");
+  f.state.delays.set(`/v1/spaces/acme/rooms/lobby/events/${first!.id}`, 1500);
+  await app.press(`id:delete:${first!.id}`);
+  await app.press(`id:delete-dialog:${first!.id}:confirm`);
+  await app.waitUntil(() => deletes(f).some((p) => p.path.endsWith(`/events/${first!.id}`)));
+  // The answer is still on the wire when the person disconnects and signs in again.
+  await app.press("id:account-menu");
+  await app.press("id:disconnect");
+  await app.clear("id:server-url");
+  await app.type("id:server-url", BASE);
+  await app.type("id:access-token", TOKENS.alice!);
+  await app.press("id:connect");
+  await app.waitFor("id:space:acme");
+  await app.press("id:space:acme");
+  await app.waitFor(`id:event:${second!.id}`);
+  expect(f.state.events.get("acme/lobby")!.some((e) => e.id === second!.id)).toBe(true);
+  await app.wait(1800); // the old request's late answer must not touch the new session
+  const target = second!;
+  await app.hover(`id:event:${target.id}`);
+  await app.press(`id:delete:${target.id}`);
+  await app.press(`id:delete-dialog:${target.id}:confirm`);
+  await app.waitFor(`id:event:${target.id}`, { state: "gone" });
+  expect(deletes(f).map((p) => p.path.split("/").pop())).toEqual([String(first!.id), String(target.id)]);
 });

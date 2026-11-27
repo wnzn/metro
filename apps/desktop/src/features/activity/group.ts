@@ -30,7 +30,6 @@ export type ActivityGroup = {
   name: string;
   steps: Step[];
   outcome: GroupOutcome;
-  noReply?: boolean;
   /** Some step or a correlated error failed, whatever the lifecycle says. */
   failed: boolean;
   /** Tied to one turn by server metadata. */
@@ -39,8 +38,6 @@ export type ActivityGroup = {
   route: ActivityRoute | null;
   /** The Space agent working the turn, when its events name one. */
   agent: EventAgent | null;
-  /** How its agent was chosen ("Picked by classifier: Coder"), from the `started` marker. */
-  pick: string | null;
   /** The server's id for the turn (a Space run's `run_…`); null for an uncorrelated event. */
   activityId: string | null;
   compactionMiss?: boolean;
@@ -104,7 +101,7 @@ export function groupTranscript(events: readonly RoomEvent[]): TranscriptItem[] 
         const { source, name } = legacySource(e.actor);
         const key = `event:${e.id}`;
         groups.set(key, {
-          key, source, name, correlated: false, failed: false, outcome: "ended", started: false, ended: true, terminal: null, route: null, agent: null, pick: null, activityId: null, firstMs: null, lastMs: null,
+          key, source, name, correlated: false, failed: false, outcome: "ended", started: false, ended: true, terminal: null, route: null, agent: null, activityId: null, firstMs: null, lastMs: null,
           steps: [{ eventId: e.id, activity: { kind: "progress", summary: "Activity update", tone: "neutral", details: text, mono: false } }],
         });
         memberOf.set(e.id, key);
@@ -112,7 +109,7 @@ export function groupTranscript(events: readonly RoomEvent[]): TranscriptItem[] 
         const { source, name } = legacySource(e.actor);
         const key = `event:${e.id}`;
         groups.set(key, {
-          key, source, name, correlated: false, failed: step.tone === "danger", outcome: "ended", started: false, ended: true, terminal: null, route: null, agent: null, pick: null, activityId: null, firstMs: null, lastMs: null,
+          key, source, name, correlated: false, failed: step.tone === "danger", outcome: "ended", started: false, ended: true, terminal: null, route: null, agent: null, activityId: null, firstMs: null, lastMs: null,
           steps: [{ eventId: e.id, activity: step }],
         });
         memberOf.set(e.id, key);
@@ -136,7 +133,6 @@ export function groupTranscript(events: readonly RoomEvent[]): TranscriptItem[] 
         terminal: null,
         route: null,
         agent: meta.agent ?? null,
-        pick: null,
         activityId: meta.id,
         firstMs: null,
         lastMs: null,
@@ -163,11 +159,9 @@ export function groupTranscript(events: readonly RoomEvent[]): TranscriptItem[] 
       if (meta.phase === "started") {
         g.started = true;
         if (meta.source === "agent" && meta.route) g.route = meta.route; // Demo never calls a model
-        if (meta.source === "agent" && meta.pick) g.pick = meta.pick;
       }
       else if (meta.phase) {
         g.terminal = TERMINAL[meta.phase];
-        g.noReply = meta.source === "agent" && meta.phase === "completed" && meta.outcome === "no_reply" || undefined;
       }
       if (meta.phase === "failed") g.failed = true;
       const extra = lifecycleStep(e, meta.phase);
@@ -206,7 +200,7 @@ export function groupTranscript(events: readonly RoomEvent[]): TranscriptItem[] 
     // A turn that ended with nothing to inspect leaves no empty shell, unless
     // its route is worth saying (a use case, a chosen model, a System One or
     // scheduled start): then it stays one row, with nothing else in it.
-    if (!g.noReply && !g.compactionMiss && g.steps.length === 0 && !routeBadge(g.route) && !pickBadge(g.pick) && (g.outcome === "completed" || g.outcome === "ended")) continue;
+    if (!g.compactionMiss && g.steps.length === 0 && !routeBadge(g.route) && (g.outcome === "completed" || g.outcome === "ended")) continue;
     placed.add(key);
     const { started: _s, ended: _e, terminal: _t, ...group } = g;
     items.push({ type: "group", key: `group:${key}`, group });
@@ -249,8 +243,15 @@ export function routeConfidence(r: ActivityRoute | null): number | null {
   return Number.isFinite(p) && p >= 0 && p <= 1 ? Math.round(p * 100) : null;
 }
 
+/** Legacy text that says an agent was picked, or its run started, by the classifier. */
+const CLASSIFIER_ATTRIBUTION = /picked by (the )?classifier|detected by system one|started by system one|judged that the message asked|classifier was unsure|the classifier\b/i;
+
 /** A route's reason with "(p 0.91)" said in words ("with 91% probability"); a malformed one is dropped. */
 function readableReason(r: ActivityRoute): string {
+  // How a run was picked is never attributed to a classifier, even in text an older
+  // server stored. Use-case routing's own explanations and failures ("System One
+  // matched the use case …", "routing failed: System One took too long") stay.
+  if (CLASSIFIER_ATTRIBUTION.test(r.reason)) return "";
   const pct = routeConfidence(r);
   return r.reason.replace(PROBABILITY, pct === null ? "" : ` with ${pct}% probability`).trim().replace(/[.\s]+$/, "");
 }
@@ -267,7 +268,6 @@ export function routeBadge(r: ActivityRoute | null): string | null {
     return `Routed: ${r.caseLabel}${pct === null ? "" : ` · ${pct}%`}`;
   }
   if (r.source === "override") return "Routed: chosen model";
-  if (r.addressedBy === "classifier") return "Started by System One";
   if (r.addressedBy === "schedule") return "Scheduled";
   return null;
 }
@@ -275,9 +275,7 @@ export function routeBadge(r: ActivityRoute | null): string | null {
 /** The turn's route in a sentence or two, for the opened details. Never the raw "(p 0.91)". */
 export function routeText(r: ActivityRoute): string {
   const how =
-    r.addressedBy === "classifier"
-      ? "System One judged that the message asked the agent; nobody typed @agent."
-      : r.addressedBy === "schedule"
+    r.addressedBy === "schedule"
         ? "A scheduled prompt started it."
         : r.addressedBy === "thread"
           ? "Delegated from a parent turn."
@@ -316,27 +314,15 @@ export function durationText(g: ActivityGroup): string | null {
  * route it took, and how it stopped when that wasn't a plain finish
  * ("cancelled"). A failure is its own pill, not a part.
  */
-export function summaryParts(g: ActivityGroup): { pick: string | null; duration: string | null; tools: string | null; route: string | null; stopped: string | null } {
+export function summaryParts(g: ActivityGroup): { duration: string | null; tools: string | null; route: string | null; stopped: string | null } {
   const n = toolCount(g);
   const outcome = groupOutcomeText(g);
   return {
-    pick: pickBadge(g.pick),
     duration: durationText(g),
     tools: n === 0 ? null : n === 1 ? "1 tool" : `${n} tools`,
     route: routeBadge(g.route),
     stopped: outcome === "cancelled" || outcome === "interrupted" ? outcome : null,
   };
-}
-
-/**
- * How the turn's agent was chosen, when that is worth a word on the collapsed
- * line: a classifier's pick or an unsure fallback. A plain default or an
- * explicit @handle says nothing more than the agent's name already does.
- */
-export function pickBadge(pick: string | null | undefined): string | null {
-  const p = pick?.trim();
-  if (!p || p === "Default agent" || /^(Addressed|Mentioned):/.test(p)) return null;
-  return p;
 }
 
 /** A tool call's arguments in a few words: a path, else the values, else the raw text; at most 60 characters. */
@@ -436,7 +422,6 @@ export function liveTitle(g: ActivityGroup, name = g.name): string {
 export function groupAccessibleLabel(g: ActivityGroup, name = g.name): string {
   const p = summaryParts(g);
   const outcome = groupOutcomeText(g) ?? (g.outcome === "completed" ? "completed" : g.outcome === "live" ? "in progress" : null);
-  const head = g.noReply && g.outcome === "completed" ? `${name} chose not to reply` :
-    g.outcome === "live" && !g.failed ? liveTitle(g, name) : g.source === "agent" ? name : "Runner activity";
+  const head = g.outcome === "live" && !g.failed ? liveTitle(g, name) : g.source === "agent" ? name : "Runner activity";
   return [head, p.duration, p.tools, p.route, outcome].filter(Boolean).join(", ");
 }

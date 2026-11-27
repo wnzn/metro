@@ -165,8 +165,8 @@ function RunnerList(props: { visibility: RunnerVisibility }) {
 export function runnerStatus(r: RegisteredRunner, now = Date.now()): string {
   const p = r.presence;
   const version = p?.version ? `v${p.version}` : p?.seenAt != null ? "Version not reported" : "Version unknown until it connects";
-  if (p?.online) return `${version} · Online`;
-  return p?.seenAt != null ? `${version} · Last seen ${relativeTime(Math.min(p.seenAt, now), now)}` : version;
+  if (p?.online) return `${version} · Connected`;
+  return p?.seenAt != null ? `${version} · Disconnected · last seen ${relativeTime(Math.min(p.seenAt, now), now)}` : `${version} · Disconnected`;
 }
 
 const registrationScope = (r: RegisteredRunner) => JSON.stringify([runnerSessionKey(), r.id, r.visibility, r.canManage]);
@@ -266,7 +266,7 @@ function RunnerUpdateControls(props: { runner: RegisteredRunner; scope: string }
   const unavailableText = () => {
     if (eligible() || pending()) return null;
     if (target() && r().canManage && u()?.action === "self_update" && !r().presence?.online) {
-      return "Bring this runner online to request an update.";
+      return "Connect this runner to request an update.";
     }
     return lostOffer() ? "This runner is no longer eligible for that update." : null;
   };

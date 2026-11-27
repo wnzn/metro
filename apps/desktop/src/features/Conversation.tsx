@@ -10,8 +10,9 @@
 // pointer or keyboard focus is on it. A message addressed to the signed-in
 // user carries an accent rail.
 //
-// Each message has a small toolbar (react, copy) shown on hover and keyboard
-// focus, and always on touch screens. Reactions open in a popover anchored
+// Each message has a small toolbar (react, reply, forward, copy, and Delete
+// where the person may delete it, after a confirmation) shown on hover and
+// keyboard focus, and always on touch screens. Reactions open in a popover anchored
 // to the toolbar's button. Explicit recipients are always shown; an audience
 // phrase is left out only where a typed @agent already says the same.
 //
@@ -27,10 +28,13 @@ import {
   activeReactions,
   activeSpace,
   actionError,
+  canDelete,
   commandHint,
   composerCommandPlace,
   composerScope,
   compacting,
+  deleteMessage,
+  deletePending,
   eventsInRoom,
   focusTarget,
   draft,
@@ -78,6 +82,9 @@ import {
   ComposerField,
   ComposerHint,
   DaySeparator,
+  DeleteConfirmation,
+  DeletedMessage,
+  DeleteMessageButton,
   DraftSuggestion,
   EmojiChoice,
   EmojiRow,
@@ -138,6 +145,8 @@ type ReplyControl = (event: RoomEvent, opener?: ViewRef) => void;
 type DirectTranscript = {
   id: string; events: () => readonly RoomEvent[]; loaded: () => boolean;
   reactions: () => ReactionMap; pending: () => string | null; react: (eventId: number, emoji: string) => void;
+  /** Deleting the person's own messages here, when the place offers it. */
+  deleting?: () => number | null; remove?: (event: RoomEvent) => Promise<boolean>;
 };
 type TranscriptActions = {
   roomId?: string; direct?: DirectTranscript; onReply?: ReplyControl; replyAnchor?: RoomEvent | null; readOnly?: boolean;
@@ -337,9 +346,10 @@ function recipientAgent(id: string | undefined) {
 
 function recipientText(m: NonNullable<RoomEvent["mentions"]>[number], myId: string | null, lastKnown?: string): string {
   if (m.kind === "agent" && !m.addressedBy && mainPlace() === "chat") return "to the agent";
-  if (m.kind === "agent" && m.addressedBy && (m.agentId || mainPlace() === "space")) {
+  // An agent the classifier picked shows like any agent recipient.
+  if (m.kind === "agent" && m.addressedBy && m.addressedBy !== "classifier" && (m.agentId || mainPlace() === "space")) {
     const a = recipientAgent(m.agentId);
-    const reason = { classifier: "detected by System One", schedule: "scheduled prompt", reply: "reply", metro: "via Metro" };
+    const reason = { schedule: "scheduled prompt", reply: "reply", metro: "via Metro" };
     return `${a?.name ?? "agent"} · ${reason[m.addressedBy]}`;
   }
   if (mainPlace() === "space") {
@@ -358,9 +368,9 @@ function recipientText(m: NonNullable<RoomEvent["mentions"]>[number], myId: stri
 function recipientDescription(m: NonNullable<RoomEvent["mentions"]>[number], myId: string | null, lastKnown?: string): string {
   if (m.kind === "agent" && m.agentId) {
     const a = recipientAgent(m.agentId);
-    return `Addressed to ${a ? `${a.name} (@${a.handle})` : "an agent"}${m.addressedBy ? ` (${recipientText(m, myId)})` : ""}`;
+    return `Addressed to ${a ? `${a.name} (@${a.handle})` : "an agent"}${m.addressedBy && m.addressedBy !== "classifier" ? ` (${recipientText(m, myId)})` : ""}`;
   }
-  if (m.kind === "agent") return `Addressed to the agent${m.addressedBy ? ` (${mentionText(m, myId)})` : ""}`;
+  if (m.kind === "agent") return `Addressed to the agent${m.addressedBy && m.addressedBy !== "classifier" ? ` (${mentionText(m, myId)})` : ""}`;
   if (m.id === myId) return "Addressed to you";
   const sid = activeSpace()?.id;
   if (mainPlace() === "space") {
@@ -379,7 +389,31 @@ export function ThreadAnchor(props: { event: RoomEvent }) {
   })} actions={{ readOnly: true }} />;
 }
 
+/** What remains of a deleted message that anchors a thread: one quiet line and its replies. */
+function DeletedRow(props: { row: () => Of<"event">; actions: TranscriptActions }) {
+  const event = () => props.row().event;
+  const replies = () => props.actions.onReply && !props.actions.readOnly && event().replies?.count ? event().replies : undefined;
+  return (
+    <MessageFrame testID={`${props.actions.readOnly ? "anchor" : "event"}:${event().id}`}
+      gutter={<AuthorGlyph testID={`avatar:${event().id}`} kind="system" tone="neutral" />}>
+      <DeletedMessage testID={`deleted:${event().id}`} />
+      <If when={replies()}>
+        {r => <ReplySummary eventId={event().id} summary={r()} last={stampOf(r().lastAt, clock())?.short}
+          onOpen={opener => { if (!openingReply()) props.actions.onReply?.(event(), opener); }} />}
+      </If>
+    </MessageFrame>
+  );
+}
+
 function MessageRow(props: { row: () => Of<"event">; actions: TranscriptActions }) {
+  return (
+    <If when={props.row().event.kind !== "deleted"} else={<DeletedRow row={props.row} actions={props.actions} />}>
+      <LiveMessageRow row={props.row} actions={props.actions} />
+    </If>
+  );
+}
+
+function LiveMessageRow(props: { row: () => Of<"event">; actions: TranscriptActions }) {
   const event = () => props.row().event;
   const spaceId = () => mainPlace() === "space" ? activeSpace()?.id : undefined;
   const pieces = computed(() => spaceId() ? sentMentions(event()) : []);
@@ -421,6 +455,10 @@ function MessageRow(props: { row: () => Of<"event">; actions: TranscriptActions 
   const replyable = () => !!props.actions.onReply && (event().kind === "message" || event().kind === "agent" || event().kind === "thread");
   const forwardable = () => !props.actions.readOnly && (event().kind === "message" || event().kind === "agent");
   const direct = () => props.actions.direct;
+  const deletable = () => !props.actions.readOnly && (direct()
+    ? !!direct()!.remove && canDelete(event(), "dm")
+    : canDelete(event(), mainPlace() === "chat" ? "chat" : "space"));
+  const deleting = () => (direct() ? direct()!.deleting?.() ?? null : deletePending()) === event().id;
   const nearby = () => direct()?.events() ?? (roomId() ? eventsInRoom(roomId()!) : activeEvents());
   const bodyScope = () => direct() ? `${disclosureScope()}\u0001dm:${direct()!.id}` : disclosureScope();
   const showQuote = () => !!event().replyTo && props.actions.replyAnchor?.id !== event().replyTo;
@@ -432,8 +470,10 @@ function MessageRow(props: { row: () => Of<"event">; actions: TranscriptActions 
   const replies = () => props.actions.onReply && !props.actions.readOnly && event().replies?.count
     ? event().replies : undefined;
   const palette = signal(false);
+  const confirming = signal(false);
   const copied = signal(false);
   let reactButton: ViewRef | null = null;
+  let deleteButton: ViewRef | null = null;
   let replyButton: ViewRef | undefined;
   let forwardButton: ViewRef | undefined;
   let frame: ViewRef | undefined;
@@ -451,6 +491,22 @@ function MessageRow(props: { row: () => Of<"event">; actions: TranscriptActions 
   const closePalette = () => {
     palette.set(false);
     reactButton?.focus();
+  };
+  const closeConfirm = () => {
+    confirming.set(false);
+    deleteButton?.focus();
+  };
+  const confirmDelete = async () => {
+    const target = event();
+    const dm = direct();
+    const done = dm?.remove ? await dm.remove(target) : await deleteMessage(target, roomId());
+    // Gone from the transcript: nothing to give the focus back to.
+    if (done) confirming.set(false);
+  };
+  const deleteDetail = () => {
+    if (direct()) return "It's removed for both of you. This can't be undone.";
+    const where = mainPlace() === "chat" ? "It's removed from your Chat" : "It's removed for everyone in this Space";
+    return `${where}, with its reactions, and agents won't see it again. Work it already started keeps going. This can't be undone.`;
   };
   const copy = () => {
     const sid = spaceId();
@@ -473,8 +529,8 @@ function MessageRow(props: { row: () => Of<"event">; actions: TranscriptActions 
       continued={continued()}
       selectable
       toolbar={
-        <If when={reactable() || copyable() || replyable() || forwardable()}>
-          <MessageToolbar open={palette()} testID={`toolbar:${event().id}`}>
+        <If when={reactable() || copyable() || replyable() || forwardable() || deletable()}>
+          <MessageToolbar open={palette() || confirming()} testID={`toolbar:${event().id}`}>
             <If when={reactable()}>
               <ToolbarIconButton
                 testID={`react:${event().id}`}
@@ -503,9 +559,26 @@ function MessageRow(props: { row: () => Of<"event">; actions: TranscriptActions 
                 onPress={copy}
               />
             </If>
+            <If when={deletable()}>
+              <DeleteMessageButton
+                testID={`delete:${event().id}`}
+                accessibilityLabel="Delete this message"
+                tooltip="Delete"
+                active={confirming()}
+                ref={node => { deleteButton = node; }}
+                onPress={() => confirming.set(!confirming())}
+              />
+            </If>
           </MessageToolbar>
           <If when={palette()}>
             <ReactionPopover eventId={event().id} roomId={roomId()} direct={direct()} anchor={reactButton} onClose={closePalette} />
+          </If>
+          <If when={confirming() && deletable()}>
+            <AnchoredPopover anchor={deleteButton} onClose={closeConfirm} placement="top" align="end" role="dialog"
+              testID={`confirm-delete:${event().id}`} accessibilityLabel="Delete this message?">
+              <DeleteConfirmation testID={`delete-dialog:${event().id}`} title="Delete this message?" detail={deleteDetail()}
+                busy={deleting()} onConfirm={() => void confirmDelete()} onCancel={closeConfirm} />
+            </AnchoredPopover>
           </If>
         </If>
       }

@@ -130,6 +130,8 @@ export function ConnectionItem(props: {
   onPress?: () => void;
   trailing?: JSX.Element;
   children?: JSX.Element;
+  /** An inline editor or confirmation under the row, inset to match it (a key field, "Remove…"). */
+  panel?: JSX.Element;
   testID?: string;
   accessibilityLabel?: string;
 }) {
@@ -180,11 +182,14 @@ export function ConnectionItem(props: {
         {props.trailing}
       </View>
       {props.children}
+      <If when={props.panel}>
+        <View class="flex-col px-(--space-4) pb-(--space-3)">{props.panel}</View>
+      </If>
     </View>
   );
 }
 
-/** A coloured dot and one short line of status ("Online · this computer"). */
+/** A coloured dot and one short line of status ("Connected · this computer"). */
 export function StatusLine(props: { tone: Tone; text: string; testID?: string }) {
   return (
     <View class="flex-row items-center gap-(--space-2)" testID={props.testID}>

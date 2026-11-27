@@ -961,9 +961,32 @@ pub async fn start_room_run(
     room: &Room,
     initiator: &Author,
     trigger: &Event,
+    route: Route,
+    agent: &SpaceAgent,
+    pick: Option<String>,
+) -> Result<RunInfo, Refusal> {
+    start_room_run_claimed(
+        state, space_id, room, initiator, trigger, route, agent, pick, false,
+    )
+    .await
+}
+
+/// [`start_room_run`] for a run a deferred decision planned
+/// ([`crate::decisions`]) when `planned`: it starts only if this process
+/// still holds that planned run, claimed in the same transaction that
+/// registers the run and writes its `started` marker. A crash after that
+/// leaves the marker, which the next startup closes as `interrupted`.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_room_run_claimed(
+    state: &AppState,
+    space_id: &str,
+    room: &Room,
+    initiator: &Author,
+    trigger: &Event,
     mut route: Route,
     agent: &SpaceAgent,
     pick: Option<String>,
+    planned: bool,
 ) -> Result<RunInfo, Refusal> {
     let Some(user_id) = initiator.id.clone() else {
         return Err(Refusal::shown("runs must be started on behalf of a person"));
@@ -1000,16 +1023,20 @@ pub async fn start_room_run(
     enum AcceptanceError {
         Room,
         Agent,
+        Deleted,
         Registry(String),
     }
-    let (sid, rid, aid, task, runs, trigger_id) = (
+    let (sid, rid, aid, task, runs, trigger_id, message) = (
         space_id.to_owned(),
         room.id.clone(),
         agent.id.clone(),
         truncate(&trigger.text, 200),
         state.runs.clone(),
         trigger.id,
+        trigger.kind == kind::MESSAGE,
     );
+    let claim = planned.then(|| state.decisions.epoch().to_owned());
+    let (room_for_marker, note) = (room.clone(), route.note.clone());
     // Read the selected agent's current configuration while registering the
     // run. Routing/model selection may have awaited since it was selected.
     let accepted = state
@@ -1023,6 +1050,20 @@ pub async fn start_room_run(
             let Some(agent) = crate::space_agents::get_in(&tx, &sid, &aid)? else {
                 return Ok(Err(AcceptanceError::Agent));
             };
+            // A person's message deleted since it was posted (for example
+            // while System One decided) starts nothing.
+            if message
+                && !crate::replies::event_in(&tx, &sid, &rid, trigger_id)?
+                    .is_some_and(|e| e.kind == kind::MESSAGE)
+            {
+                return Ok(Err(AcceptanceError::Deleted));
+            }
+            // A planned run starts only for the process that claimed it.
+            if let Some(epoch) = &claim
+                && !crate::decisions::claim_target_in(&tx, epoch, trigger_id, &aid)?
+            {
+                return Ok(Err(AcceptanceError::Deleted));
+            }
             // The stable user id authorizes stops. Create the guard here
             // too in case the caller goes away before receiving the result.
             let origin = crate::orchestration::RunOrigin {
@@ -1034,14 +1075,40 @@ pub async fn start_room_run(
                 Err(error) => return Ok(Err(AcceptanceError::Registry(error))),
             };
             let registration = crate::orchestration::Registration::new(runs, info.id.clone());
-            Ok(Ok((info, cancel, registration, agent)))
+            // The turn is shown as the agent that works it: a thread's agent
+            // by the thread's name, otherwise the Space agent's name; never
+            // the person who asked. Every event carries the agent's identity.
+            // Its `started` marker is durable with the registration.
+            let room = &room_for_marker;
+            let turn = Activity::agent(
+                info.id.clone(),
+                match &room.parent_room_id {
+                    Some(_) if !room.is_reply_thread() => room.name.clone(),
+                    _ => agent.name.clone(),
+                },
+            )
+            .with_agent(agent.badge());
+            let mut started = turn.at(activity::STARTED).with_route(note);
+            started.pick = pick;
+            crate::db::Db::append_event_in(
+                &tx,
+                &sid,
+                &rid,
+                kind::ACTIVITY,
+                &Author::server(actor::AGENT),
+                "",
+                &Addressed::room(),
+                Some(&started),
+            )?;
+            tx.commit()?;
+            Ok(Ok((info, cancel, registration, agent, turn)))
         })
         .await
         .map_err(|error| {
             tracing::warn!(%error, "could not check Space run acceptance");
             Refusal::shown("Could not verify this Space's run. No agent ran.")
         })?;
-    let (info, cancel, registration, agent) = match accepted {
+    let (info, cancel, registration, agent, turn) = match accepted {
         Ok(started) => started,
         Err(AcceptanceError::Room) => {
             return Err(Refusal::shown(
@@ -1053,34 +1120,14 @@ pub async fn start_room_run(
                 "The requested agent is no longer available in this Space. No agent ran.",
             ));
         }
+        // Nothing to say in the room: the message is gone, or another
+        // process holds this planned run.
+        Err(AcceptanceError::Deleted) => return Err(Refusal::shown("")),
         Err(AcceptanceError::Registry(e)) => {
             state.monitor_space(space_id, Code::AgentBusy).await;
             return Err(e.into());
         }
     };
-    // The turn is shown as the agent that works it: a thread's agent by the
-    // thread's name, otherwise the Space agent's name; never the person who
-    // asked. Every event carries the agent's identity.
-    let turn = Activity::agent(
-        info.id.clone(),
-        match &room.parent_room_id {
-            Some(_) if !room.is_reply_thread() => room.name.clone(),
-            _ => agent.name.clone(),
-        },
-    )
-    .with_agent(agent.badge());
-    let mut started = turn.at(activity::STARTED).with_route(route.note.clone());
-    started.pick = pick;
-    state
-        .append_with(
-            space_id,
-            &room.id,
-            kind::ACTIVITY,
-            &Author::server(actor::AGENT),
-            "",
-            Some(&started),
-        )
-        .await;
 
     let (state, space_id, room, initiator, trigger, run_id) = (
         state.clone(),
@@ -1193,6 +1240,9 @@ async fn execute_room_run(
                     )?,
                     _ => Vec::new(),
                 };
+                // A deleted anchor keeps its thread but is no longer anyone's
+                // words: neither history nor the preamble mentions it.
+                let anchor = anchor.filter(|a| a.kind != kind::DELETED);
                 let context = crate::space_context::preamble(
                     &tx,
                     &space,
@@ -1883,6 +1933,7 @@ pub async fn respond_personal_routed(
         false,
         PersonalLane::Chat,
         Activity::chat(),
+        None,
     )
     .await;
 }
@@ -1905,6 +1956,43 @@ pub async fn start_personal_run(
         true,
         PersonalLane::Chat,
         Activity::chat(),
+        None,
+    )
+    .await
+}
+
+/// A personal Chat turn registered before its model was chosen
+/// ([`crate::api::chat_turn`]): its id, the Stop signal and registration,
+/// and a signal sent once its `started` marker is written.
+pub struct ChatStart {
+    pub turn: Activity,
+    pub cancel: watch::Receiver<bool>,
+    pub guard: crate::meta::TurnGuard,
+    /// `true` once the `started` marker is written; `false` when it was
+    /// deliberately not started (stopped, its message deleted, or another
+    /// process holds it). Dropped unsent: the start failed (or panicked).
+    pub started: tokio::sync::oneshot::Sender<bool>,
+}
+
+/// [`start_personal_run`] for a turn registered already. It starts only if
+/// it wasn't stopped and `trigger` is still in the Chat.
+pub async fn start_chat_turn(
+    state: &AppState,
+    user_id: &str,
+    trigger: &Event,
+    route: Route,
+    start: ChatStart,
+) -> Result<(), String> {
+    let turn = start.turn.clone();
+    run_personal(
+        state.clone(),
+        user_id.to_owned(),
+        trigger.clone(),
+        route,
+        true,
+        PersonalLane::Chat,
+        turn,
+        Some(start),
     )
     .await
 }
@@ -1931,12 +2019,14 @@ pub async fn start_page_chat_run(
             page_id: page_id.to_owned(),
         },
         turn,
+        None,
     )
     .await
 }
 
 /// Resolve the model and a run slot, then run the turn: inline, or in the
 /// background when `detach`.
+#[allow(clippy::too_many_arguments)]
 async fn run_personal(
     state: AppState,
     user_id: String,
@@ -1945,6 +2035,7 @@ async fn run_personal(
     detach: bool,
     lane: PersonalLane,
     turn: Activity,
+    chat: Option<ChatStart>,
 ) -> Result<(), String> {
     let agent_author = Author::server(actor::AGENT);
     let append_as = |kind: &'static str, text: String, activity: Option<Activity>| {
@@ -1967,7 +2058,34 @@ async fn run_personal(
     // In Chat a refusal stands alone; on a page it carries the turn, so the
     // page can show that this click failed.
     let tag = (lane != PersonalLane::Chat).then(|| turn.clone());
-    let append = |kind: &'static str, text: String| append_as(kind, text, tag.clone());
+    // A Chat turn its sender knows by id (it waited to start): its refusal
+    // names that id, so the sender's pending Stop clears.
+    let known = chat.as_ref().map(|c| c.turn.id.clone());
+    let append = |kind: &'static str, text: String| {
+        let (state, user, known, author, plain) = (
+            state.clone(),
+            user_id.clone(),
+            known.clone(),
+            agent_author.clone(),
+            append_as(kind, text.clone(), tag.clone()),
+        );
+        async move {
+            match known {
+                Some(turn) => {
+                    let r = state
+                        .db
+                        .call(move |db| {
+                            db.append_personal_for_turn(&user, kind, &author, &text, &turn)
+                        })
+                        .await;
+                    if let Err(e) = r {
+                        tracing::error!(error = %format!("{e:#}"), "appending personal event");
+                    }
+                }
+                None => plain.await,
+            }
+        }
+    };
     // Refusals are recorded only in this person's own scope, as a code.
     let model = match route_model(&state, &user_id, None, &mut route).await {
         Ok(model) => model,
@@ -1987,7 +2105,9 @@ async fn run_personal(
         append(kind::ERROR, message.clone()).await;
         return Err(message);
     };
-    let run = execute_personal_run(state, user_id, trigger, route, model, permit, lane, turn);
+    let run = execute_personal_run(
+        state, user_id, trigger, route, model, permit, lane, turn, chat,
+    );
     if detach {
         tokio::spawn(run);
     } else {
@@ -2006,17 +2126,28 @@ async fn execute_personal_run(
     _permit: tokio::sync::OwnedSemaphorePermit,
     lane: PersonalLane,
     turn: Activity,
+    chat: Option<ChatStart>,
 ) {
     let built_from = model.built_from.clone();
     let limits = state.config.limits.clone();
     // A Chat turn can be stopped by its owner (`POST /v1/chat/turns/{id}/stop`).
-    let (cancel, _registered) = match lane {
-        PersonalLane::Chat => {
-            let (cancel, guard) = state.chat_runs.register(&turn.id, &user_id);
-            (Some(cancel), Some(guard))
+    let (cancel, _registered, started_signal) = match (lane.clone(), chat) {
+        (PersonalLane::Chat, Some(chat)) => {
+            (Some(chat.cancel), Some(chat.guard), Some(chat.started))
         }
-        PersonalLane::Page { .. } => (None, None),
+        (PersonalLane::Chat, None) => {
+            let (cancel, guard) = state.chat_runs.register(&turn.id, &user_id);
+            (Some(cancel), Some(guard), None)
+        }
+        (PersonalLane::Page { .. }, _) => (None, None, None),
     };
+    // Stopped before it started: nothing to show.
+    if cancel.as_ref().is_some_and(|c| *c.borrow()) {
+        if let Some(signal) = started_signal {
+            let _ = signal.send(false);
+        }
+        return;
+    }
     let agent_author = Author::server(actor::AGENT);
     let append_as = |kind: &'static str, text: String, activity: Option<Activity>| {
         let (state, user_id, author, lane) = (
@@ -2035,13 +2166,52 @@ async fn execute_personal_run(
             }
         }
     };
-    // The turn starts here; every way out below ends it.
-    append_as(
-        kind::ACTIVITY,
-        String::new(),
-        Some(turn.at(activity::STARTED).with_route(route.note.clone())),
-    )
-    .await;
+    // The turn starts here; every way out below ends it. A Chat message
+    // deleted since it was sent starts nothing: the check, the marker and
+    // settling its pending decision are one transaction.
+    let started = turn.at(activity::STARTED).with_route(route.note.clone());
+    if lane == PersonalLane::Chat && trigger.kind == kind::MESSAGE {
+        let (user, trigger_id, author, marker, epoch) = (
+            user_id.clone(),
+            trigger.id,
+            agent_author.clone(),
+            started.clone(),
+            state.decisions.epoch().to_owned(),
+        );
+        let written = state
+            .db
+            .call(move |db| {
+                db.append_personal_for_message(
+                    &epoch,
+                    &user,
+                    trigger_id,
+                    kind::ACTIVITY,
+                    &author,
+                    "",
+                    Some(&marker),
+                )
+            })
+            .await;
+        match written {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let Some(signal) = started_signal {
+                    let _ = signal.send(false);
+                }
+                return;
+            }
+            // The sender (if waiting) learns the start failed.
+            Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), "starting a Chat turn");
+                return;
+            }
+        }
+    } else {
+        append_as(kind::ACTIVITY, String::new(), Some(started)).await;
+    }
+    if let Some(signal) = started_signal {
+        let _ = signal.send(true);
+    }
     let end = |phase: &'static str| append_as(kind::ACTIVITY, String::new(), Some(turn.at(phase)));
     let tagged = |kind: &'static str, text: String| append_as(kind, text, Some(turn.clone()));
     let earlier = {

@@ -81,7 +81,9 @@ async fn fixture(seen: Arc<Mutex<Seen>>) -> String {
                         Some("choice") => {
                             let options: Vec<String> =
                                 q["criteria"].as_object().unwrap().keys().cloned().collect();
-                            let pick = if message.contains("code") {
+                            let pick = if options.iter().any(|o| o == "agent_1") {
+                                "agent_1"
+                            } else if message.contains("code") {
                                 "code"
                             } else if message.contains("prose") {
                                 "writing"
@@ -475,4 +477,85 @@ async fn one_question_per_request_through_the_real_client() {
             .iter()
             .all(|b| keys(b).len() == 1)
     );
+}
+
+#[tokio::test]
+async fn a_turn_with_a_chosen_model_still_decides_after_posting() {
+    let h = H::start().await;
+    let classifier = h.connect("custom-systemone", "jev-1.14.0", true).await;
+    let chosen = h.connect("custom", "chosen-model", false).await;
+    let (_, space) = h
+        .req(
+            reqwest::Method::POST,
+            "alice",
+            "/v1/spaces",
+            Some(json!({"name": "Chosen"})),
+        )
+        .await;
+    let sid = space["id"].as_str().unwrap();
+    let (s, _) = h
+        .req(
+            reqwest::Method::POST,
+            "alice",
+            &format!("/v1/spaces/{sid}/agents"),
+            Some(json!({"name": "Coder", "handle": "coder", "description": "Writes code."})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED);
+    h.req(
+        reqwest::Method::PUT,
+        "alice",
+        "/v1/model-routing",
+        Some(json!({"classifier_id": classifier})),
+    )
+    .await;
+    h.req(
+        reqwest::Method::PUT,
+        "alice",
+        &format!("/v1/spaces/{sid}/prefs"),
+        Some(json!({"classify_unaddressed": true})),
+    )
+    .await;
+    let room = format!("/v1/spaces/{sid}/rooms/lobby");
+    let before = h.systemone_since(0).len();
+    let (s, sent) = h
+        .req(
+            reqwest::Method::POST,
+            "alice",
+            &format!("{room}/messages"),
+            Some(
+                json!({"text": "@agent which of you?", "provider_connection_id": chosen,
+                        "defer_decisions": true}),
+            ),
+        )
+        .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{sent}");
+    assert_eq!(sent["decisions_pending"], true, "{sent}");
+    let (s, decided) = h
+        .req(
+            reqwest::Method::POST,
+            "alice",
+            &format!("{room}/messages/{}/decisions", sent["id"]),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{decided}");
+    assert_eq!(
+        h.systemone_since(before).len(),
+        1,
+        "one pick among the agents"
+    );
+    for _ in 0..400 {
+        if h.seen
+            .lock()
+            .unwrap()
+            .chat
+            .iter()
+            .any(|m| m == "chosen-model")
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the chosen model never answered");
 }

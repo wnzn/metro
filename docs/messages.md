@@ -1,7 +1,8 @@
 # Messages
 
-**In the source, not released.** This guide describes the messaging
-changes planned for Metro 0.6.0. See the [source overview](next-source.md).
+Markdown, Reply, Forward, the directory and DMs are in the published
+[Metro 0.6.0](released-0.6.0.md). **Delete** is in the source, not
+released, planned for 0.6.1 ([source overview](next-source.md)).
 
 ## Markdown
 
@@ -49,6 +50,31 @@ replies. Metro shows how many files were omitted. The comment goes first
 as a separate message. Neither message asks an agent or runs classification.
 The server rechecks source and destination access together.
 
+## Delete
+
+**In the source, not released (0.6.1).** Choose **Delete** in a
+message's toolbar and confirm. Deleting is permanent, and there's no
+Trash. You can delete:
+
+- your own messages anywhere you can post;
+- any message or agent reply in a Space you own;
+- anything in your personal Chat, including Metro's replies;
+- in a DM, only your own messages.
+
+There is no admin bypass. Deleting removes the message for everyone, with
+its reactions, attachment links (the Library file stays), everyone's
+search index entries for it and any conversation summary that covers
+it, so no later run sends it to a model. A message that anchors a reply
+thread, even an empty one, leaves a **Message deleted** line so the thread
+keeps its place; the deleted message is no longer part of that thread's
+agent history. Runs it already started keep going; a run that hadn't
+started yet (for example while System One was still deciding) never
+starts. Deleting never starts or stops agent work. A run's task preview
+copies the start of its message, so once the message is deleted the run
+lists (**Agent runs**, `/v1/runs`, Pages and Metro in Chat) show the run
+with its status but without that text. Copies already
+forwarded, and anything already sent to a model, aren't affected.
+
 ## Direct messages and the directory
 
 Use **Direct messages → New message** to find someone who has signed in to
@@ -93,6 +119,29 @@ conversations and messages generally return `404`.
   `addressed_by: "reply"`; a missing agent can set a private
   `addressing_note.kind: "reply_agent_unavailable"` on the POST response.
   Messages sent by Metro expose `via: "metro"` at top level.
+
+### Deleting messages
+
+**In the source, not released (0.6.1).**
+
+| Request | Who may delete |
+| --- | --- |
+| `DELETE /v1/spaces/{sid}/rooms/{rid}/events/{eid}` | The sender; the Space owner for any message or agent reply in the Space |
+| `DELETE /v1/chat/events/{eid}` | The Chat's owner, for any message or reply in it |
+| `DELETE /v1/dms/{id}/events/{eid}` | The sender only |
+
+Success returns `200` with `{deleted: true, events}`, the
+`message_deleted` events it wrote. A conversation or message the caller
+can't read, or an unknown ID, gives `404`; a reader who may not delete it
+gets `403`; anything other than a `message` or `agent` event gives `409`.
+A `message_deleted` event arrives through the normal `after` poll; its
+`text` is JSON `{target_event_id, tombstone}`. With `tombstone: true`,
+the target stays as a `kind: "deleted"` event with no text, recipients
+or metadata, anchoring its reply thread. A deletion also removes the
+`compaction` events that cover it in its own room and in the reply thread
+anchored on it, each with its own `message_deleted` event. DM polls
+include deletions only with `GET /v1/dms/{id}/events?after=&deletions=1`,
+so older clients keep receiving messages only.
 
 ### Forward
 

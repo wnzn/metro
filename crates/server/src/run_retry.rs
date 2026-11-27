@@ -124,7 +124,7 @@ pub async fn retry(state: &AppState, who: &Human, run_id: &str) -> Result<RunInf
         .map_err(internal)?;
     let target = Target {
         agent,
-        pick: format!("Retry of {run_id}"),
+        pick: Some(format!("Retry of {run_id}")),
         addressed_by: AddressedBy::Explicit,
     };
     let started = crate::agent_dispatch::start_runs(

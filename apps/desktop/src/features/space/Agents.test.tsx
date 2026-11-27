@@ -51,7 +51,7 @@ test("the @ list offers the generic @agent and each named agent; a named one is 
   await app.press("id:send");
   await app.waitUntil(() => messages(w).length === before + 1);
   // Only the wire form: the agent's id, never its handle or addressed_by.
-  expect(messages(w).at(-1)!.body).toEqual({ text: "please @Coder review the diff", invoke_agent: false, infer_text_mentions: false,
+  expect(messages(w).at(-1)!.body).toEqual({ text: "please @Coder review the diff", invoke_agent: false, infer_text_mentions: false, defer_decisions: true,
     mentions: [{ kind: "agent", agent_id: coder.id }], spans: [{ start: 7, end: 13, index: 0 }] });
 });
 
@@ -62,7 +62,7 @@ test("Ask agent: one agent has no chooser; with two, the default is preselected 
   await app.type("id:composer", "hello");
   await app.press("id:ask-agent");
   await app.waitUntil(() => messages(w).length > 0);
-  expect(messages(w).at(-1)!.body).toEqual({ text: "hello", invoke_agent: true, infer_text_mentions: false });
+  expect(messages(w).at(-1)!.body).toEqual({ text: "hello", invoke_agent: true, infer_text_mentions: false, defer_decisions: true });
 
   const w2 = spaceWorld();
   const coder = withCoder(w2);
@@ -78,7 +78,7 @@ test("Ask agent: one agent has no chooser; with two, the default is preselected 
   await app2.type("id:composer", "fix the build");
   await app2.press("id:ask-agent");
   await app2.waitUntil(() => messages(w2).length > 0);
-  expect(messages(w2).at(-1)!.body).toEqual({ text: "fix the build", invoke_agent: true, agent_id: coder.id, infer_text_mentions: false });
+  expect(messages(w2).at(-1)!.body).toEqual({ text: "fix the build", invoke_agent: true, agent_id: coder.id, infer_text_mentions: false, defer_decisions: true });
 
   // Back to the default: its id is sent explicitly.
   await app2.press("id:ask-agent-choose");
@@ -87,7 +87,7 @@ test("Ask agent: one agent has no chooser; with two, the default is preselected 
   await app2.type("id:composer", "status?");
   await app2.press("id:ask-agent");
   await app2.waitUntil(() => messages(w2).length > 1);
-  expect(messages(w2).at(-1)!.body).toEqual({ text: "status?", invoke_agent: true, agent_id: "ag-1", infer_text_mentions: false });
+  expect(messages(w2).at(-1)!.body).toEqual({ text: "status?", invoke_agent: true, agent_id: "ag-1", infer_text_mentions: false, defer_decisions: true });
 });
 
 test("Let the classifier choose is offered only with classification on; it sends no agent id", async () => {
@@ -104,7 +104,7 @@ test("Let the classifier choose is offered only with classification on; it sends
   await app.type("id:composer", "which one?");
   await app.press("id:ask-agent");
   await app.waitUntil(() => messages(w).length > 0);
-  expect(messages(w).at(-1)!.body).toEqual({ text: "which one?", invoke_agent: true, infer_text_mentions: false });
+  expect(messages(w).at(-1)!.body).toEqual({ text: "which one?", invoke_agent: true, infer_text_mentions: false, defer_decisions: true });
 });
 
 test("a run and its reply show their agent: name, picture or initial, and how it was picked", async () => {
@@ -113,7 +113,7 @@ test("a run and its reply show their agent: name, picture or initial, and how it
   const badge = { id: coder.id, handle: "coder", name: "Coder", color: "#059669" };
   const a = { id: "run_c1", name: "Coder", source: "agent", agent: badge };
   w.f.post("acme/lobby", { kind: "message", actor: "alice", text: "can someone check the tests?", mentions: [{ kind: "agent", addressed_by: "classifier", agent_id: coder.id }], audience: "agent" } as any);
-  w.f.post("acme/lobby", { kind: "activity", actor: "agent", text: "", activity: { ...a, phase: "started", pick: "Picked by classifier: Coder" } } as any);
+  w.f.post("acme/lobby", { kind: "activity", actor: "agent", text: "", activity: { ...a, phase: "started" } } as any);
   w.f.post("acme/lobby", { kind: "reasoning_summary", actor: "agent", text: "Look at the failing test first.", activity: a } as any);
   w.f.post("acme/lobby", { kind: "activity", actor: "agent", text: "", activity: { ...a, phase: "completed" } } as any);
   const reply = w.f.post("acme/lobby", { kind: "agent", actor: "agent", text: "The flaky test depends on the clock.", activity: a } as any);
@@ -123,14 +123,14 @@ test("a run and its reply show their agent: name, picture or initial, and how it
   expect(app.shows("label:Coder, agent")).toBe(true);
   // Its initial on its colour, not the generic agent glyph.
   expect(app.shows(`id:avatar:${reply.id} >> text:C`)).toBe(true);
-  // The pick is on the collapsed line and in the timeline.
-  await app.waitFor("id:activity-pick:agent:run_c1");
-  expect(app.shows("text:Picked by classifier: Coder")).toBe(true);
+  // A classifier's pick shows the agent normally: no pick label, no "detected" pill.
+  await app.waitFor("id:activity-toggle:agent:run_c1");
+  expect(app.shows("id:activity-pick:agent:run_c1")).toBe(false);
+  expect(app.shows("text:Picked by classifier: Coder")).toBe(false);
   await app.press("id:activity-toggle:agent:run_c1");
-  await app.waitFor("id:activity-pick-text:agent:run_c1");
-  expect(app.shows("text:Look at the failing test first.")).toBe(true);
-  // The classifier's recipient names the agent it picked.
-  expect(app.shows("text:Coder · detected by System One")).toBe(true);
+  await app.waitFor("text:Look at the failing test first.");
+  expect(app.shows("text:Coder · detected by System One")).toBe(false);
+  expect(app.texts().join(" ").includes("System One")).toBe(false);
 });
 
 test("every member opens Space settings from the room header and the Space's menu", async () => {

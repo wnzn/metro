@@ -17,7 +17,7 @@ type Req = { method: string; url: string; headers: Record<string, string>; body?
 
 const ROOT = "/home/me/.config/metro-desktop/local-tools/runner/0123456789abcdef/spaces";
 
-type Opts = { requested?: boolean; available?: boolean; state?: string; canReconnect?: boolean; legacy?: boolean; unavailableFor?: string; unconfirmedName?: string };
+type Opts = { requested?: boolean; available?: boolean; state?: string; canReconnect?: boolean; legacy?: boolean; unavailableFor?: string; unconfirmedName?: string; detail?: string };
 
 /** The fake bridge plus the personal runner routes. */
 function bridgeWithRunner(f: F, runnerId: string | null, name: string, opts: Opts = {}) {
@@ -31,7 +31,7 @@ function bridgeWithRunner(f: F, runnerId: string | null, name: string, opts: Opt
     marker_detail: null,
     available: st.available,
     state: !st.available ? "unavailable" : st.state,
-    detail: st.state === "revoked" ? "This computer's runner is no longer accepted by the local Metro server." : null,
+    detail: opts.detail ?? (st.state === "revoked" ? "This computer's runner is no longer accepted by the local Metro server." : null),
     runner: !st.available || !st.runnerId ? null : { id: st.runnerId, name },
     ...(opts.unconfirmedName && !st.runnerId ? { unconfirmed_name: opts.unconfirmedName } : {}),
     spaces_folder: !st.available ? null : ROOT,
@@ -264,7 +264,9 @@ for (const status of [403, 404] as const) {
     t.network[post] = req => {
       if (new URL(req.url).pathname !== "/v1/local-tools/runner/spaces/target/folder") return bridge(req);
       parked = true;
-      return { status, delay: 5_000, body: { error: {
+      // Held far past the list refresh, so how fast the machine settles that
+      // refresh cannot race the refusal: it comes only when the test moves the clock.
+      return { status, delay: 25_000, body: { error: {
         code: status === 403 ? "not_owner" : "not_found", message: "Local folder refused.",
       } } };
     };
@@ -278,11 +280,11 @@ for (const status of [403, 404] as const) {
     await app.waitUntil(() => parked);
     f.state.spaces.get("target")!.name = "Target from the newer list";
     await app.clock!.runFor(3_500);
-    expect(app.shows("id:space:target >> text:Target from the newer list")).toBe(true);
+    await app.waitFor("id:space:target >> text:Target from the newer list"); // the refresh's answer settles in real time
     expect(app.shows("id:installed-runner-space:target")).toBe(true);
     expect(app.shows("id:installed-runner-error")).toBe(false);
 
-    await app.clock!.runFor(1_600);
+    await app.clock!.runFor(25_000);
     await app.waitFor("id:installed-runner-error");
     expect(app.shows("id:installed-runner-space:target")).toBe(false);
     expect(app.shows("id:installed-runner-path:target")).toBe(false);
@@ -450,7 +452,7 @@ test("shows the installer's runner, read-only tools and how to attach; opening o
   expect(app.shows("id:installed-runner-space:other")).toBe(false);
   expect(app.shows("id:installed-runner-space:side")).toBe(false); // Bob's Space
   expect(text(app)).toContain("workspace.list, workspace.read");
-  expect(text(app)).toContain("Online");
+  expect(text(app)).toContain("Connected");
   expect(text(app)).toContain("Every Space you own has a runner.");
   expect(app.shows("id:installed-runner-reconnect")).toBe(false);
   await sleep(300);
@@ -522,7 +524,7 @@ test("reconnect is offered only when allowed, explains itself, and posts only af
   await app.waitFor("id:installed-runner-notice");
   // Plain `{}`: never a chosen runner id.
   expect(posts(t).map((l) => [l.path, l.body])).toEqual([["/v1/local-tools/runner/reconnect", "{}"]]);
-  expect(text(app)).toContain("Online");
+  expect(text(app)).toContain("Connected");
   expect(app.shows("id:installed-runner-reconnect")).toBe(false);
 });
 
@@ -881,7 +883,7 @@ for (const change of ["new", "moved", "replaced"] as const) {
       // A live status update for the same id is not a new runner.
       t.st.state = "offline";
       await app.clock!.runFor(5100);
-      await app.waitFor("id:installed-runner-state >> text:Can't reach the local server");
+      await app.waitFor("id:installed-runner-state >> text:Disconnected");
       expect(app.shows("id:runner-attach-many >> text:Attach to 1 Space")).toBe(true);
       t.st.state = "online";
     }
@@ -976,22 +978,29 @@ test("persistent concurrent consumers see late online and subsequent offline; di
   await app.waitFor(`text:Create choice: ${mine.id}`);
   expect(reads()).toBe(1); // Both watchers use the initial read.
   expect(app.shows("id:dismiss-fixture-offer")).toBe(false);
-  await app.clock!.runFor(36_000); // Longer than the old six-try window.
+  // Longer than the old six-try window: seven polls, one per five seconds.
+  // Each step waits for its read to be answered before the clock moves on:
+  // the answers settle in real time, and under load a single long runFor
+  // finished with some of them still unread.
+  for (let i = 1; i <= 7; i++) {
+    await app.clock!.runFor(5_100);
+    await app.waitUntil(() => reads() >= 1 + i);
+  }
   expect(reads()).toBeGreaterThanOrEqual(7);
   expect(reads()).toBeLessThanOrEqual(8); // At most one poll per five seconds.
   expect(app.shows("id:dismiss-fixture-offer")).toBe(false);
 
   t.st.state = "online";
   await app.clock!.runFor(5100);
-  expect(app.shows("text:Offer appearances: 1")).toBe(true);
+  await app.waitFor("text:Offer appearances: 1");
   expect(app.shows("id:dismiss-fixture-offer")).toBe(true);
   t.st.state = "offline";
   await app.clock!.runFor(5100);
-  expect(app.shows("id:dismiss-fixture-offer")).toBe(false);
+  await app.waitFor("id:dismiss-fixture-offer", { state: "gone" });
   expect(app.shows(`text:Create choice: ${mine.id}`)).toBe(true);
   t.st.state = "online";
   await app.clock!.runFor(5100);
-  expect(app.shows("text:Offer appearances: 2")).toBe(true);
+  await app.waitFor("text:Offer appearances: 2");
 
   t.st.delay = 1500;
   const before = reads();
@@ -1300,7 +1309,7 @@ test("managed runner updates require confirmation, report denial and accepted pr
   const id = `id:runner-update:${mine.id}`;
   const posts = () => f.posts().filter((p) => p.path.endsWith("/update"));
   await app.waitFor(id);
-  expect(text(app)).toContain("v0.4.0 · Online");
+  expect(text(app)).toContain("v0.4.0 · Connected");
   expect(posts()).toEqual([]);
   await app.press(id);
   expect(text(app)).toContain("Build box downloads 0.5.0 from GitHub, verifies the signature itself and restarts.");
@@ -1339,7 +1348,7 @@ test("managed runner updates require confirmation, report denial and accepted pr
   completed.presence.version = "0.5.0";
   f.state.runnerRelease.set(mine.id, completed);
   await app.clock!.runFor(5100);
-  await app.waitFor("text:v0.5.0 · Online");
+  await app.waitFor("text:v0.5.0 · Connected");
   expect(app.shows(id)).toBe(false);
   expect(posts()).toHaveLength(3);
 });
@@ -1390,7 +1399,7 @@ test("an accepted update waits for the held pre-acceptance poll before polling a
   expect(authoritative.arrived()).toBe(1);
   expect(app.shows(pending)).toBe(true);
   await app.clock!.runFor(1700);
-  await app.waitFor("text:v0.5.0 · Online");
+  await app.waitFor("text:v0.5.0 · Connected");
   expect(app.shows(pending)).toBe(false);
   expect(app.shows(id)).toBe(false);
   await app.clock!.runFor(6000);
@@ -1438,13 +1447,13 @@ test("an update offer changed while confirming never requests a different target
   const id = `id:runner-update:${mine.id}`;
   await app.press(id);
   await app.waitFor(`${id}:warning`);
-  f.state.runnerRelease.set(mine.id, fixtureRelease("managed", "self_update", { latest: "0.6.0" }));
+  f.state.runnerRelease.set(mine.id, fixtureRelease("managed", "self_update", { latest: "0.6.1" }));
   await app.press(`${id}:confirm`);
   await app.waitFor(`id:runner-update-error:${mine.id}`);
   expect(text(app)).toContain("This runner is no longer eligible for that update. Nothing was requested.");
   expect(f.posts().filter((p) => p.path.endsWith("/update"))).toEqual([]);
   await app.press(id);
-  expect(text(app)).toContain("Build box downloads 0.6.0 from GitHub");
+  expect(text(app)).toContain("Build box downloads 0.6.1 from GitHub");
 });
 
 test("a held keyboard update keeps its scoped busy panel and restores focus to retry or result", async () => {
@@ -1511,7 +1520,7 @@ test("an idle confirmation closes without a POST and hands keyboard focus to sta
   await app.keyboard.press("tab"); // Cancel → Confirm, but don't submit.
   release.presence.online = false;
   await app.clock!.runFor(5100);
-  await app.waitFor(`id:runner-update-result:${mine.id} >> text:Bring this runner online to request an update.`);
+  await app.waitFor(`id:runner-update-result:${mine.id} >> text:Connect this runner to request an update.`);
   expect(app.shows(`${id}:panel`)).toBe(false);
   expect(app.shows(id)).toBe(false);
   await app.keyboard.press("enter"); // The focused status cannot submit.
@@ -1545,7 +1554,7 @@ test("Docker guidance only exposes official version-matched pinned images; embed
   expect(text(app)).toContain("Version unknown until it connects");
   expect(text(app)).toContain("Updates with Metro.");
   expect(text(app)).toContain("An org admin can update it.");
-  expect(text(app)).toContain("Bring this runner online to request an update.");
+  expect(text(app)).toContain("Connect this runner to request an update.");
   expect(app.shows(`id:runner-update-release:${manual.id}`)).toBe(true);
   for (const r of [docker, wrong, embedded, old, org, offline, manual]) expect(app.shows(`id:runner-update:${r.id}`)).toBe(false);
   await app.press(`id:runner-update-docker:${docker.id}:toggle`);
@@ -1556,4 +1565,16 @@ test("Docker guidance only exposes official version-matched pinned images; embed
   expect(app.shows(`id:runner-copy-image:${wrong.id}`)).toBe(false);
   expect(text(app)).toContain("The server did not provide a valid pinned Metro runner image.");
   expect(f.posts().filter((p) => p.path.endsWith("/update"))).toEqual([]);
+});
+
+test("a runner that didn't start says why under its badge", async () => {
+  const f = world();
+  const mine = f.addRunner("This PC", "personal", "alice");
+  const why = "Metro couldn't open its local tools folder C:\\Users\\me\\AppData\\Local\\Metro\\local-tools: Access is denied.";
+  const t = bridgeWithRunner(f, mine.id, "This PC", { state: "failed", detail: why });
+  const app = await openWith(f, t);
+  await signInToRunners(app, "alice");
+  await app.waitFor("id:installed-runner-detail");
+  expect(installedRunnerBadge(parseInstalledRunner({ requested: true, available: true, state: "failed", tools: [] })!).label).toBe("Failed");
+  expect(text(app)).toContain("Access is denied.");
 });

@@ -732,3 +732,75 @@ async fn nothing_without_the_marker_or_the_own_server_and_account_switch_stops()
     assert_eq!(st, 200);
     assert_eq!(v["local_runner"]["state"], "unavailable");
 }
+
+/// A start that can't get going says why, in both statuses, instead of
+/// leaving nothing polling; the next session bind tries again.
+#[tokio::test]
+async fn a_folder_that_cannot_open_is_reported_and_retried_on_the_next_bind() {
+    let s = Server::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("local-tools");
+    // Not a folder: Metro can't open (or create) it.
+    std::fs::write(&root, b"not a folder").unwrap();
+    let t = tools(&root, Marker::Accepted);
+    let alice = s.hosted(ALICE, "alice");
+    t.resume(alice.clone()).await;
+
+    let v = runner_status(&t, Some(&alice)).await;
+    assert_eq!(v["state"], "failed", "{v}");
+    let detail = v["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("couldn't open its local tools folder"),
+        "{v}"
+    );
+    let (st, all) = t
+        .handle("GET", "/v1/local-tools", b"", Some(alice.clone()))
+        .await;
+    assert_eq!(st, 200, "{all}");
+    assert!(
+        all["problem"]
+            .as_str()
+            .is_some_and(|p| p.contains("couldn't open its local tools folder")),
+        "{all}"
+    );
+    assert_eq!(all["local_runner"]["state"], "failed", "{all}");
+
+    // Fixed: the next bind starts it, and the reason is gone.
+    std::fs::remove_file(&root).unwrap();
+    t.resume(alice.clone()).await;
+    let v = wait_state(&t, &alice, "online").await;
+    assert!(v["detail"].is_null(), "{v}");
+    let (_, all) = t
+        .handle("GET", "/v1/local-tools", b"", Some(alice.clone()))
+        .await;
+    assert!(all["problem"].is_null(), "{all}");
+    t.stop_all().await;
+}
+
+/// A folder problem seen by a status read goes away once a later read can
+/// open the folder, in both statuses, without waiting for a session bind.
+#[tokio::test]
+async fn a_folder_problem_clears_when_a_later_status_read_opens_it() {
+    let s = Server::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("local-tools");
+    std::fs::write(&root, b"not a folder").unwrap();
+    let t = tools(&root, Marker::Accepted);
+    let alice = s.hosted(ALICE, "alice");
+    let (_, all) = t
+        .handle("GET", "/v1/local-tools", b"", Some(alice.clone()))
+        .await;
+    assert!(all["problem"].is_string(), "{all}");
+    assert_eq!(runner_status(&t, Some(&alice)).await["state"], "failed");
+
+    std::fs::remove_file(&root).unwrap();
+    let (st, all) = t
+        .handle("GET", "/v1/local-tools", b"", Some(alice.clone()))
+        .await;
+    assert_eq!(st, 200, "{all}");
+    assert!(all["problem"].is_null(), "{all}");
+    let v = runner_status(&t, Some(&alice)).await;
+    assert_ne!(v["state"], "failed", "{v}");
+    assert!(v["detail"].is_null(), "{v}");
+    t.stop_all().await;
+}

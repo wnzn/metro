@@ -163,7 +163,7 @@ for (const width of [1200, 780]) {
     await app.press("id:dispatch-send");
     await app.waitFor("id:dispatch-notice");
     expect(f.posts().filter(p => p.path.endsWith("/messages"))).toMatchObject([
-      { path: "/v1/spaces/side/rooms/lobby/messages", body: { text: draft, invoke_agent: true, infer_text_mentions: false } },
+      { path: "/v1/spaces/side/rooms/lobby/messages", body: { text: draft, invoke_agent: true, infer_text_mentions: false, defer_decisions: true } },
     ]);
   });
 }
@@ -227,7 +227,7 @@ test("a held same-room Follow up keeps its recipient visible and can't repaint a
   await app.press("id:dispatch-send");
   await app.waitFor("id:dispatch-notice");
   expect(f.posts().filter(p => p.path.endsWith("/messages"))).toMatchObject([
-    { path: "/v1/spaces/side/rooms/lobby/messages", body: { text: draft, invoke_agent: true, infer_text_mentions: false } },
+    { path: "/v1/spaces/side/rooms/lobby/messages", body: { text: draft, invoke_agent: true, infer_text_mentions: false, defer_decisions: true } },
   ]);
 });
 
@@ -322,7 +322,7 @@ for (const order of ["move first", "purge first", "purge then explicit retarget"
     await app.waitFor("id:dispatch-notice");
     expect(f.posts().filter(p => p.path.endsWith("/messages"))).toMatchObject([
       { path: `/v1/spaces/side/rooms/${retarget ? "scratch" : "lobby"}/messages`,
-        body: { text: draft, invoke_agent: true, infer_text_mentions: false } },
+        body: { text: draft, invoke_agent: true, infer_text_mentions: false, defer_decisions: true } },
     ]);
   });
 }
@@ -399,7 +399,7 @@ for (const recovery of ["retry", "different Space"] as const) {
     await app.waitFor("id:dispatch-notice");
     expect(f.posts().filter(p => p.path.endsWith("/messages"))).toMatchObject([
       { path: recovery === "retry" ? "/v1/spaces/acme/rooms/releases/messages" : "/v1/spaces/side/rooms/releases/messages",
-        body: { text: draft, invoke_agent: true, infer_text_mentions: false } },
+        body: { text: draft, invoke_agent: true, infer_text_mentions: false, defer_decisions: true } },
     ]);
   });
 }
@@ -474,7 +474,7 @@ for (const flow of ["empty draft", "confirmed move"] as const) {
     await app.press("id:dispatch-send");
     await app.waitFor("id:dispatch-notice");
     expect(f.posts().filter(p => p.path.endsWith("/messages"))).toMatchObject([
-      { path: "/v1/spaces/side/rooms/review/messages", body: { text: draft, invoke_agent: true, infer_text_mentions: false } },
+      { path: "/v1/spaces/side/rooms/review/messages", body: { text: draft, invoke_agent: true, infer_text_mentions: false, defer_decisions: true } },
     ]);
   });
 }
@@ -552,7 +552,7 @@ test("a failed name lookup stays blocked when a different room's exact check fil
   await app.press("id:dispatch-send");
   await app.waitFor("id:dispatch-notice");
   expect(f.posts().filter(p => p.path.endsWith("/messages"))).toMatchObject([
-    { path: "/v1/spaces/side/rooms/lobby/messages", body: { text: draft, invoke_agent: true, infer_text_mentions: false } },
+    { path: "/v1/spaces/side/rooms/lobby/messages", body: { text: draft, invoke_agent: true, infer_text_mentions: false, defer_decisions: true } },
   ]);
 });
 
@@ -688,7 +688,7 @@ test("Dispatch sends exact Unicode and whitespace to the explicit thread, never 
   const text = "\u2003  🌿 @bob, résumé\ncheck the task  \t";
   await app.paste("id:dispatch-text", { text });
   const posts = () => app.requests().filter(r => r.method === "POST" && r.url.endsWith("/messages"));
-  const body = { text, invoke_agent: true, infer_text_mentions: false };
+  const body = { text, invoke_agent: true, infer_text_mentions: false, defer_decisions: true };
   for (const [i, code] of [422, 503, 0].entries()) {
     status = code;
     await app.press("id:dispatch-send");
@@ -828,4 +828,25 @@ test("no runs and no Space: the suggestions are disabled and say why, and never 
   await app.wait(200);
   expect(app.shows("id:dispatch")).toBe(false);
   expect(sentAnything(f)).toBe(false);
+});
+
+test("in their own Chat a person deletes Metro's replies and their notes, after confirming", async () => {
+  const f = world();
+  f.state.events.set("chat:alice", []);
+  const note = f.post("chat:alice", { kind: "message", actor: "alice", actor_id: "alice", text: "a private note" });
+  const reply = f.post("chat:alice", { kind: "agent", actor: "agent", text: "a reply from Metro" });
+  const app = await inChat(f);
+  await app.waitFor("text:a reply from Metro");
+  for (const ev of [reply, note]) {
+    await app.hover(`id:event:${ev.id}`);
+    await app.press(`id:delete:${ev.id}`);
+    await app.waitFor(`id:confirm-delete:${ev.id}`);
+    expect(app.shows("text:/removed from your Chat/")).toBe(true);
+    await app.press(`id:delete-dialog:${ev.id}:confirm`);
+    await app.waitFor(`id:event:${ev.id}`, { state: "gone" });
+  }
+  expect(f.posts().filter((p) => p.method === "DELETE").map((p) => p.path))
+    .toEqual([`/v1/chat/events/${reply.id}`, `/v1/chat/events/${note.id}`]);
+  // Deleting never asks the agent.
+  expect(chatPosts(f).filter((p) => p.path === "/v1/chat/messages")).toEqual([]);
 });

@@ -63,7 +63,7 @@ test("picking only stages; Remove and a cancelled pick upload nothing; Send uplo
   expect(uploads(w).length).toBe(1);
   expect(uploads(w)[0]!.url).toBe(`${BASE}/v1/library/assets?scope=space&space_id=acme&name=notes.txt`);
   const id = w.l.assets[0]!.id;
-  expect(posts(w).at(-1)!.body).toEqual({ text: "see attached", invoke_agent: false, asset_ids: [id], infer_text_mentions: false });
+  expect(posts(w).at(-1)!.body).toEqual({ text: "see attached", invoke_agent: false, asset_ids: [id], infer_text_mentions: false, defer_decisions: true });
   expect(w.f.state.log.some((l) => l.path.includes("/library/index"))).toBe(false); // never indexed
   const ev = lastFiles(w, "acme/lobby");
   await app.waitFor(`id:file:${ev.id}:${id}`);

@@ -118,6 +118,6 @@ test("narrow transcript renders people and agents, confirms links and copies fol
   await app.press(`${row} >> label:Show less`);
   expect(app.shows(`${body} >> text:Last line`)).toBe(false);
   await app.type("id:composer", "**Still plain input**");
-  expect(app.shows("id:composer-markdown-hint")).toBe(true);
+  expect(app.shows("text:Markdown supported")).toBe(false);
   expect(app.value("id:composer")).toBe("**Still plain input**");
 });

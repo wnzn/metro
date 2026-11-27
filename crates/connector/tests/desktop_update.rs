@@ -102,6 +102,40 @@ fn exec_file(path: &Path, body: &[u8]) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+// A sibling test's fork can keep a dropped flock or a just-written
+// executable's writable descriptor alive until exec, even with separate
+// fixture directories. Let libtest schedule the cases in parallel, but
+// run each fixture in its own process.
+macro_rules! isolate {
+    ($case:ident) => {
+        if !in_isolated_process(stringify!($case)) {
+            return;
+        }
+    };
+}
+
+/// Re-run just this case, with a private location for any app-menu changes.
+fn in_isolated_process(case: &str) -> bool {
+    const CHILD: &str = "METRO_TEST_DESKTOP_UPDATE_ISOLATED";
+    if std::env::var(CHILD).as_deref() == Ok(case) {
+        return true;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", case])
+        .env(CHILD, case)
+        .env("XDG_DATA_HOME", dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success() && String::from_utf8_lossy(&child.stdout).contains("1 passed;"),
+        "{}\n{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    false
+}
+
 fn desktop_archive(version: &str, kind: &str) -> Vec<u8> {
     let payload: Vec<(&str, &[u8], u32)> = vec![
         ("Metro", b"#!/bin/sh\nexit 0\n", 0o755),
@@ -173,6 +207,7 @@ fn install() -> Install {
 #[cfg(target_os = "linux")]
 #[test]
 fn desktop_updater_and_published_uninstaller_exclude_each_other() {
+    isolate!(desktop_updater_and_published_uninstaller_exclude_each_other);
     use std::process::{Command, Stdio};
     let i = install();
     let published = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -258,6 +293,7 @@ async fn until_settled(u: &Updater) -> Value {
 
 #[test]
 fn detection() {
+    isolate!(detection);
     let i = install();
     let own = Version::parse(OLD).unwrap();
     let r = Channel::Release;
@@ -324,6 +360,7 @@ fn detection() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn check_download_stage_and_apply_request() {
+    isolate!(check_download_stage_and_apply_request);
     let i = install();
     let f = serve(release(desktop_archive(NEW, "desktop")).files, vec![]);
     let u = updater(&i, &f, Channel::Release);
@@ -403,6 +440,7 @@ async fn check_download_stage_and_apply_request() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refusals_and_schedule_rules() {
+    isolate!(refusals_and_schedule_rules);
     // Source builds never make a request.
     let i = install();
     let f = serve(release(desktop_archive(NEW, "desktop")).files, vec![]);
@@ -452,6 +490,7 @@ async fn refusals_and_schedule_rules() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bad_downloads_change_nothing() {
+    isolate!(bad_downloads_change_nothing);
     // A tampered archive.
     let i = install();
     let rel = release(desktop_archive(NEW, "desktop"));
@@ -592,6 +631,7 @@ fn begin(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trial_confirmed_commits() {
+    isolate!(trial_confirmed_commits);
     let i = install();
     let mut j = staged_journal(&i);
     let p = paths(&i);
@@ -599,7 +639,7 @@ async fn trial_confirmed_commits() {
     let lock = install::Lock::take(&p.root).unwrap();
     let instance = begin(&p, &mut j, &lock);
     assert!(j.local_db_snapshot);
-    let exe = trial_stub(&i, &p.update_dir, &j.id, "printf ok > '$OK'\nsleep 5");
+    let exe = trial_stub(&i, &p.update_dir, &j.id, "printf ok > '$OK'\nexec sleep 5");
     let mut child = apply::spawn_trial(&exe, &j.id).unwrap();
     let out = apply::watch_trial(
         &p,
@@ -642,6 +682,7 @@ async fn trial_confirmed_commits() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trial_crash_rolls_back_and_restores_the_database() {
+    isolate!(trial_crash_rolls_back_and_restores_the_database);
     let i = install();
     let before = db(&i);
     let mut j = staged_journal(&i);
@@ -686,6 +727,7 @@ async fn a_bundled_server_that_outlives_the_trial_blocks_restore_and_other_launc
     const ROOT: &str = "METRO_TEST_ORPHAN_TRIAL_ROOT";
     const CASE: &str =
         "a_bundled_server_that_outlives_the_trial_blocks_restore_and_other_launchers";
+    isolate!(a_bundled_server_that_outlives_the_trial_blocks_restore_and_other_launchers);
     if let Some(root) = std::env::var_os(ROOT).map(PathBuf::from) {
         let instance = Arc::new(store::InstanceLock::adopt_trial(&root).unwrap());
         let local = root.join("local");
@@ -818,6 +860,7 @@ time.sleep(30)
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trial_timeout_kills_and_rolls_back() {
+    isolate!(trial_timeout_kills_and_rolls_back);
     let i = install();
     let before = db(&i);
     let mut j = staged_journal(&i);
@@ -844,6 +887,7 @@ async fn trial_timeout_kills_and_rolls_back() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trial_closed_at_once_is_not_committed() {
+    isolate!(trial_closed_at_once_is_not_committed);
     let i = install();
     let before = db(&i);
     let mut j = staged_journal(&i);
@@ -878,6 +922,7 @@ async fn trial_closed_at_once_is_not_committed() {
 
 #[test]
 fn legacy_msi_failure_does_not_prove_the_installer_stopped() {
+    isolate!(legacy_msi_failure_does_not_prove_the_installer_stopped);
     let i = install();
     let update_dir = i.desktop_root.join("update");
     let backup = update_dir.join("db-snapshot");
@@ -911,6 +956,7 @@ fn legacy_msi_failure_does_not_prove_the_installer_stopped() {
 
 #[test]
 fn msi_is_hashed_again_before_it_runs() {
+    isolate!(msi_is_hashed_again_before_it_runs);
     let i = install();
     let j = staged_journal(&i);
     let update_dir = i.desktop_root.join("update");
@@ -941,6 +987,7 @@ fn msi_is_hashed_again_before_it_runs() {
 
 #[test]
 fn dead_msi_helper_never_unblocks_startup_or_consumes_a_backup() {
+    isolate!(dead_msi_helper_never_unblocks_startup_or_consumes_a_backup);
     let i = install();
     let original = db(&i);
     let dir = i.desktop_root.join("update");
@@ -965,6 +1012,7 @@ fn dead_msi_helper_never_unblocks_startup_or_consumes_a_backup() {
 
 #[test]
 fn backup_intent_recovers_on_both_sides_of_publication() {
+    isolate!(backup_intent_recovers_on_both_sides_of_publication);
     for published in [false, true] {
         let i = install();
         let p = paths(&i);
@@ -1033,6 +1081,7 @@ fn backup_intent_recovers_on_both_sides_of_publication() {
 
 #[test]
 fn terminal_journal_survives_failed_cleanup_and_retries_without_restore() {
+    isolate!(terminal_journal_survives_failed_cleanup_and_retries_without_restore);
     let i = install();
     let p = paths(&i);
     let mut j = staged_journal(&i);
@@ -1075,25 +1124,7 @@ fn terminal_journal_survives_failed_cleanup_and_retries_without_restore() {
 
 #[test]
 fn committing_and_recovering_retarget_the_menu_without_running_the_staged_script() {
-    const CHILD: &str = "METRO_TEST_MENU_ISOLATED";
-    if std::env::var_os(CHILD).is_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "committing_and_recovering_retarget_the_menu_without_running_the_staged_script",
-            ])
-            .env(CHILD, "1")
-            .env("XDG_DATA_HOME", dir.path())
-            .output()
-            .unwrap();
-        assert!(
-            child.status.success(),
-            "{}",
-            String::from_utf8_lossy(&child.stdout)
-        );
-        return;
-    }
+    isolate!(committing_and_recovering_retarget_the_menu_without_running_the_staged_script);
     let apps = PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap()).join("applications");
     fs::create_dir_all(&apps).unwrap();
     let entry = apps.join("dev.metro.desktop.desktop");
@@ -1145,6 +1176,7 @@ fn committing_and_recovering_retarget_the_menu_without_running_the_staged_script
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unconfirmed_stage_is_preserved_until_a_newer_version_verifies() {
+    isolate!(an_unconfirmed_stage_is_preserved_until_a_newer_version_verifies);
     let i = install();
     let f = serve_version(
         "0.9.2",
@@ -1168,6 +1200,7 @@ async fn an_unconfirmed_stage_is_preserved_until_a_newer_version_verifies() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backwards_check_preserves_the_offer_but_manual_upgrade_invalidates_it() {
+    isolate!(backwards_check_preserves_the_offer_but_manual_upgrade_invalidates_it);
     let i = install();
     let f = serve(release(desktop_archive(NEW, "desktop")).files, vec![]);
     let u = updater(&i, &f, Channel::Release);
@@ -1210,6 +1243,7 @@ async fn backwards_check_preserves_the_offer_but_manual_upgrade_invalidates_it()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resumed_apply_requires_signed_evidence_and_every_staged_file() {
+    isolate!(resumed_apply_requires_signed_evidence_and_every_staged_file);
     let i = install();
     let f = serve(release(desktop_archive(NEW, "desktop")).files, vec![]);
     let u = updater(&i, &f, Channel::Release);
@@ -1292,6 +1326,7 @@ async fn resumed_apply_requires_signed_evidence_and_every_staged_file() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn missing_stage_evidence_does_not_hide_an_ambiguous_installation() {
+    isolate!(missing_stage_evidence_does_not_hide_an_ambiguous_installation);
     let i = install();
     let f = serve(release(desktop_archive(NEW, "desktop")).files, vec![]);
     let u = updater(&i, &f, Channel::Release);
@@ -1342,6 +1377,7 @@ async fn missing_stage_evidence_does_not_hide_an_ambiguous_installation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn expired_cached_evidence_keeps_the_newer_floor_and_pending_stage() {
+    isolate!(expired_cached_evidence_keeps_the_newer_floor_and_pending_stage);
     use metro_release::{ReleaseVerifier, Signed, SignedFacts};
     struct Expired(Vec<u8>);
     impl ReleaseVerifier for Expired {
@@ -1436,6 +1472,7 @@ async fn expired_cached_evidence_keeps_the_newer_floor_and_pending_stage() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn corrupted_settings_stay_off_and_failed_writes_are_reported() {
+    isolate!(corrupted_settings_stay_off_and_failed_writes_are_reported);
     let i = install();
     let f = serve(BTreeMap::new(), vec![]);
     let dir = i.desktop_root.join("update");
@@ -1460,6 +1497,7 @@ async fn corrupted_settings_stay_off_and_failed_writes_are_reported() {
 
 #[test]
 fn failed_restore_keeps_the_snapshot_and_can_retry_under_the_same_watchdog() {
+    isolate!(failed_restore_keeps_the_snapshot_and_can_retry_under_the_same_watchdog);
     let i = install();
     let before = db(&i);
     let mut j = staged_journal(&i);
@@ -1495,6 +1533,7 @@ fn failed_restore_keeps_the_snapshot_and_can_retry_under_the_same_watchdog() {
 
 #[test]
 fn unknown_or_foreign_journal_is_never_consumed() {
+    isolate!(unknown_or_foreign_journal_is_never_consumed);
     use std::os::unix::fs::MetadataExt;
 
     let i = install();
@@ -1544,6 +1583,7 @@ fn unknown_or_foreign_journal_is_never_consumed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_journal_that_becomes_unreadable_during_use_blocks_future_staging() {
+    isolate!(a_journal_that_becomes_unreadable_during_use_blocks_future_staging);
     let i = install();
     let f = serve(release(desktop_archive(NEW, "desktop")).files, vec![]);
     let u = updater(&i, &f, Channel::Release);
@@ -1565,6 +1605,7 @@ async fn a_journal_that_becomes_unreadable_during_use_blocks_future_staging() {
 
 #[test]
 fn a_trial_with_a_live_watchdog_is_left_alone() {
+    isolate!(a_trial_with_a_live_watchdog_is_left_alone);
     let i = install();
     let mut j = staged_journal(&i);
     let p = paths(&i);
@@ -1594,6 +1635,7 @@ fn a_trial_with_a_live_watchdog_is_left_alone() {
 /// Interruption matrix: a crash after each journal phase ends consistent.
 #[test]
 fn recovery_after_interruptions() {
+    isolate!(recovery_after_interruptions);
     let old = Version::parse(OLD).unwrap();
     let new = Version::parse(NEW).unwrap();
     use JournalPhase::*;
@@ -1644,6 +1686,7 @@ fn recovery_after_interruptions() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bridge_update_endpoints() {
+    isolate!(bridge_update_endpoints);
     let i = install();
     let f = serve(release(desktop_archive(NEW, "desktop")).files, vec![]);
     let u = updater(&i, &f, Channel::Release);
@@ -1757,6 +1800,7 @@ async fn bridge_update_endpoints() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trial_started_writes_the_ok_file() {
+    isolate!(trial_started_writes_the_ok_file);
     let i = install();
     let f = serve(BTreeMap::new(), vec![]);
     let own = Version::parse(NEW).unwrap();

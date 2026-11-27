@@ -39,7 +39,7 @@ function turn(f: F, id: string, route: unknown, withTool: boolean) {
 
 const text = (app: App) => app.texts().join(" | ");
 
-test("a classifier-started, use-case-routed turn: detected label, one row with a badge, the reason only when opened", async () => {
+test("a classifier-started, use-case-routed turn: the agent shown plainly, one row with a badge, the reason only when opened", async () => {
   const f = world();
   const ask = post(f, {
     kind: "message",
@@ -61,10 +61,10 @@ test("a classifier-started, use-case-routed turn: detected label, one row with a
   const app = await inAcme(f);
   await app.waitFor("text:reply for r1");
 
-  // Not an "@agent" the sender typed.
-  expect(app.shows(`id:recipient:${ask.id}:agent >> text:agent · detected by System One`)).toBe(true);
-  expect(app.shows(`id:event:${ask.id} >> text:@agent`)).toBe(false);
-  expect(app.shows(`id:event:${ask.id} >> text:to the agent`)).toBe(false); // the detected pill already says it
+  // The agent the classifier picked, shown like any agent recipient, with no "detected" label.
+  expect(app.shows(`id:recipient:${ask.id}:agent`)).toBe(true);
+  expect(app.shows("text:agent · detected by System One")).toBe(false);
+  expect(app.shows(`id:event:${ask.id} >> text:to the agent`)).toBe(false); // the recipient pill already says it
 
   // One collapsed row with a compact badge; no sentence, model or connection id in the transcript.
   expect(app.count("id:activity:agent:r1")).toBe(1);
@@ -79,8 +79,9 @@ test("a classifier-started, use-case-routed turn: detected label, one row with a
   await app.press("id:activity-toggle:agent:r1");
   await app.waitFor("id:activity-route:agent:r1");
   const line = text(app);
-  expect(line).toContain('Use case “Code review” (openai · gpt-fixture-2) answered: System One matched the use case "Code review" with 91% probability.');
-  expect(line).toContain("System One judged that the message asked the agent; nobody typed @agent.");
+  expect(line).toContain("Use case “Code review” (openai · gpt-fixture-2) answered");
+  expect(line).toContain('answered: System One matched the use case "Code review" with 91% probability.'); // use-case routing's own reason
+  expect(line).not.toMatch(/classifier|judged that the message asked|Started by System One/i); // the pick is never attributed
   expect(line).not.toContain("(p 0.91)"); // never the raw probability
   expect(line).not.toContain("pc_0123456789abcdef"); // connection ids are never shown
 });
@@ -144,5 +145,6 @@ test("a probability of 1.00 reads 100% on the badge and in words when opened, ne
   await app.press("id:activity-toggle:agent:sure");
   await app.waitFor("id:activity-route:agent:sure");
   expect(text(app)).toContain('System One matched the use case "Incident review" with 100% probability.');
+  expect(text(app)).not.toMatch(/classifier/i);
   expect(text(app)).not.toContain("p 1.00");
 });

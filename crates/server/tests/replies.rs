@@ -843,12 +843,7 @@ async fn opting_out_or_replying_to_people_follows_the_normal_rules() {
         )
         .await;
     let started = h.started_after(&sid, &tid, id(&e)).await;
-    assert!(
-        started["pick"]
-            .as_str()
-            .unwrap()
-            .starts_with("Picked by classifier")
-    );
+    assert!(started.get("pick").is_none(), "{started}");
     assert_eq!(h.classifier_calls(), before + 1);
 }
 

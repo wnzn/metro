@@ -8,7 +8,7 @@ import { launched } from "../../test/launched";
 const CURRENT = "0.5.0";
 const OTHER = "http://127.0.0.1:8788";
 const NEXT = "0.5.1";
-const AFTER = "0.6.0";
+const AFTER = "0.6.1";
 const RELEASE = `https://github.com/wnzn/metro/releases/tag/v${NEXT}`;
 const INERT = "[Steal](https://untrusted.invalid) <script>bad()</script> ![image](https://untrusted.invalid/image)";
 const OUTCOME_DISMISSAL_KEY = "metro.update.dismissedOutcome";

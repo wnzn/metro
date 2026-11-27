@@ -195,7 +195,9 @@ test("legacy messages still render and cancelling Forward sends nothing; modern 
   f.post("acme/lobby", { kind: "activity", actor: "agent", text: "",
     activity: { id: "no-reply", name: "Coder", source: "agent", phase: "completed", outcome: "no_reply" },
   } as any);
-  await app.waitFor("text:Coder chose not to reply");
+  await app.waitFor(`id:forwarded-time:${modern.id}`);
+  expect(app.shows("text:Coder chose not to reply")).toBe(false);
+  expect(app.shows("id:activity:no-reply")).toBe(false);
 });
 
 test("focused message rows support R for reply and F for forward", async () => {

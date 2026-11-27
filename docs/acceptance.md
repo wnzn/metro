@@ -3,6 +3,140 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Source only: Metro 0.6.1 lanes (2026-11-27, local)
+
+Lane runs on local builds, reported by each lane; not release files, a
+native desktop check by a person or a publication gate.
+
+- **Messages lane** (`1c8c9dc`: message deletion, System One decisions
+  after posting, with later review fixes). `cargo test -p metro-server`
+  passed 754 tests, including `tests/message_lifecycle.rs`.
+  The e2e scripts `smoke.py`, `threads.py`, `messaging.py`,
+  `intelligence.py`, `schedules.py`, `meta_agent.py`, `attachments.py`,
+  `compaction.py` and the new `message_lifecycle.py` passed. Desktop
+  `nsh test` passed 972/972. Latency, with a scripted System One that
+  takes 1,000 ms: a deferred message was visible to another member
+  1–2 ms after the POST, against about 1,022 ms for the waiting POST.
+- **Polish lane** (`5806e0b`, `5b58064`: composer hint, no-reply row,
+  runner wording, Settings spacing). Desktop `nsh test` passed 956/956.
+- **Runner lane** (`0abfc38` and later commits on `lane/061-runner`). `cargo test` for the runner, server and
+  connector crates: 1,041 passed, 0 failed, 3 ignored. E2e `smoke.py`,
+  `threads.py` and `settings.py` passed. Install-lock flakes went from
+  3/60 lib runs and 12/40 `self_update` runs to 0/150 and 0/60. The new
+  `tests/desktop_local_runner.rs` passed on Linux and as an
+  `x86_64-pc-windows-gnu` build under Wine 10. It is added to the
+  release workflow's Windows job, and it passed on native Windows in CI
+  (below). The reported Windows **Test runner** timeout wasn't reproduced.
+
+**Final gate on the merged branch** (`29912b6` on `fix/061-polish`,
+2026-11-27, Linux, local; source only, not a release):
+
+- Rust formatting and Clippy with `-D warnings` passed.
+  `cargo test --workspace --locked`: 1,259 passed, 0 failed, 3 ignored.
+- E2e: 17/17 scripts passed, including the feature-gated `updates.py`
+  and the offline Docker `library_reference.py`.
+- Updater `desktop_update` stress: 10/10 runs (290 case passes).
+- Packaging: ShellCheck clean, 259 passed and 10 skipped; release
+  signatures 17 passed, 1 skipped; Windows signing 41 passed, 0 skipped.
+- Desktop: `nsh check` passed; CI-mode `nsh test` 972 passed, 0 failed,
+  across 73 files.
+- Workspace example and the TUI PTY test passed; admin browser tests
+  30/30; offline media protocol 83/83.
+- Latency with a 1,000 ms scripted System One: the message was visible
+  about 2 ms after the POST, against about 1,021 ms when waiting.
+- Reviews: Opus 5.5 only for this run, by the maintainer's decision,
+  plus one earlier Astra 6.2 review whose findings were fixed. The final
+  Opus 5.5 review found no blockers or major issues.
+- **Not verified:** the desktop on native Windows by a person (the
+  reported Windows **Test runner** timeout wasn't reproduced; such
+  failures now report a reason), and real vendor accounts and sign-ins.
+
+**CI on PR #20** (GitHub, 2026-11-27). Run
+[45944072172](https://github.com/wnzn/metro/actions/runs/45944072172)
+on head `4fad361` (pull request event) succeeded; every job passed or
+was skipped by design (`release-policy`, `release`, `publish`). The
+native Windows job `package-smoke / desktop-windows` (`windows-2025`,
+05:10:39Z–05:33:20Z) ran the new step
+`cargo test --locked --release --target x86_64-pc-windows-msvc -p metro-server --test desktop_local_runner --test desktop_tools --test desktop_runner`:
+`desktop_local_runner` 2 passed, `desktop_runner` 9 passed and
+`desktop_tools` 11 passed, 0 failed. This is unattended CI with a fresh
+profile, not a desktop run by a person. The earlier run
+[45942687192](https://github.com/wnzn/metro/actions/runs/45942687192)
+(head `dd1952e`) failed `package-smoke / desktop-linux` with
+`unapproved renderer asset: src/ui/icons/trash.svg`, fixed in `4fad361`
+(`ICON_MODULES` in `packaging/package.py`); its Windows job was
+cancelled while building that step, before any of its tests ran.
+
+```sh
+gh run view 45944072172 --repo wnzn/metro --json conclusion,headSha,jobs
+gh api repos/wnzn/metro/actions/jobs/140325090204/logs | grep "test result"
+gh run view 45942687192 --repo wnzn/metro --json conclusion,headSha,jobs
+```
+
+## Published: Metro 0.6.0 (2026-11-26, GitHub release v0.6.0)
+
+**What was published.** The stable
+[Metro 0.6.0 release](https://github.com/wnzn/metro/releases/tag/v0.6.0)
+was published at `2026-11-26T03:13:02Z` (not a draft or prerelease,
+marked latest).
+Tag `v0.6.0` points to `430c835e841e8f680a0042268d00fb6a9894cdc1`,
+the merge of [PR #19](https://github.com/wnzn/metro/pull/19).
+The only Actions run on that commit is the push to `main`,
+[CI 45737693549](https://github.com/wnzn/metro/actions/runs/45737693549)
+(created `2026-11-26T01:43:40Z`), which succeeded, including the native
+Windows preview gate, asset and image signing, and publication. Windows
+code signing was skipped.
+
+The [0.6.0 guide](released-0.6.0.md) describes the shipped changes.
+The [0.6.1 changes](next-source.md) are not part of this release.
+
+**Assets** (18):
+
+| File | Verification |
+| --- | --- |
+| `Metro-0.6.0-linux-x64.tar.gz` + `.sha256` | `Metro-0.6.0-linux-x64.tar.gz.sigstore.json` |
+| `Metro-0.6.0-windows-x64.zip` + `.sha256` | No Authenticode; check against the signed manifest |
+| `Metro-0.6.0-windows-x64.unsigned-preview.msi` + `.sha256` | No Authenticode; check against the signed manifest |
+| `Metro-runner-0.6.0-linux-x64.tar.gz` + `.sha256` | `Metro-runner-0.6.0-linux-x64.tar.gz.sigstore.json` |
+| `install-metro-linux.sh`, `install-metro-runner-linux.sh`, `install-metro-windows.ps1`, `metro-runner-container.sh`, `metro-runner-container.ps1` | Listed in `SHA256SUMS`; the PowerShell scripts have no Authenticode |
+| `IMAGES.txt` | Listed in `SHA256SUMS` |
+| `SHA256SUMS` | `SHA256SUMS.sigstore.json` |
+
+**Images.** Pin by digest; there is no `latest` tag. The release's
+[`IMAGES.txt`](https://github.com/wnzn/metro/releases/download/v0.6.0/IMAGES.txt)
+records these references and the workflow's keyless Sigstore verification
+of each digest against the exact source commit.
+
+| Reference | Digest | Platforms |
+| --- | --- | --- |
+| `ghcr.io/wnzn/metro-server:v0.6.0` | `sha256:afa42b353cc5c10d7baabf7e1a3edbf56501448282b3103a6700af87d2ea9dc6` | `linux/amd64`, `linux/arm64` |
+| `ghcr.io/wnzn/metro-server` | `sha256:6db8948addf07279c62d5209f57baa20ddf5da85085c7ee324335eef2c1401e9` | `linux/amd64` |
+| `ghcr.io/wnzn/metro-server` | `sha256:81e3a42c57f8bdeebd78e27e8c75b06ccb906c5b71d9b71b707c2796f65106a1` | `linux/arm64` |
+| `ghcr.io/wnzn/metro-runner:v0.6.0` | `sha256:43f980eb451a1953055b593da7967b3825e0eb1cbf3cb059b8a8c22e7a019d7b` | `linux/amd64`, `linux/arm64` |
+| `ghcr.io/wnzn/metro-runner` | `sha256:0e16c8b1f8a016b9837c64d4e4c108cb4e6cd7d4f9ef7bb32724c154b1a73789` | `linux/amd64` |
+| `ghcr.io/wnzn/metro-runner` | `sha256:6462b36f6eda72b734898873d0a321bf4c43db20e02e56704aa03398cbb062a6` | `linux/arm64` |
+| `ghcr.io/wnzn/metro-embeddinggemma2:v0.6.0` | `sha256:46eee95152e8166ae63c6b60ff4e092b3cae4309766f20ecd332221de923a31e` | `linux/amd64` (no weights) |
+| `ghcr.io/wnzn/metro-embeddinggemma2` | `sha256:b81c579e2c876ae7979f0e73707d27b91131e58f1434d1dfa9e33051a7863928` | `linux/amd64` |
+
+**How it was checked** (2026-11-27, read-only):
+
+```sh
+gh release view v0.6.0 --repo wnzn/metro --json tagName,publishedAt,isPrerelease,isDraft,url,assets
+gh api repos/wnzn/metro/releases/latest --jq .tag_name
+gh api repos/wnzn/metro/git/ref/tags/v0.6.0
+gh pr view 19 --repo wnzn/metro --json mergeCommit
+gh api "repos/wnzn/metro/actions/runs?head_sha=430c835e841e8f680a0042268d00fb6a9894cdc1"
+gh run view 45737693549 --repo wnzn/metro --json conclusion,jobs
+gh release download v0.6.0 --repo wnzn/metro -p IMAGES.txt -p SHA256SUMS -D <new empty dir>
+```
+
+The 18 asset names and eight image references matched the release, and
+`IMAGES.txt` matched its checksum in `SHA256SUMS`. No release binary or
+container was run and no signature was independently verified in this
+check. The Windows CI gate is unattended, not a desktop or MSI wizard run
+by a person on native Windows. Real vendor accounts and sign-ins remain
+unverified.
+
 ## Published: Metro 0.5.1 (2026-11-26, GitHub release v0.5.1)
 
 **What was published.** The stable
@@ -17,7 +151,7 @@ successfully, including the native Windows preview gate, asset and image
 signing, and publication. Windows code signing was skipped.
 
 The [0.5.1 Pages guide](released-0.5.1.md) describes the shipped changes.
-The [0.6.0 changes](next-source.md) are not part of this release.
+The [0.6.0 changes](released-0.6.0.md) are not part of this release.
 
 **Assets** (18):
 

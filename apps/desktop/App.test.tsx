@@ -114,7 +114,7 @@ test("@mentions: pick a member, send, prune and clear on room change", async () 
   await app.press("id:send");
   await app.waitUntil(() => f.posts().some(p => p.path.endsWith("/messages")));
   const sent = f.posts().find((p) => p.path.endsWith("/messages"))!;
-  expect(sent.body).toEqual({ text: "can you look @bob ", invoke_agent: false, infer_text_mentions: false,
+  expect(sent.body).toEqual({ text: "can you look @bob ", invoke_agent: false, infer_text_mentions: false, defer_decisions: true,
     mentions: [{ kind: "user", id: "bob" }], spans: [{ start: 13, end: 17, index: 0 }] });
   expect(f.state.events.get("acme/lobby")!.some((e) => e.actor === "agent")).toBe(false); // a person only
   // The header names the recipient itself: a pill for bob, no agent badge, no "to people" note.
@@ -130,7 +130,7 @@ test("@mentions: pick a member, send, prune and clear on room change", async () 
   // Ask agent with no mention: invoke_agent on the wire, and one "to the agent" badge.
   await app.type("id:composer", "summarise the lobby");
   await askAgent(app);
-  expect(f.posts().filter((p) => p.path.endsWith("/messages")).at(-1)!.body).toEqual({ text: "summarise the lobby", invoke_agent: true, infer_text_mentions: false });
+  expect(f.posts().filter((p) => p.path.endsWith("/messages")).at(-1)!.body).toEqual({ text: "summarise the lobby", invoke_agent: true, infer_text_mentions: false, defer_decisions: true });
   const asked = f.state.events.get("acme/lobby")!.find((e) => e.text === "summarise the lobby")!;
   await app.waitFor(`id:recipient:${asked.id}:ask-agent`);
   expect(app.count(`id:recipient:${asked.id}:ask-agent`)).toBe(1);
@@ -586,8 +586,8 @@ test("a Space owner attaches and detaches a runner from the same list; attached 
   await app.waitFor("id:attached-runner");
   expect(f.posts().at(-1)).toMatchObject({ method: "POST", path: "/v1/spaces/side/runner/attach-if-empty", body: { runner_id: mine.id } });
   // Attached only routes this Space's jobs; it never claims the runner is up.
-  expect(text(app)).toContain("The assignment doesn't mean it's online.");
-  expect(app.shows("id:runner-card >> text:Online")).toBe(false);
+  expect(text(app)).toContain("The assignment doesn't mean it's connected.");
+  expect(app.shows("id:runner-card >> text:Connected")).toBe(false);
   expect(text(app)).not.toContain(mine.token);
 
   await app.press("id:space-runner-detach");
@@ -758,19 +758,19 @@ test("a device connection: no vendor key in Metro, a masked device token with me
   expect(text(app)).toContain("1. Run setup.");
   expect(text(app)).not.toContain("cargo");
 
-  await app.waitFor(`id:device-status:${c.id} >> text:Paired · offline`);
+  await app.waitFor(`id:device-status:${c.id} >> text:Paired · disconnected`);
   await app.press("id:reveal-test-connection");
   await app.waitFor(`id:listing-error:${c.id}`);
   expect(text(app)).toContain("metro-connector for this connection didn't answer");
   f.state.online.add(c.id);
   await app.press("id:reveal-test-connection");
   await app.waitFor(`id:listing-ok:${c.id}`);
-  await app.waitFor(`id:device-status:${c.id} >> text:Online`);
+  await app.waitFor(`id:device-status:${c.id} >> text:Connected`);
   await app.press("id:hide-runner-token");
   // Its details follow, with the models it listed already there and on.
   await app.waitFor(`id:connection-details:${c.id}`);
   await app.waitFor(`id:model-row:${c.id}:fixture-local-large`);
-  expect(app.shows(`id:connection-heading:${c.id}:status >> text:/Online · metro-connector/`)).toBe(true);
+  expect(app.shows(`id:connection-heading:${c.id}:status >> text:/Connected · metro-connector/`)).toBe(true);
   expect(text(app)).not.toContain(DEVICE_SECRET);
   expect(f.state.connections.get(c.id)!.model).toBe("fixture-local-small"); // the first listed, by itself
   await app.press(`id:model-default:${c.id}:fixture-local-large`);
@@ -806,7 +806,7 @@ test("a paired device lists its models by itself once it comes online; nobody pr
   const app = await openApp(f);
   await signIn(app, "bob");
   await openSettings(app, "providers");
-  await app.waitFor(`id:connection:${c.id}:status >> text:/Offline · metro-connector · No models yet/`);
+  await app.waitFor(`id:connection:${c.id}:status >> text:/Disconnected · metro-connector · No models yet/`);
   expect(app.shows(`id:connection-problem:${c.id} >> text:/metro-connector isn't running/`)).toBe(true);
   const refresh = `/v1/providers/${c.id}/model-list/refresh`;
   expect(f.posts().some((p) => p.path === refresh)).toBe(false);
@@ -815,7 +815,7 @@ test("a paired device lists its models by itself once it comes online; nobody pr
   await app.press("id:settings-close");
   await openSettings(app, "providers");
   await app.waitUntil(() => f.posts().some((p) => p.path === refresh));
-  await app.waitFor(`id:connection:${c.id}:status >> text:/Online · metro-connector · 2 models/`);
+  await app.waitFor(`id:connection:${c.id}:status >> text:/Connected · metro-connector · 2 models/`);
   expect(f.state.connections.get(c.id)!.model).toBe("fixture-local-small"); // its default, chosen by the server
   expect(app.shows(`id:connection-problem:${c.id}`)).toBe(false);
   expect(text(app)).not.toContain(DEVICE_SECRET);

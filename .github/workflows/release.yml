@@ -303,6 +303,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked --release --target x86_64-pc-windows-msvc -p metro-connector --lib openai_oauth::store::tests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # "Use locally" on Windows: the launcher's LocalServer starts the real
+      # metro-server (socket handed over on stdin), the bridge binds the
+      # session, and local tools or the installed runner answer Test runner,
+      # before and after a restart.
+      - name: Test runner through the desktop's local tools and installed runner on native Windows
+        run: |
+          cargo test --locked --release --target x86_64-pc-windows-msvc -p metro-server --test desktop_local_runner --test desktop_tools --test desktop_runner
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build metro-desktop, metro-server and metro-tui (native, locked)
         env:
           # Official releases only (see runner-linux).

@@ -110,6 +110,10 @@ pub struct MessageMeta {
     /// triggered it ([`crate::compaction`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<crate::compaction::Meta>,
+    /// Only on a personal Chat `error`: the Chat turn it ends before it
+    /// started (its sender knew its id from the POST).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
 }
 
 impl MessageMeta {
@@ -131,6 +135,7 @@ impl MessageMeta {
             via: key(m, "via"),
             forwarded: key(m, "forwarded"),
             compaction: key(m, "compaction"),
+            turn_id: key(m, "turn_id"),
         }
     }
 }
@@ -272,7 +277,8 @@ pub struct Activity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentBadge>,
     /// Only on a Space turn's `started` event: how its agent was chosen,
-    /// e.g. `Picked by classifier: Coder` or `Addressed: @coder`.
+    /// e.g. `Addressed: @coder` or `Default agent`. Absent when the
+    /// classifier picked it; older history may still say so.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pick: Option<String>,
     /// On a `page_draft` event only: public card metadata, never the draft body.
@@ -491,6 +497,13 @@ pub mod kind {
     /// to later runs as untrusted background, never as an ordinary turn.
     /// Never indexed, never searched.
     pub const COMPACTION: &str = "compaction";
+    /// A message or agent reply was deleted ([`crate::deletion`]). Its text
+    /// is a [`crate::deletion::DeletionPayload`] in JSON; clients replay it
+    /// like a `reaction` event. Never model history, never indexed.
+    pub const MESSAGE_DELETED: &str = "message_deleted";
+    /// What remains of a deleted message that anchors a reply thread with
+    /// replies: no text, recipients or metadata. Never model history.
+    pub const DELETED: &str = "deleted";
 }
 
 /// Actors the server writes for non-human events.
@@ -678,6 +691,7 @@ impl Db {
         // After spaces (exclusions reference them).
         crate::meta::prefs::init(&conn)?;
         crate::compaction::init(&conn)?;
+        crate::decisions::init(&conn)?;
         // After spaces (Space pages reference them).
         crate::pages::init(&conn)?;
         let version: Option<String> = conn
@@ -1543,6 +1557,109 @@ impl Db {
         ))
     }
 
+    /// [`Db::append_personal_with`], only while event `trigger` of the
+    /// same Chat is still a `message`, in one transaction that also settles
+    /// its pending decision ([`crate::decisions::settle_chat_in`]). `None`
+    /// (nothing written) once the message was deleted, the turn was
+    /// stopped before it started, or process `epoch` doesn't hold it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_personal_for_message(
+        &self,
+        epoch: &str,
+        user_id: &str,
+        trigger: i64,
+        kind: &str,
+        author: &Author,
+        text: &str,
+        activity: Option<&Activity>,
+    ) -> anyhow::Result<Option<Event>> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let present: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM personal_events WHERE id = ?1 AND user_id = ?2 AND kind = 'message')",
+            params![trigger, user_id],
+            |r| r.get(0),
+        )?;
+        let ours = crate::decisions::settle_chat_in(&tx, epoch, trigger)?;
+        if !present || !ours {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let at = now_ms();
+        let addressed = Addressed::room();
+        tx.execute(
+            "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                user_id,
+                kind,
+                author.name,
+                author.id,
+                text,
+                addressed.mentions.to_string(),
+                addressed.audience,
+                at,
+                activity_json(activity)?,
+            ],
+        )?;
+        let event = new_event(
+            tx.last_insert_rowid(),
+            kind,
+            author,
+            text,
+            &addressed,
+            activity,
+            at,
+        );
+        tx.commit()?;
+        Ok(Some(event))
+    }
+
+    /// A personal Chat event naming Chat turn `turn` (`turn_id`), such as
+    /// the error that ends it before it started.
+    pub fn append_personal_for_turn(
+        &self,
+        user_id: &str,
+        kind: &str,
+        author: &Author,
+        text: &str,
+        turn: &str,
+    ) -> anyhow::Result<Event> {
+        let conn = self.lock();
+        let at = now_ms();
+        let addressed = Addressed::room();
+        let meta = MessageMeta {
+            turn_id: Some(turn.to_owned()),
+            ..MessageMeta::default()
+        };
+        conn.execute(
+            "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                user_id,
+                kind,
+                author.name,
+                author.id,
+                text,
+                addressed.mentions.to_string(),
+                addressed.audience,
+                at,
+                event_metadata_json(None, None, &meta)?,
+            ],
+        )?;
+        let mut event = new_event(
+            conn.last_insert_rowid(),
+            kind,
+            author,
+            text,
+            &addressed,
+            None,
+            at,
+        );
+        event.meta = meta;
+        Ok(event)
+    }
+
     pub fn personal_after(
         &self,
         user_id: &str,
@@ -1643,6 +1760,17 @@ pub(crate) fn row_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
     let metadata: Option<String> = r.get(7)?;
     let kind: String = r.get(1)?;
     let (spans, meta) = match metadata.as_deref() {
+        // A Chat error's turn id; everything else of its metadata is activity.
+        Some(raw) if kind == kind::ERROR => match serde_json::from_str::<serde_json::Value>(raw) {
+            Ok(serde_json::Value::Object(m)) => (
+                None,
+                MessageMeta {
+                    turn_id: m.get("turn_id").and_then(|v| v.as_str()).map(str::to_owned),
+                    ..MessageMeta::default()
+                },
+            ),
+            _ => (None, MessageMeta::default()),
+        },
         Some(raw) if kind == kind::MESSAGE || kind == kind::COMPACTION => {
             match serde_json::from_str::<serde_json::Value>(raw) {
                 Ok(serde_json::Value::Object(mut m)) => (
@@ -2326,6 +2454,7 @@ mod tests {
                 }),
             }),
             compaction: None,
+            turn_id: None,
         };
         let addressed = Addressed {
             spans: Some(Vec::new()),
@@ -2447,6 +2576,111 @@ mod tests {
         assert_eq!(
             db.remove_member(&s.id, "bob").unwrap(),
             RemoveMember::NotMember
+        );
+    }
+
+    #[test]
+    fn a_chat_turn_marker_is_written_only_for_a_message_still_there() {
+        let db = Db::open_in_memory().unwrap();
+        let alice = Author {
+            id: Some("alice".into()),
+            name: "alice".into(),
+        };
+        let kept = db
+            .append_personal("alice", kind::MESSAGE, &alice, "hi", &Addressed::room())
+            .unwrap();
+        let gone = db
+            .append_personal("alice", kind::MESSAGE, &alice, "bye", &Addressed::room())
+            .unwrap();
+        for e in [&kept, &gone] {
+            crate::decisions::insert(
+                &db,
+                &crate::decisions::NewPending {
+                    scope: crate::decisions::Scope::Personal,
+                    user_id: "alice".into(),
+                    place: None,
+                    payload: serde_json::json!({}),
+                    claimed_by: "epoch_a".into(),
+                    turn_id: None,
+                },
+                e.id,
+            )
+            .unwrap();
+        }
+        db.lock()
+            .execute("DELETE FROM personal_events WHERE id = ?1", [gone.id])
+            .unwrap();
+        let agent = Author::server(actor::AGENT);
+        let turn = Activity::chat().at(activity::STARTED);
+        let marker = |id| {
+            db.append_personal_for_message(
+                "epoch_a",
+                "alice",
+                id,
+                kind::ACTIVITY,
+                &agent,
+                "",
+                Some(&turn),
+            )
+            .unwrap()
+        };
+        assert!(
+            marker(gone.id).is_none(),
+            "a deleted message starts nothing"
+        );
+        assert!(marker(kept.id).is_some());
+        // Another person's Chat id is no trigger of alice's.
+        assert!(
+            db.append_personal_for_message(
+                "epoch_a",
+                "bob",
+                kept.id,
+                kind::ACTIVITY,
+                &agent,
+                "",
+                Some(&turn)
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(crate::decisions::count(&db).unwrap(), 0, "both settled");
+        // Held by another process, or stopped first: no marker.
+        let other = db
+            .append_personal("alice", kind::MESSAGE, &alice, "later", &Addressed::room())
+            .unwrap();
+        for (epoch, turn_id) in [("epoch_b", None), ("epoch_a", Some("chat_x"))] {
+            crate::decisions::insert(
+                &db,
+                &crate::decisions::NewPending {
+                    scope: crate::decisions::Scope::Personal,
+                    user_id: "alice".into(),
+                    place: None,
+                    payload: serde_json::json!({}),
+                    claimed_by: epoch.into(),
+                    turn_id: turn_id.map(str::to_owned),
+                },
+                other.id,
+            )
+            .unwrap();
+            if turn_id.is_some() {
+                assert!(crate::decisions::cancel_turn(&db, "alice", "chat_x").unwrap());
+            }
+            assert!(marker(other.id).is_none(), "{epoch}");
+            if turn_id.is_none() {
+                // Left for the process that holds it.
+                assert_eq!(crate::decisions::count(&db).unwrap(), 1);
+                crate::decisions::forget_in(
+                    &db.lock(),
+                    crate::decisions::Scope::Personal,
+                    other.id,
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(
+            crate::decisions::count(&db).unwrap(),
+            0,
+            "a stopped turn is dropped"
         );
     }
 

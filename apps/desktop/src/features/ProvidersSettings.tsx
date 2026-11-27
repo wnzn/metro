@@ -326,8 +326,8 @@ export function connectionStatus(c: ProviderConnection): { tone: Tone; text: str
     if (v === "checking") parts.push("Checking…");
     else if (v === "unknown") (tone = "warning"), parts.push("Status unknown");
     else if (v === "unpaired") parts.push(packaged() ? "Not paired on this computer" : "Not paired");
-    else if (v === "online") (tone = "success"), parts.push(`Online · ${servedFrom(c)}`);
-    else (tone = "warning"), parts.push(`Offline · ${servedFrom(c)}`);
+    else if (v === "online") (tone = "success"), parts.push(`Connected · ${servedFrom(c)}`);
+    else (tone = "warning"), parts.push(`Disconnected · ${servedFrom(c)}`);
   } else {
     const p = providerById(c.providerId);
     if (p?.requiresKey && !c.hasKey) (tone = "warning"), parts.push("No key");

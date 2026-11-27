@@ -110,7 +110,7 @@ function WorkerBadge(props: { state: LocalWebSearch }) {
     if (!s.enabled) return "Off";
     if (s.worker === "starting") return "Starting";
     if (s.worker === "online" && s.paired) return "Ready";
-    if (s.worker === "offline") return "Offline";
+    if (s.worker === "offline") return "Disconnected";
     return "Unavailable";
   };
   return <Badge testID="websearch-worker" label={label()} tone={label() === "Ready" ? "success" : label() === "Off" || label() === "Starting" ? "neutral" : "warning"} />;
@@ -241,15 +241,18 @@ function ProviderRow(props: {
                 disabled: props.blocked || props.state.keysError, onPress: () => props.setRemoval(true) }] : []),
             ]} />
         </Row>
-      }>
-      <If when={props.editing && !props.state.keysError && !props.state.settingsError}>
-        <KeyEditor id={id} busy={m.busy()} onCancel={closeEditor} onSave={(key) => { closeEditor(); void m.saveKey(id, key); }} />
-      </If>
-      <ConfirmInline testID={`websearch-remove-confirm:${id}`} open={props.removing} onOpenChange={props.setRemoval}
-        returnFocus={() => menu} confirmLabel="Remove key" disabled={props.blocked || props.state.keysError}
-        message={`Remove your ${name} key? ${p().keyless ? "When used, this provider will run without a key." : `${name} can't search without it.`}`}
-        onConfirm={() => { props.setRemoval(false); void m.removeKey(id); }} />
-    </ConnectionItem>
+      }
+      panel={props.editing || props.removing ? (
+        <>
+        <If when={props.editing && !props.state.keysError && !props.state.settingsError}>
+          <KeyEditor id={id} busy={m.busy()} onCancel={closeEditor} onSave={(key) => { closeEditor(); void m.saveKey(id, key); }} />
+        </If>
+        <ConfirmInline testID={`websearch-remove-confirm:${id}`} open={props.removing} onOpenChange={props.setRemoval}
+          returnFocus={() => menu} confirmLabel="Remove key" disabled={props.blocked || props.state.keysError}
+          message={`Remove your ${name} key? ${p().keyless ? "When used, this provider will run without a key." : `${name} can't search without it.`}`}
+          onConfirm={() => { props.setRemoval(false); void m.removeKey(id); }} />
+        </>
+      ) : undefined} />
   );
 }
 

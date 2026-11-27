@@ -11,8 +11,8 @@ and Win32 on Windows. No npm or Node is needed to build or run it.
 
 Download the build for your system from
 [Releases](https://github.com/wnzn/metro/releases). The latest is
-[Metro 0.5.1](https://github.com/wnzn/metro/releases/tag/v0.5.1)
-([what was checked](../../docs/acceptance.md#published-metro-050-2026-11-25-github-release-v050)).
+[Metro 0.6.0](https://github.com/wnzn/metro/releases/tag/v0.6.0)
+([what was checked](../../docs/acceptance.md#published-metro-060-2026-11-26-github-release-v060)).
 Local checks cited here ran on local builds, not on the release files.
 You never need NSH, a
 checkout or a terminal to use the app; the build commands further down are
@@ -27,7 +27,7 @@ for contributors.
   Metro and its icon to your applications menu, and `./install-desktop
   --uninstall` removes them without touching your Metro data. Run it again
   if you move the folder. A local test archive of that source passed this
-  check; the 0.5.1 Linux archive contains `install-desktop`.
+  check; the 0.6.0 Linux archive contains `install-desktop`.
 - **Windows x64:** `Metro-<version>-windows-x64.zip`, a portable ZIP. See
   [Windows portable package](#windows-portable-package).
 
@@ -616,7 +616,7 @@ contributors only, in
 
 ## Windows portable package
 
-The release file is `Metro-0.5.1-windows-x64.zip`, a portable build with
+The release file is `Metro-0.6.0-windows-x64.zip`, a portable build with
 no installer.
 Release ZIPs ship without an Authenticode signature for now
 ([install.md](../../docs/install.md#desktop-on-windows)). No native Windows

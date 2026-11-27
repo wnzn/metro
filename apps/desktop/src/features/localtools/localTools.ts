@@ -16,7 +16,8 @@ import type { BridgeEndpoint } from "../../device/env";
 import { BridgeError, scrub } from "../../device/bridge";
 import { onSessionEnd, sessionGuard } from "../../store";
 
-export type LocalToolsWorker = "starting" | "online" | "offline" | "revoked" | "stopped";
+/** `failed`: didn't start, or stopped unexpectedly (the bridge restarts it); `detail` says why. */
+export type LocalToolsWorker = "starting" | "online" | "offline" | "revoked" | "failed" | "stopped";
 
 export type LocalToolsSpace = {
   spaceId: string;
@@ -33,11 +34,12 @@ export type LocalToolsSpace = {
 
 export type LocalToolsDisableTarget = { spaceId: string; accountId: string; revision: string };
 
-export type LocalToolsStatus = { available: boolean; reason: string | null; spaces: LocalToolsSpace[] };
+/** `problem`: why the bridge couldn't serve every pairing on this computer (null: it does). */
+export type LocalToolsStatus = { available: boolean; reason: string | null; problem: string | null; spaces: LocalToolsSpace[] };
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
-const WORKERS: readonly string[] = ["starting", "online", "offline", "revoked", "stopped"];
+const WORKERS: readonly string[] = ["starting", "online", "offline", "revoked", "failed", "stopped"];
 
 export function parseSpace(v: unknown): LocalToolsSpace {
   if (!isObj(v) || typeof v.space_id !== "string" || typeof v.folder !== "string") {
@@ -56,9 +58,11 @@ export function parseStatus(v: unknown): LocalToolsStatus {
     throw new BridgeError("protocol", "Metro's device helper sent local tools data this app doesn't understand.");
   }
   const reason = str(v.reason);
+  const problem = str(v.problem);
   return {
     available: v.available,
     reason: reason === null ? null : scrub(reason),
+    problem: problem === null ? null : scrub(problem),
     spaces: Array.isArray(v.spaces) ? v.spaces.map(parseSpace) : [],
   };
 }

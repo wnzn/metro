@@ -82,7 +82,9 @@ pub fn get_or_create(
     let Some(anchor) = event_in(&tx, space_id, room_id, event_id)? else {
         return Ok(Err(ThreadError::NotFound));
     };
-    if !REPLYABLE.contains(&anchor.kind.as_str()) {
+    // A deleted anchor keeps its existing thread but never gets a new one.
+    let deleted = anchor.kind == kind::DELETED;
+    if !deleted && !REPLYABLE.contains(&anchor.kind.as_str()) {
         return Ok(Err(ThreadError::Kind));
     }
     if let Some(existing) = tx
@@ -97,6 +99,9 @@ pub fn get_or_create(
         .optional()?
     {
         return Ok(Ok((existing, false)));
+    }
+    if deleted {
+        return Ok(Err(ThreadError::Kind));
     }
     let count: i64 = tx.query_row(
         "SELECT COUNT(*) FROM space_rooms WHERE space_id = ?1 AND anchor_event_id IS NOT NULL",

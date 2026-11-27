@@ -661,7 +661,29 @@ fn spawn(cx: &Ctx<'_>, runner_id: String, token: Secret) -> Handle {
         runner_id: runner_id.clone(),
         token,
     };
-    let task = tokio::spawn(run(spec, rx, status.clone()));
+    let crash_status = status.clone();
+    let task = tokio::spawn({
+        let status = status.clone();
+        super::worker::supervise(
+            rx,
+            super::worker::FIRST_RESTART,
+            move |delay| {
+                eprintln!(
+                    "metro-desktop: this computer's runner stopped unexpectedly; restarting in {}s",
+                    delay.as_secs()
+                );
+                set(
+                    &crash_status,
+                    RunnerState::Failed,
+                    Some(format!(
+                        "This computer's runner stopped unexpectedly. Metro restarts it in {} s.",
+                        delay.as_secs().max(1)
+                    )),
+                );
+            },
+            move |rx| run(spec.clone(), rx, status.clone()),
+        )
+    });
     Handle {
         stop: tx,
         task,
@@ -675,6 +697,27 @@ fn new_name() -> String {
     rand::rng().fill_bytes(&mut b);
     let tag: String = b.iter().map(|x| format!("{x:02x}")).collect();
     format!("Metro desktop on this computer ({tag})")
+}
+
+/// The manager couldn't get as far as starting this computer's runner
+/// (`reason` says why). Shown in its status until the next start attempt.
+pub(super) fn start_failed(slot: &mut Slot, marker: &Marker, reason: &str) {
+    if marker.accepted() && !slot.worker.as_ref().is_some_and(Handle::live) {
+        slot.set(note(RunnerState::Failed, Some(reason)));
+    }
+}
+
+/// The start failure `reason` no longer applies (nothing was started
+/// since): back to not started, unless something else was recorded.
+pub(super) fn clear_start_failed(slot: &mut Slot, reason: &str) {
+    if slot.worker.is_none()
+        && slot
+            .last
+            .as_ref()
+            .is_some_and(|n| n.state == RunnerState::Failed && n.detail.as_deref() == Some(reason))
+    {
+        slot.last = None;
+    }
 }
 
 fn fs_failed(slot: &mut Slot, what: &str) {
@@ -1013,6 +1056,7 @@ pub(super) async fn folder_for(cx: &Ctx<'_>, sid: &str) -> Result<Value, ToolsEr
 // The worker
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct Spec {
     hosted: Hosted,
     root: Arc<File>,

@@ -34,8 +34,8 @@
 //   here with onTransientClear / onSessionEnd).
 
 import { announce, batch, computed, effect, signal, Storage, untracked } from "nsh";
-import { ApiError, createClient, isCanonicalMessageRow, parseReaction } from "./api/client";
-import type { Client, Me, Member, Mention, Room, RoomEvent, Run, Space, SpaceMessageBody, TurnModelChoice } from "./api/client";
+import { ApiError, createClient, isCanonicalMessageRow, parseDeletion, parseReaction } from "./api/client";
+import type { Client, Deletion, Me, Member, Mention, ReplyAddress, Room, RoomEvent, Run, Space, SpaceMessageBody, TurnModelChoice } from "./api/client";
 export { ApiError };
 import { DEFAULT_SERVER_URL, parseServerUrl, serverHost } from "./api/serverUrl";
 import { plainHttpAccepted } from "./plainHttp";
@@ -156,6 +156,17 @@ const activeScope = computed(() => {
 });
 export const activeEvents = computed(() => eventsByScope()[activeScope()] ?? EMPTY_EVENTS);
 export const chatEvents = computed(() => eventsByScope()[CHAT] ?? EMPTY_EVENTS);
+/** Chat turns this session started, by id and their message, before their `started` marker arrives. */
+export const pendingChatTurns = signal<readonly { id: string; eventId: number }[]>([]);
+/**
+ * A backstop only: a pending turn its server never settles stops offering
+ * Stop after this long. Long, so a turn waiting for System One under load
+ * keeps its Stop.
+ */
+export const PENDING_TURN_MS = 600_000;
+function dropPendingTurn(id: string) {
+  if (pendingChatTurns().some((p) => p.id === id)) pendingChatTurns.set(pendingChatTurns().filter((p) => p.id !== id));
+}
 export const activeLoaded = computed(() => !!loadedScopes()[activeScope()]);
 const reactionsByScope = signal<Record<string, Reactions>>({});
 export const activeReactions = computed(() => reactionsByScope()[activeScope()] ?? EMPTY_REACTIONS);
@@ -166,6 +177,8 @@ export const reactionsInRoom = (roomId: string) => reactionsByScope()[roomScope(
 export const roomEventScope = (roomId: string) => roomScope(roomId);
 
 export const canReplyTo = (e: RoomEvent) => e.kind === "message" || e.kind === "agent" || e.kind === "thread";
+/** A deleted message that anchors a thread still opens it, but takes no reply. */
+export const canOpenThread = (e: RoomEvent) => canReplyTo(e) || e.kind === "deleted";
 export const replyTarget = computed(() => {
   const selection = replySelections()[activeScope()];
   if (selection) return selection;
@@ -174,7 +187,7 @@ export const replyTarget = computed(() => {
   for (let i = events.length - 1; i >= 0; i--) {
     if (events[i]!.kind === "agent") return { event: events[i]!, muted: false };
   }
-  return { event: replyAnchor()!, muted: false };
+  return canReplyTo(replyAnchor()!) ? { event: replyAnchor()!, muted: false } : null;
 });
 export function chooseReplyTarget(event: RoomEvent) {
   if (!inSpaceComposer() || !canReplyTo(event) || (!activeRoom()?.parentRoomId && !replyPane()) ||
@@ -1072,6 +1085,7 @@ function pickRoom(spaceId: string, list: readonly Room[]): string | null {
 function purgeSpace(spaceId: string, unlist: boolean) {
   clearSpaceRunnerOrder(spaceId);
   spaceEpoch.set(spaceId, epochOf(spaceId) + 1);
+  releaseDelete();
   // Keep denial evidence for the session. A complete list may still be on
   // the wire from before the denial, even if this id was unknown to it.
   roomListRequests.delete(spaceId);
@@ -1201,7 +1215,7 @@ export function closeReplyPane() {
 /** Open exactly this parent event. Never infer a destination from a reply-room name. */
 export async function openReplyThread(event: RoomEvent): Promise<boolean> {
   const c = client, parent = activeRoom(), sid = activeSpaceId();
-  if (!c || !parent || parent.parentRoomId || !sid || !inSpaceComposer() || !canReplyTo(event) ||
+  if (!c || !parent || parent.parentRoomId || !sid || !inSpaceComposer() || !canOpenThread(event) ||
     !eventsInRoom(parent.id).includes(event)) return false;
   const pane = replyPane();
   if (pane?.anchorId === event.id) return true;
@@ -1506,6 +1520,119 @@ export async function runComposerCommand(): Promise<void> {
   }
 }
 
+/**
+ * The sender-only notes of a message whose System One decisions came after it
+ * was posted, bound to the same origin as its POST. True when one was kept.
+ */
+async function collectDecisions(c: Client, origin: ReturnType<typeof captureSendOrigin>, spaceId: string, roomId: string,
+  eventId: number, sent: SpaceMessageBody, reply?: ReplyAddress): Promise<boolean> {
+  try {
+    for (let attempt = 0; attempt < 3 && origin.current(); attempt++) {
+      const notes = await c.messageDecisions(spaceId, roomId, eventId, sent, reply);
+      if (notes === undefined) continue;
+      return origin.acknowledge(notes);
+    }
+  } catch (error) {
+    if (error instanceof ApiError && error.kind === "auth" && client === c) disconnect(error.message);
+    // Otherwise the message is posted; only a private note is missing.
+  }
+  return false;
+}
+
+// ------------------------------------------------------------------ deleting messages
+
+/** The message waiting for a confirmed Delete, and the one being deleted. */
+export const deletePending = signal<number | null>(null);
+/** The delete request that owns `deletePending`; only it releases it, and a lost session or Space clears it. */
+let deleteOwner: object | null = null;
+function releaseDelete(owner: object | null = deleteOwner) {
+  if (owner !== deleteOwner) return;
+  deleteOwner = null;
+  deletePending.set(null);
+}
+
+/**
+ * Whether the signed-in person may delete `event` here: their own message
+ * anywhere; in a Space they own, any message or agent reply; in their own
+ * Chat, any message or reply. The server checks again.
+ */
+export function canDelete(event: RoomEvent, place: "space" | "chat" | "dm" = basePlace() === "chat" ? "chat" : "space"): boolean {
+  const k = event.kind;
+  if (k !== "message" && k !== "agent") return false;
+  const mine = k === "message" && !!event.actorId && event.actorId === me();
+  if (place === "dm") return mine;
+  if (place === "chat") return true;
+  return mine || activeSpace()?.role === "owner";
+}
+
+/** Deletes `event` from the open Chat, or room `roomId` (default: the active one), after the person confirmed. */
+export async function deleteMessage(event: RoomEvent, roomId?: string): Promise<boolean> {
+  const c = client;
+  const chat = basePlace() === "chat";
+  const sid = activeSpaceId();
+  const rid = roomId ?? activeRoomId();
+  if (!c || deletePending() !== null || !canDelete(event)) return false;
+  if (!chat && (!sid || !rid)) return false;
+  const scope = chat ? CHAT : scopeKey(sid!, rid!);
+  const ok = chat ? guard() : guard(sid!);
+  const owner = {};
+  deleteOwner = owner;
+  deletePending.set(event.id);
+  actionError.set(null);
+  try {
+    const markers = await c.deleteEvent(chat ? { chat: true } : { spaceId: sid!, roomId: rid! }, event.id);
+    if (!ok()) return false;
+    applyDeletions(scope, markers.map(parseDeletion).filter((d): d is Deletion => !!d));
+    // Its turn, if it was still waiting, won't start.
+    if (chat) pendingChatTurns.set(pendingChatTurns().filter((p) => p.eventId !== event.id));
+    announce("Message deleted");
+    kick();
+    return true;
+  } catch (error) {
+    if (!ok()) return false;
+    handleActionError(error, "Could not delete the message", chat ? undefined : sid!);
+    return false;
+  } finally {
+    releaseDelete(owner);
+  }
+}
+
+/** A deleted thread anchor: no text, recipients, files or metadata; its replies stay. */
+function tombstoneOf(e: RoomEvent): RoomEvent {
+  return { id: e.id, kind: "deleted", actor: e.actor, text: "", ...(e.actorId ? { actorId: e.actorId } : {}),
+    ...(e.createdAt ? { createdAt: e.createdAt } : {}), ...(e.replies ? { replies: e.replies } : {}) };
+}
+
+/** Removes (or tombstones) deleted events of `scope` and drops their reactions; the rows after. */
+function applyDeletions(scope: string, deletions: readonly Deletion[], rows: readonly RoomEvent[] = eventsByScope()[scope] ?? EMPTY_EVENTS): readonly RoomEvent[] {
+  if (!deletions.length) return rows;
+  const byId = new Map(deletions.map(d => [d.targetEventId, d]));
+  let changed = false;
+  const next: RoomEvent[] = [];
+  for (const row of rows) {
+    const d = byId.get(row.id);
+    if (!d || row.kind === "deleted" && d.tombstone) { next.push(row); continue; }
+    changed = true;
+    if (!d.tombstone) continue;
+    const stone = tombstoneOf(row);
+    next.push(stone);
+    if (replyAnchor() === row) replyAnchor.set(stone);
+  }
+  const reactions = reactionsByScope()[scope];
+  const stale = reactions && deletions.some(d => reactions[d.targetEventId]);
+  batch(() => {
+    if (changed) eventsByScope.set({ ...eventsByScope(), [scope]: next });
+    if (stale) {
+      const kept = { ...reactions };
+      for (const d of deletions) delete kept[d.targetEventId];
+      reactionsByScope.set({ ...reactionsByScope(), [scope]: kept });
+    }
+    const selection = replySelections()[scope];
+    if (selection && byId.has(selection.event.id)) forgetReplySelection(scope);
+  });
+  return changed ? next : rows;
+}
+
 /** Asking the agent needs a typed question: files alone are saved to the Library, not sent to a model. */
 export const ASK_NEEDS_TEXT = "Type a question to ask the agent. Attached files are saved to the Library; they aren't sent to the agent.";
 
@@ -1626,7 +1753,16 @@ async function sendDraft(intent: DraftSend): Promise<void> {
       if (saveNote) {
         await c.saveChatNote(text, ids);
         origin.acknowledge(null);
-      } else origin.acknowledge(await c.sendChatMessage(text, ids, selected.choice));
+      } else {
+        const sent = await c.sendChatMessage(text, ids, selected.choice);
+        origin.acknowledge(sent.notes);
+        if (sent.turn && sameSession()) {
+          const turn = sent.turn;
+          pendingChatTurns.set([...pendingChatTurns().filter((p) => p.id !== turn.id), turn].slice(-20));
+          const sess = session;
+          setTimeout(() => { if (sess === session) dropPendingTurn(turn.id); }, PENDING_TURN_MS);
+        }
+      }
     } else {
       if (!mayPost()) {
         if (here()) actionError.set("The draft or destination changed. Nothing was sent; review the draft and send again.");
@@ -1657,7 +1793,10 @@ async function sendDraft(intent: DraftSend): Promise<void> {
         ...body, text: body.text.slice(1),
         ...(body.spans ? { spans: body.spans.map(s => ({ ...s, start: s.start - 1, end: s.end - 1 })) } : {}),
       } : body;
-      origin.acknowledge(await c.sendMessage(sid!, rid!, outgoing, ids, selected.choice, reply));
+      const sent = await c.sendMessage(sid!, rid!, outgoing, ids, selected.choice, reply);
+      origin.acknowledge(sent.notes);
+      // Shown already; System One's sender-only notes follow without holding the composer.
+      if (sent.decisionsPending !== null) void collectDecisions(c, origin, sid!, rid!, sent.decisionsPending, outgoing, reply);
     }
     // Accepted files are identified by immutable staging keys, not by the
     // current room epoch. Never leave them staged for a duplicate send after
@@ -1917,7 +2056,12 @@ export async function sendDispatch(): Promise<void> {
   try {
     // Dispatch is an explicit request to the chosen Space's agent, not a
     // mention composer. Its text cannot add recipients implicitly.
-    const hadNotice = origin.acknowledge(await c.sendMessage(target.spaceId, target.roomId, { text, invoke_agent: true }));
+    const body = { text, invoke_agent: true as const };
+    const sent = await c.sendMessage(target.spaceId, target.roomId, body);
+    let hadNotice = origin.acknowledge(sent.notes);
+    if (sent.decisionsPending !== null) {
+      hadNotice = await collectDecisions(c, origin, target.spaceId, target.roomId, sent.decisionsPending, body) || hadNotice;
+    }
     if (!origin.canRetireDraft()) return;
     if (dispatchTarget() === target && dispatchDraft() === text) dispatchDraft.set("");
     if (here()) dispatchNotice.set(hadNotice ? `Posted in ${space.name} › #${room.name}.` :
@@ -2457,6 +2601,22 @@ function clearTransient(keepReply = false) {
 const stashedDrafts = signal<Record<string, { text: string; mention: MentionDraft; directory: MentionDirectory | null }>>({});
 /** Some place other than the active one has a draft not sent yet. */
 export const stashedDraftPending = computed(() => Object.values(stashedDrafts()).some((d) => d.text.trim().length > 0));
+// A pending Chat turn is settled only by its own `started` marker or by the
+// Chat error that names it (`turnId`): another turn's error never clears it.
+// Deleting its message here, ending the session and a long backstop do too.
+effect(() => {
+  const pending = pendingChatTurns();
+  if (!pending.length) return;
+  const events = chatEvents();
+  if (!events.length) return;
+  const own = new Set<string>();
+  for (const e of events) {
+    if (e.kind === "activity" && e.activity?.id) own.add(e.activity.id);
+    if (e.kind === "error" && e.turnId) own.add(e.turnId);
+  }
+  const settled = pending.filter((p) => own.has(p.id));
+  if (settled.length) untracked(() => pendingChatTurns.set(pending.filter((p) => !settled.includes(p))));
+});
 let mentionScope = "";
 effect(() => {
   const scope = activeScope();
@@ -2484,6 +2644,7 @@ effect(() => {
 
 function endSession() {
   replySelections.set({});
+  pendingChatTurns.set([]);
   session++;
   abort?.abort();
   abort = null;
@@ -2502,6 +2663,7 @@ function endSession() {
   pollAgain.clear();
   lastRoomBySpace.clear();
   spaceEpoch.clear();
+  releaseDelete();
   roomEntryNavigation = undefined;
   pendingAccessReads.clear();
   pendingMembershipReads.clear();
@@ -2963,8 +3125,8 @@ async function refreshReplyAnchors(sid: string, rid: string, first: number, pane
       if (changed) eventsByScope.set({ ...eventsByScope(), [scope]: [...rows] });
       if (pane) {
         const anchor = byId.get(pane.anchorId);
-        if (anchor && canReplyTo(anchor)) {
-          if (!replyAnchor()) replyAnchor.set(anchor);
+        if (anchor && canOpenThread(anchor)) {
+          if (!replyAnchor() || (anchor.kind === "deleted" && replyAnchor()!.kind !== "deleted")) replyAnchor.set(anchor);
         } else closeDeniedReply(sid, rid);
       }
     });
@@ -3049,7 +3211,14 @@ function merge(key: string, events: RoomEvent[]): number {
     .sort((a, b) => a.id - b.id);
   const shown: RoomEvent[] = [];
   let reactions: Reactions | null = null;
+  const deletions: Deletion[] = [];
   for (const event of fresh) {
+    if (event.kind === "message_deleted") {
+      // Like a reaction: a change to an earlier row, never a line of its own.
+      const d = parseDeletion(event);
+      if (d) deletions.push(d);
+      continue;
+    }
     if (event.kind !== "reaction") {
       shown.push(event);
       // A delegated thread was created or reported: pick up the room list now.
@@ -3084,6 +3253,7 @@ function merge(key: string, events: RoomEvent[]): number {
       rows = current.concat(shown).slice(-MAX_EVENTS_PER_ROOM);
       eventsByScope.set({ ...eventsByScope(), [key]: rows });
     }
+    rows = applyDeletions(key, deletions, rows);
     reconcileSenderNotices(key, through, rows);
   });
   return fresh.length;

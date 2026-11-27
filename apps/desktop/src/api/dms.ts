@@ -1,4 +1,4 @@
-import { ApiError, decodeEvent } from "./client";
+import { ApiError, decodeEvent, parseDeletion } from "./client";
 import type { RequestFn, RoomEvent } from "./client";
 import { decodeDirectoryPerson } from "./directory";
 import type { DirectoryPerson } from "./directory";
@@ -22,12 +22,14 @@ function decodeDm(value: unknown): DirectMessage {
   return { id: v.id, peer, unread: v.unread, lastId: lastId && Number.isSafeInteger(lastId) && lastId > 0 ? lastId : 0 };
 }
 
-function messages(value: unknown): RoomEvent[] {
+function messages(value: unknown, deletions = false): RoomEvent[] {
   if (!Array.isArray(value)) throw new ApiError("protocol", "The server did not return a list of messages.");
   return value.map(v => {
     const event = decodeEvent(v);
-    if (event?.kind !== "message") throw new ApiError("protocol", "The server returned an invalid message.");
-    return event;
+    if (event?.kind !== "message" && !(deletions && event && parseDeletion(event))) {
+      throw new ApiError("protocol", "The server returned an invalid message.");
+    }
+    return event!;
   });
 }
 
@@ -44,8 +46,8 @@ export function dmsApi(request: RequestFn) {
       return dm;
     },
     async dmEvents(id: string, after: number) {
-      const v = await request("GET", `${root(id)}/events?after=${after}`) as { events?: unknown; reactions?: unknown[] } | null;
-      const events = messages(v?.events);
+      const v = await request("GET", `${root(id)}/events?after=${after}&deletions=1`) as { events?: unknown; reactions?: unknown[] } | null;
+      const events = messages(v?.events, true);
       if (!Array.isArray(v?.reactions)) throw new ApiError("protocol", "The server did not return the message reactions.");
       const reactions: Reactions = {};
       const ids = new Set(events.map(e => e.id));
@@ -61,6 +63,15 @@ export function dmsApi(request: RequestFn) {
     },
     async postDm(id: string, text: string, replyTo?: number) {
       return messages([await request("POST", `${root(id)}/messages`, { text, reply_to: replyTo })])[0]!;
+    },
+    /** Deletes the caller's own DM message. */
+    async deleteDm(id: string, eventId: number) {
+      const data = await request("DELETE", `${root(id)}/events/${eventId}`) as { events?: unknown } | null;
+      const events = messages(data?.events, true);
+      if (!events.some(e => parseDeletion(e)?.targetEventId === eventId)) {
+        throw new ApiError("protocol", "The server did not confirm the deletion.");
+      }
+      return events;
     },
     readDm: (id: string, lastRead: number) => request("PUT", `${root(id)}/read`, { last_read: lastRead }),
     hideDm: (id: string) => request("DELETE", root(id)),

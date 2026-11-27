@@ -15,13 +15,11 @@ export function AppearanceSettings() {
     if (mounted) state.set(saved ? "saved" : "failed");
   };
   return (
-    <PageLayout testID="appearance-settings" pad={compactWidth() ? 4 : 6} gap={6} footer={
-      <If when={state() === "saved" || state() === "failed"}>
-        <Banner variant="inline" testID="appearance-feedback" tone={state() === "saved" ? "success" : "danger"}
-          message={state() === "saved" ? "Appearance saved on this computer." : "Appearance changed, but couldn't be saved for next time."}
-          action={state() === "failed" ? <Action label="Try again" onPress={() => void save(appearancePreference())} /> : undefined} />
-      </If>
-    }>
+    <PageLayout testID="appearance-settings" pad={compactWidth() ? 4 : 6} gap={6} footer={state() === "saved" || state() === "failed" ? (
+      <Banner variant="inline" testID="appearance-feedback" tone={state() === "saved" ? "success" : "danger"}
+        message={state() === "saved" ? "Appearance saved on this computer." : "Appearance changed, but couldn't be saved for next time."}
+        action={state() === "failed" ? <Action label="Try again" onPress={() => void save(appearancePreference())} /> : undefined} />
+    ) : undefined}>
       <PageHeader title="Appearance" subtitle="Choose how Metro looks." scope={{ kind: "computer" }} />
       <SettingsGroup title="Theme">
         <SettingRow label="Color scheme" description="Dark is the default; System follows your operating system." stacked={compactWidth()}>

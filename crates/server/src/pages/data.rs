@@ -512,6 +512,13 @@ fn runs(db: &Db, ctx: &Context, t: &Target, viewer: &str, all: &[RunInfo]) -> Re
                 .unwrap_or_default();
             rooms.insert(key.clone(), name);
         }
+        // The preview copies its trigger: gone once that was deleted.
+        let live =
+            crate::orchestration::trigger_live(&db.lock(), r).map_err(anyhow::Error::from)?;
+        let live_task = match live {
+            true => r.task.clone(),
+            false => String::new(),
+        };
         items.push(json!({
             "id": r.id,
             "status": r.status.as_str(),
@@ -523,7 +530,7 @@ fn runs(db: &Db, ctx: &Context, t: &Target, viewer: &str, all: &[RunInfo]) -> Re
             "started": started,
             "sender": display(db, Some(&r.actor), &r.actor),
             "sender_id": r.actor,
-            "task": r.task,
+            "task": live_task,
         }));
     }
     Ok(json!({"active": active, "items": items}))

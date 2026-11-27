@@ -265,6 +265,12 @@ pub fn load(root: &File, account_id: &str, sid: &str) -> io::Result<Option<Pairi
     Ok(parsed.filter(|p| p.account_id == account_id && p.space_id == sid))
 }
 
+/// Whether the Space's folder holds a pairing record file at all.
+fn has_record(root: &File, account_id: &str, sid: &str) -> bool {
+    space_dir(root, account_id, sid, false)
+        .is_ok_and(|dir| !matches!(open_file(&dir, PAIRING), Err(FolderError::NotFound)))
+}
+
 /// Write the Space's pairing atomically (new file, fsync, rename), mode 600.
 pub fn save(root: &File, p: &Pairing) -> io::Result<()> {
     let dir = space_dir(root, &p.account_id, &p.space_id, true)?;
@@ -341,16 +347,23 @@ pub fn remove(root: &File, account_id: &str, sid: &str) -> io::Result<()> {
 
 /// Every Space of this account that has a pairing record.
 pub fn list(root: &File, account_id: &str) -> io::Result<Vec<Pairing>> {
+    list_all(root, account_id).map(|(pairings, _)| pairings)
+}
+
+/// Every Space of this account that has a pairing record, and the ids of
+/// Spaces whose pairing record exists but can't be read (those can't be
+/// served, and the person needs to know).
+pub fn list_all(root: &File, account_id: &str) -> io::Result<(Vec<Pairing>, Vec<String>)> {
     let spaces = match subdir(root, ACCOUNTS, false)
         .and_then(|a| subdir(&a, &account_dir(account_id), false))
         .and_then(|a| subdir(&a, SPACES, false))
     {
         Ok(d) => d,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
         Err(e) => return Err(e),
     };
     let dir = cap_std::fs::Dir::from_std_file(spaces);
-    let mut out = Vec::new();
+    let (mut out, mut unreadable) = (Vec::new(), Vec::new());
     for ent in dir.entries()? {
         let ent = ent?;
         let Ok(name) = ent.file_name().into_string() else {
@@ -359,15 +372,20 @@ pub fn list(root: &File, account_id: &str) -> io::Result<Vec<Pairing>> {
         if !valid_space_id(&name) || !ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
-        if let Ok(Some(p)) = load(root, account_id, &name) {
-            out.push(p);
+        match load(root, account_id, &name) {
+            Ok(Some(p)) => out.push(p),
+            // A record that is there but malformed, or not this account's.
+            Ok(None) if has_record(root, account_id, &name) => unreadable.push(name),
+            Ok(None) => {}
+            Err(_) => unreadable.push(name),
         }
-        if out.len() >= 1000 {
+        if out.len() + unreadable.len() >= 1000 {
             break;
         }
     }
     out.sort_by(|a, b| a.space_id.cmp(&b.space_id));
-    Ok(out)
+    unreadable.sort();
+    Ok((out, unreadable))
 }
 
 #[cfg(test)]

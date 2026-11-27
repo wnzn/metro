@@ -483,15 +483,69 @@ fn suffix(
     Ok(events)
 }
 
-/// Store a summary, in `place` as written by Metro, rechecking that `by`
-/// may still read a Space place. `None` (nothing stored) when they can't.
+/// What a summary was written from: the previous summary and the folded
+/// events, each as `(id, kind, text)` when read.
+#[derive(Clone, Debug, Default)]
+struct Basis {
+    previous: Option<(i64, String, String)>,
+    folded: Vec<(i64, String, String)>,
+}
+
+impl Basis {
+    fn of(previous: Option<&Event>, folded: &[Event]) -> Self {
+        let row = |e: &Event| (e.id, e.kind.clone(), e.text.clone());
+        Self {
+            previous: previous.map(row),
+            folded: folded.iter().map(row).collect(),
+        }
+    }
+}
+
+/// Why [`store`] stored nothing.
+#[derive(Debug, PartialEq, Eq)]
+enum NotStored {
+    /// `by` can no longer read the place.
+    Access,
+    /// An event it was written from was deleted or changed meanwhile.
+    Stale,
+}
+
+/// Is every event of `basis` still in `place`, unchanged? A deletion
+/// removes the row (or tombstones it, changing kind and text), and removes
+/// the summaries covering it, so a summary written before a deletion and
+/// stored after it fails this.
+fn still_there(conn: &Connection, place: &Place, basis: &Basis) -> anyhow::Result<bool> {
+    let (table, cond, args) = scope(place);
+    let n = args.len();
+    let sql = format!(
+        "SELECT kind, text FROM {table} WHERE {cond} AND id = ?{}",
+        n + 1
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    for (id, kind, text) in basis.previous.iter().chain(&basis.folded) {
+        let mut params = args.clone();
+        params.push((*id).into());
+        let row: Option<(String, String)> = stmt
+            .query_row(params_from_iter(params), |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        if row.as_ref() != Some(&(kind.clone(), text.clone())) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Store a summary, in `place` as written by Metro, rechecking in the same
+/// transaction that `by` may still read a Space place and that everything
+/// it was written from is still there unchanged.
 fn store(
     db: &Db,
     place: &Place,
     by: &str,
     text: &str,
     meta: Meta,
-) -> anyhow::Result<Option<Event>> {
+    basis: &Basis,
+) -> anyhow::Result<Result<Event, NotStored>> {
     let author = Author::server(actor::SYSTEM);
     let meta = MessageMeta {
         compaction: Some(meta),
@@ -499,23 +553,26 @@ fn store(
     };
     let conn = db.lock();
     let tx = conn.unchecked_transaction()?;
+    if let Place::Room { space_id, room_id } = place
+        && !Db::room_member_in(&tx, space_id, room_id, by)?
+    {
+        return Ok(Err(NotStored::Access));
+    }
+    if !still_there(&tx, place, basis)? {
+        return Ok(Err(NotStored::Stale));
+    }
     let event = match place {
-        Place::Room { space_id, room_id } => {
-            if !Db::room_member_in(&tx, space_id, room_id, by)? {
-                return Ok(None);
-            }
-            Db::insert_event_in(
-                &tx,
-                space_id,
-                room_id,
-                kind::COMPACTION,
-                &author,
-                text,
-                &Addressed::room(),
-                None,
-                &meta,
-            )?
-        }
+        Place::Room { space_id, room_id } => Db::insert_event_in(
+            &tx,
+            space_id,
+            room_id,
+            kind::COMPACTION,
+            &author,
+            text,
+            &Addressed::room(),
+            None,
+            &meta,
+        )?,
         Place::Chat { user_id } => {
             let at = crate::db::now_ms();
             let addressed = Addressed::room();
@@ -546,7 +603,7 @@ fn store(
         }
     };
     tx.commit()?;
-    Ok(Some(event))
+    Ok(Ok(event))
 }
 
 // ---- Summarizing ----
@@ -594,18 +651,23 @@ async fn summarize(
         by_name: r.by_name.to_owned(),
         previous: r.previous.map(|p| p.id),
     };
-    let (place, by, text) = (
+    let (place, by, text, basis) = (
         r.place.clone(),
         r.by.to_owned(),
         truncate(text, MAX_SUMMARY_CHARS),
+        Basis::of(r.previous, folded),
     );
     match state
         .db
-        .call(move |db| store(db, &place, &by, &text, meta))
+        .call(move |db| store(db, &place, &by, &text, meta, &basis))
         .await
     {
-        Ok(Some(event)) => Ok(event),
-        Ok(None) => Err("You can no longer read this conversation.".to_owned()),
+        Ok(Ok(event)) => Ok(event),
+        Ok(Err(NotStored::Access)) => Err("You can no longer read this conversation.".to_owned()),
+        Ok(Err(NotStored::Stale)) => Err(
+            "A message was deleted while the summary was being written, so it wasn't stored."
+                .to_owned(),
+        ),
         Err(e) => {
             tracing::error!(error = %format!("{e:#}"), "storing a summary");
             Err("The summary could not be stored.".to_owned())
@@ -984,6 +1046,7 @@ async fn compact(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::Human;
 
     fn event(id: i64, text: &str) -> Event {
         let mut e = crate::db::new_event(
@@ -1117,13 +1180,27 @@ mod tests {
             room_id: "lobby".into(),
         };
         assert!(
-            store(&db, &room, "mallory", "nope", meta(ids[1]))
-                .unwrap()
-                .is_none()
-        );
-        let stored = store(&db, &room, "alice", "the summary", meta(ids[1]))
+            store(
+                &db,
+                &room,
+                "mallory",
+                "nope",
+                meta(ids[1]),
+                &Basis::default()
+            )
             .unwrap()
-            .unwrap();
+                == Err(NotStored::Access)
+        );
+        let stored = store(
+            &db,
+            &room,
+            "alice",
+            "the summary",
+            meta(ids[1]),
+            &Basis::default(),
+        )
+        .unwrap()
+        .unwrap();
         let tail = db
             .append_event(
                 &s.id,
@@ -1161,9 +1238,16 @@ mod tests {
         let m = db
             .append_personal("alice", kind::MESSAGE, &alice, "hi", &Addressed::room())
             .unwrap();
-        let stored = store(&db, &chat, "alice", "chat summary", meta(m.id))
-            .unwrap()
-            .unwrap();
+        let stored = store(
+            &db,
+            &chat,
+            "alice",
+            "chat summary",
+            meta(m.id),
+            &Basis::default(),
+        )
+        .unwrap()
+        .unwrap();
         assert!(
             db.personal_before("alice", i64::MAX, 40)
                 .unwrap()
@@ -1179,6 +1263,180 @@ mod tests {
             user_id: "bob".into(),
         };
         assert!(latest(&conn, &other, i64::MAX).unwrap().is_none());
+    }
+
+    /// A summary written from events read before a deletion, and stored
+    /// after it, is discarded: in a room, a tombstoned thread anchor, a
+    /// deleted previous summary, and personal Chat.
+    #[test]
+    fn a_summary_written_before_a_deletion_is_not_stored_after_it() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_space("alice", "S", 10).unwrap();
+        let alice = Author {
+            id: Some("alice".into()),
+            name: "alice".into(),
+        };
+        let who = Human {
+            id: "alice".into(),
+            name: "alice".into(),
+        };
+        let room = Place::Room {
+            space_id: s.id.clone(),
+            room_id: "lobby".into(),
+        };
+        let post = |text: &str| {
+            db.append_event(
+                &s.id,
+                "lobby",
+                kind::MESSAGE,
+                &alice,
+                text,
+                &Addressed::room(),
+            )
+            .unwrap()
+            .id
+        };
+        for i in 0..4 {
+            post(&format!("m{i}"));
+        }
+        let read = |db: &Db, place: &Place| {
+            let conn = db.lock();
+            let prev = latest(&conn, place, i64::MAX).unwrap();
+            let after = prev
+                .as_ref()
+                .and_then(|p| p.meta.compaction.as_ref())
+                .map_or(0, |m| m.through_event_id);
+            let fold = suffix(&conn, place, after, i64::MAX, 50).unwrap();
+            (prev, fold)
+        };
+        let lobby_summaries = |db: &Db| -> i64 {
+            db.lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM space_events WHERE space_id = ?1 AND kind = 'compaction'",
+                    [&s.id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+
+        // 1. A folded message is deleted between the read and the store.
+        let (prev, fold) = read(&db, &room);
+        let basis = Basis::of(prev.as_ref(), &fold);
+        crate::deletion::delete_in_space(&db, &s.id, "lobby", fold[1].id, &who)
+            .unwrap()
+            .unwrap();
+        let m = meta(fold.last().unwrap().id);
+        assert_eq!(
+            store(&db, &room, "alice", "has m1", m, &basis).unwrap(),
+            Err(NotStored::Stale)
+        );
+        assert_eq!(lobby_summaries(&db), 0);
+
+        // Read again: stored, as the previous summary for what follows.
+        let (prev, fold) = read(&db, &room);
+        assert!(fold.iter().all(|e| e.text != "m1"));
+        let covered = fold[0].id;
+        let first = store(
+            &db,
+            &room,
+            "alice",
+            "without m1",
+            meta(fold.last().unwrap().id),
+            &Basis::of(prev.as_ref(), &fold),
+        )
+        .unwrap()
+        .unwrap();
+
+        // 2. The previous summary is removed (a deletion it covered)
+        // while the next one is written.
+        let anchor = post("anchor");
+        post("m5");
+        let (prev, fold) = read(&db, &room);
+        assert_eq!(prev.as_ref().map(|p| p.id), Some(first.id));
+        let basis = Basis::of(prev.as_ref(), &fold);
+        crate::deletion::delete_in_space(&db, &s.id, "lobby", covered, &who)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lobby_summaries(&db), 0, "the covering summary went");
+        assert_eq!(
+            store(
+                &db,
+                &room,
+                "alice",
+                "x",
+                meta(fold.last().unwrap().id),
+                &basis
+            )
+            .unwrap(),
+            Err(NotStored::Stale)
+        );
+        assert_eq!(lobby_summaries(&db), 0);
+
+        // 3. A thread anchor becomes a tombstone (the row stays, changed).
+        db.lock()
+            .execute(
+                "INSERT INTO space_rooms (space_id, id, name, parent_room_id, anchor_event_id, created_at)
+                 VALUES (?1, 'thread', 'T', 'lobby', ?2, 0)",
+                params![s.id, anchor],
+            )
+            .unwrap();
+        let (prev, fold) = read(&db, &room);
+        let basis = Basis::of(prev.as_ref(), &fold);
+        assert!(fold.iter().any(|e| e.id == anchor));
+        crate::deletion::delete_in_space(&db, &s.id, "lobby", anchor, &who)
+            .unwrap()
+            .unwrap();
+        let k: String = db
+            .lock()
+            .query_row(
+                "SELECT kind FROM space_events WHERE id = ?1",
+                [anchor],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(k, kind::DELETED, "a tombstone");
+        assert_eq!(
+            store(
+                &db,
+                &room,
+                "alice",
+                "x",
+                meta(fold.last().unwrap().id),
+                &basis
+            )
+            .unwrap(),
+            Err(NotStored::Stale)
+        );
+        assert_eq!(lobby_summaries(&db), 0);
+
+        // 4. Personal Chat.
+        let chat = Place::Chat {
+            user_id: "alice".into(),
+        };
+        let mut gone = 0;
+        for i in 0..3 {
+            gone = db
+                .append_personal(
+                    "alice",
+                    kind::MESSAGE,
+                    &alice,
+                    &format!("c{i}"),
+                    &Addressed::room(),
+                )
+                .unwrap()
+                .id;
+        }
+        let (prev, fold) = read(&db, &chat);
+        let basis = Basis::of(prev.as_ref(), &fold);
+        crate::deletion::delete_in_chat(&db, gone, &who)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store(&db, &chat, "alice", "x", meta(gone), &basis).unwrap(),
+            Err(NotStored::Stale)
+        );
+        let conn = db.lock();
+        assert!(latest(&conn, &chat, i64::MAX).unwrap().is_none());
     }
 
     #[test]

@@ -55,6 +55,11 @@ pub(super) async fn list(ctx: &Ctx, a: Value) -> R {
                 continue;
             };
             let room = crate::db::Db::room_in(&conn, &space.id, &run.room_id)?;
+            // A deleted trigger's text never reaches the model.
+            let task = match crate::orchestration::trigger_live(&conn, &run)? {
+                true => clip(&run.task, TASK, "…"),
+                false => String::new(),
+            };
             let agent = match &run.agent_id {
                 Some(id) => crate::space_agents::get_in(&conn, &space.id, id)?
                     .map(|a| json!({"id": a.id, "handle": a.handle, "name": a.name})),
@@ -63,7 +68,7 @@ pub(super) async fn list(ctx: &Ctx, a: Value) -> R {
             let mut v = json!({
                 "run_id": run.id, "space": {"id": space.id, "name": space.name},
                 "room": room.map(|r| json!({"id": r.id, "name": if r.is_reply_thread() { "Thread".to_owned() } else { r.name }})),
-                "agent": agent, "task": clip(&run.task, TASK, "…"), "status": run.status,
+                "agent": agent, "task": task, "status": run.status,
                 "started_at": rfc3339_utc(run.started_at), "started_by_you": run.actor == user,
             });
             // The full reason is for the person who started it only.
