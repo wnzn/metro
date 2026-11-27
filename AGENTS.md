@@ -37,7 +37,7 @@ don't affect which model Metro calls at runtime.
 ## Rules
 
 The rules below describe the current source. For the published changes,
-see [New in Metro 0.6.1](docs/released-0.6.1.md); for later changes, see
+see [New in Metro 0.6.2](docs/released-0.6.2.md); for later changes, see
 [In the source, not released](docs/next-source.md).
 
 - Stay inside the files you were assigned. Don't edit another lane's files;
@@ -100,8 +100,16 @@ see [New in Metro 0.6.1](docs/released-0.6.1.md); for later changes, see
   for the signed-in server and account (or, on the app's own local
   workspace only, the installer's marker), keeps its credential in one
   mode-600 file, starts and stops with the app, updates with it, and
-  serves list and read only. Reconnect is explicit; deleting it turns it
-  off locally and keeps its folders.
+  serves list, read, write and shell (never check or MCP). Reconnect is
+  explicit; deleting it turns it off locally and keeps its folders. Set up
+  and Reconnect mark it `built_in` on the server.
+- Its owner may choose each attached Space's folder (Change / Use
+  default). A chosen folder is an existing absolute directory, not a link
+  or reparse point, a root, the home folder itself, nor inside, equal to
+  or containing Metro's data folder, and it never equals, contains or
+  sits inside another Space's chosen folder for that runner. The checks
+  rerun before every job; a failing one fails the job visibly, never
+  falling back to the default folder. Changing or clearing moves no files.
 - The desktop may offer its own eligible personal runner when creating a
   Space or for owner-selected existing Spaces. Submitting the checked
   Create Space choice or pressing Attach is the explicit action. These
@@ -123,10 +131,50 @@ see [New in Metro 0.6.1](docs/released-0.6.1.md); for later changes, see
   listing as Runner activity in the open Space room, not privately in
   Settings, and never calls a model.
 - A registered runner never runs check or MCP commands as unsandboxed host
-  processes, because they could read sibling Spaces' roots. By default it
-  offers only list and read. Check and MCP need `METRO_SANDBOX=docker`, which
-  mounts only the claiming Space's root. Dedicated runners keep their
-  existing behaviour.
+  processes, because they could read sibling Spaces' roots. Check and MCP
+  need `METRO_SANDBOX=docker`, which mounts only the claiming Space's root
+  read-only. `workspace.shell` is the exception: it runs on every runner,
+  gated by the shell policy below; with `docker` it runs in the same
+  container with the root mounted read-write and no network, without it
+  as the runner's user in the Space root. Dedicated runners keep their
+  existing check and MCP behaviour.
+- `workspace.write` (one UTF-8 file, at most 1 MiB, parents created,
+  atomic replace) is jailed like read: Space-root relative, no absolute
+  path, `..`, symlink anywhere in the path or hard link. It never needs
+  approval. Write and shell are in `default_tools`: new agents and agents
+  created without a list get them. Every agent stores its list, so agents
+  from before 0.6.3 keep theirs and gain them only when the owner adds
+  them; there's no migration. Shell stays gated by the policy below.
+- **Shell policy**: `shell_mode` `off` / `approve` (default) / `classify`
+  / `allow`, `approver` `owner` (default) / `members`. A registered
+  runner has one default plus per-Space overrides (null inherits), read
+  and changed only by its manager; a dedicated runner has one per Space,
+  set by the Space owner. Members read the effective policy. `allow` on
+  a built-in runner takes effect only while it's attached to exactly one
+  Space, else it's `approve` with `downgraded_reason`. Organization
+  runners can't save `classify`. `owner` means the personal runner's
+  owner, any org admin, or the dedicated Space's owner; every approver
+  must be a current Space member at decision time (no admin bypass).
+- `classify` is one System One Choice (`shell_risk`, keyed `safe` /
+  `unsafe`) on the runner owner's System One connection (dedicated: the
+  Space owner's), sent only the command, Space name and the run's
+  trigger text (4,000 characters). Only `safe` at probability ≥ 0.8 runs
+  without asking; anything else, including no usable connection or a
+  failure, asks for approval with the reason. Never call it containment.
+- Approvals are `shell_approval` and `shell_approval_resolved` run
+  activity events: never messages, model history, indexed or searchable.
+  The decision rechecks membership, eligibility and the assignment in one
+  transaction; first decision wins (later 409). Pending ones expire after
+  10 minutes or at restart, and are cancelled on stop, any assignment
+  change or Space deletion, not on token rotation. Only an approved or
+  allowed command reaches a runner. Waiting and running shell jobs don't
+  count against the run's time limit. A shell job is killed on timeout
+  (max 600 s; commands at most 16 KiB), stop and heartbeat
+  `401`/`404`/`409`/`410` on both runners; on Windows a process
+  started just before job-object assignment can escape (known limit).
+- Shell runs with the runner user's access, including other Spaces'
+  folders on that machine unless sandboxed. Docs must say so, and that
+  the approver choice matters.
 - Model connections are personal by default. A run uses the sender's own
   usable connections (or ones shared with them there), and so do the child
   threads that run starts, in this order: the model explicitly chosen for
@@ -478,6 +526,11 @@ see [New in Metro 0.6.1](docs/released-0.6.1.md); for later changes, see
 - *Demo* must stay deterministic and must never call a model.
 - Sandboxing is opt-in, and `docker` mode fails closed. Check and MCP commands
   are operator-defined JSON argv and are never run through a shell.
+  `workspace.shell` is the one tool that uses a shell (`/bin/sh -c`,
+  Windows `cmd.exe`), in the Space root, with a cleared environment
+  (never a Metro token).
+- A standalone runner without `METRO_WORKSPACE` uses its current
+  directory, and refuses `/`.
 - Status: [docs/system-one.md](docs/system-one.md) tracks each part.
   - Every part is implemented: scheduled prompts
     ([docs/schedules.md](docs/schedules.md)), capabilities and sharing
@@ -492,15 +545,17 @@ see [New in Metro 0.6.1](docs/released-0.6.1.md); for later changes, see
     Documents & media gate (497 Rust tests, the 83 hardened media-service
     tests, `nsh test` 106/106) and the earlier 403-test gate are historical
     milestones.
-  - **Metro 0.6.1 is published**: stable GitHub release `v0.6.1`
-    (2026-11-27T06:52:28Z), tag on `5384e8a` (PR #20), made by CI run
-    45949761195, with 18 assets, Sigstore-signed `SHA256SUMS`, unsigned
-    Windows files and signed GHCR images (see [release record](docs/acceptance.md#published-metro-061-2026-11-27-github-release-v061)).
+  - **Metro 0.6.2 is published**: stable GitHub release `v0.6.2`
+    (2026-11-27T10:59:03Z), tag on `3c0e4d1` (PR #21), made by CI run
+    45980066265, with 18 assets, Sigstore-signed `SHA256SUMS`, unsigned
+    Windows files and signed GHCR images (see [release record](docs/acceptance.md#published-metro-062-2026-11-27-github-release-v062)).
     Native Windows by a person, real vendor accounts and real sign-ins
-    remain unverified. [0.6.1 work](docs/released-0.6.1.md) is
-    released; [0.6.2 work](docs/next-source.md) is not.
-  - The previous release was [Metro 0.6.0](docs/acceptance.md#published-metro-060-2026-11-26-github-release-v060)
-    (`v0.6.0` on `430c835`, CI run 45737693549), and before it
+    remain unverified. [0.6.2 work](docs/released-0.6.2.md) is
+    released; [0.6.3 work](docs/next-source.md) is not.
+  - The previous release was [Metro 0.6.1](docs/acceptance.md#published-metro-061-2026-11-27-github-release-v061)
+    (`v0.6.1` on `5384e8a`, CI run 45949761195), and before it
+    [Metro 0.6.0](docs/acceptance.md#published-metro-060-2026-11-26-github-release-v060)
+    (`v0.6.0` on `430c835`, CI run 45737693549),
     [Metro 0.5.1](docs/acceptance.md#published-metro-051-2026-11-26-github-release-v051)
     (`v0.5.1` on `5120c52`, CI run 45725172627) and
     [Metro 0.5.0](docs/acceptance.md#published-metro-050-2026-11-25-github-release-v050).
@@ -527,22 +582,23 @@ see [New in Metro 0.6.1](docs/released-0.6.1.md); for later changes, see
   sidecar next to the desktop app. Source builds live only in
   [docs/development.md](docs/development.md). Docs point to the published
   release by the names and URLs recorded in `docs/acceptance.md`: the
-  current one is **Metro 0.6.1**
-  (https://github.com/wnzn/metro/releases/tag/v0.6.1, tag `v0.6.1` on
-  `5384e8a`), with `Metro-0.6.1-linux-x64.tar.gz`,
-  `Metro-0.6.1-windows-x64.zip`,
-  `Metro-0.6.1-windows-x64.unsigned-preview.msi`,
-  `Metro-runner-0.6.1-linux-x64.tar.gz` (each with `.sha256`), the
+  current one is **Metro 0.6.2**
+  (https://github.com/wnzn/metro/releases/tag/v0.6.2, tag `v0.6.2` on
+  `3c0e4d1`), with `Metro-0.6.2-linux-x64.tar.gz`,
+  `Metro-0.6.2-windows-x64.zip`,
+  `Metro-0.6.2-windows-x64.unsigned-preview.msi`,
+  `Metro-runner-0.6.2-linux-x64.tar.gz` (each with `.sha256`), the
   installer scripts, `SHA256SUMS` with its Sigstore bundle, `IMAGES.txt`,
-  and the images `ghcr.io/wnzn/metro-server:v0.6.1`,
-  `ghcr.io/wnzn/metro-runner:v0.6.1` and
-  `ghcr.io/wnzn/metro-embeddinggemma2:v0.6.1` (pinned by digest). Windows
+  and the images `ghcr.io/wnzn/metro-server:v0.6.2`,
+  `ghcr.io/wnzn/metro-runner:v0.6.2` and
+  `ghcr.io/wnzn/metro-embeddinggemma2:v0.6.2` (pinned by digest). Windows
   files are **unsigned** (no Authenticode). Docs never present source
   that came after a release's commit as part of that release; label it
   "in the source, not released". A newer release is named in docs only
   once its publication is recorded in `docs/acceptance.md`. The desktop app's **Use locally**
   runs a bundled local server with no token, and its owner-only, per-Space,
-  read-only local tools (`workspace.list`/`workspace.read`) never stand in
+  read-only local tools (`workspace.list`/`workspace.read`, still list
+  and read only in 0.6.3 source) never stand in
   for an operator's separately installed runner or for the app's built-in
   runner. It and the other features
   checked in the 0.2.0 Linux candidate are described as verified in that

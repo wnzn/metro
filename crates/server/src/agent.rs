@@ -18,6 +18,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use rig_agent::prelude::*;
 use rig_core::DynModel;
@@ -42,7 +43,7 @@ use crate::orchestration::{
     ThreadStatusTool, ThreadStopTool,
 };
 use crate::space_agents::SpaceAgent;
-use crate::tools::{RunnerTool, call_runner, truncate};
+use crate::tools::{RunnerTool, call_runner, record_call, run_recorded, truncate};
 
 /// A plain OpenAI-compatible endpoint: Chat Completions, bearer key,
 /// `max_tokens`, no vendor-specific behaviour.
@@ -656,8 +657,90 @@ fn reaction_tool(
     ))
 }
 
+/// Time a run spends waiting for a shell approval or a shell command,
+/// which its own time limit doesn't count.
+#[derive(Clone, Default)]
+pub(crate) struct RunClock(Arc<std::sync::Mutex<ClockState>>);
+
+#[derive(Default)]
+struct ClockState {
+    credit: Duration,
+    paused: usize,
+    since: Option<tokio::time::Instant>,
+}
+
+impl RunClock {
+    fn state(&self) -> std::sync::MutexGuard<'_, ClockState> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Stop the run's clock until the guard drops.
+    pub(crate) fn pause(&self) -> PausedClock {
+        let mut s = self.state();
+        if s.paused == 0 {
+            s.since = Some(tokio::time::Instant::now());
+        }
+        s.paused += 1;
+        PausedClock(self.clone())
+    }
+
+    /// Time not counted so far, and whether the clock is stopped now.
+    fn extra(&self) -> (Duration, bool) {
+        let s = self.state();
+        let now = s.since.map_or(Duration::ZERO, |t| t.elapsed());
+        (s.credit + now, s.paused > 0)
+    }
+}
+
+pub(crate) struct PausedClock(RunClock);
+
+impl Drop for PausedClock {
+    fn drop(&mut self) {
+        let mut s = self.0.state();
+        s.paused = s.paused.saturating_sub(1);
+        if s.paused == 0
+            && let Some(t) = s.since.take()
+        {
+            s.credit += t.elapsed();
+        }
+    }
+}
+
+/// `f`, or `Err` once `budget` has passed, not counting `clock`'s pauses.
+async fn within<F: std::future::IntoFuture>(
+    budget: Duration,
+    clock: Option<RunClock>,
+    f: F,
+) -> Result<F::Output, ()> {
+    let deadline = async move {
+        let start = tokio::time::Instant::now();
+        loop {
+            let (extra, paused) = clock
+                .as_ref()
+                .map_or((Duration::ZERO, false), RunClock::extra);
+            let now = tokio::time::Instant::now();
+            let end = start + budget + extra;
+            if !paused && now >= end {
+                return;
+            }
+            let wake = if paused {
+                now + Duration::from_secs(1)
+            } else {
+                end
+            };
+            tokio::time::sleep_until(wake).await;
+        }
+    };
+    tokio::select! {
+        r = f.into_future() => Ok(r),
+        () = deadline => Err(()),
+    }
+}
+
 /// Run `agent` on `prompt`, honouring the timeout and `cancel`, less what
-/// the run already `spent` (a compaction summary).
+/// the run already `spent` (a compaction summary) and `clock`'s pauses.
 #[allow(clippy::too_many_arguments)]
 async fn drive(
     state: &AppState,
@@ -668,6 +751,7 @@ async fn drive(
     connection: Option<&str>,
     redact_diagnostics: bool,
     spent: Spent,
+    clock: Option<RunClock>,
 ) -> Outcome {
     let limits = &state.config.limits;
     let run = agent
@@ -681,7 +765,7 @@ async fn drive(
         }
     };
     tokio::select! {
-        result = tokio::time::timeout(limits.agent_timeout.saturating_sub(spent.time), run) => match result {
+        result = within(limits.agent_timeout.saturating_sub(spent.time), clock, run) => match result {
             Ok(Ok(response)) => Outcome::Completed(response.output()),
             Ok(Err(e)) => {
                 let model_failure = ModelFailure::of(&e);
@@ -819,6 +903,7 @@ where
         route.note.connection_id.as_deref(),
         pin.is_some(),
         Spent::default(),
+        None,
     )
     .await
     {
@@ -1343,6 +1428,7 @@ async fn execute_room_run(
             .await
     };
     let mut reacted = Arc::new(AtomicBool::new(false));
+    let clock = RunClock::default();
     let outcome = match loaded {
         Err(e) => {
             tracing::error!(error = %format!("{e:#}"), "loading agent history");
@@ -1413,10 +1499,19 @@ async fn execute_room_run(
                     (true, false) => RUNNER_PREAMBLE,
                 });
             if paired && !allowed.is_empty() {
+                let bound = RunnerBinding {
+                    state: state.clone(),
+                    space_id: space_id.to_owned(),
+                    room_id: room.id.clone(),
+                    initiator: initiator.clone(),
+                    turn: turn.clone(),
+                    request: trigger.text.clone(),
+                    clock: clock.clone(),
+                };
                 builder = builder.dynamic_tools(
                     allowed
                         .iter()
-                        .map(|t| runner_tool(state, space_id, &room.id, initiator, turn, *t))
+                        .map(|t| runner_tool(bound.clone(), *t))
                         .collect(),
                 );
             }
@@ -1523,6 +1618,7 @@ async fn execute_room_run(
                 route.note.connection_id.as_deref(),
                 offers_pages,
                 window.spent,
+                Some(clock),
             )
             .await
         }
@@ -1654,52 +1750,51 @@ async fn execute_room_run(
     }
 }
 
+/// What a run's runner tools are bound to.
+#[derive(Clone)]
+struct RunnerBinding {
+    state: AppState,
+    space_id: String,
+    room_id: String,
+    initiator: Author,
+    turn: Activity,
+    /// The text of the message that started the run (for shell `classify`).
+    request: String,
+    clock: RunClock,
+}
+
 /// One of the runner's tools, bound to a Space, a room and the run's initiator.
-fn runner_tool(
-    state: &AppState,
-    space_id: &str,
-    room_id: &str,
-    initiator: &Author,
-    turn: &Activity,
-    tool: RunnerTool,
-) -> DynamicTool {
-    let (state, space_id, room_id, initiator, turn) = (
-        state.clone(),
-        space_id.to_owned(),
-        room_id.to_owned(),
-        initiator.clone(),
-        turn.clone(),
-    );
+fn runner_tool(b: RunnerBinding, tool: RunnerTool) -> DynamicTool {
     let name =
         rig_core::message::ToolName::new(tool.model_name()).expect("tool names are non-empty");
     DynamicTool::new(name, tool.description(), tool.parameters(), move |args| {
-        let (state, space_id, room_id, initiator, turn) = (
-            state.clone(),
-            space_id.clone(),
-            room_id.clone(),
-            initiator.clone(),
-            turn.clone(),
-        );
+        let b = b.clone();
         Box::pin(async move {
             let arguments = tool
                 .runner_arguments(&args)
                 .map_err(ToolExecutionError::invalid_args)?;
-            ensure_member(&state, &space_id, &initiator)
+            ensure_member(&b.state, &b.space_id, &b.initiator)
                 .await
                 .map_err(ToolExecutionError::permission_denied)?;
-            let max = state.config.limits.max_tool_output_to_model;
+            let max = b.state.config.limits.max_tool_output_to_model;
             let caller = Author::server(actor::AGENT);
-            match call_runner(
-                &state,
-                &space_id,
-                &room_id,
-                &caller,
-                Some(&turn),
-                tool,
-                arguments,
-            )
-            .await
-            {
+            let result = if tool == RunnerTool::Shell {
+                // Waiting for a person or a long command isn't the run's time.
+                let _paused = b.clock.pause();
+                shell_call(&b, &caller, arguments).await?
+            } else {
+                call_runner(
+                    &b.state,
+                    &b.space_id,
+                    &b.room_id,
+                    &caller,
+                    Some(&b.turn),
+                    tool,
+                    arguments,
+                )
+                .await
+            };
+            match result {
                 Ok(outcome) if outcome.ok => Ok(ToolOutput::text(truncate(&outcome.output, max))),
                 Ok(outcome) => Err(ToolExecutionError::other(format!(
                     "{} failed: {}",
@@ -1713,6 +1808,66 @@ fn runner_tool(
             }
         })
     })
+}
+
+/// `workspace.shell`: recorded, then queued only once its policy or a
+/// person allows it ([`crate::shell`]).
+async fn shell_call(
+    b: &RunnerBinding,
+    caller: &Author,
+    arguments: serde_json::Value,
+) -> Result<Result<crate::jobs::JobOutcome, crate::jobs::JobError>, ToolExecutionError> {
+    let tool = RunnerTool::Shell;
+    record_call(
+        &b.state,
+        &b.space_id,
+        &b.room_id,
+        caller,
+        Some(&b.turn),
+        tool,
+        &arguments,
+    )
+    .await;
+    let command = arguments["command"].as_str().unwrap_or_default();
+    let call = crate::shell::ShellCall {
+        space_id: &b.space_id,
+        room_id: &b.room_id,
+        initiator: &b.initiator,
+        activity: &b.turn,
+        command,
+        request: &b.request,
+    };
+    let refused = match crate::shell::authorize(&b.state, &call).await {
+        Ok(fence) => match ensure_member(&b.state, &b.space_id, &b.initiator).await {
+            Ok(()) => {
+                return Ok(run_recorded(
+                    &b.state,
+                    &b.space_id,
+                    &b.room_id,
+                    Some(&b.turn),
+                    tool,
+                    arguments,
+                    Some(fence),
+                )
+                .await);
+            }
+            Err(why) => why,
+        },
+        Err(why) => why,
+    };
+    b.state
+        .append_with(
+            &b.space_id,
+            &b.room_id,
+            kind::TOOL_RESULT,
+            &Author::server(actor::SYSTEM),
+            &format!("workspace.shell not run: {refused}"),
+            Some(&b.turn),
+        )
+        .await;
+    Err(ToolExecutionError::other(format!(
+        "workspace.shell not run: {refused}"
+    )))
 }
 
 /// Delegated actions are checked when they happen, not when the run started.
@@ -2551,6 +2706,7 @@ async fn execute_personal_run(
         route.note.connection_id.as_deref(),
         false,
         window.spent,
+        None,
     )
     .await
     {
@@ -2586,6 +2742,35 @@ async fn execute_personal_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn waiting_on_a_shell_command_does_not_use_up_the_run_time() {
+        let ms = Duration::from_millis;
+        let clock = RunClock::default();
+        let c = clock.clone();
+        let work = async move {
+            tokio::time::sleep(ms(100)).await;
+            {
+                let _outer = c.pause();
+                let _nested = c.pause();
+                tokio::time::sleep(ms(500)).await;
+            }
+            tokio::time::sleep(ms(100)).await;
+            "done"
+        };
+        assert_eq!(within(ms(300), Some(clock), work).await, Ok("done"));
+        let work = tokio::time::sleep(ms(500));
+        assert!(
+            within(ms(200), Some(RunClock::default()), work)
+                .await
+                .is_err()
+        );
+        assert!(
+            within(ms(200), None, tokio::time::sleep(ms(500)))
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn web_tool_events_never_become_model_history() {

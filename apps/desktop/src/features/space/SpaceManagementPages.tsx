@@ -7,6 +7,7 @@ import { localToolsBusy, localToolsError, localToolsNotice } from "../localtools
 import { PersonAvatar } from "../profile/PersonAvatar";
 import { profileName } from "../profile/profileState";
 import { TokenReveal } from "../TokenReveal";
+import { SpaceShellSection } from "../shellPolicy/ShellPolicySettings";
 import { TEST_RUNNER_DESCRIPTION, TEST_RUNNER_LABEL, TestRunnerAction } from "./TestRunner";
 import {
   changeMember, changeRunner, closeSpaceSettings, dedicatedRevealIsCurrent, isSettingsOwner, loadMembers, loadRunner, loadRunnerInventory,
@@ -128,6 +129,7 @@ export function RunnerPage() {
               </SettingRow>
             </If>
           </SettingsGroup>
+          <SpaceShellSection />
           <ChooseRunner />
           <If when={isSettingsOwner()}>
             <Disclosure title="Advanced: dedicated token and local tools" testID="space-runner-advanced" open={runnerAdvanced()} onToggle={setRunnerAdvanced}>

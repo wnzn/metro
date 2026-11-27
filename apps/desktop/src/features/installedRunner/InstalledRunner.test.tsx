@@ -24,6 +24,8 @@ function bridgeWithRunner(f: F, runnerId: string | null, name: string, opts: Opt
   const b = fakeBridge(f);
   const log: { method: string; path: string; body: string | null | undefined }[] = [];
   const t = { log };
+  const folders = new Map<string, string>();
+  const problems = new Map<string, string>();
   const st = { state: opts.state ?? "online", canReconnect: opts.canReconnect ?? false, runnerId, delay: 0, status: 200, available: opts.available ?? true };
   const status = () => ({
     marker: opts.requested === false ? "absent" : "accepted",
@@ -67,9 +69,26 @@ function bridgeWithRunner(f: F, runnerId: string | null, name: string, opts: Opt
       return { status: 200, body: status() };
     }
     const m = /^\/v1\/local-tools\/runner\/spaces\/([^/]+)\/folder$/.exec(path);
-    if (m && req.method === "POST") {
+    if (m && ["POST", "PUT", "DELETE"].includes(req.method)) {
       const sid = m[1]!;
-      return { status: 200, body: { space_id: sid, folder: `${ROOT}/${sid}`, attached: f.state.attached.get(sid) === st.runnerId, tools: ["workspace.list", "workspace.read"] } };
+      const attached = f.state.attached.get(sid) === st.runnerId;
+      if (req.method === "PUT") {
+        if (!attached) return { status: 409, body: { error: { code: "not_attached", message: "This runner is no longer attached." } } };
+        const body = JSON.parse(req.body ?? "{}");
+        if (!body.path?.startsWith("/")) return { status: 422, body: { error: { code: "folder_not_absolute", message: "Enter an absolute folder path." } } };
+        if (body.path === "/home/me/overlap") return { status: 422, body: { error: { code: "folder_overlaps", message: "That folder overlaps another Space’s folder." } } };
+        folders.set(sid, body.path);
+      }
+      if (req.method === "DELETE") folders.delete(sid);
+      const defaultFolder = `${ROOT}/${sid}`;
+      return { status: 200, body: {
+        space_id: sid, folder: folders.get(sid) ?? defaultFolder, default_folder: defaultFolder,
+        custom: folders.has(sid), folder_problem: folders.has(sid) ? problems.get(sid) ?? null : null, ...(req.method === "DELETE" ? {} : { attached }),
+        tools: ["workspace.list", "workspace.read", "workspace.write", "workspace.shell"],
+      } };
+    }
+    if (path === "/v1/local-tools/runner/folders" && req.method === "GET") {
+      return { status: 200, body: { folders: [...folders].map(([space_id, folder]) => ({ space_id, folder })) } };
     }
     if (path === "/v1/local-tools") return { status: 200, body: { available: true, reason: null, spaces: [] } };
     return { status: 404, body: { error: { code: "not_found", message: "unknown path" } } };
@@ -79,7 +98,7 @@ function bridgeWithRunner(f: F, runnerId: string | null, name: string, opts: Opt
     const inner = (b.network as any)[`${method} ${BRIDGE}/v1/*`];
     network[`${method} ${BRIDGE}/v1/*`] = (req: Req) => (new URL(req.url).pathname.startsWith("/v1/local-tools") ? handle(req) : inner(req));
   }
-  return { log, network, st };
+  return { log, network, st, folders, problems };
 }
 
 async function openWith(f: F, t: ReturnType<typeof bridgeWithRunner> | null, manualClock = false) {
@@ -109,6 +128,87 @@ async function signInToRunners(app: App, user: string) {
 const text = (app: App) => app.texts().join(" | ");
 const posts = (t: ReturnType<typeof bridgeWithRunner>) => t.log.filter((l) => l.method === "POST");
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+test("an attached Space's folder can be changed and reset, with validation errors inline", async () => {
+  const f = world();
+  const mine = f.addRunner("This PC", "personal", "alice");
+  f.addSpace("target", "Target", "alice");
+  f.state.attached.set("target", mine.id);
+  const t = bridgeWithRunner(f, mine.id, mine.name);
+  const app = await openWith(f, t);
+  await signInToRunners(app, "alice");
+  const change = "id:installed-runner-folder-change:target";
+  const input = "id:installed-runner-folder-input:target";
+  const save = "id:installed-runner-folder-save:target";
+  await app.waitFor("id:installed-runner-folder:target");
+  await app.press("id:installed-runner-folder:target");
+  await app.waitUntil(() => app.texts().includes(`${ROOT}/target`));
+  await app.press(change);
+  await app.clear(input);
+  await app.type(input, "/home/me/overlap");
+  await app.press(save);
+  await app.waitFor("text:That folder overlaps another Space’s folder.");
+  expect(app.value(input)).toBe("/home/me/overlap");
+  await app.clear(input);
+  await app.type(input, "/home/me/work");
+  await app.press(save);
+  await app.waitUntil(() => app.texts().includes("/home/me/work"));
+  await app.press("id:installed-runner-folder-default:target");
+  await app.waitUntil(() => app.texts().includes(`${ROOT}/target`));
+  const path = "/v1/local-tools/runner/spaces/target/folder";
+  expect(t.log.filter(entry => entry.path === path && entry.method === "PUT").map(entry => JSON.parse(entry.body ?? "{}")))
+    .toEqual([{ path: "/home/me/overlap" }, { path: "/home/me/work" }]);
+  expect(t.log.filter(entry => entry.path === path && entry.method === "DELETE").length).toBe(1);
+});
+
+test("a chosen folder isn't offered as detached while its assignment check is pending", async () => {
+  const f = world();
+  const mine = f.addRunner("This PC", "personal", "alice");
+  f.addSpace("target", "Target", "alice");
+  f.state.attached.set("target", mine.id);
+  const scan = f.answerLate("/v1/spaces/target/runner", TOKENS.alice!, 3_000);
+  const t = bridgeWithRunner(f, mine.id, mine.name);
+  t.folders.set("target", "/home/me/work");
+  const app = await openWith(f, t, true);
+  await signInToRunners(app, "alice");
+  await app.waitUntil(() => scan.arrived() > 0);
+  await app.clock!.runFor(100);
+  expect(app.shows("id:installed-runner-stale-default:target")).toBe(false);
+  await app.clock!.runFor(3_100);
+  await app.waitFor("id:installed-runner-space:target");
+  expect(app.shows("id:installed-runner-folder-default:target")).toBe(true);
+  expect(app.shows("id:installed-runner-stale-default:target")).toBe(false);
+});
+
+test("a chosen folder that can't be used shows its problem without a press", async () => {
+  const f = world();
+  const mine = f.addRunner("This PC", "personal", "alice");
+  f.addSpace("target", "Target", "alice");
+  f.state.attached.set("target", mine.id);
+  const t = bridgeWithRunner(f, mine.id, mine.name);
+  t.folders.set("target", "/home/me/gone");
+  t.problems.set("target", "The chosen folder doesn't exist.");
+  const app = await openWith(f, t);
+  await signInToRunners(app, "alice");
+  await app.waitFor("id:installed-runner-folder-problem:target");
+  expect(app.texts()).toContain("Jobs fail until this is fixed: The chosen folder doesn't exist.");
+  const reads = t.log.filter(entry => entry.path === "/v1/local-tools/runner/spaces/target/folder");
+  expect(reads.map(entry => entry.method)).toEqual(["POST"]);
+});
+
+test("a chosen folder on a verified detached Space can be cleared", async () => {
+  const f = world();
+  const mine = f.addRunner("This PC", "personal", "alice");
+  f.addSpace("target", "Target", "alice", [], true); // Now uses a dedicated runner.
+  const t = bridgeWithRunner(f, mine.id, mine.name);
+  t.folders.set("target", "/home/me/work");
+  const app = await openWith(f, t);
+  await signInToRunners(app, "alice");
+  await app.waitFor("id:installed-runner-stale-default:target");
+  await app.press("id:installed-runner-stale-default:target");
+  await app.waitFor("id:installed-runner-stale-folder:target", { state: "gone" });
+  expect(t.log.filter(entry => entry.path === "/v1/local-tools/runner/spaces/target/folder" && entry.method === "DELETE").length).toBe(1);
+});
 
 for (const variant of ["member", "unversioned"] as const) {
   test(`a fresh ${variant} assignment cannot certify an installed folder`, async () => {
@@ -1535,7 +1635,8 @@ test("a held keyboard update keeps its scoped busy panel and restores focus to r
   await app.waitFor(`id:runner-update-result:${mine.id} >> text:Update to 0.5.0 requested`);
   expect(app.shows(`${id}:panel`)).toBe(false);
   expect(app.shows(id)).toBe(false);
-  await app.keyboard.press("tab"); // Result summary → next control (Rotate token).
+  await app.keyboard.press("tab"); // Result summary → Shell commands.
+  await app.keyboard.press("tab"); // Shell commands → Rotate token.
   await app.keyboard.press("enter");
   await app.waitFor(`id:rotate-runner:${mine.id}:panel`);
   expect(updates()).toHaveLength(2);
@@ -1563,7 +1664,8 @@ test("an idle confirmation closes without a POST and hands keyboard focus to sta
   expect(app.shows(`${id}:panel`)).toBe(false);
   expect(app.shows(id)).toBe(false);
   await app.keyboard.press("enter"); // The focused status cannot submit.
-  await app.keyboard.press("tab"); // Status → this runner's Rotate token.
+  await app.keyboard.press("tab"); // Status → this runner's Shell commands.
+  await app.keyboard.press("tab"); // Shell commands → Rotate token.
   await app.keyboard.press("enter");
   await app.waitFor(`id:rotate-runner:${mine.id}:panel`);
   expect(f.posts().filter((p) => p.path.endsWith("/update"))).toEqual([]);

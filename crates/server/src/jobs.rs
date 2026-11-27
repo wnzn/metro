@@ -112,6 +112,8 @@ struct Job {
     generation: u64,
     tool: String,
     arguments: serde_json::Value,
+    /// How long the runner has after claiming it.
+    lease: Duration,
     state: State,
     tx: oneshot::Sender<Result<JobOutcome, JobError>>,
 }
@@ -204,6 +206,8 @@ pub struct JobQueue {
     capacity: usize,
     claim_timeout: Duration,
     run_timeout: Duration,
+    /// Space ids whose runner assignment changed ([`JobQueue::revoke`]).
+    revoked: tokio::sync::broadcast::Sender<String>,
 }
 
 impl JobQueue {
@@ -214,7 +218,14 @@ impl JobQueue {
             capacity,
             claim_timeout,
             run_timeout,
+            revoked: tokio::sync::broadcast::channel(64).0,
         }
+    }
+
+    /// Space ids, as their runner assignment changes. A lagging receiver
+    /// should treat a lag as a change.
+    pub fn subscribe_revoked(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.revoked.subscribe()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -225,6 +236,7 @@ impl JobQueue {
 
     /// Insert synchronously under the database's assignment fence, then
     /// return a waiter that abandons the job if dropped, even before polling.
+    #[cfg(test)]
     pub(crate) fn enqueue_at(
         &self,
         space: &str,
@@ -232,6 +244,21 @@ impl JobQueue {
         tool: &str,
         arguments: serde_json::Value,
     ) -> Result<impl Future<Output = Result<JobOutcome, JobError>> + Send + use<>, JobError> {
+        self.enqueue_leased(space, version, tool, arguments, None)
+    }
+
+    /// Insert synchronously under the database's assignment fence, then
+    /// return a waiter that abandons the job if dropped, even before polling.
+    /// `lease` extends the default run timeout (a long shell command).
+    pub(crate) fn enqueue_leased(
+        &self,
+        space: &str,
+        version: RunnerVersion,
+        tool: &str,
+        arguments: serde_json::Value,
+        lease: Option<Duration>,
+    ) -> Result<impl Future<Output = Result<JobOutcome, JobError>> + Send + use<>, JobError> {
+        let lease = lease.map_or(self.run_timeout, |l| l.max(self.run_timeout));
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, mut rx) = oneshot::channel();
         {
@@ -254,6 +281,7 @@ impl JobQueue {
                     generation: version.generation,
                     tool: tool.to_owned(),
                     arguments,
+                    lease,
                     state: State::Queued,
                     tx,
                 },
@@ -273,12 +301,12 @@ impl JobQueue {
             // queued, otherwise give it the rest of its run time.
             let run_deadline = {
                 let mut inner = guard.queue.lock();
-                match inner.jobs.get(&guard.id).map(|job| &job.state) {
-                    Some(State::Queued) => {
+                match inner.jobs.get(&guard.id).map(|job| (&job.state, job.lease)) {
+                    Some((State::Queued, _)) => {
                         inner.fail(&guard.id, None);
                         return Err(JobError::NotClaimed);
                     }
-                    Some(State::Claimed { at, .. }) => *at + guard.queue.run_timeout,
+                    Some((State::Claimed { at, .. }, lease)) => *at + lease,
                     // Finished while we took the lock; the result is in `rx`.
                     None => Instant::now(),
                 }
@@ -396,7 +424,7 @@ impl JobQueue {
                 inner.fail(id, Some(JobError::CredentialChanged));
                 return Err(CompleteError::Expired);
             }
-            State::Claimed { at, .. } if at.elapsed() > self.run_timeout => {
+            State::Claimed { at, .. } if at.elapsed() > job.lease => {
                 inner.fail(id, Some(JobError::TimedOut));
                 return Err(CompleteError::Expired);
             }
@@ -408,6 +436,46 @@ impl JobQueue {
         // The waiter may have just given up; the result then goes nowhere.
         let _ = job.tx.send(Ok(outcome));
         Ok(())
+    }
+
+    /// Whether `claimer` should keep working on job `id`: `Ok` while it is
+    /// claimed by `claimer` at a generation it still serves and within its
+    /// lease. A finished or failed job (run stopped, lease over, runner
+    /// changed) is [`CompleteError::Expired`].
+    pub(crate) fn heartbeat_at(
+        &self,
+        claimer: &str,
+        spaces: &[(String, RunnerVersion)],
+        id: &str,
+    ) -> Result<(), CompleteError> {
+        let mut inner = self.lock();
+        let space = match inner.jobs.get(id) {
+            Some(job) => job.space.clone(),
+            None => {
+                return Err(match inner.finished.get(id) {
+                    Some((s, _)) if spaces.iter().any(|(x, _)| x == s) => CompleteError::Expired,
+                    _ => CompleteError::Unknown,
+                });
+            }
+        };
+        let Some(version) = spaces.iter().find(|(s, _)| *s == space).map(|(_, v)| *v) else {
+            return Err(CompleteError::Unknown);
+        };
+        if !inner.observe(&space, version) {
+            return Err(CompleteError::Expired);
+        }
+        let Some(job) = inner.jobs.get(id) else {
+            return Err(CompleteError::Expired);
+        };
+        match &job.state {
+            State::Queued => Err(CompleteError::NotClaimed),
+            State::Claimed { claimer: c, .. } if c != claimer => Err(CompleteError::Unknown),
+            State::Claimed { generation: g, .. } if *g != version.generation => {
+                Err(CompleteError::Expired)
+            }
+            State::Claimed { at, .. } if at.elapsed() > job.lease => Err(CompleteError::Expired),
+            State::Claimed { .. } => Ok(()),
+        }
     }
 
     /// The same runner's token was rotated (`generation` is the Space's new
@@ -434,6 +502,7 @@ impl JobQueue {
                 drop_before: generation,
             },
         );
+        let _ = self.revoked.send(space.to_owned());
     }
 
     #[cfg(test)]
@@ -808,6 +877,69 @@ mod tests {
         // Or it still lists the Space with its old generation.
         assert_eq!(
             q.complete(r, &sp("s", 1), &job.id, ok("late")),
+            Err(CompleteError::Expired)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_long_lease_outlives_the_default_and_the_heartbeat_follows_the_job() {
+        // Default run timeout 300 ms; this job may take 2 s.
+        let q = queue();
+        let v = RunnerVersion {
+            generation: 1,
+            drop_before: 0,
+        };
+        let waiter = q
+            .enqueue_leased(
+                "s",
+                v,
+                "workspace.shell",
+                json!({}),
+                Some(Duration::from_secs(2)),
+            )
+            .unwrap();
+        let task = tokio::spawn(waiter);
+        let job = claim_wait(&q, D, &sp("s", 1)).await;
+        let beat = |who: &str, spaces: &[(String, u64)]| {
+            q.heartbeat_at(who, &test_versions(spaces), &job.id)
+        };
+        assert_eq!(beat(D, &sp("s", 1)), Ok(()));
+        assert_eq!(beat("runner:x", &sp("s", 1)), Err(CompleteError::Unknown));
+        assert_eq!(beat(D, &sp("other", 1)), Err(CompleteError::Unknown));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(beat(D, &sp("s", 1)), Ok(()), "still inside its own lease");
+        q.complete(D, &sp("s", 1), &job.id, ok("done")).unwrap();
+        assert_eq!(task.await.unwrap().unwrap().output, "done");
+        assert_eq!(beat(D, &sp("s", 1)), Err(CompleteError::Expired));
+        assert_eq!(beat(D, &[]), Err(CompleteError::Unknown));
+    }
+
+    #[tokio::test]
+    async fn abandoning_or_revoking_tells_the_heartbeat_to_stop() {
+        let q = JobQueue::new(4, Duration::from_secs(5), Duration::from_secs(5));
+        let mut revoked = q.subscribe_revoked();
+        let task = tokio::spawn({
+            let q = q.clone();
+            async move { q.run("s", 1, "workspace.shell", json!({})).await }
+        });
+        let job = claim_wait(&q, D, &sp("s", 1)).await;
+        // The run stopped: its waiter is dropped.
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            q.heartbeat_at(D, &test_versions(&sp("s", 1)), &job.id),
+            Err(CompleteError::Expired)
+        );
+        let task = tokio::spawn({
+            let q = q.clone();
+            async move { q.run("s", 1, "workspace.shell", json!({})).await }
+        });
+        let job = claim_wait(&q, D, &sp("s", 1)).await;
+        q.revoke("s", 2);
+        assert_eq!(revoked.recv().await.unwrap(), "s");
+        assert_eq!(task.await.unwrap(), Err(JobError::CredentialChanged));
+        assert_eq!(
+            q.heartbeat_at(D, &test_versions(&sp("s", 2)), &job.id),
             Err(CompleteError::Expired)
         );
     }

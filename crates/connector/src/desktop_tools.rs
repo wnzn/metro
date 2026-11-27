@@ -49,9 +49,11 @@
 //! different thing from the per-Space dedicated pairings above: neither
 //! stands in for the other, and Metro never attaches it to a Space.
 
+pub mod chosen;
 pub mod folder;
 pub mod hosted;
 pub mod runner;
+pub mod shell;
 pub mod store;
 pub mod worker;
 
@@ -252,6 +254,17 @@ fn pairing_changed() -> ToolsError {
     )
 }
 
+/// A request under `/v1/local-tools/runner/`.
+enum RunnerOp<'p> {
+    Setup,
+    Reconnect(Option<String>),
+    Forget(String),
+    Folder(&'p str),
+    SetFolder(&'p str, String),
+    ClearFolder(&'p str),
+    Folders,
+}
+
 struct Inner {
     root: Option<Arc<File>>,
     /// (server URL, account id) the workers belong to.
@@ -299,6 +312,14 @@ impl DesktopTools {
     pub fn with_local_runner(mut self, marker: runner::Marker) -> Self {
         self.marker = marker;
         self
+    }
+
+    /// Metro's own data folder: the desktop root holding `local-tools`.
+    fn data_root(&self) -> &std::path::Path {
+        self.root_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(&self.root_path)
     }
 
     fn root(&self, inner: &mut Inner) -> Result<Arc<File>, ToolsError> {
@@ -522,38 +543,7 @@ impl DesktopTools {
             }
             return Ok(self.runner_status(&inner, session.as_ref()));
         }
-        let folder_sid = rest
-            .strip_prefix("/spaces/")
-            .and_then(|r| r.strip_suffix("/folder"))
-            .filter(|s| !s.contains('/'));
-        let action = rest.strip_prefix('/').unwrap_or_default();
-        if !matches!(action, "setup" | "reconnect" | "forget") && folder_sid.is_none() {
-            return Err(ToolsError::new(404, "not_found", "unknown path"));
-        }
-        if method != "POST" {
-            return Err(ToolsError::new(405, "method_not_allowed", "use POST"));
-        }
-        // `{}`, or `{"runner_id": "<id>"}`: for reconnect, a runner the
-        // person chose from their own list; for forget, the one they just
-        // deleted. Always by id.
-        let fields = if body.iter().all(u8::is_ascii_whitespace) {
-            serde_json::Map::new()
-        } else {
-            serde_json::from_slice::<serde_json::Map<String, Value>>(body)
-                .map_err(|_| ToolsError::new(422, "invalid", "the body must be a JSON object"))?
-        };
-        let choice = match fields.get("runner_id") {
-            None => None,
-            Some(Value::String(id))
-                if matches!(action, "reconnect" | "forget") && hosted::valid_job_id(id) =>
-            {
-                Some(id.clone())
-            }
-            Some(_) => return Err(ToolsError::new(422, "invalid", "invalid runner_id")),
-        };
-        if fields.keys().any(|k| k != "runner_id") {
-            return Err(ToolsError::new(422, "invalid", "unknown field"));
-        }
+        let op = Self::runner_op(method, rest, body)?;
         let Some(h) = session else {
             self.stop_all().await;
             return Err(ToolsError::new(409, "no_session", NO_SESSION));
@@ -567,26 +557,88 @@ impl DesktopTools {
             marker: &self.marker,
             root: &root,
             root_path: &self.root_path,
+            data_root: self.data_root(),
             session: &h,
             api: &api,
             store_lock: &self.store_lock,
         };
-        if let Some(sid) = folder_sid {
-            // Asked right after attaching: a runner that didn't start (or
-            // stopped) gets another go now, not only at the next sign-in.
-            runner::ensure(&mut inner.runner, &cx).await;
-            return runner::folder_for(&cx, sid).await;
-        }
-        match action {
-            "setup" => runner::setup(&mut inner.runner, &cx).await?,
-            "forget" => {
-                let id = choice
-                    .ok_or_else(|| ToolsError::new(422, "invalid", "runner_id is required"))?;
-                runner::forget(&mut inner.runner, &cx, &id).await?
+        match op {
+            RunnerOp::Folder(sid) => {
+                // Asked right after attaching: a runner that didn't start (or
+                // stopped) gets another go now, not only at the next sign-in.
+                runner::ensure(&mut inner.runner, &cx).await;
+                return runner::folder_for(&cx, sid).await;
             }
-            _ => runner::reconnect(&mut inner.runner, &cx, choice).await?,
+            RunnerOp::SetFolder(sid, path) => return runner::set_folder(&cx, sid, &path).await,
+            RunnerOp::ClearFolder(sid) => return runner::clear_folder(&cx, sid),
+            RunnerOp::Folders => return runner::list_folders(&cx),
+            RunnerOp::Setup => runner::setup(&mut inner.runner, &cx).await?,
+            RunnerOp::Forget(id) => runner::forget(&mut inner.runner, &cx, &id).await?,
+            RunnerOp::Reconnect(choice) => {
+                runner::reconnect(&mut inner.runner, &cx, choice).await?
+            }
         }
         Ok(self.runner_status(&inner, Some(&h)))
+    }
+
+    /// What a `/v1/local-tools/runner/...` request asks for (`rest` is the
+    /// part after `/runner`, not empty). Unknown paths and wrong methods are
+    /// refused before the body is looked at. Bodies are JSON objects without
+    /// unknown fields; an empty body is `{}`.
+    fn runner_op<'p>(method: &str, rest: &'p str, body: &[u8]) -> Result<RunnerOp<'p>, ToolsError> {
+        let folder = rest
+            .strip_prefix("/spaces/")
+            .and_then(|r| r.strip_suffix("/folder"))
+            .filter(|s| !s.contains('/'));
+        let action = rest.strip_prefix('/').unwrap_or_default();
+        let (methods, allowed): (&[&str], &[&str]) = match (folder, action) {
+            (Some(_), _) => (&["POST", "PUT", "DELETE"], &["path"]),
+            (None, "folders") => (&["GET"], &[]),
+            (None, "setup" | "reconnect" | "forget") => (&["POST"], &["runner_id"]),
+            _ => return Err(ToolsError::new(404, "not_found", "unknown path")),
+        };
+        if !methods.contains(&method) {
+            return Err(ToolsError::new(
+                405,
+                "method_not_allowed",
+                format!("use {}", methods.join(", ")),
+            ));
+        }
+        let fields = if body.iter().all(u8::is_ascii_whitespace) {
+            serde_json::Map::new()
+        } else {
+            serde_json::from_slice::<serde_json::Map<String, Value>>(body)
+                .map_err(|_| ToolsError::new(422, "invalid", "the body must be a JSON object"))?
+        };
+        let invalid = |m: &str| ToolsError::new(422, "invalid", m);
+        if fields.keys().any(|k| !allowed.contains(&k.as_str())) {
+            return Err(invalid("unknown field"));
+        }
+        if let Some(sid) = folder {
+            return match (method, fields.get("path")) {
+                ("PUT", Some(Value::String(p))) => Ok(RunnerOp::SetFolder(sid, p.clone())),
+                ("PUT", _) => Err(invalid("path is required")),
+                (_, Some(_)) => Err(invalid("unknown field")),
+                ("DELETE", None) => Ok(RunnerOp::ClearFolder(sid)),
+                (_, None) => Ok(RunnerOp::Folder(sid)),
+            };
+        }
+        // `{}`, or `{"runner_id": "<id>"}`: for reconnect, a runner the
+        // person chose from their own list; for forget, the one they just
+        // deleted. Always by id.
+        let choice = match fields.get("runner_id") {
+            None => None,
+            Some(Value::String(id)) if action != "setup" && hosted::valid_job_id(id) => {
+                Some(id.clone())
+            }
+            Some(_) => return Err(invalid("invalid runner_id")),
+        };
+        Ok(match action {
+            "folders" => RunnerOp::Folders,
+            "setup" => RunnerOp::Setup,
+            "forget" => RunnerOp::Forget(choice.ok_or_else(|| invalid("runner_id is required"))?),
+            _ => RunnerOp::Reconnect(choice),
+        })
     }
 
     async fn status(&self, session: Option<&BoundSession>) -> Result<Value, ToolsError> {
@@ -889,6 +941,7 @@ impl DesktopTools {
             marker: &self.marker,
             root: &root,
             root_path: &self.root_path,
+            data_root: self.data_root(),
             session,
             api: &api,
             store_lock: &self.store_lock,
@@ -1013,6 +1066,211 @@ mod tests {
             )
             .contains("local-bearer")
         );
+    }
+
+    /// A Metro server where alice owns s-a, s-b and s-c; this computer's
+    /// runner rn-1 is attached to s-a and s-b.
+    async fn fake_metro() -> String {
+        use axum::routing::{get, post};
+        let authed = |h: &axum::http::HeaderMap| {
+            h.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer sess")
+        };
+        let app = axum::Router::new()
+            .route(
+                "/v1/me",
+                get(move |h: axum::http::HeaderMap| async move {
+                    if authed(&h) {
+                        (
+                            axum::http::StatusCode::OK,
+                            axum::Json(json!({"id": "alice"})),
+                        )
+                    } else {
+                        (axum::http::StatusCode::UNAUTHORIZED, axum::Json(json!({})))
+                    }
+                }),
+            )
+            .route(
+                "/v1/spaces",
+                get(|| async {
+                    axum::Json(json!({"spaces": [
+                        {"id": "s-a", "role": "owner"},
+                        {"id": "s-b", "role": "owner"},
+                        {"id": "s-c", "role": "owner"},
+                    ]}))
+                }),
+            )
+            .route(
+                "/v1/spaces/{sid}/runner",
+                get(
+                    |axum::extract::Path(sid): axum::extract::Path<String>| async move {
+                        axum::Json(if sid == "s-c" {
+                            json!({"runner": null})
+                        } else {
+                            json!({"runner": {"kind": "registered", "id": "rn-1", "name": "n"}})
+                        })
+                    },
+                ),
+            )
+            .route(
+                "/v1/runners",
+                get(|| async {
+                    axum::Json(json!({"runners": [{"id": "rn-1", "name": "n",
+                        "visibility": "personal", "can_manage": true}]}))
+                }),
+            )
+            .route(
+                "/v1/runner/claim",
+                post(|| async { axum::http::StatusCode::NO_CONTENT }),
+            );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn runner_folder_routes() {
+        let url = fake_metro().await;
+        let t = tempfile::tempdir().unwrap();
+        let base = chosen::canonical(t.path()).unwrap();
+        let tools_root = base.join("data").join("local-tools");
+        let h = BoundSession::signed_in(&url, &Secret::new("sess"), "alice").unwrap();
+        let rec = runner::Record {
+            server_url: h.server_url().to_owned(),
+            account_id: "alice".into(),
+            name: "n".into(),
+            state: runner::RecordState::Active,
+            runner_id: Some("rn-1".into()),
+            token: Some(Secret::new("metro_rt_v2_x")),
+        };
+        runner::save(&store::open_root(&tools_root).unwrap(), &h, &rec).unwrap();
+        let tools = DesktopTools::new(tools_root.clone());
+        let call = |m: &'static str, p: String, b: Value| {
+            let (tools, h) = (&tools, h.clone());
+            async move {
+                let body = if b.is_null() {
+                    Vec::new()
+                } else {
+                    b.to_string().into_bytes()
+                };
+                tools.handle(m, &p, &body, Some(h)).await
+            }
+        };
+        let path = |sid: &str| format!("/v1/local-tools/runner/spaces/{sid}/folder");
+        let s = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        let work = base.join("work");
+        for d in ["a", "a/inner", "b"] {
+            std::fs::create_dir_all(work.join(d)).unwrap();
+        }
+
+        // Default folder first.
+        let (st, v) = call("POST", path("s-a"), json!({})).await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["custom"], false);
+        assert_eq!(v["attached"], true);
+        assert_eq!(v["folder"], v["default_folder"]);
+        assert_eq!(v["tools"], json!(runner::TOOLS));
+
+        // Choose one: stored canonical.
+        let raw = format!("{}/./", work.join("a").display());
+        let (st, v) = call("PUT", path("s-a"), json!({"path": raw})).await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["custom"], true);
+        assert_eq!(v["folder"], s(&work.join("a")));
+        assert!(v["folder_problem"].is_null());
+        assert_ne!(v["folder"], v["default_folder"]);
+        let (_, v) = call("POST", path("s-a"), json!({})).await;
+        assert_eq!(v["folder"], s(&work.join("a")));
+
+        // Refusals.
+        for (sid, p, status, code) in [
+            ("s-b", s(&work.join("a")), 422, "folder_overlaps"),
+            ("s-b", s(&work.join("a/inner")), 422, "folder_overlaps"),
+            ("s-b", s(&work), 422, "folder_overlaps"),
+            ("s-b", "relative/x".into(), 422, "folder_not_absolute"),
+            ("s-b", s(&work.join("missing")), 422, "folder_missing"),
+            ("s-b", s(&tools_root), 422, "folder_in_app_data"),
+            ("s-b", s(&base), 422, "folder_in_app_data"),
+            ("s-c", s(&work.join("b")), 409, "not_attached"),
+            ("s-x", s(&work.join("b")), 404, "not_found"),
+            ("..", s(&work.join("b")), 404, "not_found"),
+        ] {
+            let (st, v) = call("PUT", path(sid), json!({"path": p})).await;
+            assert_eq!(
+                (st, v["error"]["code"].as_str()),
+                (status, Some(code)),
+                "{sid} {p}: {v}"
+            );
+        }
+        for body in [
+            json!({}),
+            json!({"path": 1}),
+            json!({"path": "/x", "more": 1}),
+        ] {
+            let (st, _) = call("PUT", path("s-b"), body).await;
+            assert_eq!(st, 422);
+        }
+        let (st, _) = call("POST", path("s-a"), json!({"path": "/x"})).await;
+        assert_eq!(st, 422);
+        let (st, _) = call("GET", path("s-a"), Value::Null).await;
+        assert_eq!(st, 405);
+
+        let (st, v) = call("PUT", path("s-b"), json!({"path": s(&work.join("b"))})).await;
+        assert_eq!(st, 200, "{v}");
+        let (st, v) = call("GET", "/v1/local-tools/runner/folders".into(), Value::Null).await;
+        assert_eq!(st, 200);
+        assert_eq!(
+            v["folders"],
+            json!([
+                {"space_id": "s-a", "folder": s(&work.join("a"))},
+                {"space_id": "s-b", "folder": s(&work.join("b"))},
+            ])
+        );
+        let (st, _) = call("POST", "/v1/local-tools/runner/folders".into(), json!({})).await;
+        assert_eq!(st, 405);
+
+        // A chosen folder that went away is reported, not replaced.
+        std::fs::remove_dir_all(work.join("b")).unwrap();
+        let (_, v) = call("POST", path("s-b"), json!({})).await;
+        assert_eq!(v["custom"], true);
+        assert!(v["folder_problem"].as_str().is_some(), "{v}");
+
+        // Clearing: back to the default; files stay where they are.
+        std::fs::write(work.join("a/keep.txt"), "x").unwrap();
+        let (st, v) = call("DELETE", path("s-a"), Value::Null).await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!(v["custom"], false);
+        assert_eq!(v["folder"], v["default_folder"]);
+        assert!(v.get("attached").is_none());
+        assert!(work.join("a/keep.txt").is_file());
+        let (st, _) = call("DELETE", path("s-a"), Value::Null).await;
+        assert_eq!(st, 200, "clearing twice is fine");
+        let (_, v) = call("GET", "/v1/local-tools/runner/folders".into(), Value::Null).await;
+        assert_eq!(v["folders"].as_array().unwrap().len(), 1);
+        // Now s-a's old folder is free for s-c... once attached; s-b's
+        // stale choice still counts for overlap.
+        std::fs::create_dir_all(work.join("b/deeper")).unwrap();
+        let (st, v) = call(
+            "PUT",
+            path("s-a"),
+            json!({"path": s(&work.join("b/deeper"))}),
+        )
+        .await;
+        assert_eq!(
+            (st, v["error"]["code"].as_str()),
+            (422, Some("folder_overlaps"))
+        );
+
+        // Without a session nothing is read or changed.
+        let (st, v) = tools.handle("DELETE", &path("s-b"), b"", None).await;
+        assert_eq!((st, v["error"]["code"].as_str()), (409, Some("no_session")));
+        // Another account's session doesn't see these choices.
+        let bob = BoundSession::signed_in(&url, &Secret::new("sess"), "bob").unwrap();
+        let (st, v) = tools
+            .handle("GET", "/v1/local-tools/runner/folders", b"", Some(bob))
+            .await;
+        assert_eq!(st, 422, "the server says this session is alice: {v}");
+        tools.stop_all().await;
     }
 
     #[tokio::test]

@@ -13,6 +13,8 @@ import { pagesApi } from "./pages";
 import type { PageDraftEvent } from "./pages";
 import { profileApi } from "./profile";
 import { serverUpdateApi } from "./serverUpdate";
+import { readSpaceShell, shellApi } from "./shell";
+import type { SpaceShell } from "./shell";
 import { spacesApi } from "./spaces";
 import type { RawFn } from "./profile";
 import { parseWebTool, webSearchPrefsApi } from "./webSearch";
@@ -164,6 +166,8 @@ export type RunnerUpdate = {
 export type RegisteredRunner = {
   id: string; name: string; visibility: RunnerVisibility; canManage: boolean;
   presence?: RunnerPresence; update?: RunnerUpdate;
+  /** Marked by the server as a desktop app's built-in runner (set at Set up and Reconnect). */
+  builtIn?: boolean;
 };
 
 /**
@@ -579,6 +583,8 @@ export function createClient(options: ClientOptions) {
     return {
       runner: runner && isAssignmentRevision(data.assignment_revision) ? { ...runner, assignmentRevision: data.assignment_revision } : runner,
       guardedTokenChanges: data.guarded_token_changes === true,
+      /** The effective shell policy (0.6.3); null without a runner or from an older server. */
+      shell: (runner ? readSpaceShell(data.shell) : null) satisfies SpaceShell | null,
     };
   }
 
@@ -600,6 +606,8 @@ export function createClient(options: ClientOptions) {
     ...monitoringApi(request),
     ...webSearchPrefsApi(request),
     ...serverUpdateApi(request),
+    // Runner shell policy and approvals (src/api/shell.ts).
+    ...shellApi(request),
 
     async me(): Promise<Me> {
       const data = await request("GET", "/v1/me");
@@ -1150,6 +1158,7 @@ function toRegisteredRunner(v: { id: string | number; name: string; visibility: 
   const at = isObject(last) ? runnerTimestamp(last.at) : null;
   return {
     id: String(v.id), name: v.name, visibility: v.visibility, canManage: v.can_manage === true,
+    ...((v as { built_in?: unknown }).built_in === true ? { builtIn: true } : {}),
     presence: presence && {
       seenAt: runnerTimestamp(presence.seen_at), online: presence.online === true, version: runnerVersion(presence.version),
       install: install === "managed" || install === "unmanaged" || install === "container" || install === "desktop" ? install : null,

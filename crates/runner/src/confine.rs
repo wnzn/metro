@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 pub const MAX_PATH_LEN: usize = 4096;
 pub const MAX_READ_BYTES: usize = 1024 * 1024;
 pub const MAX_LIST_ENTRIES: usize = 2000;
+pub const MAX_WRITE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug)]
 pub enum ConfineError {
@@ -203,6 +204,130 @@ impl Workspace {
             size,
             truncated,
         })
+    }
+
+    /// Create or replace a regular file with `content`, creating missing
+    /// parent directories (0755). Stricter than reads: no `..` component and
+    /// no symlink anywhere in the path. The file is written to a temporary
+    /// name in its directory and renamed over the target, so a hard link at
+    /// the target is replaced, never written through; a FIFO or device is
+    /// refused.
+    pub fn write(&self, rel: &str, content: &[u8]) -> Result<u64, ConfineError> {
+        if content.len() > MAX_WRITE_BYTES {
+            return Err(ConfineError::InvalidPath(format!(
+                "content exceeds {MAX_WRITE_BYTES} bytes"
+            )));
+        }
+        let rel = validate_rel(rel)?;
+        let mut parts: Vec<&str> = Vec::new();
+        for comp in rel.split('/') {
+            match comp {
+                "" | "." => {}
+                ".." => {
+                    return Err(ConfineError::InvalidPath(
+                        "`..` is not allowed in a write path".into(),
+                    ));
+                }
+                c => parts.push(c),
+            }
+        }
+        let Some((name, dirs)) = parts.split_last() else {
+            return Err(ConfineError::InvalidPath("path names no file".into()));
+        };
+        let strict = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS;
+        let mut dir = openat2(
+            self.root.as_fd(),
+            ".",
+            libc::O_PATH | libc::O_DIRECTORY,
+            strict,
+        )?;
+        for comp in dirs {
+            dir = match openat2(dir.as_fd(), comp, libc::O_PATH | libc::O_DIRECTORY, strict) {
+                Ok(d) => d,
+                Err(ConfineError::NotFound) => {
+                    let c = CString::new(*comp)
+                        .map_err(|_| ConfineError::InvalidPath("NUL byte".into()))?;
+                    // SAFETY: dir is a valid directory fd and c is NUL-terminated.
+                    if unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o755) } != 0 {
+                        let e = io::Error::last_os_error();
+                        if e.raw_os_error() != Some(libc::EEXIST) {
+                            return Err(ConfineError::Io(e));
+                        }
+                    }
+                    openat2(dir.as_fd(), comp, libc::O_PATH | libc::O_DIRECTORY, strict)?
+                }
+                Err(e) => return Err(e),
+            };
+        }
+        // The target, if present, must be a regular file (never a symlink).
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let target =
+            CString::new(*name).map_err(|_| ConfineError::InvalidPath("NUL byte".into()))?;
+        // SAFETY: dir and target are valid; st is writable.
+        let exists = unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                target.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == 0;
+        let mode = if exists {
+            match st.st_mode & libc::S_IFMT {
+                libc::S_IFREG => st.st_mode & 0o777,
+                libc::S_IFLNK => return Err(ConfineError::Escape),
+                libc::S_IFDIR => {
+                    return Err(ConfineError::InvalidPath("path is a directory".into()));
+                }
+                _ => return Err(ConfineError::NotAFile),
+            }
+        } else {
+            0o644
+        };
+        let tmp_name = format!(".metro-write-{:016x}", crate::util::random_u64());
+        let tmp = CString::new(tmp_name.as_str()).expect("no NUL");
+        // SAFETY: dir is a directory fd; tmp is NUL-terminated. O_EXCL|O_NOFOLLOW
+        // never opens an existing entry.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                tmp.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                mode as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(ConfineError::Io(io::Error::last_os_error()));
+        }
+        // SAFETY: fd is a fresh descriptor owned here.
+        let mut file = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+        let unlink_tmp = || {
+            // SAFETY: dir and tmp are valid.
+            unsafe { libc::unlinkat(dir.as_raw_fd(), tmp.as_ptr(), 0) };
+        };
+        use std::io::Write as _;
+        if let Err(e) = file.write_all(content).and_then(|_| file.sync_all()) {
+            unlink_tmp();
+            return Err(ConfineError::Io(e));
+        }
+        // SAFETY: fd is valid; umask may have narrowed the create mode.
+        unsafe { libc::fchmod(file.as_raw_fd(), mode) };
+        drop(file);
+        // SAFETY: both names are relative to the same directory fd.
+        if unsafe {
+            libc::renameat(
+                dir.as_raw_fd(),
+                tmp.as_ptr(),
+                dir.as_raw_fd(),
+                target.as_ptr(),
+            )
+        } != 0
+        {
+            let e = io::Error::last_os_error();
+            unlink_tmp();
+            return Err(ConfineError::Io(e));
+        }
+        Ok(content.len() as u64)
     }
 
     /// List a directory (non-recursive), sorted by name, without following
@@ -470,6 +595,96 @@ mod tests {
         assert!(c.truncated);
         assert_eq!(c.text.len(), MAX_READ_BYTES);
         assert_eq!(c.size, (MAX_READ_BYTES + 10) as u64);
+    }
+
+    #[test]
+    fn writes_inside_and_creates_parents() {
+        let (_o, r, w) = ws();
+        assert_eq!(w.write("new/deep/f.txt", b"hi").unwrap(), 2);
+        assert_eq!(
+            std::fs::read_to_string(r.path().join("new/deep/f.txt")).unwrap(),
+            "hi"
+        );
+        // Replaces, keeping the mode.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            r.path().join("b.txt"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        w.write("./b.txt", b"new").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(r.path().join("b.txt")).unwrap(),
+            "new"
+        );
+        let mode = std::fs::metadata(r.path().join("b.txt"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // No temporary files left behind.
+        assert!(
+            w.list(".")
+                .unwrap()
+                .entries
+                .iter()
+                .all(|e| !e.name.starts_with(".metro-write-"))
+        );
+    }
+
+    #[test]
+    fn write_rejects_escapes() {
+        let (o, r, w) = ws();
+        symlink(o.path(), r.path().join("dir_link")).unwrap();
+        symlink("sub", r.path().join("inner_dir")).unwrap();
+        symlink(o.path().join("secret.txt"), r.path().join("file_link")).unwrap();
+        symlink("b.txt", r.path().join("inner_file")).unwrap();
+        for (path, why) in [
+            ("../x", "parent"),
+            ("sub/../b.txt", "any .."),
+            ("/tmp/x", "absolute"),
+            ("dir_link/x", "dir symlink out"),
+            ("inner_dir/x", "dir symlink in"),
+            ("file_link", "file symlink out"),
+            ("inner_file", "file symlink in"),
+            ("", "empty"),
+            (".", "no file"),
+            ("sub", "directory"),
+            ("a\0b", "NUL"),
+        ] {
+            assert!(w.write(path, b"x").is_err(), "{why}: {path:?}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(o.path().join("secret.txt")).unwrap(),
+            "TOP SECRET"
+        );
+        assert!(!o.path().join("x").exists());
+        // The links themselves are untouched.
+        assert!(
+            std::fs::symlink_metadata(r.path().join("inner_file"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(w.write("big", &vec![b'x'; MAX_WRITE_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn write_never_goes_through_a_hard_link() {
+        let (o, r, w) = ws();
+        let outside = o.path().join("hl-target");
+        std::fs::write(&outside, "keep").unwrap();
+        std::fs::hard_link(&outside, r.path().join("hl")).unwrap();
+        w.write("hl", b"changed").unwrap();
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+        assert_eq!(
+            std::fs::read_to_string(r.path().join("hl")).unwrap(),
+            "changed"
+        );
+        // A FIFO is refused, never opened.
+        let fifo = CString::new(r.path().join("fifo").to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(matches!(w.write("fifo", b"x"), Err(ConfineError::NotAFile)));
     }
 
     #[test]

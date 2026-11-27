@@ -62,8 +62,10 @@ const NO_AGENT: &str = "no such agent";
 /// Every entry an agent's tool allowlist may hold. The web tools run on the
 /// computer of whoever asks (`crate::web_tools`).
 pub fn all_tools() -> Vec<String> {
-    default_tools()
-        .into_iter()
+    RunnerTool::ALL
+        .iter()
+        .map(|t| t.runner_name().to_owned())
+        .chain([THREADS_TOOL.to_owned()])
         .chain(crate::pages::agent_tools::NAMES.map(str::to_owned))
         .chain([
             crate::web_tools::WEB_SEARCH.to_owned(),
@@ -74,7 +76,7 @@ pub fn all_tools() -> Vec<String> {
 
 /// Pages and web tools are opt-in, even for the Space's built-in agent.
 pub(crate) fn default_tools() -> Vec<String> {
-    RunnerTool::ALL
+    RunnerTool::DEFAULT
         .iter()
         .map(|t| t.runner_name().to_owned())
         .chain([THREADS_TOOL.to_owned()])
@@ -609,7 +611,7 @@ pub struct CreateBody {
     description: String,
     #[serde(default)]
     instructions: String,
-    /// Default: the original workspace and thread tools.
+    /// Default: [`default_tools`].
     #[serde(default)]
     tools: Option<Vec<String>>,
     #[serde(default)]

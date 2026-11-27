@@ -30,11 +30,12 @@ async function openSettingsFor(app: App, space = "acme") {
 
 const calls = (w: W, method: string, path: string) => w.s.log.filter((r) => r.method === method && r.path === path);
 
-for (const legacy of [false, true]) {
-  test(`new agent tool defaults stay opt-in (${legacy ? "legacy catalogue" : "explicit defaults"})`, async () => {
+for (const defaults of ["legacy", "empty", "current"] as const) {
+  test(`new agents use the server's tool defaults (${defaults})`, async () => {
     const w = spaceWorld();
-    w.s.toolCatalog = ["workspace.list", "workspace.read", "threads", "pages_list", "page_read", "page_propose", "web_search", "web_fetch"];
-    w.s.defaultTools = legacy ? undefined : []; // An explicit empty list is not a legacy response.
+    w.s.toolCatalog = ["workspace.list", "workspace.read", "workspace.write", "workspace.shell", "threads", "pages_list", "page_read", "page_propose", "web_search", "web_fetch"];
+    const current = ["workspace.list", "workspace.read", "workspace.write", "workspace.shell", "threads"];
+    w.s.defaultTools = defaults === "legacy" ? undefined : defaults === "empty" ? [] : current;
     const app = await signIn(w);
     await openSettingsFor(app);
     await app.press("id:space-settings-tab:agents");
@@ -42,15 +43,28 @@ for (const legacy of [false, true]) {
     await app.press("id:add-agent");
     await app.type("id:agent-name", "Fixture assistant");
     await app.type("id:agent-description", "Checks tool defaults.");
-    if (!legacy) {
+    expect(app.shows("id:agent-tools:workspace >> text:Write files")).toBe(true);
+    expect(app.shows("id:agent-tools:workspace >> text:Run shell commands")).toBe(true);
+    if (defaults === "empty") {
       await app.press("id:agent-tool:page_read");
       await app.press("id:agent-tool:web_search");
+      await app.press("id:agent-tool:workspace.write");
+      await app.press("id:agent-tool:workspace.shell");
     }
     await app.press("id:agent-save");
     await app.waitUntil(() => !app.shows("id:agent-editor"));
     expect(calls(w, "POST", "/v1/spaces/acme/agents")[0]!.body.tools).toEqual(
-      legacy ? ["workspace.list", "workspace.read", "threads"] : ["page_read", "web_search"],
+      defaults === "legacy" ? ["workspace.list", "workspace.read", "threads"] :
+        defaults === "empty" ? ["page_read", "web_search", "workspace.write", "workspace.shell"] : current,
     );
+    if (defaults === "current") {
+      await app.press("id:edit-agent:ag-1");
+      await app.clear("id:agent-description");
+      await app.type("id:agent-description", "Existing agent keeps its tools.");
+      await app.press("id:agent-save");
+      await app.waitFor("id:agent-editor", { state: "gone" });
+      expect(calls(w, "PATCH", "/v1/spaces/acme/agents/ag-1")[0]!.body).toEqual({ description: "Existing agent keeps its tools." });
+    }
   });
 }
 

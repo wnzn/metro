@@ -17,10 +17,11 @@ instead: `workspace.list` and `workspace.read` over one private folder per
 Space on that computer, with no check, MCP or commands. They're offered
 only when the Space has no runner, and they never replace one. See
 [apps/desktop/README.md](../apps/desktop/README.md#local-tools-on-this-computer).
-**The desktop app also has a runner built in** (in the source, not
-released): **Settings → Runners → This computer's runner → Set up** makes it
+**The desktop app also has a runner built in** (released in 0.6.2):
+**Settings → Runners → This computer's runner → Set up** makes it
 your personal registered runner for the server you're signed in to, and it
-runs while Metro is open, with list and read only. See
+runs while Metro is open. In 0.6.2 it lists and reads only; in the source,
+not released, it also writes files and runs shell commands. See
 [install.md](install.md#the-desktops-own-runner). Everything else on this
 page is the separately installed runner, for another machine, for check and
 MCP, or for one that runs while the app is closed.
@@ -33,6 +34,7 @@ MCP, or for one that runs while the app is closed.
 | Serves | Exactly one Space | Each Space it's attached to, and no other |
 | Workspace | `METRO_WORKSPACE` itself | One directory per Space: `METRO_WORKSPACE/spaces/<sid>/` |
 | Tools | list, read, and the operator's check and MCP | list and read. Check and MCP only in a per-Space Docker sandbox ([below](#check-and-mcp-on-a-registered-runner)). |
+| Write and shell (in the source, not released) | Yes; shell policy set by the Space owner | Yes; shell policy set by the runner's manager, with per-Space overrides |
 | Managed by | The Space owner | The runner's owner (personal) or the org admins (organization) |
 
 The runner works out which kind it is from the token's prefix alone, never
@@ -110,16 +112,19 @@ tool root. Each Space gets its own root under it:
 ```text
 /workspace/                  METRO_WORKSPACE, writable by the runner
 └── spaces/
-    ├── <sid-of-space-A>/    everything Space A's agent can list and read
-    └── <sid-of-space-B>/    everything Space B's agent can list and read
+    ├── <sid-of-space-A>/    Space A's root
+    └── <sid-of-space-B>/    Space B's root
 ```
 
 - The runner creates `spaces/<sid>/` the first time a job arrives for that
   Space. A claim without a valid Space id is refused.
-- A job for Space A can't reach `spaces/<sid-of-space-B>/` or anything else
-  outside Space A's root. File access uses
-  `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)`, the same as dedicated
-  runners.
+- A list, read or write job for Space A can't reach
+  `spaces/<sid-of-space-B>/` or anything else outside Space A's root. File
+  access uses `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)`, the same
+  as dedicated runners. A `workspace.shell` command (in the source, not
+  released) only starts in Space A's root: without the Docker sandbox it can
+  reach whatever the runner's user can, including Space B's directory
+  ([below](#shell-on-a-registered-runner-in-the-source-not-released)).
 - The runner refuses `/` as the base. It creates `spaces/` (mode 711) at
   startup, and each Space directory with mode 755.
 - `spaces/` and `spaces/<sid>/` must be real directories. A symlink in either
@@ -136,7 +141,8 @@ tool root. Each Space gets its own root under it:
 A check or MCP process that runs unsandboxed has the runner's own file access.
 On a registered runner that includes every sibling Space's directory, so a
 registered runner **never** runs check or MCP commands unsandboxed. By default
-it offers only `workspace.list` and `workspace.read`.
+it offers only `workspace.list` and `workspace.read` (and, in the source, not
+released, `workspace.write` and `workspace.shell`).
 
 With `METRO_SANDBOX=docker`, check and MCP commands run in a locked-down
 container that mounts only the claiming Space's directory, read-only, at
@@ -147,6 +153,37 @@ Linux runner binary on the host, not the runner image. See
 Dedicated runners keep their existing behaviour: with `METRO_SANDBOX=none`,
 check and MCP run with the runner's privileges over its one workspace.
 
+### Shell on a registered runner (in the source, not released)
+
+`workspace.shell` is not limited like check and MCP. It runs on a
+registered runner with or without the sandbox, and the
+[shell policy](runner.md#shell-commands-in-the-source-not-released) decides
+whether each command runs. Without `METRO_SANDBOX=docker` a command runs
+as the runner's user and can read and change every Space's directory under
+`METRO_WORKSPACE`, and anything else that user can reach. Before you choose
+**Always allow** or **Any Space member** for a runner that serves several
+Spaces, consider that a member of one Space could then reach the others.
+With the sandbox, the command sees only its own Space's directory.
+
+### Shell policy API (in the source, not released)
+
+| Request | Who | Result |
+| --- | --- | --- |
+| `GET /v1/runners/{id}/shell-policy` | the runner's manager | `{"runner_id", "runner_name", "visibility", "built_in", "default": {"shell_mode", "approver"}, "spaces": [...]}`; each Space has its override (`null` inherits), `effective_mode`, `effective_approver` and `downgraded_reason` |
+| `PUT /v1/runners/{id}/shell-policy` `{"shell_mode", "approver"}` | the runner's manager | The runner's default. `400` for `classify` on an organization runner. |
+| `PUT /v1/runners/{id}/spaces/{sid}/shell-policy` `{"shell_mode", "approver"}` (each may be `null`) | the runner's manager | One Space's override. `404` when the runner isn't attached there. |
+| `PUT /v1/spaces/{sid}/shell-policy` `{"shell_mode", "approver"}` | Space owner | A dedicated runner's policy. `409` without a dedicated token. |
+| `GET /v1/spaces/{sid}/runner` | members | Adds `"shell"`: `shell_mode`, `approver`, `effective_mode`, `downgraded_reason`, `runner_name` and `source` (`dedicated`, `runner_default` or `space_override`) |
+| `GET /v1/spaces/{sid}/shell-approvals` | members | Pending approvals, each with `can_decide` |
+| `POST /v1/spaces/{sid}/shell-approvals/{approval_id}` `{"decision": "approve" \| "deny"}` | eligible approvers | `200` when this decision won; `409` once decided, expired or cancelled; `403` for a member who can't approve; `404` otherwise |
+
+`shell_mode` is `off`, `approve`, `classify` or `allow`; `approver` is
+`owner` or `members`. `downgraded_reason` is `null`,
+`built_in_multiple_spaces` or `classify_unavailable`. `POST /v1/runners`
+and `POST /v1/runners/{id}/token` accept `"built_in": true` for a personal
+runner, and `GET /v1/runners` items include `built_in`; the desktop sets it
+for its own runner.
+
 ### Packaging is not sandboxing
 
 Running `metro-runner` inside a Docker container is a way to **package** it.
@@ -155,15 +192,17 @@ sets up below. It isn't the same as the **sandbox**, which is the opt-in
 `METRO_SANDBOX=docker` mode, where the runner starts a separate throwaway
 container for each check or MCP command. The bundled runner image has no
 Docker access, so it always runs with `METRO_SANDBOX=none`, and as a
-registered runner it offers list and read only.
+registered runner it offers no check or MCP. In the source, not released,
+its shell commands run inside the runner container, which can reach every
+Space's directory in the workspace volume.
 
 ## Run a registered runner in Docker
 
 These steps use the published runner image and need no Metro source. The
 workspaces live in a named Docker volume.
 
-> **Published:** `ghcr.io/wnzn/metro-runner:v0.6.1` is in
-> [Metro 0.6.1](https://github.com/wnzn/metro/releases/tag/v0.6.1). Pin it
+> **Published:** `ghcr.io/wnzn/metro-runner:v0.6.2` is in
+> [Metro 0.6.2](https://github.com/wnzn/metro/releases/tag/v0.6.2). Pin it
 > by the digest in the release's `IMAGES.txt`
 > ([deploy.md](deploy.md#release-files-and-images)). Contributors can build
 > the same image themselves ([development.md](development.md#images-and-binaries)).

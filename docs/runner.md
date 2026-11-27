@@ -22,9 +22,14 @@ runner runs the check and MCP commands with its own privileges on its host.
 Set `METRO_SANDBOX=docker` to run them in a locked-down container instead; see
 [Docker sandbox](#docker-sandbox-opt-in-fails-closed). A registered runner
 never runs them on the host, because they could read other Spaces' roots.
-With `METRO_SANDBOX=none` it offers list and read only, and `workspace.check`
-and the MCP tools return an error. With `docker`, they run in a container
-that mounts only the claiming Space's root.
+With `METRO_SANDBOX=none`, `workspace.check` and the MCP tools return an
+error. With `docker`, they run in a container that mounts only the claiming
+Space's root.
+
+`workspace.shell` (in the source, not released) is different: it runs on
+every runner, dedicated or registered, with or without the sandbox, and the
+server's [shell policy](#shell-commands-in-the-source-not-released) decides
+whether a command may run.
 
 Running the runner itself in a container (the `runner` image) is packaging,
 not this sandbox. That image has no Docker access, so it always uses
@@ -43,6 +48,20 @@ Containers use the host kernel, so this applies to them too.
 | `workspace.read` | Reads a UTF-8 text file beneath the workspace | 1 MiB (truncated beyond) |
 | `workspace.check` | Runs `METRO_CHECK_ARGV`; reports an error if unset | [Time limits](#time-limits), output capped |
 | MCP tools | From the stdio server in `METRO_MCP_ARGV`, if set | [Time limits](#time-limits) |
+| `workspace.write` | Creates or replaces one UTF-8 text file beneath the workspace (in the source, not released) | 1 MiB |
+| `workspace.shell` | Runs one command through the shell in the workspace (in the source, not released) | Command at most 16 KiB; 120 s default, 600 s max; 64 KiB per output stream |
+
+`workspace.write` uses the same path rules as read: the path is relative to
+the Space's root, and absolute paths, `..` and symlinks anywhere in the path
+are refused. It creates missing parent folders (mode 755), replaces the file
+atomically, and never writes through a hard link. It never needs approval.
+
+Both new tools are in the agents' default tool list: new agents, and agents
+created without an explicit list, get them. Agents created before 0.6.3
+keep their saved list and don't gain them; a Space owner adds
+`workspace.write` and `workspace.shell` to their tool list. Shell commands
+still follow the [shell policy](#shell-policy), which asks every time by
+default.
 
 ## Environment
 
@@ -52,7 +71,7 @@ invalid or contradictory value. Empty values count as unset.
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `METRO_RUNNER_TOKEN` | **required** | A dedicated Space token, or a registered runner credential (`metro_rt_v2_…`) |
-| `METRO_WORKSPACE` | **required** | An existing directory, canonicalized at startup. Registered runners need it writable, and refuse `/`. |
+| `METRO_WORKSPACE` | the current directory (in the source, not released; required in 0.6.2) | An existing directory, canonicalized at startup. Registered runners need it writable, and refuse `/`. Unset, the runner refuses a current directory of `/`. The runner image sets `/workspace`. |
 | `METRO_SERVER_URL` | `http://127.0.0.1:8787` | Set it explicitly for any runner that isn't on the server's machine. Plain `http://` is allowed only for loopback hosts. |
 | `METRO_ALLOW_INSECURE_HTTP` | `0` | Accepted for compatibility; not needed in 0.5.0. The runner warns on plain HTTP outside loopback and recognized Tailscale hosts. Prefer HTTPS or an SSH forward. |
 | `METRO_POLL_INTERVAL_MS` | `1000` | 50 – 600000 |
@@ -86,6 +105,106 @@ export METRO_CHECK_ARGV='["./check.sh"]'
 export METRO_MCP_ARGV='["/usr/local/bin/my-mcp-server","--stdio"]'
 ```
 
+## Shell commands (in the source, not released)
+
+`workspace.shell` is the only tool that runs a shell, and the agent writes
+the command, at most 16 KiB with no NUL character. The runner runs
+`/bin/sh -c <command>` (Windows, built-in runner only: `cmd.exe /d /s /c`)
+with the Space's root as its working folder, in its own process group, with
+stdin closed. The environment is cleared except `PATH`, `HOME`, `LANG`,
+`TERM=dumb` and `METRO_SPACE_ROOT` (on Windows, `USERPROFILE` instead of
+`HOME`, plus `SystemRoot`, `windir`, `ComSpec`, `PATHEXT`, `TEMP` and
+`TMP`); no Metro token is passed. The result looks like this:
+
+```text
+exit: <code | signal N>
+--- stdout ---
+...
+[metro-runner: stdout truncated, <total> bytes total]
+--- stderr ---
+...
+```
+
+Each stream keeps up to 64 KiB. The truncation line appears only when a
+stream was cut, and the built-in runner writes `metro-desktop` instead of
+`metro-runner`. Only exit code 0 counts as success. A command that didn't
+end on its own (timeout, cancellation, the runner stopping) fails, and its
+result starts with a line beginning `workspace.shell: `, such as
+`workspace.shell: timed out after <n>s and was killed`, followed by any
+output captured until then.
+
+**What this means for security.** Without the sandbox, a shell command runs
+as the runner's user, with that user's access to the machine. That includes
+other Spaces' folders on that machine, the runner's own files and the
+network. The folder is where the command starts, not a limit on what it can
+reach. With `METRO_SANDBOX=docker`, the command runs in the same locked-down
+container as checks, with no network, and only the Space's root mounted, this
+time read-write. So who may approve commands matters, and `classify` is a
+model's judgement, not containment.
+
+### Shell policy
+
+The server decides for each call, before any job reaches the runner:
+
+| Mode | Label in Settings | What a call does |
+| --- | --- | --- |
+| `off` | Off | The tool fails. No job, no approval. |
+| `approve` (default) | Ask every time | An approval card appears; the command runs only once someone approves it. |
+| `classify` | Ask when System One flags it | System One judges the command. It runs at once only when System One says *safe* with probability at least 0.8; otherwise an approval card appears with the reason. |
+| `allow` | Always allow | The command runs without asking. |
+
+Who approves is either the owner (default) or **Any Space member**. The
+owner choice is labelled **Runner owner** for a personal runner (its
+owner), **Org admin** for an organization runner (any org admin) and
+**Space owner** for a dedicated runner. An approver must be a current
+member of the Space when they decide; nobody approves from outside the
+Space.
+
+- A registered runner has one default policy and an optional override per
+  attached Space (**Inherit** uses the default), under **Settings →
+  Runners → Shell commands** for that runner. Only whoever manages the
+  runner reads or changes them. Overrides are dropped when the runner is
+  detached or the Space deleted.
+- A dedicated runner has one policy per Space, set by the Space owner
+  under **Space settings → Runner → Shell commands**.
+- Every member sees the effective policy for their Space under **Space
+  settings → Runner → Shell commands**, read-only.
+- Organization runners can't use *Ask when System One flags it*, because
+  there's no one owner whose System One connection would be used.
+- On the desktop's built-in runner, *Always allow* takes effect only while
+  it's attached to exactly one Space. Otherwise it acts as *Ask every time*,
+  and Settings says why.
+
+`classify` makes one System One call on the runner owner's System One
+connection (for a dedicated runner, the Space owner's). It sends only the
+command, the Space's name and the text of the message that started the run
+(at most 4,000 characters). If that person has no usable System One
+connection, or the call fails, the command waits for approval.
+
+### Approvals
+
+An approval appears in the run's room or thread as run activity, with the
+command, who started the run, the runner and the reason. Eligible approvers
+see **Approve** and **Deny**. It's never a message, never part of the
+agent's history, and never indexed or searchable.
+
+- The first decision wins. A later one gets `409`.
+- After 10 minutes with no decision it expires. A server restart expires
+  pending approvals too.
+- Stopping the run, any change to the Space's runner assignment (attach,
+  detach, replace, revoke, delete) or deleting the Space cancels it.
+  Rotating a token doesn't.
+- When nothing ran, the room shows a tool result from Metro, and the agent
+  gets the same text: `workspace.shell not run: ` followed by the reason.
+  The reasons are that shell is off, the command was denied (with who
+  denied it), nobody approved it within 10 minutes, the approval was
+  cancelled, or the person who started the run left the Space while it
+  waited.
+- Time spent waiting for approval, and running a shell command, doesn't
+  count against the run's own time limit.
+
+The API is in [runners.md](runners.md#shell-policy-api-in-the-source-not-released).
+
 ## Job semantics
 
 The server keeps the job queue in memory and never re-queues a job once it's
@@ -98,6 +217,14 @@ guarantee of completion, and choose commands that are safe to repeat if a
 person runs the action again. Stopping a run (`POST /v1/runs/{id}/stop`)
 halts the agent, but a job the runner has already claimed runs until it ends
 or hits its time limit.
+
+In the source, not released: while a `workspace.shell` job runs, both
+`metro-runner` and the desktop's built-in runner send
+`POST /v1/runner/jobs/{id}/heartbeat` about every 2 seconds. Both kill the
+command on `401` (credential revoked or rotated), `404` (job not found),
+`409` (job not claimed) or `410` (job expired or cancelled). A network error
+isn't a cancellation; the command keeps going until its timeout. Killing
+the command does not undo changes it already made.
 
 ## Time limits
 
@@ -120,6 +247,10 @@ accepted. To give a check more time, lower the HTTP timeout to match. For
 example, `METRO_CHECK_TIMEOUT_SECS=110` with `METRO_HTTP_TIMEOUT_SECS=10` is
 allowed.
 
+A `workspace.shell` job (in the source, not released) has its own limit: the
+agent may ask for 1 to 600 seconds (default 120), the runner kills the
+command at that time, and the server's lease is that time plus 60 seconds.
+
 These limits don't cover everything:
 
 - Removing a timed-out sandbox container (`docker rm -f`) can take up to 30
@@ -134,10 +265,10 @@ runner image or the Linux runner binary. Either needs Linux ≥ 5.6
 (`openat2`). The remote runner must reach the server over `https://`, so
 expose the server through a TLS reverse proxy (see [deploy.md](deploy.md)).
 
-> **Published in [Metro 0.6.1](https://github.com/wnzn/metro/releases/tag/v0.6.1):**
-> the image `ghcr.io/wnzn/metro-runner:v0.6.1` (`linux/amd64`,
+> **Published in [Metro 0.6.2](https://github.com/wnzn/metro/releases/tag/v0.6.2):**
+> the image `ghcr.io/wnzn/metro-runner:v0.6.2` (`linux/amd64`,
 > `linux/arm64`; pin the digest from the release's `IMAGES.txt`) and the
-> binary archive `Metro-runner-0.6.1-linux-x64.tar.gz` with its `.sha256`
+> binary archive `Metro-runner-0.6.2-linux-x64.tar.gz` with its `.sha256`
 > ([deploy.md](deploy.md#release-files-and-images)). Building them yourself
 > is contributor tooling ([development.md](development.md#images-and-binaries)).
 
@@ -210,6 +341,9 @@ docker run --rm --label dev.metro.runner=1 --pull=never --network=none
 - **No host fallback.** If Docker or the image is unavailable, the command
   fails. It never runs on the host.
 - **Read-only workspace, no network.** Only `/tmp` (tmpfs) is writable.
+  The exception is `workspace.shell` (in the source, not released): its
+  container mounts the Space's root read-write and runs the image's
+  `/bin/sh`, with the same other limits.
 - **One Space per container.** On a registered runner, the mounted workspace
   is the claiming Space's `spaces/<sid>/` root, never the base or a sibling.
 - The runner refuses to mount `/`, or a workspace that contains the Docker

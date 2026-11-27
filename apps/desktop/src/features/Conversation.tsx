@@ -60,6 +60,7 @@ import {
   status,
   steeredIn,
   toggleReaction,
+  activeRoomId,
 } from "../store";
 import { cancelQueuedTurn, queuedChatTurns } from "./meta/state";
 import type { Reactions as ReactionMap, RoomEvent } from "../store";
@@ -117,7 +118,10 @@ import { audienceText, kindLabel, mentionsMe, mentionText, reactionSummary, tone
 import { ActivityGroupRow, FailureBody, FoldableText } from "./activity/ActivityRow";
 import { failureText } from "./activity/failure";
 import { disclosureKey, disclosureScope } from "./activity/disclosure";
-import { DEFAULT_AGENT_NAME, groupTranscript } from "./activity/group";
+import { DEFAULT_AGENT_NAME, groupTranscript, isSystemEvent } from "./activity/group";
+import { ShellApprovalCard } from "./activity/ShellApprovalCard";
+import { readShellApproval, readShellResolution } from "../api/shell";
+import type { ShellResolution } from "../api/shell";
 import { PageDraftCard } from "./pages/PageDraftCard";
 import { SpacePostRow } from "./meta/SpacePostRow";
 import { clockFor, stampOf } from "./chatTime";
@@ -211,6 +215,15 @@ export function Transcript(props: TranscriptActions & { emptyText: string; empty
   const events = computed(() => (props.direct?.events() ?? (props.roomId ? eventsInRoom(props.roomId) : activeEvents()))
     .filter(e => e.kind !== "compaction" || !props.direct && e.compaction));
   const rows = computed(() => transcriptRows(groupTranscript(events()), events(), clock()));
+  const shellResolutions = computed(() => {
+    const out = new Map<string, ShellResolution>();
+    for (const e of events()) {
+      if (e.kind !== "shell_approval_resolved" || !isSystemEvent(e)) continue;
+      const r = readShellResolution(e.text);
+      if (r && !out.has(r.approvalId)) out.set(r.approvalId, r); // the first decision wins
+    }
+    return out;
+  });
   const ideas = () => props.ideas ?? [];
   const glyph = (): ChatGlyphName => (chat() || props.direct ? "chat" : "hash");
   let feed: import("nsh").ListRef | undefined;
@@ -253,7 +266,7 @@ export function Transcript(props: TranscriptActions & { emptyText: string; empty
         </If>
       }
     >
-      {(row) => <TranscriptRowView row={row} actions={props} />}
+      {(row) => <TranscriptRowView row={row} actions={props} shellResolutions={shellResolutions} />}
     </FeedList>
   );
 }
@@ -265,13 +278,19 @@ type Of<T extends TranscriptRow["type"]> = Extract<TranscriptRow, { type: T }>;
  * one collapsed group; people's messages, the agent's replies, errors and
  * status stay in full.
  */
-function TranscriptRowView(props: { row: () => TranscriptRow; actions: TranscriptActions }) {
+function TranscriptRowView(props: { row: () => TranscriptRow; actions: TranscriptActions; shellResolutions: () => ReadonlyMap<string, ShellResolution> }) {
   const row = props.row;
   const as = <T extends TranscriptRow["type"]>(type: T) => (row().type === type ? (row() as Of<T>) : null);
+  const shellResolutionFor = (e: RoomEvent) => {
+    const request = readShellApproval(e.text);
+    return request ? props.shellResolutions().get(request.approvalId) ?? null : null;
+  };
   const card = () => {
     const entry = as("event"), where = mainPlace();
     if (!entry) return null;
     if (entry.event.compaction) return entry;
+    // Run activity, never a message: a card wherever it appears (decisions only in a Space).
+    if (entry.event.kind === "shell_approval" && isSystemEvent(entry.event)) return entry;
     if (entry.event.kind === "page_draft" && (where === "space" || where === "chat")) return entry;
     return where === "chat" && entry.event.kind === "space_post" && entry.event.activity?.spacePost ? entry : null;
   };
@@ -283,8 +302,13 @@ function TranscriptRowView(props: { row: () => TranscriptRow; actions: Transcrip
           <If when={card()} else={<MessageRow row={() => row() as Of<"event">} actions={props.actions} />}>
             {entry => <If when={entry().event.compaction} else={
               <MessageFrame gutter={<StampGutter stamp={entry().stamp} id={entry().event.id} />} continued>
-                <If when={entry().event.kind === "space_post"} else={<PageDraftCard event={entry().event} />}>
-                  <SpacePostRow event={entry().event} />
+                <If when={entry().event.kind === "shell_approval"} else={
+                  <If when={entry().event.kind === "space_post"} else={<PageDraftCard event={entry().event} />}>
+                    <SpacePostRow event={entry().event} />
+                  </If>
+                }>
+                  <ShellApprovalCard event={entry().event} resolution={shellResolutionFor(entry().event)}
+                    roomId={props.actions.roomId ?? activeRoomId()} />
                 </If>
               </MessageFrame>
             }><CompactionMarker event={entry().event} stamp={entry().stamp}

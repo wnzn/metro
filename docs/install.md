@@ -3,12 +3,12 @@
 This guide uses published installers. See [Updates](updates.md) for the
 update controls and Linux journal diagnostic.
 
-> **Latest release: [Metro 0.6.1](https://github.com/wnzn/metro/releases/tag/v0.6.1)**
-> (2026-11-27, from `5384e8a`). Releases are published automatically when a
+> **Latest release: [Metro 0.6.2](https://github.com/wnzn/metro/releases/tag/v0.6.2)**
+> (2026-11-27, from `3c0e4d1`). Releases are published automatically when a
 > version bump is merged into the protected `main` branch
 > ([how](#official-releases)). Its `SHA256SUMS` is signed with Sigstore; its
 > Windows files are **not** code-signed. What was checked is in
-> [acceptance](acceptance.md#published-metro-061-2026-11-27-github-release-v061).
+> [acceptance](acceptance.md#published-metro-062-2026-11-27-github-release-v062).
 >
 > This page describes the per-user installer scripts at `fb7cb06`, the
 > Windows MSI from `ff28b09` onwards, and the desktop's runner screen at
@@ -87,12 +87,12 @@ against the Sigstore-verified `SHA256SUMS` before you run it
 come back once a certificate is set up and it says `signed`
 ([deploy.md](deploy.md#windows-releases-signed-or-unsigned)).
 
-**Unattended checks on native Windows.** In 0.6.1 and earlier releases, the
+**Unattended checks on native Windows.** In 0.6.2 and earlier releases, the
 run's `windows-distribution / preview` job on a GitHub `windows-2025`
 runner installed the unsigned MSI into a chosen folder, checked its
 payload, ran the server and uninstalled it, and passed the MSI lane's
 native tests (upgrade, repair, downgrade, uninstall), all unattended
-([0.6.1 release record](acceptance.md#published-metro-061-2026-11-27-github-release-v061), [0.6.0](acceptance.md#published-metro-060-2026-11-26-github-release-v060), [0.5.1](acceptance.md#published-metro-051-2026-11-26-github-release-v051), [0.5.0](acceptance.md#published-metro-050-2026-11-25-github-release-v050), [0.4.0](acceptance.md#published-metro-040-2026-11-25-github-release-v040), [0.3.2](acceptance.md#published-metro-032-2026-11-24-github-release-v032)).
+([0.6.2 release record](acceptance.md#published-metro-062-2026-11-27-github-release-v062), [0.6.1](acceptance.md#published-metro-061-2026-11-27-github-release-v061), [0.6.0](acceptance.md#published-metro-060-2026-11-26-github-release-v060), [0.5.1](acceptance.md#published-metro-051-2026-11-26-github-release-v051), [0.5.0](acceptance.md#published-metro-050-2026-11-25-github-release-v050), [0.4.0](acceptance.md#published-metro-040-2026-11-25-github-release-v040), [0.3.2](acceptance.md#published-metro-032-2026-11-24-github-release-v032)).
 Earlier local desktop GUI smoke tests ran under Wine on Linux, not on
 native Windows. **No person has verified the desktop GUI or the MSI
 wizard on native Windows.** See the [MSI notes](../packaging/windows-msi/README.md).
@@ -119,8 +119,8 @@ wizard on native Windows.** See the [MSI notes](../packaging/windows-msi/README.
   an unknown publisher, and to check the file against its SHA-256 checksum
   (`SHA256SUMS`) before installing. Windows SmartScreen may warn about it. Only a signed release
   has `Metro-<version>-windows-x64.msi`, signed with Authenticode ([check
-  it](#check-a-download)). The 0.6.1 release has the unsigned
-  `Metro-0.6.1-windows-x64.unsigned-preview.msi` only.
+  it](#check-a-download)). The 0.6.2 release has the unsigned
+  `Metro-0.6.2-windows-x64.unsigned-preview.msi` only.
 
 ### The portable ZIP and `install-metro-windows.ps1`
 
@@ -160,9 +160,9 @@ has never run.
 ## The desktop's own runner
 
 The desktop app has a runner built in, so you don't install one to give
-your Spaces tools on this computer. It's **in the source, not released**
-(after Metro 0.6.1); in Metro 0.6.1 and earlier it works only in the app's
-own local workspace and only when the installer asked for it.
+your Spaces tools on this computer. Since Metro 0.6.2, you can set it up on
+any server you're signed in to. In Metro 0.6.1 and earlier it worked only in
+the app's own local workspace and only when the installer asked for it.
 
 - **Set it up in the app.** Open **Settings → Runners → This computer's
   runner** and press **Set up**. Metro creates **one personal registered
@@ -172,9 +172,11 @@ own local workspace and only when the installer asked for it.
 - **It runs while Metro is open.** Later launches start it again for that
   server and account, without another press. It stops when you sign out,
   switch server or account, or quit Metro. It updates with the app.
-- **List and read only.** It lists and reads files in each attached Space's
-  own folder on this computer. It never runs commands, checks, MCP or
-  Docker, and opens no port.
+- **Tools.** In 0.6.2 it lists and reads files in each attached Space's own
+  folder on this computer, and never runs commands. In the source, not
+  released, it can also write files (`workspace.write`) and run shell
+  commands (`workspace.shell`) there, under the shell policy below. It
+  never runs checks, MCP or Docker, and opens no port.
 - **Installer choice.** The desktop installers still turn on **local runner
   support** for a new install, by placing an empty `enable-local-runner`
   file next to the launcher (on macOS, beside `Metro.app` in its private
@@ -191,7 +193,7 @@ own local workspace and only when the installer asked for it.
   new one.
 
 **Settings → Runners → This computer's runner** (`57409bb`) shows its name,
-its state and its read-only tools. It's hidden without the launcher (for
+its state and its tools. It's hidden without the launcher (for
 example in a browser) or with an older launcher.
 
 - **Choose where to attach it.** You can use the
@@ -201,6 +203,47 @@ example in a browser) or with an older launcher.
   never replace an existing assignment. Each attached Space gets its
   own folder, with **Show folder** and **Copy path** under this computer's
   runner.
+
+### Folders and shell commands (in the source, not released)
+
+- **Folder per Space.** Under this computer's runner, **Change** picks the
+  folder a Space's jobs use, for example an existing project, and **Use
+  default** goes back to the Space's own folder in Metro's data folder.
+  Only Spaces this runner is attached to can get a chosen folder. Metro
+  refuses a folder that doesn't exist, a link or junction, a drive or
+  filesystem root, your home folder itself (a folder inside it is fine),
+  anything inside or containing Metro's data folder, and a folder that is,
+  contains or sits inside another Space's chosen folder. Changing the
+  folder moves no files and applies from the next job. If a chosen folder
+  can't be used later (for example it was deleted), the Space's row says
+  why, and that Space's jobs fail with an error until you change it or
+  choose **Use default**; Metro never falls back to the default folder.
+- **Shell mode.** **Settings → Runners → Shell commands** sets this
+  runner's mode: **Off**, **Ask every time** (the default), **Ask when
+  System One flags it** or **Always allow**, and who approves: **Runner
+  owner** (you, the default) or **Any Space member**. Each Space can
+  override both or **Inherit** the default. **Always
+  allow** applies only while the runner is attached to exactly one Space;
+  with more, it asks every time. When a command needs approval, an
+  approval card with **Approve** and **Deny** appears in the room. See
+  [Shell commands](runner.md#shell-commands-in-the-source-not-released).
+- **What a command can reach.** A shell command runs as you, with your
+  access to this computer. It starts in the Space's folder but can read and
+  change anything you can, including other Spaces' folders, your files and
+  the network. There's no sandbox for the built-in runner. Keep **Ask every
+  time** and **Runner owner** unless you trust every member of the Space
+  with that access. **Ask when System One flags it** relies on a model's
+  judgement, which can be wrong.
+- **Stopping.** A command is stopped with everything it started when it
+  times out, when the run is stopped, when the runner stops (sign-out or
+  quitting Metro), and when the shell itself exits, so background
+  processes don't outlive it.
+- **Windows.** Shell commands run with `cmd.exe` and are stopped with
+  their Windows job object. A process started in the instant before it is
+  added to the job object may keep running after a stop. The refusal of
+  junctions as chosen folders hasn't been checked on a real Windows
+  machine.
+- Per-Space **Local tools** in **Use locally** stay list and read only.
 - **Recovery is explicit.** If its token is no longer accepted, or setup was
   interrupted, the state says so and nothing is retried on its own.
   **Reconnect…** first explains what it will do, then:
@@ -220,8 +263,8 @@ checks and MCP, or for a runner that keeps going while Metro is closed. See the
 ## A standalone runner (operators)
 
 For any Metro server, local or remote. First create the runner in
-**Settings → Runners → Add runner**; its credential is shown once. In the
-source, not released (0.6.2), the app shows the matching steps on tabs
+**Settings → Runners → Add runner**; its credential is shown once. Since
+0.6.2, the app shows the matching steps on tabs
 next to it: **Linux**, **Docker run** and **Docker Compose** (**Cloud** is
 coming soon). Save the credential to a file only you can read, without
 echoing it:
@@ -284,7 +327,7 @@ sh metro-runner-container.sh status
 - On a Linux host, the token file must be readable by the image's runner
   user (uid 1000); otherwise use the native runner.
 - The image named by `--version` is the GHCR runner image
-  `ghcr.io/wnzn/metro-runner:v<version>`, published in 0.6.1
+  `ghcr.io/wnzn/metro-runner:v<version>`, published in 0.6.2
   (`linux/amd64`, `linux/arm64`).
 
 ### Networking
@@ -336,9 +379,9 @@ that.
 
 ## Official releases
 
-> **This process published [Metro 0.6.1](https://github.com/wnzn/metro/releases/tag/v0.6.1)**
-> on 2026-11-27, from `5384e8a`, in CI run
-> [45949761195](https://github.com/wnzn/metro/actions/runs/45949761195).
+> **This process published [Metro 0.6.2](https://github.com/wnzn/metro/releases/tag/v0.6.2)**
+> on 2026-11-27, from `3c0e4d1`, in CI run
+> [45980066265](https://github.com/wnzn/metro/actions/runs/45980066265).
 > There's no Windows code-signing setup, so releases ship Windows unsigned
 > for now ([deploy.md](deploy.md#windows-releases-signed-or-unsigned)).
 

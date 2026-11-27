@@ -1,6 +1,6 @@
 # Metro desktop
 
-See [New in Metro 0.5.0](../../docs/released-0.5.0.md) for the published
+See [New in Metro 0.6.2](../../docs/released-0.6.2.md) for the published
 features or [In the source, not released](../../docs/next-source.md) for later work.
 
 The Metro desktop client, written in TSX on [Native Shell (NSH)](https://nsh.dev).
@@ -11,8 +11,8 @@ and Win32 on Windows. No npm or Node is needed to build or run it.
 
 Download the build for your system from
 [Releases](https://github.com/wnzn/metro/releases). The latest is
-[Metro 0.6.1](https://github.com/wnzn/metro/releases/tag/v0.6.1)
-([what was checked](../../docs/acceptance.md#published-metro-061-2026-11-27-github-release-v061)).
+[Metro 0.6.2](https://github.com/wnzn/metro/releases/tag/v0.6.2)
+([what was checked](../../docs/acceptance.md#published-metro-062-2026-11-27-github-release-v062)).
 Local checks cited here ran on local builds, not on the release files.
 You never need NSH, a
 checkout or a terminal to use the app; the build commands further down are
@@ -161,7 +161,7 @@ They never stand in for each other.
 | Server | This app's own local workspace | Any Metro server you're signed in to | Any Metro server, local or remote |
 | Who turns it on | The Space owner, under **Space settings → Runner** | You, with **Set up** in **Settings → Runners** (or the installer's choice, for the local workspace) | Its operator |
 | Attached to Spaces | That one Space | Only the Spaces the owner [explicitly chooses](../../docs/released-0.5.0.md#this-computers-runner) | As its owner or the Space owners choose |
-| Tools | List and read | List and read | List and read; check and MCP when configured ([runners.md](../../docs/runners.md)) |
+| Tools | List and read | List and read; write and shell in the source, not released | List and read; check and MCP when configured ([runners.md](../../docs/runners.md)); write and shell in the source, not released |
 | Runs while | Metro is open | Metro is open and signed in to that server | Its process or container runs |
 
 **The app's personal runner** (`baff3f0`, `e0982d7`, installers at
@@ -171,7 +171,7 @@ Debian 13 in the local
 scripted models; released in 0.3.2, not checked on Windows or macOS).
 Installing and recovery are in [docs/install.md](../../docs/install.md#the-desktops-own-runner).
 
-- In the source, not released: it's created when you press **Set up** under
+- Since 0.6.2, it's created when you press **Set up** under
   **Settings → Runners → This computer's runner**, for the server and
   account you're signed in to, local or remote. In the app's own local
   workspace the installer's `enable-local-runner` marker also creates it
@@ -192,11 +192,36 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   token if it's still one of your personal runners, or otherwise creates a
   new, unattached personal runner. (The launcher's local API can also take
   a runner ID you choose; the screen doesn't offer that.)
-- Each job must name a Space, and reads only that Space's own folder under
-  the app's data folder. It refuses checks, MCP and commands, uses no
-  Docker, and opens no inbound port. It starts with the app once set up,
-  and stops on sign-out, on switching server or account, and when Metro
-  quits.
+- Each job must name a Space, and works only in that Space's folder. In
+  0.6.2 that is its own folder under the app's data folder, and it refuses
+  commands. It refuses checks and MCP, uses no Docker, and opens no
+  inbound port. It starts with the app once set up, and stops on
+  sign-out, on switching server or account, and when Metro quits.
+- In the source, not released, it also runs `workspace.write` and
+  `workspace.shell`:
+  - **Folder per Space.** **Change** under this computer's runner picks an
+    existing folder for an attached Space; **Use default** returns to the
+    Space's own folder. Links and junctions, roots, the home folder
+    itself, anything inside or containing Metro's data folder, and folders
+    overlapping another Space's chosen folder are refused. Nothing is
+    moved. A chosen folder that stops working shows why on its row and
+    fails that Space's jobs visibly; there's no fallback to the default.
+  - **Shell mode.** **Settings → Runners → Shell commands** sets **Off**,
+    **Ask every time** (default), **Ask when System One flags it** or
+    **Always allow**, and who approves, **Runner owner** (default) or
+    **Any Space member**, with a per-Space override or **Inherit**.
+    **Always allow** applies only while the runner is attached to exactly
+    one Space. Members see the effective policy, read-only, under **Space
+    settings → Runner → Shell commands**.
+  - **Approval cards.** A command that needs approval shows a card with
+    the command in the room's run activity, with **Approve** and **Deny**
+    for eligible approvers. It expires after 10 minutes.
+  - **Access.** A shell command runs as you, with your access to this
+    computer, including other Spaces' folders. There's no sandbox. See
+    [install.md](../../docs/install.md#folders-and-shell-commands-in-the-source-not-released).
+  - On Windows, commands run with `cmd.exe` in a job object; a process
+    started just before it joins the job object may survive a stop.
+- **Local tools** in **Use locally** stay list and read only.
 
 ### Not verified yet
 
@@ -458,7 +483,7 @@ by automated tests. Windows and macOS weren't checked.
     a mode-600 file, or run `ghcr.io/wnzn/metro-runner:v<version>` with
     `docker run --env-file ./runner.env` and a named volume at `/workspace`.
     Each Space gets `spaces/<space id>/`. Metro never asks you to build the
-    runner. In the source, not released (0.6.2), these steps are on tabs,
+    runner. Since 0.6.2, these steps are on tabs
     for both this token and a Space's dedicated token: **Linux**, **Docker
     run** and **Docker Compose** (a `compose.yaml` that reads the same
     `runner.env` and uses a named workspace volume); **Cloud** is shown as
@@ -627,7 +652,7 @@ contributors only, in
 
 ## Windows portable package
 
-The release file is `Metro-0.6.1-windows-x64.zip`, a portable build with
+The release file is `Metro-0.6.2-windows-x64.zip`, a portable build with
 no installer.
 Release ZIPs ship without an Authenticode signature for now
 ([install.md](../../docs/install.md#desktop-on-windows)). No native Windows

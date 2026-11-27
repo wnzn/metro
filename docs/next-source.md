@@ -1,51 +1,68 @@
-# In the source, not released
+# Metro 0.6.3 (in the source, not released)
 
-## Metro 0.6.2 (in the source, not released)
+These changes are in the source after the
+[Metro 0.6.2 release](released-0.6.2.md). They aren't in any published
+release, and no release files contain them yet.
 
-These changes are in the source planned for Metro 0.6.2, after the
-published [Metro 0.6.1](released-0.6.1.md). None of them is in a
-release yet. See [Acceptance](acceptance.md#source-only-metro-062-lanes-2026-11-27-local)
-for what has been tested.
+## Changes
 
-- **A runner built into the desktop app.** **Settings → Runners → This
-  computer's runner → Set up** makes the app's built-in runner your
-  personal registered runner on whichever server you're signed in to,
-  local or remote, with no separate install. It runs while Metro is open,
-  updates with the app, lists and reads only, and is attached only where
-  you choose. Deleting it there turns it off on this computer and keeps
-  its folders. In 0.6.1 and earlier it worked only in the app's own local
-  workspace, when the installer asked for it. See
-  [the desktop's own runner](install.md#the-desktops-own-runner).
-- **Runner install tabs.** When a runner token is shown, its setup steps
-  are on tabs: **Linux** (the prebuilt binary archive), **Docker run**
-  and **Docker Compose** (the prebuilt runner image, with a private env
-  file and a named workspace volume). **Cloud** is shown as coming soon
-  and can't be chosen. No step contains the token. See
-  [A standalone runner](install.md#a-standalone-runner-operators).
-- **Readable dropdowns.** Dropdown and menu text keeps its contrast in
-  both the dark and the light theme.
-- **More context for classification.** When you've turned on
-  classification in a Space, System One also sees the Space, room and
-  member display names, and up to eight earlier messages in that room or
-  thread (400 characters each, 2,400 in total, with who wrote them and
-  whom they addressed). In a reply thread, the message it started from
-  comes first. *No agent* is now only for a message that talks to another
-  person, is only conversation about someone, or says no agent should
-  answer; a request to the room about someone still gets an agent. See
-  [Classification in 0.6.2](system-one.md#classification-in-062).
-- **Write while an agent replies.** The Chat composer stays usable while
-  Metro replies: **Queue** (the default) sends the message after the
-  current reply, **Steer** adds it to the running reply at its next step.
-  In Space rooms and threads, your next message to an agent that is
-  already working on your message there steers that run instead of
-  starting a second one. See [While an agent replies](messages.md#while-an-agent-replies).
-- **Chat threads.** Your personal Chat can have threads: start one with
-  **New thread**, or choose **Reply** on a Chat message. Each thread is
-  its own conversation with Metro, with its own history, summaries,
-  **Stop** and Queue/Steer line, so a turn in one never waits for another.
-  Rename or delete a thread from its menu; deleting is permanent and
-  removes everything in it. See [Chat threads](messages.md#chat-threads).
+- **Agents can write files.** A new runner tool, `workspace.write`,
+  creates or replaces one UTF-8 text file (at most 1 MiB) in the Space's
+  folder. It follows the same path rules as reading: no absolute paths,
+  no `..`, no links. It never asks for approval. See
+  [Tools](runner.md#tools).
+- **Agents can run shell commands.** A new runner tool, `workspace.shell`,
+  runs one command with `/bin/sh -c` (on Windows, `cmd.exe`) in the
+  Space's folder, for up to 120 seconds by default and 600 at most. It
+  works on dedicated and registered runners, standalone and built in. A
+  stopped run kills its command. See
+  [Shell commands](runner.md#shell-commands-in-the-source-not-released).
+- **Both tools are in the default tool list.** New agents, including a new
+  Space's default agent, get them unless their owner picks a list.
+  Agents created before 0.6.3 keep their saved list; a Space owner adds the
+  tools to them.
+- **Shell policy.** Each runner has a shell mode: **Off**, **Ask every
+  time** (the default), **Ask when System One flags it** or **Always
+  allow**, and who approves: the runner's owner (the default; **Org
+  admin** for an organization runner, **Space owner** for a dedicated one)
+  or **Any Space member**. A registered runner's manager sets its default and can
+  override it per Space; a dedicated runner's policy is set by the Space
+  owner. On the desktop's built-in runner, **Always allow** applies only
+  while it's attached to exactly one Space. Organization runners can't use
+  **Ask when System One flags it**. See
+  [Shell policy](runner.md#shell-policy).
+- **Approval cards.** A command that needs approval shows a card in the
+  room with **Approve** and **Deny** for eligible approvers. The first
+  decision wins; it expires after 10 minutes, and is cancelled when the
+  run stops or the Space's runner changes. Cards are run activity, never
+  messages, agent history or search results. Waiting for approval doesn't
+  use up the run's time limit. See [Approvals](runner.md#approvals).
+- **System One checks commands.** With **Ask when System One flags it**,
+  the runner owner's System One connection judges each command. Only a
+  confident *safe* runs without asking. See
+  [Shell command checks](system-one.md#shell-command-checks-in-the-source-not-released).
+- **A folder per Space for this computer's runner.** Under **Settings →
+  Runners → This computer's runner**, **Change** points an attached Space
+  at an existing folder, such as a project, and **Use default** goes back.
+  Metro refuses roots, the home folder itself, links, Metro's own data
+  folder and folders that overlap another Space's. See
+  [Folders and shell commands](install.md#folders-and-shell-commands-in-the-source-not-released).
+- **`METRO_WORKSPACE` is optional.** A standalone runner without it uses
+  the folder it was started in, and refuses `/`. See
+  [Environment](runner.md#environment).
+- **Shell in the Docker sandbox.** With `METRO_SANDBOX=docker`, shell
+  commands run in the locked-down container with no network and only the
+  Space's folder mounted, read-write. Check and MCP stay read-only and,
+  on registered runners, sandbox only.
 
-For the API, see [Chat threads](messages.md#chat-threads-1) and
-[Queue and steer](messages.md#queue-and-steer) under
-[Messaging API](messages.md#messaging-api).
+**Shell commands run as the runner's user**, with that user's access to
+the machine, including other Spaces' folders there unless the Docker
+sandbox is on. The built-in runner has no sandbox. Choose the approver
+with that in mind; System One's answer is a model's judgement, not
+containment.
+
+Known limits: on Windows, a process started in the instant before it joins
+the command's job object may survive a stop, and refusing a junction as a
+chosen folder hasn't been checked on a real Windows machine.
+
+For the API, see [Shell policy API](runners.md#shell-policy-api-in-the-source-not-released).

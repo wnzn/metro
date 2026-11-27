@@ -5,27 +5,27 @@ source is for contributors: [development.md](development.md).
 
 ## Release files and images
 
-> **Latest release: [Metro 0.6.1](https://github.com/wnzn/metro/releases/tag/v0.6.1)**,
-> published 2026-11-27 from commit `5384e8a` of
+> **Latest release: [Metro 0.6.2](https://github.com/wnzn/metro/releases/tag/v0.6.2)**,
+> published 2026-11-27 from commit `3c0e4d1` of
 > <https://github.com/wnzn/metro>. Releases are published automatically
 > when a version bump is merged into the protected `main` branch
 > ([CI and publishing](#ci-and-publishing)). Each archive and MSI comes
 > with a `.sha256` file beside it. The full release file list
 > is in [install.md](install.md#official-releases); what was checked is in
-> [acceptance](acceptance.md#published-metro-061-2026-11-27-github-release-v061).
+> [acceptance](acceptance.md#published-metro-062-2026-11-27-github-release-v062).
 > The image digests are in the release's
-> [`IMAGES.txt`](https://github.com/wnzn/metro/releases/download/v0.6.1/IMAGES.txt).
+> [`IMAGES.txt`](https://github.com/wnzn/metro/releases/download/v0.6.2/IMAGES.txt).
 
-| Part | Where | Name in 0.6.1 |
+| Part | Where | Name in 0.6.2 |
 | --- | --- | --- |
-| Server image | GitHub Container Registry | `ghcr.io/wnzn/metro-server:v0.6.1` (`linux/amd64`, `linux/arm64`) |
-| Runner image | GitHub Container Registry | `ghcr.io/wnzn/metro-runner:v0.6.1` (`linux/amd64`, `linux/arm64`) |
-| Media embedding image (optional) | GitHub Container Registry | `ghcr.io/wnzn/metro-embeddinggemma2:v0.6.1` (`linux/amd64`, no weights) |
-| Desktop, Windows x64 | [Releases](https://github.com/wnzn/metro/releases/tag/v0.6.1) | `Metro-0.6.1-windows-x64.zip` and `Metro-0.6.1-windows-x64.unsigned-preview.msi` (+ `.sha256`), **unsigned** |
-| Desktop, Linux x64 | Releases | `Metro-0.6.1-linux-x64.tar.gz` (+ `.sha256`) |
-| Runner, Linux x64 binary | Releases | `Metro-runner-0.6.1-linux-x64.tar.gz` (+ `.sha256`) |
+| Server image | GitHub Container Registry | `ghcr.io/wnzn/metro-server:v0.6.2` (`linux/amd64`, `linux/arm64`) |
+| Runner image | GitHub Container Registry | `ghcr.io/wnzn/metro-runner:v0.6.2` (`linux/amd64`, `linux/arm64`) |
+| Media embedding image (optional) | GitHub Container Registry | `ghcr.io/wnzn/metro-embeddinggemma2:v0.6.2` (`linux/amd64`, no weights) |
+| Desktop, Windows x64 | [Releases](https://github.com/wnzn/metro/releases/tag/v0.6.2) | `Metro-0.6.2-windows-x64.zip` and `Metro-0.6.2-windows-x64.unsigned-preview.msi` (+ `.sha256`), **unsigned** |
+| Desktop, Linux x64 | Releases | `Metro-0.6.2-linux-x64.tar.gz` (+ `.sha256`) |
+| Runner, Linux x64 binary | Releases | `Metro-runner-0.6.2-linux-x64.tar.gz` (+ `.sha256`) |
 
-`<tag>` is the release tag, `v` plus the version (for example `v0.6.1`).
+`<tag>` is the release tag, `v` plus the version (for example `v0.6.2`).
 The Windows files ship without an Authenticode signature until a
 code-signing certificate is set up
 ([Windows releases](#windows-releases-signed-or-unsigned)); expect
@@ -260,9 +260,9 @@ verified so far is in [acceptance.md](acceptance.md).
 
 ### Releases from `main` on a version bump
 
-This process published Metro 0.6.1 from `5384e8a` in CI run
-[45949761195](https://github.com/wnzn/metro/actions/runs/45949761195)
-([acceptance](acceptance.md#published-metro-061-2026-11-27-github-release-v061)).
+This process published Metro 0.6.2 from `3c0e4d1` in CI run
+[45980066265](https://github.com/wnzn/metro/actions/runs/45980066265)
+([acceptance](acceptance.md#published-metro-062-2026-11-27-github-release-v062)).
 
 `packaging/release_policy.py` decides. A release runs only for a
 **protected, non-deleted, non-forced push to `refs/heads/main`** of
@@ -336,7 +336,7 @@ Image and file signatures are bound to `refs/heads/main` and to the exact
 commit. A rerun after a failure resumes, and a rerun after success changes
 nothing. A prerelease version is never marked latest.
 
-A release needs this setup, which was in place for 0.6.1:
+A release needs this setup, which was in place for 0.6.2:
 
 - **The `main` branch,** the repository's default branch, protected against
   deletion and force pushes. Changes, including version bumps, arrive
@@ -435,10 +435,16 @@ in the same or a later pull request, because only a version bump releases.
   what that Space's members may see.
 - **Registered runner:** serves each Space it's attached to, each in its own
   `spaces/<sid>/` root. Members of one Space can't reach another Space's
-  root through it, and it never runs check or MCP commands on the host. Its
-  operator can read every Space root on that machine, so a Space owner who
-  attaches someone's runner is trusting that person with the Space's
-  files.
+  root through its list, read and write tools, and it never runs check or
+  MCP commands on the host. Its operator can read every Space root on that
+  machine, so a Space owner who attaches someone's runner is trusting that
+  person with the Space's files.
+- **Shell commands** (in the source, not released): `workspace.shell` runs
+  as the runner's user. Without the Docker sandbox it can reach everything
+  that user can, including other Spaces' roots on the same runner. Whoever
+  may approve commands, or **Always allow**, decides who effectively has
+  that access. A System One check is a model's judgement, not containment.
+  See [runner.md](runner.md#shell-commands-in-the-source-not-released).
 - **Model provider:** room, thread and Chat history, with author and
   recipient labels, plus tool output (up to 64 KiB per tool call) go to the
   model connection of whoever started the run. That's their device connector,
