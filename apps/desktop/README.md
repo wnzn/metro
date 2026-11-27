@@ -1,6 +1,6 @@
 # Metro desktop
 
-See [New in Metro 0.5.0](../../docs/released-0.5.0.md) for the published
+See [New in Metro 0.6.2](../../docs/released-0.6.2.md) for the published
 features or [In the source, not released](../../docs/next-source.md) for later work.
 
 The Metro desktop client, written in TSX on [Native Shell (NSH)](https://nsh.dev).
@@ -11,8 +11,8 @@ and Win32 on Windows. No npm or Node is needed to build or run it.
 
 Download the build for your system from
 [Releases](https://github.com/wnzn/metro/releases). The latest is
-[Metro 0.6.1](https://github.com/wnzn/metro/releases/tag/v0.6.1)
-([what was checked](../../docs/acceptance.md#published-metro-061-2026-11-27-github-release-v061)).
+[Metro 0.6.2](https://github.com/wnzn/metro/releases/tag/v0.6.2)
+([what was checked](../../docs/acceptance.md#published-metro-062-2026-11-27-github-release-v062)).
 Local checks cited here ran on local builds, not on the release files.
 You never need NSH, a
 checkout or a terminal to use the app; the build commands further down are
@@ -171,7 +171,7 @@ Debian 13 in the local
 scripted models; released in 0.3.2, not checked on Windows or macOS).
 Installing and recovery are in [docs/install.md](../../docs/install.md#the-desktops-own-runner).
 
-- In the source, not released: it's created when you press **Set up** under
+- Since 0.6.2, it's created when you press **Set up** under
   **Settings → Runners → This computer's runner**, for the server and
   account you're signed in to, local or remote. In the app's own local
   workspace the installer's `enable-local-runner` marker also creates it
@@ -458,7 +458,7 @@ by automated tests. Windows and macOS weren't checked.
     a mode-600 file, or run `ghcr.io/wnzn/metro-runner:v<version>` with
     `docker run --env-file ./runner.env` and a named volume at `/workspace`.
     Each Space gets `spaces/<space id>/`. Metro never asks you to build the
-    runner. In the source, not released (0.6.2), these steps are on tabs,
+    runner. Since 0.6.2, these steps are on tabs
     for both this token and a Space's dedicated token: **Linux**, **Docker
     run** and **Docker Compose** (a `compose.yaml` that reads the same
     `runner.env` and uses a named workspace volume); **Cloud** is shown as
@@ -627,7 +627,7 @@ contributors only, in
 
 ## Windows portable package
 
-The release file is `Metro-0.6.1-windows-x64.zip`, a portable build with
+The release file is `Metro-0.6.2-windows-x64.zip`, a portable build with
 no installer.
 Release ZIPs ship without an Authenticode signature for now
 ([install.md](../../docs/install.md#desktop-on-windows)). No native Windows

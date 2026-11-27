@@ -208,7 +208,7 @@ a named agent mention.
 
 ### Classification in 0.6.2
 
-**In the source, not released.** The classifier now gets more of the
+The classifier gets more of the
 conversation and a narrower reason to stay quiet. For unaddressed text,
 the sender's System One connection receives, along with the agent
 options and the new message:

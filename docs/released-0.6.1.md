@@ -74,4 +74,4 @@ completion activity still carries `outcome: "no_reply"`; the desktop
 shows nothing for it. A run whose message was deleted keeps its status
 in `/v1/runs` with an empty `task`.
 
-Later changes are [in the source, not released](next-source.md).
+The [0.6.2 changes](released-0.6.2.md) came in the next release.

@@ -2,8 +2,8 @@
 
 Markdown, Reply, Forward, the directory and DMs are in the published
 [Metro 0.6.0](released-0.6.0.md), and **Delete** in [Metro 0.6.1](released-0.6.1.md).
-**Chat threads** and writing **while an agent replies** are in the source,
-not released, planned for 0.6.2 ([source overview](next-source.md)).
+**Chat threads** and writing **while an agent replies** are in
+[Metro 0.6.2](released-0.6.2.md).
 
 ## Markdown
 
@@ -39,7 +39,7 @@ opens a Chat thread (below).
 
 ## Chat threads
 
-**In the source, not released (0.6.2).** Your personal Chat can have
+**Since 0.6.2.** Your personal Chat can have
 threads: separate conversations with Metro, listed under **Chat** in the
 navigation while the Chat is open. Use **New thread** and give it a title,
 or choose **Reply** on a message or reply in the main Chat to open the
@@ -103,7 +103,7 @@ forwarded, and anything already sent to a model, aren't affected.
 
 ## While an agent replies
 
-**In the source, not released (0.6.2).** You can keep writing while an
+**Since 0.6.2.** You can keep writing while an
 agent replies.
 
 **Personal Chat.** **Send** stays next to **Stop**. While Metro replies,
@@ -184,7 +184,7 @@ conversations and messages generally return `404`.
 
 ### Chat threads
 
-**In the source, not released (0.6.2).** Only the Chat's owner can use
+**Since 0.6.2.** Only the Chat's owner can use
 these; anyone else, and an unknown thread, gets `404`.
 
 | Request | Does |
@@ -232,7 +232,7 @@ so older clients keep receiving messages only.
 
 ### Queue and steer
 
-**In the source, not released (0.6.2).**
+**Since 0.6.2.**
 
 - `POST /v1/chat/messages` accepts `delivery`: `"queue"` (the default) or
   `"steer"`. Older servers reject the field with `422`. A person's Chat
