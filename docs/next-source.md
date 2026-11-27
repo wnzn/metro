@@ -15,6 +15,12 @@
   In Space rooms and threads, your next message to an agent that is
   already working on your message there steers that run instead of
   starting a second one. See [While an agent replies](messages.md#while-an-agent-replies).
+- **Chat threads.** Your personal Chat can have threads: start one with
+  **New thread**, or choose **Reply** on a Chat message. Each thread is
+  its own conversation with Metro, with its own history, summaries,
+  **Stop** and Queue/Steer line. Rename or delete a thread from its menu;
+  deleting is permanent and removes everything in it. See
+  [Chat threads](messages.md#chat-threads).
 
 These changes are in the source planned for Metro 0.6.1, after the
 published [Metro 0.6.0](released-0.6.0.md). See [Acceptance](acceptance.md)

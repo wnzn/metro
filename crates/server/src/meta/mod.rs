@@ -92,6 +92,8 @@ pub struct PostedAgent {
 pub struct Ctx {
     pub state: AppState,
     pub user: String,
+    /// The Chat thread this turn answers in (`None`: the main Chat).
+    pub thread: Option<String>,
     /// The person's display name as on their latest message: the author
     /// name of what Metro posts for them.
     pub name: String,
@@ -116,6 +118,7 @@ impl Ctx {
     pub fn new(
         state: &AppState,
         user: &str,
+        thread: Option<&str>,
         turn: &Activity,
         trigger: &crate::db::Event,
         earlier: &[crate::db::Event],
@@ -129,6 +132,7 @@ impl Ctx {
         Self {
             state: state.clone(),
             user: user.to_owned(),
+            thread: thread.map(str::to_owned),
             name: trigger.actor.clone(),
             turn: turn.clone(),
             budget: budget::Budget::default(),
@@ -203,7 +207,15 @@ pub(crate) fn untrusted(body: &str) -> String {
 /// Running personal Chat turns, so their owner can stop them. Stopping a
 /// turn never stops a Space run it delegated to.
 #[derive(Default)]
-pub struct ChatTurns(Mutex<HashMap<String, (String, watch::Sender<bool>)>>);
+pub struct ChatTurns(Mutex<HashMap<String, Registered>>);
+
+/// A registered turn: its owner, its thread (`None`: the main Chat) and
+/// its Stop signal.
+struct Registered {
+    owner: String,
+    thread: Option<String>,
+    stop: watch::Sender<bool>,
+}
 
 /// Unregisters its turn when dropped.
 pub struct TurnGuard(Arc<ChatTurns>, String);
@@ -215,18 +227,27 @@ impl Drop for TurnGuard {
 }
 
 impl ChatTurns {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (String, watch::Sender<bool>)>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Registered>> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Register `user`'s turn `turn`; the receiver turns `true` on stop.
+    /// Register `user`'s turn `turn` in `thread` of their Chat; the
+    /// receiver turns `true` on stop.
     pub fn register(
         self: &Arc<Self>,
         turn: &str,
         user: &str,
+        thread: Option<&str>,
     ) -> (watch::Receiver<bool>, TurnGuard) {
         let (tx, rx) = watch::channel(false);
-        self.lock().insert(turn.to_owned(), (user.to_owned(), tx));
+        self.lock().insert(
+            turn.to_owned(),
+            Registered {
+                owner: user.to_owned(),
+                thread: thread.map(str::to_owned),
+                stop: tx,
+            },
+        );
         (rx, TurnGuard(self.clone(), turn.to_owned()))
     }
 
@@ -235,25 +256,37 @@ impl ChatTurns {
     pub fn turns_of(&self, user: &str) -> Vec<String> {
         self.lock()
             .iter()
-            .filter(|(_, (owner, _))| owner == user)
+            .filter(|(_, r)| r.owner == user)
             .map(|(id, _)| id.clone())
             .collect()
     }
 
-    /// Whether `user` has a Chat turn running.
-    pub fn running_for(&self, user: &str) -> bool {
-        self.lock().values().any(|(owner, _)| owner == user)
+    /// Whether `user` has a Chat turn running in `thread` (`None`: the
+    /// main Chat).
+    pub fn running_for(&self, user: &str, thread: Option<&str>) -> bool {
+        self.lock()
+            .values()
+            .any(|r| r.owner == user && r.thread.as_deref() == thread)
     }
 
     /// Stop `user`'s running turn `turn`. `false` for anyone else's or one
     /// that isn't running.
     pub fn stop(&self, turn: &str, user: &str) -> bool {
         match self.lock().get(turn) {
-            Some((owner, tx)) if owner == user => {
-                tx.send_replace(true);
+            Some(r) if r.owner == user => {
+                r.stop.send_replace(true);
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Stop every turn of `user` in their Chat thread `thread`.
+    pub fn stop_thread(&self, user: &str, thread: &str) {
+        for r in self.lock().values() {
+            if r.owner == user && r.thread.as_deref() == Some(thread) {
+                r.stop.send_replace(true);
+            }
         }
     }
 }

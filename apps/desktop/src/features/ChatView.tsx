@@ -11,7 +11,9 @@
 import { announce, cleanup, effect, keymap, signal } from "nsh";
 import type { ViewRef } from "nsh";
 import {
+  activeChatThread,
   activeEvents,
+  chatThreadsSupported,
   activeLoaded,
   chatUnavailable,
   canRetryRun,
@@ -24,7 +26,9 @@ import {
   draft,
   followUp,
   isActiveRun,
+  mainChatEvents,
   me,
+  openChatReplyThread,
   openRun,
   place,
   roomsOf,
@@ -46,10 +50,11 @@ import {
   chatDelivery,
 } from "../store";
 import type { Run } from "../store";
-import { Action, ActionBar, Badge, Banner, Chip, Column, Field, Icon, IconButton, Label, Modal, modalOpen, PanelToggle, ResizeHandle, Row, runsPanel, ScrollArea, SegmentedControl, Spacer, Surface } from "../ui";
+import { Action, ActionBar, Badge, Banner, Chip, Column, Field, Icon, IconButton, Label, Modal, modalOpen, MoreMenu, PanelToggle, ResizeHandle, Row, runsPanel, ScrollArea, SegmentedControl, Spacer, Surface } from "../ui";
 import { EmptyState, sidePanelFits, SuggestionChip } from "../ui/activity";
 import { runStatusLabel, runTitle, runTone } from "./activity/runs";
-import { Composer, ConnectionBanner, focusComposer, Transcript } from "./Conversation";
+import { Composer, ConnectionBanner, focusComposer, ThreadAnchor, Transcript } from "./Conversation";
+import { ChatThreadDialogs, threadMenuItems } from "./chatThreads/ChatThreads";
 import { CreateSpaceForm } from "./CreateSpaceForm";
 import { ModelOnboarding, needsChatModel } from "./ModelOnboarding";
 import { roomTree } from "./Sidebar";
@@ -84,13 +89,16 @@ export function ChatView() {
       <Surface variant="panel" grow>
         <Surface variant="toolbar" padX={4} padY={3} gap={3}>
           <Column grow gap={1}>
-            <Label variant="heading" testID="room-title">
-              Chat
+            <Label variant="heading" testID="room-title" lines={1}>
+              {activeChatThread()?.title ?? "Chat"}
             </Label>
             <Label variant="caption" color="muted" lines={2}>
-              Only you can open this chat in Metro.
+              {activeChatThread() ? "A thread in your Chat. Only you can open it." : "Only you can open this chat in Metro."}
             </Label>
           </Column>
+          <If when={activeChatThread()}>
+            {(t) => <MoreMenu testID="chat-thread-actions" accessibilityLabel={`More for ${t().title}`} items={threadMenuItems(t(), "chat-header")} />}
+          </If>
           <PanelToggle side="right" name="agent runs" testID="runs-toggle"
             status={runs().some(isActiveRun) ? `${runs().filter(isActiveRun).length} active` : undefined}
             attention={runs().some(isActiveRun)}
@@ -103,9 +111,17 @@ export function ChatView() {
         <If
           when={chatUnavailable()}
           else={
-            <If when={activeLoaded() && activeEvents().length === 0} else={<Transcript emptyText="No messages yet." />}>
-              <ChatEmpty />
-            </If>
+            <Column grow>
+              <If when={threadAnchor()}>
+                {(anchor) => <Column padX={4} padY={2} testID="chat-thread-anchor"><ThreadAnchor event={anchor()} /></Column>}
+              </If>
+              <If when={activeLoaded() && activeEvents().length === 0} else={
+                <Transcript emptyText="No messages yet."
+                  onReply={activeChatThread() || !chatThreadsSupported() ? undefined : event => void openChatReplyThread(event)} />
+              }>
+                <ChatEmpty />
+              </If>
+            </Column>
           }
         >
           {(message) => (
@@ -116,7 +132,7 @@ export function ChatView() {
         </If>
         <ChatNotice />
         <If when={runningChatTurn() && chatStopError()}><Banner tone="danger" message={chatStopError()} /></If>
-        <Composer placeholder="Message your Chat" agentHint="No runner or workspace tools here." disabled={!!chatUnavailable()}
+        <Composer placeholder={activeChatThread() ? "Message this thread" : "Message your Chat"} agentHint="No runner or workspace tools here." disabled={!!chatUnavailable()}
           stopReply={runningChatTurn() ? <>
             <SegmentedControl testID="chat-delivery" compact accessibilityLabel="While Metro replies, Send"
               value={chatDelivery()} onChange={setChatDelivery} options={DELIVERY_OPTIONS} />
@@ -137,11 +153,20 @@ export function ChatView() {
         <RunsPanel visible={runsPanel.open() && sidePanelFits()} />
         </Surface>
       </If>
+      <ChatThreadDialogs />
       <Modal testID="runs-dialog" title="Agent runs" open={runsDialogOpen() && !sidePanelFits()} onClose={() => runsDialogOpen.set(false)}>
         <RunsPanel visible={runsDialogOpen() && !sidePanelFits()} onClose={() => runsDialogOpen.set(false)} />
       </Modal>
     </Surface>
   );
+}
+
+/** The main-Chat message a reply thread answers, while it is loaded and not deleted. */
+function threadAnchor() {
+  const id = activeChatThread()?.anchorEventId;
+  if (id === undefined) return null;
+  const event = mainChatEvents().find(e => e.id === id);
+  return event && event.kind !== "deleted" ? event : null;
 }
 
 /** An empty Chat: what it is for, and drafts that only fill an empty message box. */

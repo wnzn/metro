@@ -29,8 +29,12 @@ use crate::db::{Activity, Addressed, Author, Event, actor, kind};
 /// Where a running turn takes steering.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Place {
-    /// `user`'s personal Chat.
-    Chat { user: String },
+    /// `user`'s main Chat (`thread` `None`) or one of its threads: each
+    /// has its own inbox.
+    Chat {
+        user: String,
+        thread: Option<String>,
+    },
     /// Runs of `agent` that `user` started in room (or thread) `room`.
     Room {
         space: String,
@@ -209,15 +213,17 @@ fn deliver(
 ) -> anyhow::Result<Option<Event>> {
     let author = Author::server(actor::AGENT);
     match place {
-        Place::Chat { user } => {
+        Place::Chat { user, thread } => {
+            // Only a message of the same thread (or the main Chat).
             let message = {
                 let conn = db.lock();
                 let mut stmt = conn.prepare(
                     "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at
-                     FROM personal_events WHERE id = ?1 AND user_id = ?2 AND kind = 'message'",
+                     FROM personal_events
+                     WHERE id = ?1 AND user_id = ?2 AND thread_id IS ?3 AND kind = 'message'",
                 )?;
                 use rusqlite::OptionalExtension;
-                stmt.query_row(rusqlite::params![id, user], crate::db::row_event)
+                stmt.query_row(rusqlite::params![id, user, thread], crate::db::row_event)
                     .optional()?
             };
             let Some(message) = message else {
@@ -325,6 +331,7 @@ mod tests {
     fn place() -> Place {
         Place::Chat {
             user: "alice".into(),
+            thread: None,
         }
     }
 

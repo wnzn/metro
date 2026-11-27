@@ -46,6 +46,7 @@ fn ctx(state: &AppState, user: &str) -> Ctx {
     Ctx {
         state: state.clone(),
         user: user.to_owned(),
+        thread: None,
         name: user.to_owned(),
         turn: Activity::chat(),
         budget: budget::Budget::default(),

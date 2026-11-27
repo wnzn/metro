@@ -1060,8 +1060,10 @@ pub enum WebScope {
         space_id: String,
         room_id: String,
     },
-    /// The initiator's own personal Chat.
-    PersonalChat,
+    /// The initiator's own personal Chat, or its thread `thread`.
+    PersonalChat {
+        thread: Option<String>,
+    },
 }
 
 /// The person and scope to reauthorize for the exact queued operation.
@@ -1138,7 +1140,7 @@ impl WebContext {
     /// prompt's author carries).
     async fn whose(&self) -> String {
         match self.scope {
-            WebScope::PersonalChat => "your".to_owned(),
+            WebScope::PersonalChat { .. } => "your".to_owned(),
             WebScope::Room { .. } => {
                 let user = self.user().to_owned();
                 let name = self
@@ -1166,14 +1168,15 @@ impl WebContext {
                     .append_with(space_id, room_id, kind, &author, &text, Some(&activity))
                     .await;
             }
-            WebScope::PersonalChat => {
-                let user = self.user().to_owned();
+            WebScope::PersonalChat { thread } => {
+                let (user, thread) = (self.user().to_owned(), thread.clone());
                 let r = self
                     .state
                     .db
                     .call(move |db| {
                         db.append_personal_with(
                             &user,
+                            thread.as_deref(),
                             kind,
                             &author,
                             &text,
@@ -1183,7 +1186,7 @@ impl WebContext {
                     })
                     .await;
                 if let Err(e) = r {
-                    tracing::error!(error = %format!("{e:#}"), "appending web tool event");
+                    crate::db::log_append_error(&e, "appending web tool event");
                 }
             }
         }
@@ -1217,7 +1220,7 @@ impl WebContext {
                     .monitor_space(space_id, Code::WebSearchUnavailable)
                     .await
             }
-            WebScope::PersonalChat => {
+            WebScope::PersonalChat { .. } => {
                 self.state
                     .monitor_personal(self.user(), Code::WebSearchUnavailable)
                     .await
@@ -1231,7 +1234,7 @@ impl WebContext {
                 caller: Caller::in_space(self.user(), space_id),
                 agent_id: self.agent_id.clone(),
             },
-            WebScope::PersonalChat => WebGrant::personal_chat(self.user()),
+            WebScope::PersonalChat { .. } => WebGrant::personal_chat(self.user()),
         }
     }
 

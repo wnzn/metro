@@ -11,6 +11,7 @@ pub mod agent_dispatch;
 pub mod api;
 pub mod attachments;
 pub mod auth;
+pub mod chat_threads;
 pub mod compaction;
 pub mod config;
 pub mod db;
@@ -365,6 +366,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::compaction::router())
         // Deleting a message: Space rooms and threads, personal Chat, DMs.
         .merge(crate::deletion::router())
+        .merge(crate::chat_threads::router())
         .layer(DefaultBodyLimit::max(HUMAN_BODY_LIMIT));
     // Room for the largest result plus JSON escaping.
     let runner_limit = state.config.limits.max_result_bytes * 2 + 1024;

@@ -677,6 +677,7 @@ impl Db {
              CREATE INDEX IF NOT EXISTS personal_events_user ON personal_events (user_id, id);",
         )?;
         add_activity_columns(&conn)?;
+        crate::chat_threads::init(&conn)?;
         add_space_description(&conn)?;
         add_room_anchor(&conn)?;
         reactions::init(&conn)?;
@@ -1521,6 +1522,7 @@ impl Db {
 }
 
 impl Db {
+    /// Append to `user_id`'s main Chat.
     pub fn append_personal(
         &self,
         user_id: &str,
@@ -1529,13 +1531,17 @@ impl Db {
         text: &str,
         addressed: &Addressed,
     ) -> anyhow::Result<Event> {
-        self.append_personal_with(user_id, kind, author, text, addressed, None)
+        self.append_personal_with(user_id, None, kind, author, text, addressed, None)
     }
 
-    /// [`Db::append_personal`] tagged with the agent turn that wrote it.
+    /// Append to `user_id`'s main Chat (`thread` `None`) or one of its
+    /// threads ([`crate::chat_threads`]), tagged with the agent turn that
+    /// wrote it. Fails, writing nothing, once the thread was deleted.
+    #[allow(clippy::too_many_arguments)]
     pub fn append_personal_with(
         &self,
         user_id: &str,
+        thread: Option<&str>,
         kind: &str,
         author: &Author,
         text: &str,
@@ -1544,20 +1550,16 @@ impl Db {
     ) -> anyhow::Result<Event> {
         let conn = self.lock();
         let at = now_ms();
-        conn.execute(
-            "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                user_id,
-                kind,
-                author.name,
-                author.id,
-                text,
-                addressed.mentions.to_string(),
-                addressed.audience,
-                at,
-                activity_json(activity)?,
-            ],
+        insert_personal_in(
+            &conn,
+            user_id,
+            thread,
+            kind,
+            author,
+            text,
+            addressed,
+            at,
+            activity_json(activity)?,
         )?;
         Ok(new_event(
             conn.last_insert_rowid(),
@@ -1571,10 +1573,11 @@ impl Db {
     }
 
     /// [`Db::append_personal_with`], only while event `trigger` of the
-    /// same Chat is still a `message`, in one transaction that also settles
-    /// its pending decision ([`crate::decisions::settle_chat_in`]). `None`
-    /// (nothing written) once the message was deleted, the turn was
-    /// stopped before it started, or process `epoch` doesn't hold it.
+    /// same Chat is still a `message`, in its thread, in one transaction
+    /// that also settles its pending decision
+    /// ([`crate::decisions::settle_chat_in`]). `None` (nothing written) once
+    /// the message was deleted, the turn was stopped before it started, or
+    /// process `epoch` doesn't hold it.
     #[allow(clippy::too_many_arguments)]
     pub fn append_personal_for_message(
         &self,
@@ -1588,32 +1591,30 @@ impl Db {
     ) -> anyhow::Result<Option<Event>> {
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let present: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM personal_events WHERE id = ?1 AND user_id = ?2 AND kind = 'message')",
-            params![trigger, user_id],
-            |r| r.get(0),
-        )?;
+        let present: Option<Option<String>> = tx
+            .query_row(
+                "SELECT thread_id FROM personal_events WHERE id = ?1 AND user_id = ?2 AND kind = 'message'",
+                params![trigger, user_id],
+                |r| r.get(0),
+            )
+            .optional()?;
         let ours = crate::decisions::settle_chat_in(&tx, epoch, trigger)?;
-        if !present || !ours {
+        let (Some(thread), true) = (present, ours) else {
             tx.commit()?;
             return Ok(None);
-        }
+        };
         let at = now_ms();
         let addressed = Addressed::room();
-        tx.execute(
-            "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                user_id,
-                kind,
-                author.name,
-                author.id,
-                text,
-                addressed.mentions.to_string(),
-                addressed.audience,
-                at,
-                activity_json(activity)?,
-            ],
+        insert_personal_in(
+            &tx,
+            user_id,
+            thread.as_deref(),
+            kind,
+            author,
+            text,
+            &addressed,
+            at,
+            activity_json(activity)?,
         )?;
         let event = new_event(
             tx.last_insert_rowid(),
@@ -1629,10 +1630,11 @@ impl Db {
     }
 
     /// A personal Chat event naming Chat turn `turn` (`turn_id`), such as
-    /// the error that ends it before it started.
+    /// the error that ends it before it started, in the turn's thread.
     pub fn append_personal_for_turn(
         &self,
         user_id: &str,
+        thread: Option<&str>,
         kind: &str,
         author: &Author,
         text: &str,
@@ -1645,20 +1647,16 @@ impl Db {
             turn_id: Some(turn.to_owned()),
             ..MessageMeta::default()
         };
-        conn.execute(
-            "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                user_id,
-                kind,
-                author.name,
-                author.id,
-                text,
-                addressed.mentions.to_string(),
-                addressed.audience,
-                at,
-                event_metadata_json(None, None, &meta)?,
-            ],
+        insert_personal_in(
+            &conn,
+            user_id,
+            thread,
+            kind,
+            author,
+            text,
+            &addressed,
+            at,
+            event_metadata_json(None, None, &meta)?,
         )?;
         let mut event = new_event(
             conn.last_insert_rowid(),
@@ -1673,55 +1671,100 @@ impl Db {
         Ok(event)
     }
 
+    /// Events of `user_id`'s main Chat with an id above `after`.
     pub fn personal_after(
         &self,
         user_id: &str,
         after: i64,
         limit: usize,
     ) -> anyhow::Result<Vec<Event>> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at FROM personal_events
-             WHERE user_id = ?1 AND id > ?2 ORDER BY id ASC LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![user_id, after, limit as i64], row_event)?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        self.chat_after(user_id, None, after, limit)
     }
 
-    pub fn personal_before(
+    /// Events of `user_id`'s main Chat (`thread` `None`) or one of its
+    /// threads with an id above `after`, oldest first.
+    pub fn chat_after(
         &self,
         user_id: &str,
-        before: i64,
-        limit: usize,
-    ) -> anyhow::Result<Vec<Event>> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at FROM personal_events
-             WHERE user_id = ?1 AND id < ?2
-               AND kind NOT IN ('activity', 'reasoning_summary', 'compaction', 'steered')
-             ORDER BY id DESC LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![user_id, before, limit as i64], row_event)?;
-        let mut events: Vec<Event> = rows.collect::<Result<_, _>>()?;
-        events.reverse();
-        Ok(events)
-    }
-
-    /// The agent's replies in `user_id`'s Chat after event `after`, oldest
-    /// first, at most `limit`: what a turn that waited for earlier ones
-    /// missed in the history before its message.
-    pub fn personal_replies_after(
-        &self,
-        user_id: &str,
+        thread: Option<&str>,
         after: i64,
         limit: usize,
     ) -> anyhow::Result<Vec<Event>> {
         let conn = self.lock();
         let mut stmt = conn.prepare_cached(
             "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at FROM personal_events
-             WHERE user_id = ?1 AND id > ?2 AND kind = 'agent' ORDER BY id ASC LIMIT ?3",
+             WHERE user_id = ?1 AND thread_id IS ?2 AND id > ?3 ORDER BY id ASC LIMIT ?4",
         )?;
-        let rows = stmt.query_map(params![user_id, after, limit as i64], row_event)?;
+        let rows = stmt.query_map(params![user_id, thread, after, limit as i64], row_event)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Model history of `user_id`'s main Chat before `before`.
+    pub fn personal_before(
+        &self,
+        user_id: &str,
+        before: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Event>> {
+        self.chat_before(user_id, None, before, limit)
+    }
+
+    /// The last `limit` events of `user_id`'s main Chat or thread `thread`
+    /// below `before`, oldest first, without transcript-only kinds.
+    pub fn chat_before(
+        &self,
+        user_id: &str,
+        thread: Option<&str>,
+        before: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Event>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at FROM personal_events
+             WHERE user_id = ?1 AND thread_id IS ?2 AND id < ?3
+               AND kind NOT IN ('activity', 'reasoning_summary', 'compaction', 'steered')
+             ORDER BY id DESC LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(params![user_id, thread, before, limit as i64], row_event)?;
+        let mut events: Vec<Event> = rows.collect::<Result<_, _>>()?;
+        events.reverse();
+        Ok(events)
+    }
+
+    /// Event `id` of `user_id`'s Chat, with its thread (`None`: the main Chat).
+    pub fn chat_event(
+        &self,
+        user_id: &str,
+        id: i64,
+    ) -> anyhow::Result<Option<(Event, Option<String>)>> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at, thread_id
+                 FROM personal_events WHERE id = ?1 AND user_id = ?2",
+                params![id, user_id],
+                |r| Ok((row_event(r)?, r.get::<_, Option<String>>(9)?)),
+            )
+            .optional()?)
+    }
+
+    /// The agent's replies in `user_id`'s main Chat (`thread` `None`) or
+    /// thread `thread` after event `after`, oldest first, at most `limit`:
+    /// what a turn that waited for earlier ones missed in the history
+    /// before its message.
+    pub fn personal_replies_after(
+        &self,
+        user_id: &str,
+        thread: Option<&str>,
+        after: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Event>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at FROM personal_events
+             WHERE user_id = ?1 AND thread_id IS ?2 AND id > ?3 AND kind = 'agent' ORDER BY id ASC LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(params![user_id, thread, after, limit as i64], row_event)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -1739,6 +1782,66 @@ impl Db {
         )?;
         let rows = stmt.query_map(params![space_id, room_id, after, limit as i64], row_event)?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+}
+
+/// Insert one row into `user_id`'s Chat or its thread `thread`; a thread
+/// must exist (and be theirs) in the same statement, or nothing is written.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn insert_personal_in(
+    conn: &Connection,
+    user_id: &str,
+    thread: Option<&str>,
+    kind: &str,
+    author: &Author,
+    text: &str,
+    addressed: &Addressed,
+    at: i64,
+    metadata: Option<String>,
+) -> anyhow::Result<()> {
+    let n = conn.execute(
+        "INSERT INTO personal_events (user_id, thread_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+         WHERE ?2 IS NULL OR EXISTS (SELECT 1 FROM chat_threads WHERE id = ?2 AND user_id = ?1)",
+        params![
+            user_id,
+            thread,
+            kind,
+            author.name,
+            author.id,
+            text,
+            addressed.mentions.to_string(),
+            addressed.audience,
+            at,
+            metadata,
+        ],
+    )?;
+    if n != 1 {
+        return Err(ThreadGone.into());
+    }
+    Ok(())
+}
+
+/// Nothing was written: the Chat thread was deleted (a turn still running
+/// there when it was is stopped; its last events have nowhere to go).
+#[derive(Debug)]
+pub struct ThreadGone;
+
+impl std::fmt::Display for ThreadGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("this Chat thread was deleted")
+    }
+}
+
+impl std::error::Error for ThreadGone {}
+
+/// Log a failed Chat append as an error, except one refused because its
+/// thread was deleted: that is expected and logged at debug level.
+pub fn log_append_error(e: &anyhow::Error, what: &'static str) {
+    if e.is::<ThreadGone>() {
+        tracing::debug!(what, "Chat thread deleted; event dropped");
+    } else {
+        tracing::error!(error = %format!("{e:#}"), "{what}");
     }
 }
 
@@ -1983,10 +2086,10 @@ const ACTIVITY_SCOPES: [ActivityScope; 2] = [
     },
     ActivityScope {
         table: "personal_events",
-        scope: "user_id",
+        scope: "user_id, thread_id",
         mark_key: "activity_reconciled_through:personal_events",
-        insert: "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, created_at, activity)
-                 VALUES (?1, 'activity', ?3, ?4, '', ?5, ?6)",
+        insert: "INSERT INTO personal_events (user_id, thread_id, kind, actor, actor_id, text, created_at, activity)
+                 VALUES (?1, NULLIF(?2, ''), 'activity', ?3, ?4, '', ?5, ?6)",
     },
 ];
 
@@ -2010,7 +2113,7 @@ fn orphaned_starts_sql(s: &ActivityScope, bounded: bool) -> String {
     let scope_cols = if s.table == "space_events" {
         "e.space_id, e.room_id"
     } else {
-        "e.user_id, ''"
+        "e.user_id, COALESCE(e.thread_id, '')"
     };
     // json_valid flags (SQLite 3.45+; the bundled one is newer): 0x02 JSON5
     // text, 0x08 strictly valid JSONB. Text that fails it would make
@@ -2333,6 +2436,7 @@ mod tests {
             }
             db.append_personal_with(
                 "alice",
+                None,
                 kind::ACTIVITY,
                 &agent,
                 "",
@@ -2345,6 +2449,7 @@ mod tests {
             for p in [activity::STARTED, activity::FAILED] {
                 db.append_personal_with(
                     "bob",
+                    None,
                     kind::ACTIVITY,
                     &agent,
                     "",

@@ -130,7 +130,8 @@ pub struct QuickBody {
 }
 
 /// One message: where it is, who wrote it, and a snippet of its text.
-/// `space_id` and `room_id` are both null for the personal Chat.
+/// `space_id` is null for the personal Chat; `room_id` is then its Chat
+/// thread ([`crate::chat_threads`]), or null for the main Chat.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct QuickMessage {
     pub space_id: Option<String>,
@@ -244,8 +245,8 @@ fn chat_messages(
     limit: usize,
 ) -> anyhow::Result<Vec<QuickMessage>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id, actor, text, created_at FROM (
-             SELECT id, actor, text, created_at FROM personal_events
+        "SELECT id, actor, text, created_at, thread_id FROM (
+             SELECT id, actor, text, created_at, thread_id FROM personal_events
              WHERE user_id = :user AND kind IN ('message', 'agent')
              ORDER BY id DESC LIMIT :window)
          WHERE text LIKE :pattern ESCAPE '\\'
@@ -263,7 +264,8 @@ fn chat_messages(
         |r| {
             Ok(QuickMessage {
                 space_id: None,
-                room_id: None,
+                // A Chat thread's id stands where a room's would.
+                room_id: r.get(4)?,
                 event_id: r.get(0)?,
                 actor: r.get(1)?,
                 text: r.get(2)?,

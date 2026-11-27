@@ -527,3 +527,179 @@ async fn a_sender_who_lost_access_steers_nothing() {
     let all = serde_json::to_string(&h.model.calls()).unwrap();
     assert!(!all.contains("afterthought"), "{all}");
 }
+
+// ---- Chat threads: one line and one inbox per conversation ----
+
+impl H {
+    async fn thread(&self) -> String {
+        let (s, v) = self
+            .post("alice", "/v1/chat/threads", json!({"title": "T"}))
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{v}");
+        v["id"].as_str().unwrap().to_owned()
+    }
+
+    async fn say_in(&self, tid: &str, text: &str, delivery: Option<&str>) -> Value {
+        let mut body = json!({"text": text});
+        if let Some(d) = delivery {
+            body["delivery"] = json!(d);
+        }
+        let (s, v) = self
+            .post("alice", &format!("/v1/chat/messages?thread={tid}"), body)
+            .await;
+        assert_eq!(s, StatusCode::ACCEPTED, "{v}");
+        v
+    }
+
+    async fn in_thread(&self, tid: &str) -> Vec<Value> {
+        let (s, v) = self
+            .req(
+                Method::GET,
+                "alice",
+                &format!("/v1/chat/events?thread={tid}"),
+                None,
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        v["events"].as_array().unwrap().clone()
+    }
+}
+
+#[tokio::test]
+async fn a_turn_in_one_conversation_never_blocks_another() {
+    let h = H::start().await;
+    h.say("[slow] main first", None).await;
+    h.calls_reach(1).await;
+    let tid = h.thread().await;
+    // The thread's turn runs while the main Chat's is still going.
+    h.say_in(&tid, "thread question", None).await;
+    let t = h
+        .until(|| h.in_thread(&tid), |e| !replies(e).is_empty())
+        .await;
+    assert_eq!(replies(&t), ["reply-2"]);
+    // A queued main-Chat message still waits for its own line only.
+    h.say("q-main", None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.model.calls().len(), 2, "the main Chat's line is its own");
+    // And another thread message doesn't wait for the main Chat either.
+    h.say_in(&tid, "thread again", None).await;
+    let t = h
+        .until(|| h.in_thread(&tid), |e| replies(e).len() == 2)
+        .await;
+    assert_eq!(replies(&t).len(), 2);
+    h.model.open();
+    let main = h.until(|| h.chat(), |e| replies(e).len() == 2).await;
+    assert_eq!(phase(&main, "started").len(), 2);
+    assert_eq!(h.pending(), 0);
+    // Each conversation saw only its own messages.
+    for call in h.model.calls() {
+        let text = call.to_string();
+        assert!(
+            !(text.contains("main first") && text.contains("thread question")),
+            "{text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_steer_goes_only_into_the_turn_running_in_the_same_thread() {
+    let h = H::start().await;
+    h.say("[tool] main lookup", None).await;
+    h.calls_reach(1).await;
+    let tid = h.thread().await;
+    // Nothing runs in the thread: the steer starts its own turn there.
+    let steer = h.say_in(&tid, "steer for the thread", Some("steer")).await;
+    let t = h
+        .until(|| h.in_thread(&tid), |e| !replies(e).is_empty())
+        .await;
+    assert!(steered(&t).is_empty() && phase(&t, "started").len() == 1);
+    assert!(steered(&h.chat().await).is_empty());
+    // A steer in the main Chat goes into the main Chat's running turn.
+    let main_steer = h.say("steer for main", Some("steer")).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    h.model.open();
+    let main = h.until(|| h.chat(), |e| !replies(e).is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let main = {
+        let _ = main;
+        h.chat().await
+    };
+    assert_eq!(steered(&main), [id(&main_steer)]);
+    assert_eq!(phase(&main, "started").len(), 1);
+    for call in h.model.calls() {
+        let text = call.to_string();
+        if text.contains("main lookup") {
+            assert!(!text.contains("steer for the thread"), "{text}");
+        }
+    }
+    assert!(!h.chat().await.iter().any(|e| id(e) == id(&steer)));
+    assert_eq!(h.pending(), 0);
+}
+
+#[tokio::test]
+async fn deleting_a_thread_stops_its_running_reply_and_keeps_nothing() {
+    // Errors the server logs meanwhile (tasks run on this test's thread).
+    let logged = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = logged.clone();
+    let _logs = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::ERROR)
+            .with_ansi(false)
+            .with_writer(move || Sink(sink.clone()))
+            .finish(),
+    );
+    let h = H::start().await;
+    let tid = h.thread().await;
+    h.say_in(&tid, "[slow] long answer", None).await;
+    h.calls_reach(1).await;
+    // Queued behind it in the same thread.
+    h.say_in(&tid, "queued in thread", None).await;
+    let (s, v) = h
+        .req(
+            Method::DELETE,
+            "alice",
+            &format!("/v1/chat/threads/{tid}"),
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    // The running turn stops; let the model answer after the fact.
+    h.model.open();
+    for _ in 0..200 {
+        if h.state.chat_runs.turns_of("alice").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(h.state.chat_runs.turns_of("alice").is_empty());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Nothing of it was written after the delete, here or in the main Chat,
+    // and the queued message reached no model.
+    assert!(
+        h.state
+            .db
+            .chat_after("alice", Some(&tid), 0, 100)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(h.chat().await.is_empty());
+    assert_eq!(h.model.calls().len(), 1);
+    assert_eq!(h.pending(), 0);
+    // The main Chat still answers.
+    h.say("still here", None).await;
+    h.until(|| h.chat(), |e| !replies(e).is_empty()).await;
+    let logged = String::from_utf8(logged.lock().unwrap().clone()).unwrap();
+    assert!(logged.is_empty(), "the server logged errors: {logged}");
+}
+
+struct Sink(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Sink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}

@@ -31,7 +31,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -121,8 +122,15 @@ pub enum Trigger {
 /// Where a compaction applies.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Place {
-    Chat { user_id: String },
-    Room { space_id: String, room_id: String },
+    /// A person's main Chat (`thread` `None`) or one of its threads.
+    Chat {
+        user_id: String,
+        thread: Option<String>,
+    },
+    Room {
+        space_id: String,
+        room_id: String,
+    },
 }
 
 /// Time and model turns a run spent before its own first model call.
@@ -431,10 +439,13 @@ fn scope(place: &Place) -> (&'static str, &'static str, Vec<SqlValue>) {
             "space_id = ?1 AND room_id = ?2",
             vec![space_id.clone().into(), room_id.clone().into()],
         ),
-        Place::Chat { user_id } => (
+        Place::Chat { user_id, thread } => (
             "personal_events",
-            "user_id = ?1",
-            vec![user_id.clone().into()],
+            "user_id = ?1 AND thread_id IS ?2",
+            vec![
+                user_id.clone().into(),
+                thread.clone().map_or(SqlValue::Null, SqlValue::from),
+            ],
         ),
     }
 }
@@ -573,21 +584,25 @@ fn store(
             None,
             &meta,
         )?,
-        Place::Chat { user_id } => {
+        Place::Chat { user_id, thread } => {
             let at = crate::db::now_ms();
             let addressed = Addressed::room();
-            tx.execute(
-                "INSERT INTO personal_events
-                     (user_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
-                 VALUES (?1, ?2, ?3, NULL, ?4, '[]', 'room', ?5, ?6)",
-                params![
-                    user_id,
-                    kind::COMPACTION,
-                    author.name,
-                    text,
-                    at,
-                    crate::db::event_metadata_json(None, None, &meta)?,
-                ],
+            if thread
+                .as_deref()
+                .is_some_and(|t| !crate::chat_threads::exists_in(&tx, user_id, t).unwrap_or(false))
+            {
+                return Ok(Err(NotStored::Access));
+            }
+            crate::db::insert_personal_in(
+                &tx,
+                user_id,
+                thread.as_deref(),
+                kind::COMPACTION,
+                &author,
+                text,
+                &addressed,
+                at,
+                crate::db::event_metadata_json(None, None, &meta)?,
             )?;
             let mut e = crate::db::new_event(
                 tx.last_insert_rowid(),
@@ -812,14 +827,15 @@ async fn auto_failed(state: &AppState, run: &Run<'_>, reason: String) {
                 .await;
         }
         // Chat is private: the reason is shown there.
-        Place::Chat { user_id } => {
-            let (user, turn) = (user_id.clone(), run.turn.clone());
+        Place::Chat { user_id, thread } => {
+            let (user, thread, turn) = (user_id.clone(), thread.clone(), run.turn.clone());
             let text = format!("{AUTO_FAILED}: {reason} The agent used the most recent messages.");
             let r = state
                 .db
                 .call(move |db| {
                     db.append_personal_with(
                         &user,
+                        thread.as_deref(),
                         kind::STATUS,
                         &author,
                         &text,
@@ -829,7 +845,7 @@ async fn auto_failed(state: &AppState, run: &Run<'_>, reason: String) {
                 })
                 .await;
             if let Err(e) = r {
-                tracing::error!(error = %format!("{e:#}"), "appending summary failure");
+                crate::db::log_append_error(&e, "appending summary failure");
             }
         }
     }
@@ -923,18 +939,23 @@ fn busy() -> ApiError {
         .with_code("reply_running")
 }
 
-/// `POST /v1/chat/compact {focus?}`
+/// `POST /v1/chat/compact?thread={tid} {focus?}`: the main Chat, or one
+/// of the caller's Chat threads.
 async fn compact_chat(
     State(state): State<AppState>,
     who: Human,
+    query: Result<Query<crate::api::ChatQuery>, QueryRejection>,
     body: axum::body::Bytes,
 ) -> ApiResult<(StatusCode, Json<Event>)> {
+    let Query(query) = query?;
     let focus = focus_of(&body)?;
-    if state.chat_runs.running_for(&who.id) {
+    let thread = crate::chat_threads::checked(&state, &who, query.thread).await?;
+    if state.chat_runs.running_for(&who.id, thread.as_deref()) {
         return Err(busy());
     }
     let place = Place::Chat {
         user_id: who.id.clone(),
+        thread,
     };
     let route = Route::default_for(AddressedBy::Explicit);
     compact(&state, &who, place, None, route, focus).await
@@ -1234,6 +1255,7 @@ mod tests {
 
         let chat = Place::Chat {
             user_id: "alice".into(),
+            thread: None,
         };
         let m = db
             .append_personal("alice", kind::MESSAGE, &alice, "hi", &Addressed::room())
@@ -1261,6 +1283,7 @@ mod tests {
         );
         let other = Place::Chat {
             user_id: "bob".into(),
+            thread: None,
         };
         assert!(latest(&conn, &other, i64::MAX).unwrap().is_none());
     }
@@ -1412,6 +1435,7 @@ mod tests {
         // 4. Personal Chat.
         let chat = Place::Chat {
             user_id: "alice".into(),
+            thread: None,
         };
         let mut gone = 0;
         for i in 0..3 {
@@ -1444,9 +1468,11 @@ mod tests {
         let c = Arc::new(Compaction::default());
         let a = Place::Chat {
             user_id: "alice".into(),
+            thread: None,
         };
         let b = Place::Chat {
             user_id: "bob".into(),
+            thread: None,
         };
         let held = c.try_lock(&a, false).unwrap();
         assert!(c.try_lock(&a, true).is_none(), "held");

@@ -1,6 +1,7 @@
 import { announce, cleanup, Clipboard, signal } from "nsh";
 import { onLocalWorkspace } from "../localWorkspace";
 import {
+  activeChatThreadId,
   activeRoomId,
   activeSpaceId,
   connectedTo,
@@ -34,6 +35,7 @@ import { PersonAvatar } from "./profile/PersonAvatar";
 import { profileName } from "./profile/profileState";
 import { openSpaceSettings } from "./space/spaceSettingsState";
 import { CreateSpaceForm } from "./CreateSpaceForm";
+import { ChatThreadsNav } from "./chatThreads/ChatThreads";
 import { DirectMessagesSection } from "./dms/DirectMessages";
 import { activeDm, dmUnread, openMessages } from "./dms/state";
 
@@ -64,9 +66,10 @@ export function Sidebar(props: { mode: "full" | "rail" | "hidden" }) {
             icon="chat"
             emphasis
             trailing={activeRunCount() ? `${activeRunCount()} running` : undefined}
-            selected={mainPlace() === "chat"}
+            selected={mainPlace() === "chat" && !activeChatThreadId()}
             onPress={openChat}
           />
+          <ChatThreadsNav />
           <NavItem testID="nav-library" label="Library" icon="library" selected={mainPlace() === "library"} onPress={() => openPlace("library")} />
           <NavItem testID="nav-pages" label="Pages" icon="file" selected={selectedPages()} onPress={() => goPages()} />
           <PinnedPages />

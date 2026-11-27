@@ -1,7 +1,7 @@
 // An in-memory Metro server for headless tests (nsh test's network stubs).
 // It speaks the desktop's HTTP contract closely enough to exercise the app:
 // Spaces with members and runner tokens, rooms (with delegated threads),
-// events with mentions and reactions, the personal Chat and agent runs,
+// events with mentions and reactions, the personal Chat (with its threads) and agent runs,
 // registered runners and their Space attachments, the provider catalog and
 // personal model connections (with a device connector that is offline until
 // a test says otherwise), connection capabilities and sharing, the models a
@@ -71,7 +71,10 @@ export function fakeServer() {
     ignoreCursor: false,
     spaces: new Map<string, Space>(),
     rooms: new Map<string, Room[]>(), // by space id
-    events: new Map<string, Ev[]>(), // by `${space}/${room}` or `chat:${user}`
+    events: new Map<string, Ev[]>(), // by `${space}/${room}`, `chat:${user}` or `chat:${user}:${thread}`
+    /** Chat threads per user; `noChatThreads` answers 404 as an older server does. */
+    chatThreads: new Map<string, { id: string; title: string; anchor_event_id?: number }[]>(),
+    noChatThreads: false,
     runs: [] as Run[],
     log: [] as { user: string; method: string; path: string; body: any }[],
     afters: [] as string[],
@@ -561,8 +564,51 @@ export function fakeServer() {
       return ok({});
     }
     if (path.startsWith("/v1/chat/")) {
-      const key = `chat:${user}`;
-      if (!state.events.has(key)) state.events.set(key, []);
+      const main = `chat:${user}`;
+      if (!state.events.has(main)) state.events.set(main, []);
+      const threads = state.chatThreads.get(user) ?? [];
+      state.chatThreads.set(user, threads);
+      const threadJson = (t: { id: string; title: string; anchor_event_id?: number }) => {
+        const evs = state.events.get(`${main}:${t.id}`) ?? [];
+        return { ...t, count: evs.filter(e => e.kind === "message" || e.kind === "agent").length, created_at: "2026-11-27T00:00:00.000Z", last_at: null };
+      };
+      if (path.startsWith("/v1/chat/threads") || /^\/v1\/chat\/events\/\d+\/thread$/.test(path)) {
+        if (state.noChatThreads) return err(404, "unknown route");
+        if (path === "/v1/chat/threads" && req.method === "GET") return ok({ threads: threads.map(threadJson) });
+        if (path === "/v1/chat/threads" && req.method === "POST") {
+          const t = { id: `ct-${nextId++}`, title: (body?.title ?? "New thread").trim() };
+          threads.unshift(t);
+          state.events.set(`${main}:${t.id}`, []);
+          return ok(threadJson(t), 201);
+        }
+        if ((r = m(/^\/v1\/chat\/events\/(\d+)\/thread$/)) && req.method === "POST") {
+          const eid = Number(r[1]);
+          if (!state.events.get(main)!.some(e => e.id === eid)) return err(404, "no such message");
+          const found = threads.find(t => t.anchor_event_id === eid);
+          if (found) return ok(threadJson(found));
+          const anchor = state.events.get(main)!.find(e => e.id === eid)!;
+          const t = { id: `ct-${nextId++}`, title: anchor.text.slice(0, 80) || "Thread", anchor_event_id: eid };
+          threads.unshift(t);
+          state.events.set(`${main}:${t.id}`, []);
+          return ok(threadJson(t), 201);
+        }
+        if ((r = m(/^\/v1\/chat\/threads\/([^/]+)$/))) {
+          const t = threads.find(x => x.id === decodeURIComponent(r![1]));
+          if (!t) return err(404, "no such Chat thread");
+          if (req.method === "PATCH") {
+            t.title = String(body.title).trim();
+            return ok(threadJson(t));
+          }
+          if (req.method === "DELETE") {
+            threads.splice(threads.indexOf(t), 1);
+            state.events.delete(`${main}:${t.id}`);
+            return ok({ deleted: true, events: [] });
+          }
+        }
+      }
+      const thread = url.searchParams.get("thread");
+      if (thread && !threads.some(t => t.id === thread)) return err(404, "no such Chat thread");
+      const key = thread ? `${main}:${thread}` : main;
       if (path === "/v1/chat/events") {
         const after = Number(url.searchParams.get("after"));
         return ok({ events: state.events.get(key)!.filter((e) => state.ignoreCursor || e.id > after) });

@@ -35,7 +35,7 @@
 
 import { announce, batch, computed, effect, signal, Storage, untracked } from "nsh";
 import { ApiError, createClient, isCanonicalMessageRow, parseDeletion, parseReaction } from "./api/client";
-import type { ChatDelivery, Client, Deletion, Me, Member, Mention, ReplyAddress, Room, RoomEvent, Run, Space, SpaceMessageBody, TurnModelChoice } from "./api/client";
+import type { ChatDelivery, ChatThread, Client, Deletion, Me, Member, Mention, ReplyAddress, Room, RoomEvent, Run, Space, SpaceMessageBody, TurnModelChoice } from "./api/client";
 export { ApiError };
 import { DEFAULT_SERVER_URL, parseServerUrl, serverHost } from "./api/serverUrl";
 import { plainHttpAccepted } from "./plainHttp";
@@ -51,13 +51,16 @@ import { confirmChangedAutomaticMentions } from "./features/mentions/preflight";
 import type { PostedSenderNotes, SenderNoticeDetails } from "./features/senderNotices/response";
 import { renderedRecipientsKey } from "./features/senderNotices/response";
 
-export type { Member, Mention, Room, RoomEvent, Run, Space };
+export type { ChatThread, Member, Mention, Room, RoomEvent, Run, Space };
 
 export const LOBBY = "lobby";
 export const POLL_MS = 1500;
 const LISTS_REFRESH_MS = 10_000;
 const RUNS_REFRESH_MS = 3000;
 const CHAT = "chat"; // the personal Chat's cache key (room keys always contain \u0001)
+/** The cache key of the main Chat (no thread) or one of its threads. */
+const chatScopeOf = (thread: string | null | undefined) => thread ? `${CHAT}\u0002${thread}` : CHAT;
+const isChatScope = (key: string) => key === CHAT || key.startsWith(`${CHAT}\u0002`);
 const MAX_BACKOFF_MS = 30_000;
 const MAX_EVENTS_PER_ROOM = 2000;
 const SERVER_URL_KEY = "metro.serverUrl"; // not secret: remembered between launches
@@ -147,15 +150,33 @@ export const replyAnchor = signal<RoomEvent | null>(null);
 export const openingReply = signal(false);
 const replySelections = signal<Record<string, { event: RoomEvent; muted: boolean }>>({});
 const composerRoomId = () => replyPane()?.roomId ?? activeRoomId();
+
+/** The threads of the personal Chat, most recently active first. */
+export const chatThreads = signal<readonly ChatThread[]>([]);
+/** The server has Chat threads (an older one answers 404). */
+export const chatThreadsSupported = signal(true);
+/** The Chat thread open in the Chat; null is the main Chat. */
+export const activeChatThreadId = signal<string | null>(null);
+export const activeChatThread = computed(() => chatThreads().find(t => t.id === activeChatThreadId()) ?? null);
+const activeChatScope = () => chatScopeOf(activeChatThreadId());
+/** Where a Chat message goes now: the main Chat or the open thread. */
+const chatDestination = (): SendDestination => {
+  const thread = activeChatThreadId();
+  return thread ? { kind: "chat", thread } : { kind: "chat" };
+};
+
 const activeScope = computed(() => {
-  if (basePlace() === "chat") return CHAT;
+  if (basePlace() === "chat") return activeChatScope();
   if (basePlace() === "dm") return "";
   const sid = activeSpaceId();
   const rid = composerRoomId();
   return sid && rid ? scopeKey(sid, rid) : "";
 });
 export const activeEvents = computed(() => eventsByScope()[activeScope()] ?? EMPTY_EVENTS);
-export const chatEvents = computed(() => eventsByScope()[CHAT] ?? EMPTY_EVENTS);
+/** Events of the open Chat: the main Chat or the open thread. */
+export const chatEvents = computed(() => eventsByScope()[activeChatScope()] ?? EMPTY_EVENTS);
+/** Events of the main Chat, wherever the Chat is. */
+export const mainChatEvents = computed(() => eventsByScope()[CHAT] ?? EMPTY_EVENTS);
 /** Chat turns this session started, by id and their message, before their `started` (or `steered`) marker arrives. */
 export const pendingChatTurns = signal<readonly { id: string; eventId: number; delivery?: ChatDelivery }[]>([]);
 const CHAT_DELIVERY_KEY = "metro.chatDelivery";
@@ -716,7 +737,12 @@ function supersedeRoomEntry() {
 }
 
 export function openChat() {
-  if (basePlace() === "chat" && !settingsOpen()) return;
+  openChatThread(null);
+}
+
+/** Opens the Chat on thread `id`, or on the main Chat when null. */
+export function openChatThread(id: string | null) {
+  if (basePlace() === "chat" && !settingsOpen() && activeChatThreadId() === id) return;
   navigationGeneration++;
   batch(() => {
     supersedeRoomEntry();
@@ -724,6 +750,7 @@ export function openChat() {
     view.set("room");
     settingsOpen.set(false);
     basePlace.set("chat");
+    activeChatThreadId.set(id);
     actionError.set(null);
     notice.set(null);
   });
@@ -810,8 +837,15 @@ export const focusTarget = signal<{ scope: string; eventId: number } | null>(nul
 export async function openLocation(target: Location): Promise<boolean> {
   if (!client) return false;
   if (target.spaceId === null) {
-    if (basePlace() !== "chat" || settingsOpen()) openChat();
-    if (target.eventId !== undefined) focusTarget.set({ scope: CHAT, eventId: target.eventId });
+    // A Chat result's room is its Chat thread; none is the main Chat.
+    const thread = target.roomId ?? null;
+    if (thread && !chatThreads().some(t => t.id === thread)) await refreshChatThreads();
+    if (thread && !chatThreads().some(t => t.id === thread)) {
+      notice.set("That Chat thread isn't available any more.");
+      return false;
+    }
+    openChatThread(thread);
+    if (target.eventId !== undefined) focusTarget.set({ scope: chatScopeOf(thread), eventId: target.eventId });
     return true;
   }
   const sid = target.spaceId;
@@ -1314,7 +1348,7 @@ export async function createRoom(nameInput: string): Promise<boolean> {
  * Where a message goes: the personal Chat (files to the sender's personal
  * library) or a Space's room or thread (files to that Space's library).
  */
-export type SendDestination = { kind: "chat" } | { kind: "room"; spaceId: string; roomId: string };
+export type SendDestination = { kind: "chat"; thread?: string } | { kind: "room"; spaceId: string; roomId: string };
 
 // Only the initiating POST writes here. Not an event cache: it is never
 // merged into a transcript, persisted, or used for model/search history.
@@ -1328,11 +1362,11 @@ const pendingSenderNotices = new Map<string, PendingSenderNotice>();
 const MAX_PENDING_SENDER_NOTICES = 32;
 const noticeEpochs = new Map<string, number>();
 const noticeEpoch = (scope: string) => noticeEpochs.get(scope) ?? 0;
-const destinationScope = (to: SendDestination) => to.kind === "chat" ? CHAT : scopeKey(to.spaceId, to.roomId);
+const destinationScope = (to: SendDestination) => to.kind === "chat" ? chatScopeOf(to.thread) : scopeKey(to.spaceId, to.roomId);
 const pendingKey = (scope: string, id: number) => JSON.stringify([scope, id]);
 
 function noticeDestinationVisible(to: SendDestination) {
-  return to.kind === "chat" ? !chatUnavailable() :
+  return to.kind === "chat" ? !chatUnavailable() && (!to.thread || chatThreads().some(t => t.id === to.thread)) :
     spaces().some(s => s.id === to.spaceId) && !!roomsBySpace()[to.spaceId]?.some(r => r.id === to.roomId);
 }
 
@@ -1504,7 +1538,7 @@ export async function runComposerCommand(): Promise<void> {
   commandHint.set(hint);
   if (hint || !parsed.command) return;
 
-  const to: SendDestination = chat ? { kind: "chat" } : { kind: "room", spaceId: sid!, roomId: rid! };
+  const to: SendDestination = chat ? chatDestination() : { kind: "room", spaceId: sid!, roomId: rid! };
   const origin = captureSendOrigin(c, to);
   const sameSession = guard();
   const navigation = navigationGeneration;
@@ -1595,7 +1629,7 @@ export async function deleteMessage(event: RoomEvent, roomId?: string): Promise<
   const rid = roomId ?? activeRoomId();
   if (!c || deletePending() !== null || !canDelete(event)) return false;
   if (!chat && (!sid || !rid)) return false;
-  const scope = chat ? CHAT : scopeKey(sid!, rid!);
+  const scope = chat ? activeChatScope() : scopeKey(sid!, rid!);
   const ok = chat ? guard() : guard(sid!);
   const owner = {};
   deleteOwner = owner;
@@ -1617,6 +1651,172 @@ export async function deleteMessage(event: RoomEvent, roomId?: string): Promise<
   } finally {
     releaseDelete(owner);
   }
+}
+
+// ------------------------------------------------------------------ Chat threads
+
+let lastChatThreadsRefresh = 0;
+/** Bumped by every local change to the list, so an older list read can't undo it. */
+let chatThreadsVersion = 0;
+/** A thread is being created, opened, renamed or deleted. */
+export const chatThreadBusy = signal(false);
+
+/** Puts each thread's reply summary on its main-Chat anchor. */
+function applyThreadSummaries() {
+  const rows = eventsByScope()[CHAT];
+  if (!rows || !chatThreadsSupported()) return;
+  const byAnchor = new Map(chatThreads().filter(t => t.anchorEventId !== undefined).map(t => [t.anchorEventId!, t]));
+  let changed = false;
+  const next = rows.map(e => {
+    const t = byAnchor.get(e.id);
+    const old = e.replies;
+    if (!t) {
+      if (!old) return e;
+      changed = true;
+      const { replies: _gone, ...rest } = e;
+      return rest;
+    }
+    if (old && old.roomId === t.id && old.count === t.count && old.lastAt === t.lastAt) return e;
+    changed = true;
+    return { ...e, replies: { roomId: t.id, count: t.count, ...(t.lastAt ? { lastAt: t.lastAt } : {}), participantIds: [] } };
+  });
+  if (changed) eventsByScope.set({ ...eventsByScope(), [CHAT]: next });
+}
+
+function setChatThreads(list: readonly ChatThread[]) {
+  chatThreadsVersion++;
+  batch(() => {
+    chatThreads.set(list);
+    applyThreadSummaries();
+  });
+}
+
+function upsertChatThread(thread: ChatThread) {
+  setChatThreads([thread, ...chatThreads().filter(t => t.id !== thread.id)]);
+}
+
+async function refreshChatThreads() {
+  const c = client;
+  if (!c || !chatThreadsSupported()) return;
+  lastChatThreadsRefresh = Date.now();
+  const ok = guard();
+  const version = chatThreadsVersion;
+  try {
+    const list = await c.listChatThreads();
+    if (!ok() || version !== chatThreadsVersion) return;
+    const open = activeChatThreadId();
+    setChatThreads(list);
+    // Deleted elsewhere (another device): leave it.
+    if (open && !list.some(t => t.id === open)) forgetChatThread(open);
+  } catch (error) {
+    if (!ok()) return;
+    if (error instanceof ApiError && error.kind === "not_found") chatThreadsSupported.set(false);
+  }
+}
+
+/** Forgets everything cached for Chat thread `id`; leaves it for the main Chat if it is open. */
+function forgetChatThread(id: string) {
+  const key = chatScopeOf(id);
+  cursors.delete(key);
+  inflight.delete(key);
+  pollAgain.delete(key);
+  batch(() => {
+    forgetSenderNotices(key);
+    if (activeChatThreadId() === id) {
+      // Its unsent draft goes with it.
+      draft.set("");
+      navigationGeneration++;
+      activeChatThreadId.set(null);
+    }
+    const { [key]: _e, ...events } = eventsByScope();
+    eventsByScope.set(events);
+    const { [key]: _l, ...loaded } = loadedScopes();
+    loadedScopes.set(loaded);
+    const { [key]: _r, ...reactions } = reactionsByScope();
+    reactionsByScope.set(reactions);
+    const { [key]: _d, ...drafts } = stashedDrafts();
+    stashedDrafts.set(drafts);
+    if (chatThreads().some(t => t.id === id)) setChatThreads(chatThreads().filter(t => t.id !== id));
+  });
+}
+
+/** Runs one thread action, reporting its failure where the Chat shows errors. */
+async function chatThreadAction<T>(what: string, act: (c: Client) => Promise<T>): Promise<T | null> {
+  const c = client;
+  if (!c || chatThreadBusy()) return null;
+  const ok = guard();
+  batch(() => {
+    chatThreadBusy.set(true);
+    actionError.set(null);
+  });
+  try {
+    const result = await act(c);
+    return ok() ? result : null;
+  } catch (error) {
+    if (ok()) handleActionError(error, what);
+    return null;
+  } finally {
+    if (ok()) chatThreadBusy.set(false);
+  }
+}
+
+/** Creates a Chat thread named `title` and opens it. */
+export async function createChatThread(title: string): Promise<boolean> {
+  const name = title.trim();
+  if (!name) return false;
+  const thread = await chatThreadAction("Could not create the thread", c => c.createChatThread(name));
+  if (!thread) return false;
+  upsertChatThread(thread);
+  openChatThread(thread.id);
+  announce(`Opened thread ${thread.title}`);
+  return true;
+}
+
+/** Opens the reply thread of a main-Chat message, creating it the first time. */
+export async function openChatReplyThread(event: RoomEvent): Promise<boolean> {
+  if (basePlace() !== "chat" || activeChatThreadId() !== null || !canOpenThread(event) || openingReply()) return false;
+  const known = event.replies?.roomId ?? chatThreads().find(t => t.anchorEventId === event.id)?.id;
+  if (known && chatThreads().some(t => t.id === known)) {
+    openChatThread(known);
+    return true;
+  }
+  if (event.kind === "deleted") return false;
+  const navigation = navigationGeneration;
+  openingReply.set(true);
+  try {
+    const thread = await chatThreadAction("Could not open the thread", c => c.chatReplyThread(event.id));
+    if (!thread) return false;
+    upsertChatThread(thread);
+    // Only if the person is still where they asked.
+    if (navigation === navigationGeneration && basePlace() === "chat" && activeChatThreadId() === null) openChatThread(thread.id);
+    return true;
+  } finally {
+    openingReply.set(false);
+  }
+}
+
+export async function renameChatThread(id: string, title: string): Promise<boolean> {
+  const name = title.trim();
+  if (!name) return false;
+  const thread = await chatThreadAction("Could not rename the thread", c => c.renameChatThread(id, name));
+  if (!thread) return false;
+  setChatThreads(chatThreads().map(t => (t.id === id ? thread : t)));
+  announce("Thread renamed");
+  return true;
+}
+
+/** Deletes Chat thread `id` and everything in it, after the person confirmed. */
+export async function deleteChatThread(id: string): Promise<boolean> {
+  const markers = await chatThreadAction("Could not delete the thread", c => c.deleteChatThread(id));
+  if (!markers) return false;
+  batch(() => {
+    forgetChatThread(id);
+    // A deleted anchor that only stayed for this thread goes too.
+    applyDeletions(CHAT, markers.map(parseDeletion).filter((d): d is Deletion => !!d));
+  });
+  announce("Thread deleted");
+  kick();
+  return true;
 }
 
 /** A deleted thread anchor: no text, recipients, files or metadata; its replies stay. */
@@ -1709,7 +1909,8 @@ async function sendDraft(intent: DraftSend): Promise<void> {
     });
     return;
   }
-  const to: SendDestination = chat ? { kind: "chat" } : { kind: "room", spaceId: sid!, roomId: rid! };
+  const to: SendDestination = chat ? chatDestination() : { kind: "room", spaceId: sid!, roomId: rid! };
+  const thread = to.kind === "chat" ? to.thread : undefined;
   const sameSession = guard();
   const ok = chat ? sameSession : guard(sid!);
   const navigation = navigationGeneration;
@@ -1773,11 +1974,11 @@ async function sendDraft(intent: DraftSend): Promise<void> {
     if (chat) {
       origin = captureSendOrigin(c, to);
       if (saveNote) {
-        await c.saveChatNote(text, ids);
+        await c.saveChatNote(text, ids, thread);
         origin.acknowledge(null);
       } else {
         const delivery = chatDelivery();
-        const sent = await c.sendChatMessage(text, ids, selected.choice, delivery);
+        const sent = await c.sendChatMessage(text, ids, selected.choice, delivery, thread);
         origin.acknowledge(sent.notes);
         if (sent.turn && sameSession()) {
           const turn = { ...sent.turn, delivery };
@@ -2191,7 +2392,7 @@ export async function toggleReaction(eventId: number, emoji: string, roomId?: st
   const sid = activeSpaceId();
   const rid = roomId ?? composerRoomId();
   if (!inChat && (!sid || !rid)) return;
-  const key = inChat ? CHAT : scopeKey(sid!, rid!);
+  const key = inChat ? activeChatScope() : scopeKey(sid!, rid!);
   const mine = (reactionsByScope()[key]?.[eventId]?.[emoji] ?? []).includes(`user:${myId}`);
   const ok = inChat ? guard() : guard(sid!);
   reactionPending.set(`${eventId}|${emoji}`);
@@ -2669,6 +2870,7 @@ effect(() => {
 function endSession() {
   replySelections.set({});
   pendingChatTurns.set([]);
+  lastChatThreadsRefresh = 0;
   session++;
   abort?.abort();
   abort = null;
@@ -2709,6 +2911,10 @@ function endSession() {
     me.set(null);
     settingsOpen.set(false);
     basePlace.set("chat");
+    activeChatThreadId.set(null);
+    chatThreads.set([]);
+    chatThreadsSupported.set(true);
+    chatThreadBusy.set(false);
     focusTarget.set(null);
     chatUnavailable.set(null);
     runs.set([]);
@@ -2784,6 +2990,9 @@ async function tick(sess: number) {
     if (Date.now() - lastListsRefresh >= LISTS_REFRESH_MS) await refreshLists();
     if (sess !== session) return;
     if (basePlace() === "chat") {
+      // Chat threads are read only while the Chat is open.
+      if (Date.now() - lastChatThreadsRefresh >= LISTS_REFRESH_MS) await refreshChatThreads();
+      if (sess !== session) return;
       if (Date.now() >= chatProbeAfter) await pollChat();
       if (sess === session && Date.now() - lastRunsRefresh >= RUNS_REFRESH_MS) await refreshRuns();
     } else if (basePlace() === "dm") {
@@ -3168,13 +3377,15 @@ async function refreshReplyAnchors(sid: string, rid: string, first: number, pane
 
 async function pollChat(): Promise<void> {
   const sameSession = guard();
-  const epoch = noticeEpoch(CHAT);
-  const ok = () => sameSession() && noticeEpoch(CHAT) === epoch;
+  const thread = activeChatThreadId();
+  const key = chatScopeOf(thread);
+  const epoch = noticeEpoch(key);
+  const ok = () => sameSession() && noticeEpoch(key) === epoch;
   let request = 0;
   try {
-    await poll(CHAT, ok, async (c, after) => {
+    await poll(key, ok, async (c, after) => {
       request = nextAccessRequest();
-      const events = await c.listChatEvents(after);
+      const events = await c.listChatEvents(after, thread ?? undefined);
       if (ok()) {
         verifyAccess(CHAT, request);
         observeChatAvailability(request, null);
@@ -3183,6 +3394,11 @@ async function pollChat(): Promise<void> {
     });
   } catch (error) {
     if (!ok()) return;
+    // A thread deleted elsewhere: only it is gone, never the whole Chat.
+    if (thread && error instanceof ApiError && error.kind === "not_found") {
+      forgetChatThread(thread);
+      return;
+    }
     if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found" || error.kind === "protocol")) {
       if (!request || newerAccess(CHAT, request)) return;
       observeChatAvailability(request, `Your Chat isn't available on this server: ${error.message}`);
@@ -3247,7 +3463,7 @@ function merge(key: string, events: RoomEvent[]): number {
       shown.push(event);
       // A delegated thread was created or reported: pick up the room list now.
       if (event.kind === "thread") lastListsRefresh = 0;
-      if (key !== CHAT && isRoomCompactionMiss(event)) compactionRunRefresh = true;
+      if (!isChatScope(key) && isRoomCompactionMiss(event)) compactionRunRefresh = true;
       continue;
     }
     const change = parseReaction(event);
@@ -3265,6 +3481,8 @@ function merge(key: string, events: RoomEvent[]): number {
     }
     reactions[change.targetEventId] = byEmoji;
   }
+  // A thread's count and last activity changed: its summary on the anchor too.
+  if (key !== CHAT && isChatScope(key) && shown.some(e => e.kind === "message" || e.kind === "agent")) lastChatThreadsRefresh = 0;
   batch(() => {
     if (!loadedScopes()[key]) loadedScopes.set({ ...loadedScopes(), [key]: true });
     if (fresh.length === 0) return;
