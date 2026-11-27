@@ -293,6 +293,35 @@ pub async fn post_room_message(
     recipients.extend(plan.targets.iter().map(|target| Mention::AgentId {
         agent_id: target.agent.id.clone(),
     }));
+    // A target whose agent already runs for the sender here gets the
+    // message in that run: durable with it, so a restart before delivery
+    // starts it as usual, and only once.
+    let steered: Vec<String> = plan
+        .targets
+        .iter()
+        .filter(|t| {
+            steer_place(&space.id, &room.id, &author, &t.agent.id, &chosen)
+                .is_some_and(|p| state.steering.is_open(&p))
+        })
+        .map(|t| t.agent.id.clone())
+        .collect();
+    let planned = (!steered.is_empty()).then(|| crate::decisions::NewTargets {
+        epoch: state.decisions.epoch().to_owned(),
+        space: space.id.clone(),
+        room: room.id.clone(),
+        user: who.id.clone(),
+        targets: plan
+            .targets
+            .iter()
+            .filter(|t| steered.contains(&t.agent.id))
+            .map(|t| crate::decisions::PlannedTarget {
+                agent_id: t.agent.id.clone(),
+                pick: t.pick.clone(),
+                addressed_by: t.addressed_by,
+            })
+            .collect(),
+        choice: None,
+    });
     let event = match db(state, move |db| {
         attachments::append_message(
             db,
@@ -304,6 +333,7 @@ pub async fn post_room_message(
             &recipients,
             &meta,
             pending.as_ref(),
+            planned.as_ref(),
         )
     })
     .await?
@@ -353,7 +383,7 @@ pub async fn post_room_message(
         });
     }
     let started = finish(
-        state, &space.id, &room, &author, &event, plan, chosen, &settings, &prefs,
+        state, &space.id, &room, &author, &event, plan, &steered, chosen, &settings, &prefs,
     )
     .await;
     Ok(Posted {
@@ -405,6 +435,8 @@ pub(crate) struct Finished {
 }
 
 /// Post the plan's room errors, then start its runs answering `event`.
+/// The targets in `steered` were stored as planned runs with the message:
+/// each goes to its agent's running turn, or starts as planned.
 #[allow(clippy::too_many_arguments)]
 async fn finish(
     state: &AppState,
@@ -413,6 +445,7 @@ async fn finish(
     author: &Author,
     event: &Event,
     plan: crate::agent_dispatch::Plan,
+    steered: &[String],
     chosen: Option<crate::model_routing::Route>,
     settings: &RoutingSettings,
     prefs: &crate::space_prefs::SpacePrefs,
@@ -433,50 +466,31 @@ async fn finish(
             .targets
             .iter()
             .any(|t| t.addressed_by == crate::model_routing::AddressedBy::Classifier);
-    // A target whose agent already runs for the sender here gets the
-    // message in that run; one handed back starts as usual.
-    let mut targets = Vec::new();
-    for t in plan.targets {
-        let Some(taken) = steer(state, space, &room.id, author, event.id, &t, &chosen, false)
-        else {
-            targets.push(t);
-            continue;
-        };
-        let (state, space, room, author, event_id, settings, prefs) = (
-            state.clone(),
-            space.to_owned(),
-            room.clone(),
-            author.clone(),
-            event.id,
-            settings.clone(),
-            prefs.clone(),
-        );
-        tokio::spawn(async move {
-            if taken.await.is_ok() {
-                return;
-            }
-            // The message as it is now: one deleted meanwhile starts nothing.
-            if let Some(event) = live_message(&state, &space, &room.id, event_id).await {
-                crate::agent_dispatch::start_runs(
-                    &state,
-                    &space,
-                    &room,
-                    &author,
-                    &event,
-                    vec![t],
-                    None,
-                    &settings,
-                    &prefs,
-                )
-                .await;
-            }
-        });
-    }
+    let (planned, targets): (Vec<_>, Vec<_>) = plan
+        .targets
+        .into_iter()
+        .partition(|t| steered.contains(&t.agent.id));
     // Mentioning only people never starts agent work.
-    let started = crate::agent_dispatch::start_runs(
-        state, space, room, author, event, targets, chosen, settings, prefs,
+    let mut started = crate::agent_dispatch::start_runs(
+        state,
+        space,
+        room,
+        author,
+        event,
+        targets,
+        chosen.clone(),
+        settings,
+        prefs,
     )
     .await;
+    if !planned.is_empty() {
+        let more = dispatch_planned(
+            state, space, room, author, event.id, planned, chosen, settings, prefs,
+        )
+        .await;
+        started.runs.extend(more.runs);
+        started.note = started.note.or(more.note);
+    }
     Finished {
         addressing_note: plan.addressing_note.map(SenderNote::Addressing),
         routing_note: started.note,
@@ -775,16 +789,28 @@ fn steer(
     chosen: &Option<crate::model_routing::Route>,
     planned: bool,
 ) -> Option<tokio::sync::oneshot::Receiver<()>> {
+    let place = steer_place(space, room_id, author, &t.agent.id, chosen)?;
+    state.steering.offer(&place, event_id, planned, None)
+}
+
+/// Where `author`'s message for `agent` would steer; `None` for a message
+/// with an explicit model for the turn.
+fn steer_place(
+    space: &str,
+    room_id: &str,
+    author: &Author,
+    agent: &str,
+    chosen: &Option<crate::model_routing::Route>,
+) -> Option<crate::steering::Place> {
     if chosen.is_some() {
         return None;
     }
-    let place = crate::steering::Place::Room {
+    Some(crate::steering::Place::Room {
         space: space.to_owned(),
         room: room_id.to_owned(),
-        agent: t.agent.id.clone(),
+        agent: agent.to_owned(),
         user: author.id.clone()?,
-    };
-    state.steering.offer(&place, event_id, planned, None)
+    })
 }
 
 /// Start one planned run of `event` ([`dispatch_planned`]).

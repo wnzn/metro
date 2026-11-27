@@ -103,6 +103,11 @@ struct H {
 
 impl H {
     async fn start() -> Self {
+        Self::start_on(None).await
+    }
+
+    /// On database `file` (a fresh in-memory one when `None`), with its own model.
+    async fn start_on(file: Option<&std::path::Path>) -> Self {
         let model = Model::new();
         let served = model.clone();
         let app = axum::Router::new().route(
@@ -131,9 +136,11 @@ impl H {
             },
             org_admins: vec![],
         };
-        let state = AppState::new(config, Db::open_in_memory().unwrap(), Arc::new(FakeAuth))
-            .await
-            .unwrap();
+        let db = match file {
+            Some(f) => Db::open(f).unwrap(),
+            None => Db::open_in_memory().unwrap(),
+        };
+        let state = AppState::new(config, db, Arc::new(FakeAuth)).await.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let app = state.clone();
@@ -499,6 +506,93 @@ async fn in_a_room_a_message_the_run_never_took_starts_its_own_run() {
     assert_eq!(phase(&room, "started").len(), 2);
     let call = &h.model.calls()[1];
     assert!(position(call, "reply-1").unwrap().0 < position(call, "msg-two").unwrap().0);
+}
+
+#[tokio::test]
+async fn a_steer_not_delivered_before_a_restart_starts_its_run_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("metro.sqlite3");
+    let before = H::start_on(Some(&file)).await;
+    let sid = before.space().await;
+    before
+        .sent("alice", &sid, json!({"text": "@agent [tool] go"}))
+        .await;
+    before.calls_reach(1).await;
+    before
+        .sent("alice", &sid, json!({"text": "@agent left-waiting"}))
+        .await;
+    // Offered to the running turn, durable until it's delivered.
+    assert_eq!(before.pending(), 1);
+
+    // The process stops before the turn's next model call; the next one
+    // starts the message's own run, once.
+    let after = H::start_on(Some(&file)).await;
+    assert_eq!(
+        metro_server::decisions::resume(after.state.clone())
+            .await
+            .unwrap(),
+        1
+    );
+    let room = after
+        .until(|| after.room(&sid), |e| !replies(e).is_empty())
+        .await;
+    assert!(steered(&room).is_empty());
+    let calls = after.model.calls();
+    assert_eq!(calls.len(), 1);
+    assert!(position(&calls[0], "left-waiting").is_some());
+    assert_eq!(after.pending(), 0);
+    assert_eq!(
+        metro_server::decisions::resume(after.state.clone())
+            .await
+            .unwrap(),
+        0
+    );
+    // The old turn goes on, but no longer holds the message: it neither
+    // takes it nor starts it a second time.
+    before.model.open();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let room = after.room(&sid).await;
+    assert!(steered(&room).is_empty(), "{room:?}");
+    assert_eq!(
+        phase(&room, "started").len(),
+        2,
+        "the first run and the steer's own, never another: {room:?}"
+    );
+    let all = serde_json::to_string(&before.model.calls()).unwrap();
+    assert!(!all.contains("left-waiting"), "{all}");
+    assert_eq!(after.model.calls().len(), 1);
+}
+
+#[tokio::test]
+async fn a_delivered_steer_never_starts_a_run_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("metro.sqlite3");
+    let before = H::start_on(Some(&file)).await;
+    let sid = before.space().await;
+    before
+        .sent("alice", &sid, json!({"text": "@agent [tool] go"}))
+        .await;
+    before.calls_reach(1).await;
+    let steer = before
+        .sent("alice", &sid, json!({"text": "@agent also this"}))
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    before.model.open();
+    let room = before
+        .until(|| before.room(&sid), |e| !replies(e).is_empty())
+        .await;
+    assert_eq!(steered(&room), [id(&steer)]);
+    assert_eq!(before.pending(), 0, "delivery settles the planned run");
+    let after = H::start_on(Some(&file)).await;
+    assert_eq!(
+        metro_server::decisions::resume(after.state.clone())
+            .await
+            .unwrap(),
+        0
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(after.model.calls().is_empty());
+    assert_eq!(phase(&after.room(&sid).await, "started").len(), 1);
 }
 
 #[tokio::test]

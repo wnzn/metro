@@ -1122,6 +1122,7 @@ pub async fn chat_message(
                 &[],
                 &MessageMeta::default(),
                 pending.as_ref(),
+                None,
             )
         });
         Ok((appended?, ticket))

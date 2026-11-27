@@ -147,6 +147,7 @@ pub fn append_message(
     recipients: &[crate::mentions::Mention],
     meta: &MessageMeta,
     pending: Option<&crate::decisions::NewPending>,
+    planned: Option<&crate::decisions::NewTargets>,
 ) -> anyhow::Result<Append> {
     let Some(sender) = author.id.as_deref() else {
         return Ok(Append::NoRoom);
@@ -242,6 +243,10 @@ pub fn append_message(
     // A decision to make after the response is durable with its message.
     if let Some(p) = pending {
         crate::decisions::insert_in(&tx, p, event.id)?;
+    }
+    // So are the runs offered to running turns ([`crate::steering`]).
+    if let Some(p) = planned {
+        crate::decisions::insert_targets_in(&tx, p, event.id)?;
     }
     tx.commit()?;
     event.attachments = attachments.into_iter().map(Attachment::File).collect();

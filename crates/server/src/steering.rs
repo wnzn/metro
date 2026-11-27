@@ -106,7 +106,7 @@ impl Steering {
         Some(rx)
     }
 
-    #[cfg(test)]
+    /// Whether a turn runs at `place` now.
     pub fn is_open(&self, place: &Place) -> bool {
         self.lock().contains_key(place)
     }

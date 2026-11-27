@@ -306,27 +306,15 @@ pub fn plan_in(
     if !held || !present {
         return Ok(false);
     }
-    let now = crate::db::now_ms();
-    for (position, t) in targets.iter().enumerate() {
-        tx.execute(
-            "INSERT OR IGNORE INTO pending_targets (event_id, agent_id, position, space_id, room_id,
-                 user_id, pick, addressed_by, choice, claimed_by, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                event_id,
-                t.agent_id,
-                position as i64,
-                space,
-                room,
-                user,
-                t.pick,
-                serde_json::to_value(t.addressed_by)?.as_str(),
-                choice.map(|c| c.to_string()),
-                epoch,
-                now
-            ],
-        )?;
-    }
+    let planned = NewTargets {
+        epoch: epoch.to_owned(),
+        space: space.to_owned(),
+        room: room.to_owned(),
+        user: user.to_owned(),
+        targets: targets.to_vec(),
+        choice: choice.cloned(),
+    };
+    insert_targets_in(&tx, &planned, event_id)?;
     for reason in errors {
         crate::db::Db::append_event_in(
             &tx,
@@ -341,6 +329,43 @@ pub fn plan_in(
     }
     tx.commit()?;
     Ok(true)
+}
+
+/// Planned runs of a Space message, claimed by the process `epoch` that
+/// writes them.
+pub struct NewTargets {
+    pub epoch: String,
+    pub space: String,
+    pub room: String,
+    pub user: String,
+    pub targets: Vec<PlannedTarget>,
+    pub choice: Option<serde_json::Value>,
+}
+
+/// Write `p` for message `event_id`, inside the caller's transaction.
+pub fn insert_targets_in(conn: &Connection, p: &NewTargets, event_id: i64) -> anyhow::Result<()> {
+    let now = crate::db::now_ms();
+    for (position, t) in p.targets.iter().enumerate() {
+        conn.execute(
+            "INSERT OR IGNORE INTO pending_targets (event_id, agent_id, position, space_id, room_id,
+                 user_id, pick, addressed_by, choice, claimed_by, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                event_id,
+                t.agent_id,
+                position as i64,
+                p.space,
+                p.room,
+                p.user,
+                t.pick,
+                serde_json::to_value(t.addressed_by)?.as_str(),
+                p.choice.as_ref().map(|c| c.to_string()),
+                p.epoch,
+                now
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 /// Claim one planned run inside the transaction that registers it and
