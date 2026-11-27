@@ -42,11 +42,15 @@
 //! - **No Space is attached by Metro.** The Space owner attaches it in the
 //!   existing Space runner settings. Metro never attaches, detaches or
 //!   replaces any Space's runner.
-//! - **Read-only, confined, no programs.** Claims with protocol 2, requires
-//!   every job to name a valid Space, and serves `workspace.list` and
-//!   `workspace.read` from that Space's own private `spaces/<sid>/` folder,
-//!   opened handle-relative without following links ([`super::folder`]).
-//!   Check, MCP and commands are refused; no Docker, no inbound port.
+//! - **Confined to the Space's folder.** Claims with protocol 2, requires
+//!   every job to name a valid Space, and serves [`TOOLS`] in that Space's
+//!   folder: its own private `spaces/<sid>/`, or a folder the person chose
+//!   for that Space ([`super::chosen`], kept in `folders.json`, checked
+//!   again before every job). Files are opened handle-relative without
+//!   following links ([`super::folder`]); `workspace.shell` runs one command
+//!   there ([`super::shell`]). The server decides whether a command may run
+//!   before it queues the job. Check and MCP are refused; no Docker, no
+//!   inbound port.
 //! - **Starts and stops with the app**: resumed when a session of that
 //!   server and account is bound, stopped on sign-out, server or account
 //!   switch, and app exit.
@@ -54,9 +58,11 @@
 //! ```text
 //! <local-tools root>/runner/<sha256(server, account)[..16]>/
 //!   runner.json     600: state, runner id + name, the runner token
-//!   spaces/<sid>/   the only folder a job for <sid> reads
+//!   folders.json    600: the folder chosen per Space, if any
+//!   spaces/<sid>/   the default folder of a job for <sid>
 //! ```
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -70,8 +76,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 use zeroize::Zeroize;
 
-use super::folder::Folder;
+use super::chosen::{self, Limits};
+use super::folder::{self, Folder};
 use super::hosted::{CallError, Claim, CreateError, Hosted, Job, RunnerInfo};
+use super::shell;
 use super::store::{read_capped, subdir, valid_space_id, write_atomic};
 use super::{BoundSession, ToolsError, from_call};
 use crate::Secret;
@@ -83,15 +91,25 @@ const RUNNER_DIR: &str = "runner";
 const SPACES: &str = "spaces";
 const RECORD: &str = "runner.json";
 const RECORD_TMP: &str = "runner.json.tmp";
+const FOLDERS: &str = "folders.json";
+const FOLDERS_TMP: &str = "folders.json.tmp";
 const MAX_RECORD_BYTES: u64 = 16 * 1024;
+const MAX_FOLDERS_BYTES: u64 = 512 * 1024;
+const MAX_FOLDERS: usize = 1000;
 const IDLE_POLL: Duration = Duration::from_millis(750);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const RESULT_ATTEMPTS: u32 = 6;
-pub const TOOLS: [&str; 2] = ["workspace.list", "workspace.read"];
+const HEARTBEAT: Duration = Duration::from_secs(2);
+pub const TOOLS: [&str; 4] = [
+    "workspace.list",
+    "workspace.read",
+    "workspace.write",
+    "workspace.shell",
+];
 
 pub const NOT_OFFERED: &str = "is not available here: this Space is served by the Metro desktop \
-     app's personal runner, which only lists and reads files in the Space's folder on this \
-     computer and never runs commands or MCP servers";
+     app's personal runner, which lists, reads and writes files and runs shell commands in the \
+     Space's folder on this computer, and never runs checks or MCP servers";
 
 // ---------------------------------------------------------------------------
 // Installer marker
@@ -496,6 +514,107 @@ pub fn space_folder(root: &File, h: &BoundSession, sid: &str) -> io::Result<File
     subdir(&s, sid, true)
 }
 
+/// The folder chosen per Space for this (server, account). A file that is
+/// there but can't be read is an error, never "no choice": a job must not
+/// run in the default folder when another one was chosen.
+pub fn load_folders(root: &File, h: &BoundSession) -> io::Result<BTreeMap<String, PathBuf>> {
+    let dir = match identity_handle(root, h, false) {
+        Ok(d) => d,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(e),
+    };
+    let bytes = match read_capped(&dir, FOLDERS, MAX_FOLDERS_BYTES)? {
+        None => return Ok(BTreeMap::new()),
+        Some(None) => return Err(io::Error::other("folder choices too large")),
+        Some(Some(b)) => b,
+    };
+    let bad = || io::Error::other("folder choices unreadable");
+    let v: Value = serde_json::from_slice(&bytes).map_err(|_| bad())?;
+    if v.get("v").and_then(Value::as_u64) != Some(1) {
+        return Err(bad());
+    }
+    let map = v
+        .get("folders")
+        .and_then(Value::as_object)
+        .ok_or_else(bad)?;
+    if map.len() > MAX_FOLDERS {
+        return Err(bad());
+    }
+    map.iter()
+        .map(|(sid, p)| match p.as_str().map(Path::new) {
+            Some(p) if valid_space_id(sid) && p.is_absolute() => Ok((sid.clone(), p.to_owned())),
+            _ => Err(bad()),
+        })
+        .collect()
+}
+
+pub fn save_folders(
+    root: &File,
+    h: &BoundSession,
+    folders: &BTreeMap<String, PathBuf>,
+) -> io::Result<()> {
+    let map: Map<String, Value> = folders
+        .iter()
+        .map(|(k, v)| (k.clone(), json!(v.to_string_lossy())))
+        .collect();
+    let data = serde_json::to_vec(&json!({"v": 1, "folders": map})).expect("serializable");
+    write_atomic(
+        &identity_handle(root, h, true)?,
+        FOLDERS,
+        FOLDERS_TMP,
+        &data,
+    )
+}
+
+fn as_others(folders: &BTreeMap<String, PathBuf>) -> Vec<(String, PathBuf)> {
+    folders
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// The folder a job for `sid` runs in, opened without following links, and
+/// its path: the chosen one (checked again now) or the default
+/// `spaces/<sid>/` (created if needed). Never the default instead of a
+/// chosen folder that can't be used.
+fn job_folder(spec: &Spec, sid: &str) -> Result<(File, PathBuf), String> {
+    let folders = {
+        let _g = spec.store_lock.lock();
+        load_folders(&spec.root, &spec.session)
+    }
+    .map_err(|_| "Metro couldn't read which folder was chosen for this Space on this computer")?;
+    if let Some(p) = folders.get(sid) {
+        let limits = Limits {
+            home: Limits::home_from_env(),
+            data_root: &spec.data_root,
+        };
+        chosen::recheck(p, sid, &limits, &as_others(&folders)).map_err(|r| {
+            format!(
+                "the folder chosen for this Space on this computer can't be used: {} Choose \
+                 another one, or go back to the default, in this computer's runner settings.",
+                r.message
+            )
+        })?;
+        let f = folder::open_dir_path(p)
+            .map_err(|e| format!("the folder chosen for this Space on this computer: {e}"))?;
+        return Ok((f, p.clone()));
+    }
+    let opened = {
+        let _g = spec.store_lock.lock();
+        space_folder(&spec.root, &spec.session, sid)
+    };
+    let f = opened.map_err(|_| {
+        "this Space's folder on this computer is missing or is not a plain folder".to_string()
+    })?;
+    let path = spaces_path(
+        &spec.root_path,
+        &spec.session.server_url,
+        &spec.session.account_id,
+    )
+    .join(sid);
+    Ok((f, path))
+}
+
 // ---------------------------------------------------------------------------
 // State shown to the person
 // ---------------------------------------------------------------------------
@@ -600,12 +719,25 @@ pub struct Ctx<'a> {
     pub marker: &'a Marker,
     pub root: &'a Arc<File>,
     pub root_path: &'a Path,
+    /// Metro's own data folder, which no chosen folder may overlap.
+    pub data_root: &'a Path,
     pub session: &'a BoundSession,
     pub api: &'a Hosted,
     pub store_lock: &'a Arc<Mutex<()>>,
 }
 
 impl Ctx<'_> {
+    fn load_folders(&self) -> Result<BTreeMap<String, PathBuf>, ToolsError> {
+        let _g = self.store_lock.lock();
+        load_folders(self.root, self.session)
+            .map_err(|_| super::fs_error("read the folders chosen for this computer's runner"))
+    }
+    fn limits(&self) -> Limits<'_> {
+        Limits {
+            home: Limits::home_from_env(),
+            data_root: self.data_root,
+        }
+    }
     fn load(&self) -> io::Result<Option<Record>> {
         let _g = self.store_lock.lock();
         load(self.root, self.session)
@@ -691,6 +823,8 @@ fn spawn(cx: &Ctx<'_>, runner_id: String, token: Secret) -> Handle {
     let spec = Spec {
         hosted: cx.api.clone(),
         root: cx.root.clone(),
+        root_path: cx.root_path.to_path_buf(),
+        data_root: cx.data_root.to_path_buf(),
         store_lock: cx.store_lock.clone(),
         session: cx.session.clone(),
         runner_id: runner_id.clone(),
@@ -1095,10 +1229,9 @@ async fn rotate_into(
     Ok(())
 }
 
-/// `POST /v1/local-tools/runner/spaces/{sid}/folder`: the Space's folder on
-/// this computer (created if needed) and whether this runner serves it.
-/// Members only; attaching stays in the Space's runner settings.
-pub(super) async fn folder_for(cx: &Ctx<'_>, sid: &str) -> Result<Value, ToolsError> {
+/// The runner is set up, the person is a member of `sid`, and whether this
+/// runner (by id) is the one attached there.
+async fn attached_to(cx: &Ctx<'_>, sid: &str) -> Result<bool, ToolsError> {
     if !valid_space_id(sid) {
         return Err(ToolsError::new(404, "not_found", "no such Space"));
     }
@@ -1123,24 +1256,110 @@ pub(super) async fn folder_for(cx: &Ctx<'_>, sid: &str) -> Result<Value, ToolsEr
         return Err(ToolsError::new(404, "not_found", "no such Space"));
     }
     // By the stable runner id, never by display name.
-    let attached = cx
+    Ok(cx
         .api
         .space_runner_id(&cx.session.token, sid)
         .await
         .map_err(from_call)?
-        .is_some_and(|id| Some(&id) == rec.runner_id.as_ref());
+        .is_some_and(|id| Some(&id) == rec.runner_id.as_ref()))
+}
+
+/// The folder a Space's jobs use on this computer: `folder` (chosen or
+/// default), `default_folder`, `custom`, and `folder_problem` when a chosen
+/// folder can't be used now (its jobs then fail; nothing falls back).
+fn folder_view(cx: &Ctx<'_>, sid: &str, attached: Option<bool>) -> Result<Value, ToolsError> {
+    let default =
+        spaces_path(cx.root_path, &cx.session.server_url, &cx.session.account_id).join(sid);
+    let folders = cx.load_folders()?;
+    let chosen = folders.get(sid);
+    let problem = chosen.and_then(|p| {
+        chosen::recheck(p, sid, &cx.limits(), &as_others(&folders))
+            .err()
+            .map(|r| r.message)
+    });
+    let mut v = json!({
+        "space_id": sid,
+        "folder": chosen.unwrap_or(&default).to_string_lossy(),
+        "default_folder": default.to_string_lossy(),
+        "custom": chosen.is_some(),
+        "folder_problem": problem,
+        "tools": TOOLS,
+    });
+    if let Some(a) = attached {
+        v["attached"] = json!(a);
+    }
+    Ok(v)
+}
+
+/// `POST /v1/local-tools/runner/spaces/{sid}/folder`: the Space's folder on
+/// this computer (the default one created if needed) and whether this
+/// runner serves it. Members only; attaching stays in the Space's runner
+/// settings.
+pub(super) async fn folder_for(cx: &Ctx<'_>, sid: &str) -> Result<Value, ToolsError> {
+    let attached = attached_to(cx, sid).await?;
     {
         let _g = cx.store_lock.lock();
         space_folder(cx.root, cx.session, sid)
             .map_err(|_| super::fs_error("create the Space's folder"))?;
     }
-    let path = spaces_path(cx.root_path, &cx.session.server_url, &cx.session.account_id).join(sid);
-    Ok(json!({
-        "space_id": sid,
-        "folder": path.to_string_lossy(),
-        "attached": attached,
-        "tools": TOOLS,
-    }))
+    folder_view(cx, sid, Some(attached))
+}
+
+/// `PUT /v1/local-tools/runner/spaces/{sid}/folder` `{"path"}`: use `path`
+/// for this Space's jobs from the next job on, only while this runner is
+/// attached there. Moves nothing.
+pub(super) async fn set_folder(cx: &Ctx<'_>, sid: &str, raw: &str) -> Result<Value, ToolsError> {
+    if !attached_to(cx, sid).await? {
+        return Err(ToolsError::new(
+            409,
+            "not_attached",
+            "This computer's runner isn't attached to this Space.",
+        ));
+    }
+    {
+        let _g = cx.store_lock.lock();
+        let mut folders = load_folders(cx.root, cx.session)
+            .map_err(|_| super::fs_error("read the folders chosen for this computer's runner"))?;
+        let canon = chosen::check(raw, sid, &cx.limits(), &as_others(&folders))
+            .map_err(|r| ToolsError::new(422, r.code, r.message))?;
+        folders.insert(sid.to_owned(), canon);
+        if folders.len() > MAX_FOLDERS {
+            return Err(ToolsError::new(422, "too_many", "Too many chosen folders."));
+        }
+        save_folders(cx.root, cx.session, &folders)
+            .map_err(|_| super::fs_error("save the folder chosen for this Space"))?;
+    }
+    folder_view(cx, sid, Some(true))
+}
+
+/// `DELETE /v1/local-tools/runner/spaces/{sid}/folder`: back to the default
+/// folder from the next job on. Local only; moves nothing.
+pub(super) fn clear_folder(cx: &Ctx<'_>, sid: &str) -> Result<Value, ToolsError> {
+    if !valid_space_id(sid) {
+        return Err(ToolsError::new(404, "not_found", "no such Space"));
+    }
+    {
+        let _g = cx.store_lock.lock();
+        let mut folders = load_folders(cx.root, cx.session)
+            .map_err(|_| super::fs_error("read the folders chosen for this computer's runner"))?;
+        if folders.remove(sid).is_some() {
+            save_folders(cx.root, cx.session, &folders).map_err(|_| {
+                super::fs_error("save the folders chosen for this computer's runner")
+            })?;
+        }
+    }
+    folder_view(cx, sid, None)
+}
+
+/// `GET /v1/local-tools/runner/folders`: every chosen folder, including
+/// those of Spaces this runner is no longer attached to.
+pub(super) fn list_folders(cx: &Ctx<'_>) -> Result<Value, ToolsError> {
+    let folders = cx.load_folders()?;
+    let rows: Vec<Value> = folders
+        .iter()
+        .map(|(sid, p)| json!({"space_id": sid, "folder": p.to_string_lossy()}))
+        .collect();
+    Ok(json!({ "folders": rows }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1151,6 +1370,8 @@ pub(super) async fn folder_for(cx: &Ctx<'_>, sid: &str) -> Result<Value, ToolsEr
 struct Spec {
     hosted: Hosted,
     root: Arc<File>,
+    root_path: PathBuf,
+    data_root: PathBuf,
     store_lock: Arc<Mutex<()>>,
     session: BoundSession,
     runner_id: String,
@@ -1200,7 +1421,7 @@ async fn run(spec: Spec, mut rx: watch::Receiver<bool>, status: Arc<Mutex<Note>>
             }
             Ok(Claim::Job(job)) => {
                 set(&status, RunnerState::Online, None);
-                let (ok, output) = execute(&spec, &job).await;
+                let (ok, output) = execute(&spec, &job, rx.clone()).await;
                 if !report(&spec, &mut rx, &status, &job.id, ok, &output).await {
                     break;
                 }
@@ -1276,7 +1497,29 @@ struct PathArgs {
     path: Option<String>,
 }
 
-async fn execute(spec: &Spec, job: &Job) -> (bool, String) {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WriteArgs {
+    path: String,
+    content: String,
+}
+
+/// Parse a job's arguments object into `T`.
+fn args<T: for<'de> Deserialize<'de>>(v: &Value) -> Result<T, String> {
+    match v.as_object() {
+        Some(m) => serde_json::from_value(Value::Object(Map::clone(m)))
+            .map_err(|e| format!("invalid arguments: {e}")),
+        None => Err("arguments must be a JSON object".into()),
+    }
+}
+
+enum Call {
+    Files(String, Option<String>),
+    Write(WriteArgs),
+    Shell(shell::Request),
+}
+
+async fn execute(spec: &Spec, job: &Job, stop: watch::Receiver<bool>) -> (bool, String) {
     // Protocol 2: every job names its Space. No Space, or one that can't be
     // a folder name, touches nothing.
     let Some(sid) = job.space_id.clone().filter(|s| valid_space_id(s)) else {
@@ -1285,50 +1528,70 @@ async fn execute(spec: &Spec, job: &Job) -> (bool, String) {
             "refusing job: it doesn't name a valid Space for this runner".into(),
         );
     };
-    let tool = job.tool.clone();
-    if !TOOLS.contains(&tool.as_str()) {
-        return (
-            false,
-            format!("{} {NOT_OFFERED}", crate::secret::clean_line(&tool, 64)),
-        );
-    }
-    let args: PathArgs = match job.arguments.as_object() {
-        Some(m) => match serde_json::from_value(Value::Object(Map::clone(m))) {
-            Ok(a) => a,
-            Err(e) => return (false, format!("invalid arguments: {e}")),
-        },
-        None => return (false, "arguments must be a JSON object".into()),
+    let tool = job.tool.as_str();
+    let call = match tool {
+        "workspace.list" | "workspace.read" => {
+            args::<PathArgs>(&job.arguments).map(|a| Call::Files(tool.to_owned(), a.path))
+        }
+        "workspace.write" => args::<WriteArgs>(&job.arguments).map(Call::Write),
+        "workspace.shell" => shell::parse(&job.arguments).map(Call::Shell),
+        _ => {
+            return (
+                false,
+                format!("{} {NOT_OFFERED}", crate::secret::clean_line(tool, 64)),
+            );
+        }
     };
-    let (root, session, lock) = (
-        spec.root.clone(),
-        spec.session.clone(),
-        spec.store_lock.clone(),
-    );
-    let r = tokio::task::spawn_blocking(move || {
-        // Opened fresh per job, from the root handle, without following
-        // links: only this Space's own folder.
-        let opened = {
-            let _g = lock.lock();
-            space_folder(&root, &session, &sid)
-        };
-        let ws = match opened {
-            Ok(f) => Folder::from_handle(f),
-            Err(_) => {
-                return (
-                    false,
-                    "this Space's folder on this computer is missing or is not a plain folder"
-                        .to_string(),
-                );
-            }
-        };
-        super::worker::run_tool(&ws, &tool, args.path)
-    })
-    .await
-    .unwrap_or_else(|_| (false, "internal error in this computer's runner".into()));
+    let call = match call {
+        Ok(c) => c,
+        Err(e) => return (false, e),
+    };
+    // Opened fresh per job, without following links: this Space's folder.
+    let s = spec.clone();
+    let opened = tokio::task::spawn_blocking(move || job_folder(&s, &sid)).await;
+    let (dir, path) = match opened {
+        Ok(Ok(d)) => d,
+        Ok(Err(m)) => return (false, m),
+        Err(_) => return (false, "internal error in this computer's runner".into()),
+    };
+    let r = match call {
+        Call::Shell(req) => shell::run(&req, &dir, &path, stop, job_ended(spec, &job.id)).await,
+        Call::Files(tool, p) => {
+            in_folder(dir, move |ws| super::worker::run_tool(ws, &tool, p)).await
+        }
+        Call::Write(a) => in_folder(dir, move |ws| write_tool(ws, &a)).await,
+    };
     (
         r.0,
         super::worker::truncate_utf8(r.1, super::worker::MAX_OUTPUT_BYTES),
     )
+}
+
+/// Finishes once the server says the job is over, asked every
+/// [`HEARTBEAT`].
+async fn job_ended(spec: &Spec, id: &str) {
+    loop {
+        tokio::time::sleep(HEARTBEAT).await;
+        if !spec.hosted.heartbeat(&spec.token, id).await {
+            return;
+        }
+    }
+}
+
+async fn in_folder(
+    dir: File,
+    f: impl FnOnce(&Folder) -> (bool, String) + Send + 'static,
+) -> (bool, String) {
+    tokio::task::spawn_blocking(move || f(&Folder::from_handle(dir)))
+        .await
+        .unwrap_or_else(|_| (false, "internal error in this computer's runner".into()))
+}
+
+fn write_tool(ws: &Folder, a: &WriteArgs) -> (bool, String) {
+    match ws.write(&a.path, a.content.as_bytes()) {
+        Ok(w) => (true, format!("wrote {} bytes to {}", w.bytes, w.path)),
+        Err(e) => (false, format!("workspace.write {:?}: {e}", a.path)),
+    }
 }
 
 /// The runner id the worker serves, if one runs (tests, status).
@@ -1490,6 +1753,144 @@ mod tests {
             session("https://metro.example:8443").server_url(),
             "https://metro.example"
         );
+    }
+
+    fn spec(t: &Path) -> Spec {
+        let tools = t.join("data").join("local-tools");
+        Spec {
+            hosted: Hosted::new("http://127.0.0.1:9").unwrap(),
+            root: Arc::new(crate::desktop_tools::store::open_root(&tools).unwrap()),
+            root_path: tools,
+            data_root: t.join("data"),
+            store_lock: Arc::new(Mutex::new(())),
+            session: BoundSession::signed_in("http://127.0.0.1:9", &Secret::new("s"), "alice")
+                .unwrap(),
+            runner_id: "rn-1".into(),
+            token: Secret::new("metro_rt_v2_x"),
+        }
+    }
+
+    async fn call(spec: &Spec, tool: &str, args: Value) -> (bool, String) {
+        let job = Job {
+            id: "j1".into(),
+            tool: tool.into(),
+            arguments: args,
+            space_id: Some("s-a".into()),
+        };
+        let (_tx, rx) = watch::channel(false);
+        execute(spec, &job, rx).await
+    }
+
+    #[tokio::test]
+    async fn jobs_use_the_chosen_folder_or_the_default_never_both() {
+        let t = tempfile::tempdir().unwrap();
+        let s = spec(t.path());
+        let default = spaces_path(&s.root_path, "http://127.0.0.1:9", "alice").join("s-a");
+        let (ok, out) = call(
+            &s,
+            "workspace.write",
+            json!({"path": "notes/a.md", "content": "hello"}),
+        )
+        .await;
+        assert!(ok, "{out}");
+        assert_eq!(out, "wrote 5 bytes to notes/a.md");
+        assert_eq!(std::fs::read(default.join("notes/a.md")).unwrap(), b"hello");
+        let (ok, out) = call(&s, "workspace.read", json!({"path": "notes/a.md"})).await;
+        assert_eq!((ok, out.as_str()), (true, "hello"));
+        #[cfg(unix)]
+        {
+            let (ok, out) = call(&s, "workspace.shell", json!({"command": "cat notes/a.md"})).await;
+            assert!(ok, "{out}");
+            assert!(out.starts_with("exit: 0\n--- stdout ---\nhello\n"), "{out}");
+        }
+
+        // A chosen folder: the next job runs there; nothing was moved.
+        let chosen = chosen::canonical(t.path()).unwrap().join("project");
+        std::fs::create_dir(&chosen).unwrap();
+        let folders = BTreeMap::from([("s-a".to_string(), chosen.clone())]);
+        save_folders(&s.root, &s.session, &folders).unwrap();
+        assert_eq!(load_folders(&s.root, &s.session).unwrap(), folders);
+        let (ok, out) = call(
+            &s,
+            "workspace.write",
+            json!({"path": "b.txt", "content": "b"}),
+        )
+        .await;
+        assert!(ok, "{out}");
+        assert!(chosen.join("b.txt").is_file());
+        assert!(!default.join("b.txt").exists());
+        assert!(default.join("notes/a.md").is_file());
+        let (ok, out) = call(&s, "workspace.list", json!({})).await;
+        assert!(
+            ok && out.contains("b.txt") && !out.contains("notes"),
+            "{out}"
+        );
+        #[cfg(unix)]
+        {
+            let (ok, out) = call(&s, "workspace.shell", json!({"command": "pwd"})).await;
+            assert!(ok, "{out}");
+            assert!(out.contains(&format!("\n{}\n", chosen.display())), "{out}");
+        }
+
+        // Gone: the job fails visibly; the default folder isn't used instead.
+        std::fs::remove_dir_all(&chosen).unwrap();
+        let (ok, out) = call(
+            &s,
+            "workspace.write",
+            json!({"path": "c.txt", "content": "c"}),
+        )
+        .await;
+        assert!(!ok);
+        assert!(out.contains("folder chosen for this Space"), "{out}");
+        assert!(!default.join("c.txt").exists());
+        // Unreadable choices: also no fallback.
+        let dir = identity_handle(&s.root, &s.session, false).unwrap();
+        write_atomic(&dir, FOLDERS, FOLDERS_TMP, b"{not json").unwrap();
+        assert!(load_folders(&s.root, &s.session).is_err());
+        let (ok, out) = call(&s, "workspace.list", json!({})).await;
+        assert!(!ok);
+        assert!(out.contains("couldn't read which folder"), "{out}");
+        // Cleared: the default again.
+        save_folders(&s.root, &s.session, &BTreeMap::new()).unwrap();
+        let (ok, out) = call(&s, "workspace.list", json!({"path": "notes"})).await;
+        assert!(ok && out.contains("a.md"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn jobs_are_refused_without_a_space_tool_or_valid_arguments() {
+        let t = tempfile::tempdir().unwrap();
+        let s = spec(t.path());
+        let (_tx, rx) = watch::channel(false);
+        let job = Job {
+            id: "j1".into(),
+            tool: "workspace.write".into(),
+            arguments: json!({"path": "x", "content": "x"}),
+            space_id: None,
+        };
+        let (ok, out) = execute(&s, &job, rx).await;
+        assert!(!ok && out.starts_with("refusing job"), "{out}");
+        for (tool, args) in [
+            ("workspace.check", json!({})),
+            ("workspace.mcp_call", json!({})),
+            ("workspace.write", json!({"path": "x"})),
+            ("workspace.write", json!({"path": "x", "content": 1})),
+            (
+                "workspace.write",
+                json!({"path": "x", "content": "", "mode": 7}),
+            ),
+            ("workspace.write", json!({"path": "../x", "content": "x"})),
+            (
+                "workspace.shell",
+                json!({"command": "ls", "timeout_secs": 601}),
+            ),
+            ("workspace.shell", json!({"cmd": "ls"})),
+            ("workspace.read", json!({"path": "x", "extra": true})),
+        ] {
+            let (ok, out) = call(&s, tool, args.clone()).await;
+            assert!(!ok, "{tool} {args}: {out}");
+        }
+        let (_, out) = call(&s, "workspace.check", json!({})).await;
+        assert!(out.contains("never runs checks or MCP servers"), "{out}");
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! Read-only, handle-relative access to one Space's local folder.
+//! Handle-relative access to one Space's local folder: list, read, and
+//! create or replace one file.
 //!
 //! Every path an agent sends is split into plain names and opened one name
 //! at a time, relative to the handle of the directory before it, with
@@ -11,14 +12,18 @@
 //! absolute paths never reach the OS, and nothing outside the folder (a
 //! sibling Space, the pairing file, the rest of the disk) can be named.
 //!
-//! The folder is only read: no create, write, rename or delete exists here.
+//! Writing ([`Folder::write`]) creates missing parent directories (0755)
+//! one name at a time under the same rules, writes a new file beside the target and
+//! renames it over the target. A link is never written through or replaced,
+//! and a hard-linked target is replaced, not modified in place. Nothing here
+//! deletes or renames the person's files.
 
 use std::fmt;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::Path;
 
-use cap_primitives::fs::{FollowSymlinks, OpenOptions};
+use cap_primitives::fs::{DirOptions, FollowSymlinks, OpenOptions};
 
 pub const MAX_PATH_LEN: usize = 4096;
 pub const MAX_DEPTH: usize = 64;
@@ -26,6 +31,7 @@ pub const MAX_NAME_LEN: usize = 255;
 /// Leaves room for the truncation note under Metro's 1 MiB result limit.
 pub const MAX_READ_BYTES: usize = 1024 * 1024 - 4096;
 pub const MAX_LIST_ENTRIES: usize = 2000;
+pub const MAX_WRITE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug)]
 pub enum FolderError {
@@ -203,7 +209,15 @@ pub fn open_file(dir: &File, name: &str) -> Result<File, FolderError> {
         use cap_primitives::fs::OpenOptionsExt;
         opts.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
     }
-    let f = cap_primitives::fs::open(dir, Path::new(name), &opts).map_err(map_open_err)?;
+    let f = match cap_primitives::fs::open(dir, Path::new(name), &opts) {
+        Ok(f) => f,
+        // Windows refuses to open a directory as a file with "access denied".
+        #[cfg(windows)]
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied && open_subdir(dir, name).is_ok() => {
+            return Err(FolderError::NotAFile);
+        }
+        Err(e) => return Err(map_open_err(e)),
+    };
     let ft = handle_kind(&f)?;
     if ft.is_dir() {
         return Err(FolderError::NotAFile);
@@ -212,6 +226,61 @@ pub fn open_file(dir: &File, name: &str) -> Result<File, FolderError> {
         return Err(FolderError::NotAFile);
     }
     Ok(f)
+}
+
+/// [`open_subdir`], creating `name` first when it is missing.
+fn open_or_create_subdir(dir: &File, name: &str) -> Result<File, FolderError> {
+    match open_subdir(dir, name) {
+        Err(FolderError::NotFound) => {
+            #[cfg_attr(not(unix), allow(unused_mut))]
+            let mut o = DirOptions::new();
+            #[cfg(unix)]
+            {
+                use cap_primitives::fs::DirBuilderExt;
+                o.mode(0o755);
+            }
+            match cap_primitives::fs::create_dir(dir, Path::new(name), &o) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(map_open_err(e)),
+            }
+            open_subdir(dir, name)
+        }
+        r => r,
+    }
+}
+
+/// Open the absolute directory `path` (a folder the person chose), refusing
+/// it when its last component is a link or reparse point. Nothing is
+/// created.
+pub fn open_dir_path(path: &Path) -> Result<File, FolderError> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        opts.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let f = opts.open(path).map_err(map_open_err)?;
+    if !handle_kind(&f)?.is_dir() {
+        return Err(FolderError::NotADirectory);
+    }
+    Ok(f)
+}
+
+/// What [`Folder::write`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Written {
+    pub path: String,
+    pub bytes: usize,
+    pub created: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -248,6 +317,11 @@ impl Folder {
     /// links (see [`open_subdir`]).
     pub fn from_handle(root: File) -> Self {
         Folder { root }
+    }
+
+    /// The folder's own handle (the shell's working directory on Unix).
+    pub fn handle(&self) -> &File {
+        &self.root
     }
 
     fn walk(&self, names: &[&str]) -> Result<File, FolderError> {
@@ -331,6 +405,55 @@ impl Folder {
             truncated,
         })
     }
+
+    /// Create or replace the file `rel` with `content` (at most
+    /// [`MAX_WRITE_BYTES`]), creating missing parent directories. Only a
+    /// regular file is replaced; a link, directory or other object at `rel`
+    /// is refused. On Unix a replaced file keeps its permission bits.
+    pub fn write(&self, rel: &str, content: &[u8]) -> Result<Written, FolderError> {
+        if content.len() > MAX_WRITE_BYTES {
+            return Err(FolderError::Unsupported(format!(
+                "content is larger than {MAX_WRITE_BYTES} bytes"
+            )));
+        }
+        let mut names = split_path(rel)?;
+        let Some(last) = names.pop() else {
+            return Err(FolderError::InvalidPath("path is required".into()));
+        };
+        let mut dir = self.root.try_clone().map_err(FolderError::Io)?;
+        for name in &names {
+            dir = open_or_create_subdir(&dir, name)?;
+        }
+        let existing = match open_file(&dir, last) {
+            Ok(f) => Some(f.metadata().map_err(FolderError::Io)?.permissions()),
+            Err(FolderError::NotFound) => None,
+            Err(e) => return Err(e),
+        };
+        let tmp = format!(".metro-write-{:016x}.tmp", rand::random::<u64>());
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        opts._cap_fs_ext_follow(FollowSymlinks::No);
+        let written = (|| -> io::Result<()> {
+            let mut f = cap_primitives::fs::open(&dir, Path::new(&tmp), &opts)?;
+            f.write_all(content)?;
+            #[cfg(unix)]
+            if let Some(p) = &existing {
+                f.set_permissions(p.clone())?;
+            }
+            f.sync_all()
+        })()
+        .and_then(|()| cap_primitives::fs::rename(&dir, Path::new(&tmp), &dir, Path::new(last)));
+        if let Err(e) = written {
+            let _ = cap_primitives::fs::remove_file(&dir, Path::new(&tmp));
+            return Err(map_open_err(e));
+        }
+        names.push(last);
+        Ok(Written {
+            path: names.join("/"),
+            bytes: content.len(),
+            created: existing.is_none(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -338,7 +461,7 @@ mod tests {
     use super::*;
 
     fn folder(dir: &Path) -> Folder {
-        let parent = File::open(dir.parent().unwrap()).unwrap();
+        let parent = open_dir_path(dir.parent().unwrap()).unwrap();
         let name = dir.file_name().unwrap().to_str().unwrap();
         Folder::from_handle(open_subdir(&parent, name).unwrap())
     }
@@ -488,6 +611,193 @@ mod tests {
         let f = folder(&ws);
         assert!(matches!(f.read("pipe"), Err(FolderError::NotAFile)));
         assert!(matches!(f.read("bin"), Err(FolderError::Unsupported(_))));
+    }
+
+    #[test]
+    fn writes_create_and_replace_inside() {
+        let t = tempfile::tempdir().unwrap();
+        let ws = t.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let f = folder(&ws);
+        let w = f.write("a/b/./c.txt", b"one").unwrap();
+        assert_eq!(
+            w,
+            Written {
+                path: "a/b/c.txt".into(),
+                bytes: 3,
+                created: true
+            }
+        );
+        assert_eq!(std::fs::read(ws.join("a/b/c.txt")).unwrap(), b"one");
+        let w = f.write("a/b/c.txt", b"two!").unwrap();
+        assert!(!w.created);
+        assert_eq!(f.read("a/b/c.txt").unwrap().text, "two!");
+        f.write("empty", b"").unwrap();
+        assert_eq!(std::fs::read(ws.join("empty")).unwrap(), b"");
+        // No temporary file is left behind.
+        assert!(
+            std::fs::read_dir(ws.join("a/b"))
+                .unwrap()
+                .all(|e| e.unwrap().file_name() == "c.txt")
+        );
+        for bad in [
+            "",
+            ".",
+            "/etc/x",
+            "../x",
+            "a/../../x",
+            "C:/x",
+            "a/con",
+            "x:y",
+        ] {
+            assert!(
+                matches!(f.write(bad, b"x"), Err(FolderError::InvalidPath(_))),
+                "{bad}"
+            );
+        }
+        assert!(matches!(f.write("a", b"x"), Err(FolderError::NotAFile)));
+        assert!(matches!(
+            f.write("empty/x", b"x"),
+            Err(FolderError::NotADirectory)
+        ));
+        let big = vec![b'a'; MAX_WRITE_BYTES + 1];
+        assert!(matches!(
+            f.write("big", &big),
+            Err(FolderError::Unsupported(_))
+        ));
+        assert!(f.write("max", &big[..MAX_WRITE_BYTES]).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_never_follow_or_replace_links() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let t = tempfile::tempdir().unwrap();
+        let ws = t.path().join("ws");
+        let out = t.path().join("out");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("victim.txt"), "outside").unwrap();
+        symlink(out.join("victim.txt"), ws.join("file_link")).unwrap();
+        symlink(&out, ws.join("dir_link")).unwrap();
+        symlink("missing-target", ws.join("dangling")).unwrap();
+        let f = folder(&ws);
+        for p in [
+            "file_link",
+            "dir_link/victim.txt",
+            "dir_link/new.txt",
+            "dangling",
+        ] {
+            let e = f.write(p, b"pwned").unwrap_err();
+            assert!(
+                matches!(e, FolderError::Link | FolderError::NotADirectory),
+                "{p}: {e:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(out.join("victim.txt")).unwrap(),
+            "outside"
+        );
+        assert!(!out.join("new.txt").exists());
+        assert!(!out.join("missing-target").exists());
+        assert!(
+            std::fs::symlink_metadata(ws.join("file_link"))
+                .unwrap()
+                .is_symlink()
+        );
+        // A hard link to a file outside is replaced, never written through.
+        std::fs::hard_link(out.join("victim.txt"), ws.join("hard")).unwrap();
+        f.write("hard", b"new").unwrap();
+        assert_eq!(std::fs::read(ws.join("hard")).unwrap(), b"new");
+        assert_eq!(
+            std::fs::read_to_string(out.join("victim.txt")).unwrap(),
+            "outside"
+        );
+        // A replaced file keeps its mode.
+        std::fs::write(ws.join("run.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(ws.join("run.sh"), std::fs::Permissions::from_mode(0o750))
+            .unwrap();
+        f.write("run.sh", b"#!/bin/sh\necho hi\n").unwrap();
+        let mode = std::fs::metadata(ws.join("run.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o750);
+        // A FIFO is not a file to replace.
+        let fifo = std::ffi::CString::new(ws.join("pipe").as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(matches!(f.write("pipe", b"x"), Err(FolderError::NotAFile)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junctions_are_never_followed() {
+        let t = tempfile::tempdir().unwrap();
+        let ws = t.path().join("ws");
+        let out = t.path().join("out");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("victim.txt"), "outside").unwrap();
+        let made = std::process::Command::new("cmd")
+            .arg("/c")
+            .arg("mklink")
+            .arg("/J")
+            .arg(ws.join("j"))
+            .arg(&out)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !made || !ws.join("j").exists() {
+            eprintln!("skipped: junctions can't be made here");
+            return;
+        }
+        let f = folder(&ws);
+        for p in ["j/victim.txt", "j/new.txt"] {
+            assert!(f.write(p, b"pwned").is_err(), "{p}");
+            assert!(f.read(p).is_err(), "{p}");
+        }
+        assert!(f.list("j").is_err());
+        assert_eq!(
+            std::fs::read_to_string(out.join("victim.txt")).unwrap(),
+            "outside"
+        );
+        assert!(!out.join("new.txt").exists());
+        assert!(open_dir_path(&ws.join("j")).is_err());
+        let limits = super::super::chosen::Limits {
+            home: None,
+            data_root: &t.path().join("data"),
+        };
+        let raw = ws.join("j").to_string_lossy().into_owned();
+        assert_eq!(
+            super::super::chosen::check(&raw, "s", &limits, &[])
+                .unwrap_err()
+                .code,
+            "folder_is_link"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chosen_folder_open_refuses_links() {
+        use std::os::unix::fs::symlink;
+        let t = tempfile::tempdir().unwrap();
+        let real = t.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(t.path().join("file"), "x").unwrap();
+        symlink(&real, t.path().join("link")).unwrap();
+        assert!(open_dir_path(&real).is_ok());
+        assert!(matches!(
+            open_dir_path(&t.path().join("link")),
+            Err(FolderError::Link | FolderError::NotADirectory)
+        ));
+        assert!(matches!(
+            open_dir_path(&t.path().join("file")),
+            Err(FolderError::NotADirectory)
+        ));
+        assert!(matches!(
+            open_dir_path(&t.path().join("missing")),
+            Err(FolderError::NotFound)
+        ));
     }
 
     #[test]
