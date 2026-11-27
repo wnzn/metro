@@ -49,16 +49,19 @@ Containers use the host kernel, so this applies to them too.
 | `workspace.check` | Runs `METRO_CHECK_ARGV`; reports an error if unset | [Time limits](#time-limits), output capped |
 | MCP tools | From the stdio server in `METRO_MCP_ARGV`, if set | [Time limits](#time-limits) |
 | `workspace.write` | Creates or replaces one UTF-8 text file beneath the workspace (in the source, not released) | 1 MiB |
-| `workspace.shell` | Runs one command through the shell in the workspace (in the source, not released) | 120 s default, 600 s max; 64 KiB per output stream |
+| `workspace.shell` | Runs one command through the shell in the workspace (in the source, not released) | Command at most 16 KiB; 120 s default, 600 s max; 64 KiB per output stream |
 
 `workspace.write` uses the same path rules as read: the path is relative to
 the Space's root, and absolute paths, `..` and symlinks anywhere in the path
 are refused. It creates missing parent folders (mode 755), replaces the file
 atomically, and never writes through a hard link. It never needs approval.
 
-Both new tools are opt-in for agents: a Space owner adds `workspace.write`
-and `workspace.shell` to an agent's tool list. Existing agents and agents
-created without a list don't get them.
+Both new tools are in the agents' default tool list: new agents, and agents
+created without an explicit list, get them. Agents created before 0.6.3
+keep their saved list and don't gain them; a Space owner adds
+`workspace.write` and `workspace.shell` to their tool list. Shell commands
+still follow the [shell policy](#shell-policy), which asks every time by
+default.
 
 ## Environment
 
@@ -105,13 +108,30 @@ export METRO_MCP_ARGV='["/usr/local/bin/my-mcp-server","--stdio"]'
 ## Shell commands (in the source, not released)
 
 `workspace.shell` is the only tool that runs a shell, and the agent writes
-the command. The runner runs `/bin/sh -c <command>` (Windows, built-in
-runner only: `cmd.exe /d /s /c`) with the Space's root as its working
-folder, in its own process group, with stdin closed. The environment is
-cleared except `PATH`, `HOME`, `LANG`, `TERM=dumb` and `METRO_SPACE_ROOT`;
-no Metro token is passed. The result has the exit code and up to 64 KiB of
-stdout and of stderr, with a note when either was cut. Only exit code 0
-counts as success.
+the command, at most 16 KiB with no NUL character. The runner runs
+`/bin/sh -c <command>` (Windows, built-in runner only: `cmd.exe /d /s /c`)
+with the Space's root as its working folder, in its own process group, with
+stdin closed. The environment is cleared except `PATH`, `HOME`, `LANG`,
+`TERM=dumb` and `METRO_SPACE_ROOT` (on Windows, `USERPROFILE` instead of
+`HOME`, plus `SystemRoot`, `windir`, `ComSpec`, `PATHEXT`, `TEMP` and
+`TMP`); no Metro token is passed. The result looks like this:
+
+```text
+exit: <code | signal N>
+--- stdout ---
+...
+[metro-runner: stdout truncated, <total> bytes total]
+--- stderr ---
+...
+```
+
+Each stream keeps up to 64 KiB. The truncation line appears only when a
+stream was cut, and the built-in runner writes `metro-desktop` instead of
+`metro-runner`. Only exit code 0 counts as success. A command that didn't
+end on its own (timeout, cancellation, the runner stopping) fails, and its
+result starts with a line beginning `workspace.shell: `, such as
+`workspace.shell: timed out after <n>s and was killed`, followed by any
+output captured until then.
 
 **What this means for security.** Without the sandbox, a shell command runs
 as the runner's user, with that user's access to the machine. That includes
@@ -169,8 +189,12 @@ agent's history, and never indexed or searchable.
 - Stopping the run, any change to the Space's runner assignment (attach,
   detach, replace, revoke, delete) or deleting the Space cancels it.
   Rotating a token doesn't.
-- The agent gets a plain result: denied (with who denied it), expired or
-  cancelled.
+- When nothing ran, the room shows a tool result from Metro, and the agent
+  gets the same text: `workspace.shell not run: ` followed by the reason.
+  The reasons are that shell is off, the command was denied (with who
+  denied it), nobody approved it within 10 minutes, the approval was
+  cancelled, or the person who started the run left the Space while it
+  waited.
 - Time spent waiting for approval, and running a shell command, doesn't
   count against the run's own time limit.
 
@@ -193,7 +217,11 @@ In the source, not released: while a `workspace.shell` job runs, the runner
 sends `POST /v1/runner/jobs/{id}/heartbeat` about every 2 seconds. When the
 run stops, the lease runs out or the Space's runner assignment or credential
 changes, the server answers `410` (or `404` for a job it doesn't know), and
-the runner kills the command's process group. A network error isn't a
+the runner kills the command's process group. Once the runner's credential
+is revoked or rotated the server answers `401`: the desktop's built-in
+runner kills the command then, while `metro-runner` treats it as an error
+and lets the command run until it ends or times out; the server has
+already dropped that job, so its result is discarded. A network error isn't a
 cancellation; the command keeps going until its timeout. A shell command
 that already changed files has changed them.
 

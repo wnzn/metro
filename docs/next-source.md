@@ -17,9 +17,10 @@ release, and no release files contain them yet.
   works on dedicated and registered runners, standalone and built in. A
   stopped run kills its command. See
   [Shell commands](runner.md#shell-commands-in-the-source-not-released).
-- **Both tools are opt-in.** A Space owner adds them to an agent's tool
-  list. Existing agents and new agents with the default tools don't get
-  them.
+- **Both tools are in the default tool list.** New agents, including a new
+  Space's default agent, get them unless their owner picks a list.
+  Agents created before 0.6.3 keep their saved list; a Space owner adds the
+  tools to them.
 - **Shell policy.** Each runner has a shell mode: **Off**, **Ask every
   time** (the default), **Ask when System One flags it** or **Always
   allow**, and an **Approver**: **Runner owner** (the default) or **Any

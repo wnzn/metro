@@ -233,6 +233,10 @@ example in a browser) or with an older launcher.
   time** and **Runner owner** unless you trust every member of the Space
   with that access. **Ask when System One flags it** relies on a model's
   judgement, which can be wrong.
+- **Stopping.** A command is stopped with everything it started when it
+  times out, when the run is stopped, when the runner stops (sign-out or
+  quitting Metro), and when the shell itself exits, so background
+  processes don't outlive it.
 - **Windows.** Shell commands run with `cmd.exe` and are stopped with
   their Windows job object. A process started in the instant before it is
   added to the job object may keep running after a stop. The refusal of

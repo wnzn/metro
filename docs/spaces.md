@@ -136,10 +136,11 @@ A Space has one or more **agents**, at most 16. Each has:
   it can only answer. The allowlist only narrows what the run would have
   anyway: a Space without a runner still has no workspace tools, and a
   thread never gets thread tools. In the source, not released, the list
-  can also hold `workspace.write` and `workspace.shell`. They're opt-in:
-  `GET .../agents` lists them in `tools` but not in `default_tools`, so
-  existing agents and agents created without `tools` don't get them. Shell
-  commands also follow the runner's
+  can also hold `workspace.write` and `workspace.shell`, and both are in
+  `default_tools`: a new Space's default agent and agents created without
+  `tools` get them. Every agent stores its list, so agents created before
+  0.6.3 keep their saved list and don't gain them; the owner adds them.
+  Shell commands also follow the runner's
   [shell policy](runner.md#shell-commands-in-the-source-not-released).
 
 Exactly one agent is the Space's **default**. Every Space starts with one

@@ -141,8 +141,10 @@ see [New in Metro 0.6.2](docs/released-0.6.2.md); for later changes, see
 - `workspace.write` (one UTF-8 file, at most 1 MiB, parents created,
   atomic replace) is jailed like read: Space-root relative, no absolute
   path, `..`, symlink anywhere in the path or hard link. It never needs
-  approval. Write and shell are opt-in agent tools: not in
-  `default_tools`, so an agent gets them only when its owner lists them.
+  approval. Write and shell are in `default_tools`: new agents and agents
+  created without a list get them. Every agent stores its list, so agents
+  from before 0.6.3 keep theirs and gain them only when the owner adds
+  them; there's no migration. Shell stays gated by the policy below.
 - **Shell policy**: `shell_mode` `off` / `approve` (default) / `classify`
   / `allow`, `approver` `owner` (default) / `members`. A registered
   runner has one default plus per-Space overrides (null inherits), read
@@ -167,7 +169,8 @@ see [New in Metro 0.6.2](docs/released-0.6.2.md); for later changes, see
   change or Space deletion, not on token rotation. Only an approved or
   allowed command reaches a runner. Waiting and running shell jobs don't
   count against the run's time limit. A shell job is killed on timeout
-  (max 600 s), stop and heartbeat `410`/`404`; on Windows a process
+  (max 600 s; commands at most 16 KiB), stop and heartbeat `410`/`404`
+  (the built-in runner also on `401`/`409`); on Windows a process
   started just before job-object assignment can escape (known limit).
 - Shell runs with the runner user's access, including other Spaces'
   folders on that machine unless sandboxed. Docs must say so, and that
