@@ -1,4 +1,4 @@
-// Copyable, non-secret setup text for a registered runner (the prebuilt
+// Copyable, non-secret setup text for a runner (the prebuilt
 // standalone runner, or its Docker image) and for a device model connection
 // on a headless computer (metro-connector). Pure functions of public facts
 // only: none of them takes a token, so no token can end up in a command, a
@@ -122,6 +122,28 @@ export function dockerRunCommand(opts: { serverUrl: string; runnerName: string; 
     runnerImage(opts.appVersion),
   ];
   return lines.join(" \\\n  ");
+}
+
+/** A standalone Compose file; Docker reads the same private env file as `docker run`. */
+export function dockerComposeFile(opts: { serverUrl: string; runnerName: string; appVersion: string }): string {
+  const name = `metro-runner-${slug(opts.runnerName)}`;
+  return [
+    `name: ${name}`,
+    "services:",
+    "  runner:",
+    `    image: ${runnerImage(opts.appVersion)}`,
+    "    restart: unless-stopped",
+    "    init: true",
+    "    cap_drop: [ALL]",
+    "    security_opt: [no-new-privileges:true]",
+    ...(isLoopbackServer(opts.serverUrl) ? ["    network_mode: host"] : []),
+    "    env_file: ./runner.env",
+    "    volumes:",
+    "      - workspace:/workspace",
+    "volumes:",
+    "  workspace:",
+    "",
+  ].join("\n");
 }
 
 /** What the runner may do as configured by the template, said plainly. */

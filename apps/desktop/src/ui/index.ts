@@ -18,3 +18,4 @@ export * from "./settings";
 export { ConnectionItem, MoreMenu, ProblemNote } from "./providers";
 export type { ConnectionTag, MoreMenuItem } from "./providers";
 export * from "./modelPicker";
+export { CopyBlock, RunnerInstall } from "./runnerInstall";
