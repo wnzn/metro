@@ -223,7 +223,8 @@ see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
   preceding human or agent excerpts (400 characters each, 2,400 in
   total, newest kept), each with its author's name, whether a person or
   an agent, and the names it explicitly addressed, to the sender's
-  System One connection. Lean strongly toward a useful agent; "No agent"
+  System One connection. In a reply thread the anchor (unless deleted)
+  is the first excerpt, within those bounds and always kept. Lean strongly toward a useful agent; "No agent"
   is for text directed at or about another person, or that says no
   agent should answer. Below the directedness threshold or on failure,
   start nothing; at or above it, "No agent" uses the strongest agent

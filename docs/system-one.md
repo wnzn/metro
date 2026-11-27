@@ -223,7 +223,10 @@ options and the new message:
   together at most 2,400 (the newest are kept). Each one says who wrote
   it, whether a person or an agent, and, when it named recipients, their
   display names (`to`: people, agents, or `agent` for the generic
-  `@agent`).
+  `@agent`). In a reply thread, the message the thread started from
+  comes first, marked `anchor`, unless it was deleted. It counts as one
+  of the eight and within the 2,400 characters, and is always kept: the
+  thread's older messages are dropped first.
 
 Only events before the message are included, and deleted messages never
 are. There are still no stable participant IDs or agent instructions.

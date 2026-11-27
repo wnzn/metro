@@ -1244,7 +1244,8 @@ fn clip(s: &str, max: usize) -> String {
 /// messages or agent replies before event `before` (the message being
 /// classified, which may be stored already), never it or anything after it.
 /// Each excerpt says who wrote it, whether a person or an agent, and whom
-/// it explicitly addressed (`to`, when it named anyone).
+/// it explicitly addressed (`to`, when it named anyone). In a reply thread
+/// its anchor comes first (`anchor: true`).
 fn classifier_context(
     conn: &Connection,
     user: &str,
@@ -1284,40 +1285,14 @@ fn classifier_context(
         .prepare_cached("SELECT id, name FROM space_agents WHERE space_id = ?1")?
         .query_map([space], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
-    let mut stmt = conn.prepare_cached(
-        "SELECT kind, actor, substr(text, 1, ?4), mentions, json_extract(activity, '$.agent.name')
-         FROM space_events WHERE space_id = ?1 AND room_id = ?2 AND kind IN ('message', 'agent')
-           AND id < ?3
-         ORDER BY id DESC LIMIT ?5",
-    )?;
-    let rows = stmt
-        .query_map(
-            params![
-                space,
-                room,
-                before,
-                CONTEXT_EXCERPT_CHARS as i64,
-                CONTEXT_EXCERPTS as i64
-            ],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, Option<String>>(4)?,
-                ))
-            },
-        )?
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut budget = CONTEXT_TOTAL_CHARS;
-    let mut previous = Vec::new();
-    for (kind, actor, text, mentions, agent) in rows {
-        if budget == 0 {
-            break;
-        }
-        let text = clip(&text, budget);
-        budget -= text.chars().count();
+    type Row = (String, String, String, String, Option<String>);
+    let row = |r: &rusqlite::Row| -> rusqlite::Result<Row> {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+    };
+    const COLUMNS: &str = "kind, actor, text, mentions, json_extract(activity, '$.agent.name')";
+    let excerpt = |(kind, actor, text, mentions, agent): Row, budget: &mut usize| {
+        let text = clip(&text, (*budget).min(CONTEXT_EXCERPT_CHARS));
+        *budget -= text.chars().count();
         let mut to: Vec<String> = Vec::new();
         for m in serde_json::from_str::<Vec<Value>>(&mentions).unwrap_or_default() {
             let named = match (m["kind"].as_str(), m["id"].as_str(), m["agent_id"].as_str()) {
@@ -1341,8 +1316,46 @@ fn classifier_context(
         if !to.is_empty() {
             excerpt["to"] = json!(to);
         }
-        previous.push(excerpt);
+        excerpt
+    };
+    let mut budget = CONTEXT_TOTAL_CHARS;
+    // A reply thread's anchor (in the parent room) comes first and is always
+    // kept, unless it was deleted; it takes one slot and its share of the
+    // budget before the thread's newest messages.
+    let anchor: Option<Row> = conn
+        .query_row(
+            &format!(
+                "SELECT {COLUMNS} FROM space_events e
+                 JOIN space_rooms r ON r.space_id = e.space_id AND r.parent_room_id = e.room_id
+                   AND r.anchor_event_id = e.id
+                 WHERE r.space_id = ?1 AND r.id = ?2 AND e.kind IN ('message', 'agent') AND e.id < ?3"
+            ),
+            params![space, room, before],
+            row,
+        )
+        .optional()?;
+    let anchor = anchor.map(|a| {
+        let mut e = excerpt(a, &mut budget);
+        e["anchor"] = json!(true);
+        e
+    });
+    let slots = CONTEXT_EXCERPTS - usize::from(anchor.is_some());
+    let rows = conn
+        .prepare_cached(&format!(
+            "SELECT {COLUMNS} FROM space_events
+             WHERE space_id = ?1 AND room_id = ?2 AND kind IN ('message', 'agent') AND id < ?3
+             ORDER BY id DESC LIMIT ?4"
+        ))?
+        .query_map(params![space, room, before, slots as i64], row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut previous = Vec::new();
+    for r in rows {
+        if budget == 0 {
+            break;
+        }
+        previous.push(excerpt(r, &mut budget));
     }
+    previous.extend(anchor);
     previous.reverse();
     let sender = members.get(user).cloned();
     let mut people: Vec<&String> = members
@@ -1873,6 +1886,101 @@ mod tests {
         assert_eq!(previous.len(), CONTEXT_TOTAL_CHARS / CONTEXT_EXCERPT_CHARS);
         assert_eq!(c["sender"], "Bob");
         assert_eq!(c["people"], json!(["Alice", "Carol"]));
+    }
+
+    #[test]
+    fn a_reply_threads_anchor_comes_first_and_is_always_kept() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let sid = db.create_space("alice", "S", 10).unwrap().id;
+        db.add_member(&sid, "bob", 10).unwrap();
+        for id in ["alice", "bob"] {
+            db.lock()
+                .execute(
+                    "INSERT INTO profiles (user_id, display_name, updated_at) VALUES (?1, ?1, 0)",
+                    [id],
+                )
+                .unwrap();
+        }
+        let author = |id: &str| Author {
+            id: Some(id.into()),
+            name: id.into(),
+        };
+        let post = |room: &str, a: &str, text: &str, mentions: Value| {
+            let addressed = Addressed {
+                mentions,
+                audience: "room".into(),
+                spans: None,
+            };
+            db.append_event(&sid, room, kind::MESSAGE, &author(a), text, &addressed)
+                .unwrap()
+                .id
+        };
+        let anchor = post(
+            "lobby",
+            "bob",
+            &"a".repeat(500),
+            json!([{"kind": "user", "id": "alice"}]),
+        );
+        post("lobby", "bob", "lobby chatter", json!([]));
+        let (thread, _) = crate::replies::get_or_create(&db, &sid, "lobby", anchor, "alice", 10)
+            .unwrap()
+            .unwrap();
+        for i in 0..10 {
+            post(
+                &thread.id,
+                "alice",
+                &format!("{i}{}", "t".repeat(399)),
+                json!([]),
+            );
+        }
+        let context = || {
+            classifier_context(&db.lock(), "alice", &sid, &thread.id, i64::MAX)
+                .unwrap()
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeMap<_, _>>()["previous"]
+                .clone()
+        };
+        let previous = context();
+        let previous = previous.as_array().unwrap();
+        // The anchor plus the newest five: 6 × 400 fills the budget first.
+        assert_eq!(previous.len(), CONTEXT_TOTAL_CHARS / CONTEXT_EXCERPT_CHARS);
+        assert_eq!(previous[0]["anchor"], true);
+        assert_eq!(previous[0]["speaker"], "bob");
+        assert_eq!(previous[0]["to"], json!(["alice"]));
+        assert_eq!(
+            previous[0]["text"].as_str().unwrap().chars().count(),
+            CONTEXT_EXCERPT_CHARS
+        );
+        let firsts: Vec<char> = previous[1..]
+            .iter()
+            .map(|e| e["text"].as_str().unwrap().chars().next().unwrap())
+            .collect();
+        assert_eq!(firsts, ['5', '6', '7', '8', '9']);
+        assert!(previous[1..].iter().all(|e| e.get("anchor").is_none()));
+        // Short thread messages: the anchor takes one of the eight slots.
+        for i in 0..8 {
+            post(&thread.id, "alice", &format!("s{i}"), json!([]));
+        }
+        let previous = context();
+        assert_eq!(previous.as_array().unwrap().len(), CONTEXT_EXCERPTS);
+        assert_eq!(previous[0]["anchor"], true);
+        assert_eq!(previous[1]["text"], "s1");
+        // A deleted anchor (a tombstone) is left out.
+        db.lock()
+            .execute(
+                "UPDATE space_events SET kind = 'deleted' WHERE id = ?1",
+                [anchor],
+            )
+            .unwrap();
+        let previous = context();
+        assert_eq!(previous.as_array().unwrap().len(), CONTEXT_EXCERPTS);
+        assert_eq!(previous[0]["text"], "s0");
+        // Top-level rooms have no anchor.
+        let lobby = classifier_context(&db.lock(), "alice", &sid, "lobby", i64::MAX)
+            .unwrap()
+            .unwrap();
+        assert!(!lobby[4].1.to_string().contains("\"anchor\""));
     }
 
     #[test]

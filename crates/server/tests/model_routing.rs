@@ -904,6 +904,43 @@ async fn addressing_inference_is_opt_in_thresholded_and_abstains() {
     assert_eq!(to("lunch?"), Some(Value::Null));
     h.answer_after("alice", Some(&sid), e["id"].as_i64().unwrap())
         .await;
+
+    // In a reply thread, its anchor in the parent room comes first.
+    let anchor = h
+        .events("alice", Some(&sid))
+        .await
+        .into_iter()
+        .find(|e| e["text"] == "@alice what do you think?")
+        .unwrap();
+    let (s, thread) = h
+        .post(
+            "alice",
+            &format!(
+                "/v1/spaces/{sid}/rooms/lobby/events/{}/thread",
+                anchor["id"]
+            ),
+            json!({}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{thread}");
+    let (s, e) = h
+        .post(
+            "alice",
+            &format!(
+                "/v1/spaces/{sid}/rooms/{}/messages",
+                thread["id"].as_str().unwrap()
+            ),
+            json!({"text": "noted, thanks"}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{e}");
+    let (_, _, _, payload, _) = h.fake.last_call();
+    assert_eq!(payload["message"], "noted, thanks");
+    assert_eq!(
+        payload["previous"],
+        json!([{"speaker_kind": "person", "speaker": "bob", "text": "@alice what do you think?",
+                "to": ["alice"], "anchor": true}])
+    );
 }
 
 #[tokio::test]
