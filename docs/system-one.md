@@ -206,6 +206,38 @@ doesn't turn classification on. [Replying to a specific agent](messages.md#reply
 addresses it directly and bypasses the unaddressed classifier, as does
 a named agent mention.
 
+### Classification in 0.6.2
+
+**In the source, not released.** The classifier now gets more of the
+conversation and a narrower reason to stay quiet. For unaddressed text,
+the sender's System One connection receives, along with the agent
+options and the new message:
+
+- the Space name, up to 300 characters of its description, and the room
+  or thread name;
+- the sender's display name and the display names of the Space's other
+  current members (at most 32; a member with no name is left out, never
+  replaced by an id);
+- up to eight earlier messages or agent replies in that room or thread,
+  oldest first: each excerpt is at most 400 characters, and all of them
+  together at most 2,400 (the newest are kept). Each one says who wrote
+  it, whether a person or an agent, and, when it named recipients, their
+  display names (`to`: people, agents, or `agent` for the generic
+  `@agent`).
+
+Only events before the message are included, and deleted messages never
+are. There are still no stable participant IDs or agent instructions.
+
+The prompt leans strongly toward an agent: a question, request, task or
+remark to the room, or a follow-up to an agent, gets the agent that fits
+it best. *No agent* is for two cases only: another person is the
+addressee or the subject of the message (it talks to someone by name,
+continues a conversation with another person, or is about what someone
+said or did), or the sender says an agent shouldn't respond (for example
+"just noting" or "not for the bot"). The threshold and its handling
+above are unchanged. Messages that mention only people (`@bob`) still
+never reach System One.
+
 ### Decisions after posting
 
 **In the source, not released (0.6.1).** A Space message POST with
