@@ -1,5 +1,14 @@
 # In the source, not released
 
+## Metro 0.6.2 (in the source, not released)
+
+- **Write while an agent replies.** The Chat composer stays usable while
+  Metro replies: **Queue** (the default) sends the message after the
+  current reply, **Steer** adds it to the running reply at its next step.
+  In Space rooms and threads, your next message to an agent that is
+  already working on your message there steers that run instead of
+  starting a second one. See [While an agent replies](messages.md#while-an-agent-replies).
+
 These changes are in the source planned for Metro 0.6.1, after the
 published [Metro 0.6.0](released-0.6.0.md). See [Acceptance](acceptance.md)
 for release records.
