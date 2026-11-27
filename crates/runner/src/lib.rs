@@ -33,6 +33,15 @@ pub fn shutdown_requested() -> bool {
     SHUTDOWN.load(Ordering::SeqCst)
 }
 
+/// Set while the current job is no longer wanted by the server (its
+/// heartbeat answered 404/410). The runner runs one job at a time and
+/// clears it before each job; shell waits poll it.
+pub static JOB_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+pub fn job_cancelled() -> bool {
+    JOB_CANCELLED.load(Ordering::SeqCst)
+}
+
 /// Unit tests that start processes run apart from tests that check the
 /// install lock. That lock is a `flock` on the install directory, which
 /// belongs to its open file description: a child forked by another test

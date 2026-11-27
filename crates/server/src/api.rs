@@ -1619,6 +1619,33 @@ pub async fn runner_result(
     }
 }
 
+/// `POST /v1/runner/jobs/{id}/heartbeat`: whether the runner should keep
+/// working on a claimed job. 410 tells it to stop (the run stopped, the
+/// lease ran out or the Space's runner changed).
+pub async fn runner_heartbeat(
+    State(state): State<AppState>,
+    runner: Runner,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> ApiResult<Json<serde_json::Value>> {
+    empty_object(&body)?;
+    let jobs = state.jobs.clone();
+    match db(&state, move |db| {
+        db.with_runner_queue_access(&runner.spaces, |spaces| {
+            jobs.heartbeat_at(&runner.claimer(), spaces, &id)
+        })
+    })
+    .await?
+    {
+        Ok(()) => Ok(Json(json!({"live": true}))),
+        Err(CompleteError::Expired | CompleteError::Duplicate) => {
+            Err(ApiError::new(StatusCode::GONE, "job expired"))
+        }
+        Err(CompleteError::NotClaimed) => Err(ApiError::conflict("job has not been claimed")),
+        Err(CompleteError::Unknown) => Err(ApiError::not_found("no such job")),
+    }
+}
+
 #[cfg(test)]
 #[test]
 fn only_a_failed_membership_reads_as_an_unknown_run() {

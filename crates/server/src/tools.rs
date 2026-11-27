@@ -15,17 +15,36 @@ const MAX_PATH_LEN: usize = 4096;
 const MAX_MCP_NAME_LEN: usize = 128;
 const MAX_MCP_ARGS_BYTES: usize = 64 * 1024;
 
+const MAX_WRITE_BYTES: usize = 1024 * 1024;
+const MAX_COMMAND_BYTES: usize = 16 * 1024;
+pub const SHELL_DEFAULT_TIMEOUT_SECS: u64 = 120;
+pub const SHELL_MAX_TIMEOUT_SECS: u64 = 600;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunnerTool {
     List,
     Read,
+    Write,
+    Shell,
     Check,
     McpList,
     Mcp,
 }
 
 impl RunnerTool {
-    pub const ALL: [RunnerTool; 5] = [
+    pub const ALL: [RunnerTool; 7] = [
+        RunnerTool::List,
+        RunnerTool::Read,
+        RunnerTool::Write,
+        RunnerTool::Shell,
+        RunnerTool::Check,
+        RunnerTool::McpList,
+        RunnerTool::Mcp,
+    ];
+
+    /// The tools an agent gets without an explicit list. Write and shell are
+    /// opt-in.
+    pub const DEFAULT: [RunnerTool; 5] = [
         RunnerTool::List,
         RunnerTool::Read,
         RunnerTool::Check,
@@ -38,6 +57,8 @@ impl RunnerTool {
         match self {
             RunnerTool::List => "workspace.list",
             RunnerTool::Read => "workspace.read",
+            RunnerTool::Write => "workspace.write",
+            RunnerTool::Shell => "workspace.shell",
             RunnerTool::Check => "workspace.check",
             RunnerTool::McpList => "workspace.mcp_list",
             RunnerTool::Mcp => "workspace.mcp",
@@ -49,6 +70,8 @@ impl RunnerTool {
         match self {
             RunnerTool::List => "workspace_list",
             RunnerTool::Read => "workspace_read",
+            RunnerTool::Write => "workspace_write",
+            RunnerTool::Shell => "workspace_shell",
             RunnerTool::Check => "workspace_check",
             RunnerTool::McpList => "workspace_mcp_list",
             RunnerTool::Mcp => "workspace_mcp",
@@ -63,6 +86,15 @@ impl RunnerTool {
             }
             RunnerTool::Read => {
                 "Read a text file from the shared workspace. Paths are relative to the workspace root."
+            }
+            RunnerTool::Write => {
+                "Create or replace one UTF-8 text file in the shared workspace (at most 1 MiB). \
+                 Missing parent directories are created. Paths are relative to the workspace root."
+            }
+            RunnerTool::Shell => {
+                "Run one shell command in the workspace root on the runner's machine and return \
+                 its exit code, stdout and stderr. Depending on the runner's policy a person may \
+                 have to approve the command first; a denied or expired command returns an error."
             }
             RunnerTool::Check => {
                 "Run the workspace's operator-configured check command (for example tests or a build) \
@@ -95,6 +127,25 @@ impl RunnerTool {
                 "required": ["path"],
                 "additionalProperties": false
             }),
+            RunnerTool::Write => json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File relative to the workspace root."},
+                    "content": {"type": "string", "description": "The file's full new text."}
+                },
+                "required": ["path", "content"],
+                "additionalProperties": false
+            }),
+            RunnerTool::Shell => json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The shell command line."},
+                    "timeout_secs": {"type": "integer", "minimum": 1, "maximum": SHELL_MAX_TIMEOUT_SECS,
+                                     "description": "Seconds before the command is killed. Defaults to 120."}
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }),
             RunnerTool::Check | RunnerTool::McpList => json!({
                 "type": "object",
                 "properties": {},
@@ -123,6 +174,8 @@ impl RunnerTool {
         };
         let allowed: &[&str] = match self {
             RunnerTool::List | RunnerTool::Read => &["path"],
+            RunnerTool::Write => &["path", "content"],
+            RunnerTool::Shell => &["command", "timeout_secs"],
             RunnerTool::Check | RunnerTool::McpList => &[],
             RunnerTool::Mcp => &["name", "arguments"],
         };
@@ -140,6 +193,41 @@ impl RunnerTool {
             RunnerTool::Read => {
                 let path = check_path(obj.get("path").ok_or("`path` is required")?)?;
                 Ok(json!({"path": path}))
+            }
+            RunnerTool::Write => {
+                let path = check_path(obj.get("path").ok_or("`path` is required")?)?;
+                let content = obj
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .ok_or("`content` must be a string")?;
+                if content.len() > MAX_WRITE_BYTES {
+                    return Err(format!("`content` exceeds {MAX_WRITE_BYTES} bytes"));
+                }
+                Ok(json!({"path": path, "content": content}))
+            }
+            RunnerTool::Shell => {
+                let command = obj
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .ok_or("`command` must be a string")?;
+                if command.trim().is_empty()
+                    || command.len() > MAX_COMMAND_BYTES
+                    || command.contains('\0')
+                {
+                    return Err(format!(
+                        "`command` must be 1..={MAX_COMMAND_BYTES} bytes without NUL"
+                    ));
+                }
+                let timeout = match obj.get("timeout_secs") {
+                    None | Some(Value::Null) => SHELL_DEFAULT_TIMEOUT_SECS,
+                    Some(v) => v
+                        .as_u64()
+                        .filter(|n| (1..=SHELL_MAX_TIMEOUT_SECS).contains(n))
+                        .ok_or(format!(
+                            "`timeout_secs` must be an integer 1..={SHELL_MAX_TIMEOUT_SECS}"
+                        ))?,
+                };
+                Ok(json!({"command": command, "timeout_secs": timeout}))
             }
             RunnerTool::Check | RunnerTool::McpList => Ok(json!({})),
             RunnerTool::Mcp => {
@@ -197,6 +285,33 @@ pub fn truncate(text: &str, max: usize) -> String {
     )
 }
 
+/// Time a shell job's runner has after its command's own timeout to
+/// deliver the result.
+const SHELL_LEASE_MARGIN_SECS: u64 = 60;
+
+/// Record that `caller` calls `tool` with `arguments` in `room`.
+pub async fn record_call(
+    state: &AppState,
+    space: &str,
+    room: &str,
+    caller: &Author,
+    activity: Option<&Activity>,
+    tool: RunnerTool,
+    arguments: &Value,
+) {
+    let call_text = format!("{} {}", tool.runner_name(), arguments);
+    state
+        .append_with(
+            space,
+            room,
+            kind::TOOL_CALL,
+            caller,
+            &truncate(&call_text, state.config.limits.max_event_text),
+            activity,
+        )
+        .await;
+}
+
 /// Run `tool` on the runner serving `space` (dedicated or attached), recording the call and its
 /// result as shared events in `room`. `caller` is the author of the call event;
 /// `activity`, the agent turn or Demo run making the call, tags all of them.
@@ -209,19 +324,29 @@ pub async fn call_runner(
     tool: RunnerTool,
     arguments: Value,
 ) -> Result<JobOutcome, JobError> {
-    let limits = &state.config.limits;
-    let call_text = format!("{} {}", tool.runner_name(), arguments);
-    state
-        .append_with(
-            space,
-            room,
-            kind::TOOL_CALL,
-            caller,
-            &truncate(&call_text, limits.max_event_text),
-            activity,
-        )
-        .await;
+    record_call(state, space, room, caller, activity, tool, &arguments).await;
+    run_recorded(state, space, room, activity, tool, arguments, None).await
+}
 
+/// The job of a call [`record_call`] already recorded. With `fence`, the
+/// job is queued only while the Space's assignment fence is still that
+/// value (an approved shell command never reaches a different runner).
+pub async fn run_recorded(
+    state: &AppState,
+    space: &str,
+    room: &str,
+    activity: Option<&Activity>,
+    tool: RunnerTool,
+    arguments: Value,
+    fence: Option<i64>,
+) -> Result<JobOutcome, JobError> {
+    let limits = &state.config.limits;
+    let lease = (tool == RunnerTool::Shell).then(|| {
+        let secs = arguments["timeout_secs"]
+            .as_u64()
+            .unwrap_or(SHELL_DEFAULT_TIMEOUT_SECS);
+        std::time::Duration::from_secs(secs + SHELL_LEASE_MARGIN_SECS)
+    });
     // The job is bound to whoever serves the Space right now; if that
     // changes before a runner answers, the job fails instead of crossing to
     // the new runner.
@@ -232,7 +357,10 @@ pub async fn call_runner(
             .db
             .call(move |db| {
                 db.with_runner_queue_version(&space, |version| {
-                    jobs.enqueue_at(&space, version, tool.runner_name(), arguments)
+                    if fence.is_some_and(|f| f as u64 != version.drop_before) {
+                        return Err(JobError::CredentialChanged);
+                    }
+                    jobs.enqueue_leased(&space, version, tool.runner_name(), arguments, lease)
                 })
             })
             .await
@@ -332,6 +460,56 @@ mod tests {
                 .runner_arguments(&json!({"name": "t", "arguments": {"q": 1}}))
                 .unwrap(),
             json!({"name": "t", "arguments": {"q": 1}})
+        );
+    }
+
+    #[test]
+    fn write_and_shell_arguments() {
+        assert_eq!(
+            RunnerTool::Shell
+                .runner_arguments(&json!({"command": "ls"}))
+                .unwrap(),
+            json!({"command": "ls", "timeout_secs": SHELL_DEFAULT_TIMEOUT_SECS})
+        );
+        assert_eq!(
+            RunnerTool::Shell
+                .runner_arguments(&json!({"command": "ls", "timeout_secs": 600}))
+                .unwrap()["timeout_secs"],
+            600
+        );
+        for bad in [
+            json!({}),
+            json!({"command": " "}),
+            json!({"command": "a\u{0}b"}),
+            json!({"command": "ls", "timeout_secs": 0}),
+            json!({"command": "ls", "timeout_secs": 601}),
+            json!({"command": "ls", "timeout_secs": 1.5}),
+            json!({"command": "ls", "cwd": "/"}),
+            json!({"command": "x".repeat(MAX_COMMAND_BYTES + 1)}),
+        ] {
+            assert!(RunnerTool::Shell.runner_arguments(&bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            RunnerTool::Write
+                .runner_arguments(&json!({"path": "a.md", "content": ""}))
+                .unwrap(),
+            json!({"path": "a.md", "content": ""})
+        );
+        for bad in [
+            json!({"path": "a.md"}),
+            json!({"content": "x"}),
+            json!({"path": "a.md", "content": 3}),
+            json!({"path": "a.md", "content": "x".repeat(MAX_WRITE_BYTES + 1)}),
+        ] {
+            assert!(RunnerTool::Write.runner_arguments(&bad).is_err());
+        }
+        // Write and shell are offered but never on by default.
+        assert!(!RunnerTool::DEFAULT.contains(&RunnerTool::Shell));
+        assert!(!RunnerTool::DEFAULT.contains(&RunnerTool::Write));
+        assert!(
+            RunnerTool::DEFAULT
+                .iter()
+                .all(|t| RunnerTool::ALL.contains(t))
         );
     }
 

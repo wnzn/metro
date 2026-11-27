@@ -996,7 +996,7 @@ fn message_payload(text: &str, in_space: bool) -> Value {
 }
 
 /// Some System One endpoints accept only one typed question per request.
-async fn ask_one(
+pub(crate) async fn ask_one(
     state: &AppState,
     user: &str,
     space: Option<&str>,

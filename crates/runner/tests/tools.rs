@@ -46,7 +46,9 @@ fn registry_names() {
             "workspace.list",
             "workspace.mcp",
             "workspace.mcp_list",
-            "workspace.read"
+            "workspace.read",
+            "workspace.shell",
+            "workspace.write"
         ]
     );
 }

@@ -8,13 +8,57 @@
 //! the server ever receiving a result for it.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::client::{Claim, Job, ServerClient, valid_space_id};
+use crate::client::{Claim, Job, Liveness, ServerClient, valid_space_id};
 use crate::config::Config;
 use crate::spaces::SpaceRoots;
 use crate::tools::{Registry, ToolResult};
 use crate::util::{Backoff, sleep_interruptible};
+
+/// How often a running shell job asks whether the server still wants it.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Asks the server about one running job until dropped; sets
+/// [`crate::JOB_CANCELLED`] when the job is gone (run stopped, lease over,
+/// runner changed). Transport errors never cancel.
+struct Heartbeat {
+    stop: Arc<AtomicBool>,
+}
+
+impl Heartbeat {
+    fn start(client: ServerClient, id: String) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        // Not joined: a request in flight must not delay the result.
+        std::thread::spawn(move || {
+            loop {
+                let until = Instant::now() + HEARTBEAT_INTERVAL;
+                while Instant::now() < until {
+                    if flag.load(Ordering::SeqCst) || crate::shutdown_requested() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                let gone = matches!(client.heartbeat(&id), Ok(Liveness::Gone));
+                // A late answer for a finished job must not touch the next one.
+                if gone && !flag.load(Ordering::SeqCst) {
+                    eprintln!("metro-runner: job {id}: cancelled by the server; stopping it");
+                    crate::JOB_CANCELLED.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+        });
+        Heartbeat { stop }
+    }
+}
+
+impl Drop for Heartbeat {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
 
 pub const RESULT_MAX_ATTEMPTS: u32 = 8;
 pub const RESULT_MAX_ELAPSED: Duration = Duration::from_secs(300);
@@ -165,7 +209,12 @@ impl Runner {
                     _ => eprintln!("metro-runner: job {} tool {}", job.id, job.tool),
                 }
                 let started = Instant::now();
+                crate::JOB_CANCELLED.store(false, Ordering::SeqCst);
+                let beat = (job.tool == "workspace.shell")
+                    .then(|| Heartbeat::start(self.client.clone(), job.id.clone()));
                 let r = self.dispatch.run(&job);
+                drop(beat);
+                crate::JOB_CANCELLED.store(false, Ordering::SeqCst);
                 eprintln!(
                     "metro-runner: job {} finished ok={} in {:.1}s ({} bytes)",
                     job.id,

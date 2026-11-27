@@ -40,6 +40,7 @@ pub mod runner_pairing;
 pub mod runners;
 pub mod schedules;
 pub mod search;
+pub mod shell;
 pub mod space_agents;
 mod space_context;
 pub mod space_prefs;
@@ -107,6 +108,8 @@ pub struct AppState {
     pub decisions: Arc<crate::decisions::Pending>,
     /// Inboxes of running turns that take steering (memory only).
     pub steering: Arc<crate::steering::Steering>,
+    /// `workspace.shell` approvals waiting for a decision (memory only).
+    pub shell: crate::shell::SharedApprovals,
 }
 
 impl AppState {
@@ -154,6 +157,7 @@ impl AppState {
             compaction: Arc::default(),
             decisions: Arc::default(),
             steering: Arc::default(),
+            shell: Arc::default(),
             meta_waits: Arc::new(Semaphore::new((limits.max_agent_runs / 2).max(1))),
             managed,
             library,
@@ -181,6 +185,14 @@ impl AppState {
                 crate::monitoring::Code::ServerStarted,
             )
             .await;
+        // Their runs ended with the previous process.
+        let expired = state.db.call(crate::shell::expire_orphans).await?;
+        if expired > 0 {
+            tracing::info!(
+                expired,
+                "pending shell approvals from before the restart expired"
+            );
+        }
         Ok(state)
     }
 
@@ -367,12 +379,18 @@ pub fn router(state: AppState) -> Router {
         // Deleting a message: Space rooms and threads, personal Chat, DMs.
         .merge(crate::deletion::router())
         .merge(crate::chat_threads::router())
+        // Shell policy and approvals for `workspace.shell`.
+        .merge(crate::shell::router())
         .layer(DefaultBodyLimit::max(HUMAN_BODY_LIMIT));
     // Room for the largest result plus JSON escaping.
     let runner_limit = state.config.limits.max_result_bytes * 2 + 1024;
     let runner = Router::new()
         .route("/v1/runner/claim", post(api::runner_claim))
         .route("/v1/runner/jobs/{id}/result", post(api::runner_result))
+        .route(
+            "/v1/runner/jobs/{id}/heartbeat",
+            post(api::runner_heartbeat),
+        )
         .layer(DefaultBodyLimit::max(runner_limit));
     Router::new()
         .route("/healthz", get(api::healthz))
