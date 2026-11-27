@@ -568,6 +568,33 @@ mod tests {
     }
 
     #[test]
+    fn each_conversation_has_its_own_turn_line() {
+        use crate::decisions::chat_line;
+        assert_eq!(chat_line("alice", None), "alice");
+        let a = chat_line("alice", Some("ct-1"));
+        assert_ne!(a, chat_line("alice", Some("ct-2")));
+        assert_ne!(a, chat_line("bob", Some("ct-1")));
+        assert_ne!(a, "alice");
+    }
+
+    #[test]
+    fn an_append_to_a_deleted_thread_is_a_quiet_thread_gone() {
+        let db = Db::open_in_memory().unwrap();
+        let e = db
+            .append_personal_with(
+                "alice",
+                Some("ct-nope"),
+                kind::STATUS,
+                &Author::server("agent"),
+                "x",
+                &Addressed::room(),
+                None,
+            )
+            .unwrap_err();
+        assert!(e.is::<crate::db::ThreadGone>());
+    }
+
+    #[test]
     fn a_thread_turn_is_stopped_with_its_thread_only() {
         let turns = Arc::new(crate::meta::ChatTurns::default());
         let (main, _g1) = turns.register("t-main", "alice", None);

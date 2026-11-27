@@ -64,7 +64,7 @@ pub(super) fn args<T: DeserializeOwned>(v: Value) -> Result<T, String> {
 }
 
 pub(super) fn internal(e: anyhow::Error) -> String {
-    tracing::error!(error = %format!("{e:#}"), "Metro in Chat tool");
+    crate::db::log_append_error(&e, "Metro in Chat tool");
     "the operation couldn't be completed".to_owned()
 }
 
@@ -388,7 +388,7 @@ async fn record(ctx: &Ctx, event_kind: &'static str, text: &str, note: MetaNote)
         })
         .await;
     if let Err(e) = r {
-        tracing::error!(error = %format!("{e:#}"), "appending Metro in Chat event");
+        crate::db::log_append_error(&e, "appending Metro in Chat event");
     }
 }
 
@@ -787,7 +787,7 @@ async fn page_propose(ctx: &Ctx, a: Value) -> R {
         })
         .await
     {
-        tracing::error!(error = %format!("{e:#}"), "appending a Chat page draft card");
+        crate::db::log_append_error(&e, "appending a Chat page draft card");
     }
     let base_spaces = base
         .as_ref()

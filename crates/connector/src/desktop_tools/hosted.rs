@@ -1,8 +1,10 @@
-//! HTTP to the desktop's own hosted Metro server: the owner's calls (with the
-//! person's session) and the runner calls (with the Space's dedicated token).
+//! HTTP to the bound Metro server (the desktop's own hosted one, or the one
+//! the person signed in to): the person's calls (with their session) and
+//! the runner calls (with a dedicated or registered runner token).
 //!
-//! No redirects, no proxy (loopback only), bounded bodies, and tokens only in
-//! the `Authorization` header, never in a URL or a log line.
+//! No redirects, the bridge's proxy rules for that server (loopback and
+//! Tailscale directly), bounded bodies, and tokens only in the
+//! `Authorization` header, never in a URL or a log line.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -40,7 +42,7 @@ impl CallError {
             | CallError::NotFound(m)
             | CallError::Precondition(m)
             | CallError::Other(m) => m.clone(),
-            CallError::Unauthorized => "the local Metro server refused the sign-in".into(),
+            CallError::Unauthorized => "the Metro server refused the sign-in".into(),
         }
     }
 }
@@ -106,7 +108,7 @@ pub struct Hosted {
 
 fn transport(e: reqwest::Error) -> CallError {
     let _ = e; // never echo: the error can carry the URL
-    CallError::Unreachable("the local Metro server didn't answer".into())
+    CallError::Unreachable("the Metro server didn't answer".into())
 }
 
 /// The server's own `{"error": "..."}` text, single line and short.
@@ -130,13 +132,7 @@ pub(super) fn pairing_revision(etag: &str) -> Option<&str> {
 
 impl Hosted {
     pub fn new(base: &str) -> anyhow::Result<Self> {
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(30))
-            .user_agent(crate::USER_AGENT)
-            .build()?;
+        let http = crate::http::client_for_server(Duration::from_secs(30), base)?;
         Ok(Hosted {
             http,
             base: base.trim_end_matches('/').to_owned(),
@@ -189,7 +185,7 @@ impl Hosted {
         let resp_headers = resp.headers().clone();
         let bytes = read_capped(resp, cap)
             .await
-            .map_err(|_| CallError::Other("the local Metro server sent too much data".into()))?;
+            .map_err(|_| CallError::Other("the Metro server sent too much data".into()))?;
         Ok((status, resp_headers, bytes))
     }
 
@@ -199,9 +195,9 @@ impl Hosted {
             403 => CallError::Forbidden(server_message(v, "not allowed")),
             404 => CallError::NotFound(server_message(v, "not found")),
             412 => CallError::Precondition(server_message(v, "the Space's runner changed")),
-            300..=399 => CallError::Other("the local Metro server answered with a redirect".into()),
+            300..=399 => CallError::Other("the Metro server answered with a redirect".into()),
             408 | 425 | 429 | 500..=599 => {
-                CallError::Unreachable(format!("the local Metro server answered HTTP {status}"))
+                CallError::Unreachable(format!("the Metro server answered HTTP {status}"))
             }
             _ => CallError::Other(server_message(v, &format!("HTTP {status}"))),
         }
@@ -218,7 +214,7 @@ impl Hosted {
         v.get("id")
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .ok_or_else(|| CallError::Other("the local Metro server sent no account id".into()))
+            .ok_or_else(|| CallError::Other("the Metro server sent no account id".into()))
     }
 
     /// `None` is proof of absence only in a fully valid roster.
@@ -250,8 +246,7 @@ impl Hosted {
             id: String,
             role: SpaceRole,
         }
-        let invalid =
-            || CallError::Other("the local Metro server sent an invalid Space roster".into());
+        let invalid = || CallError::Other("the Metro server sent an invalid Space roster".into());
         // Serde structs also accept positional arrays. Only JSON objects
         // count as roster entries, regardless of their positional values.
         let shape: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
@@ -371,21 +366,19 @@ impl Hosted {
                 out
             }
             _ => {
-                return Err(CallError::Other(
-                    "the local Metro server sent no token".into(),
-                ));
+                return Err(CallError::Other("the Metro server sent no token".into()));
             }
         };
         // A dedicated token only: never a reusable (`metro_rt_v2_`) one.
         let t = token.expose();
         if !t.starts_with("metro_rt_") || t.starts_with("metro_rt_v2_") || t.len() > 256 {
             return Err(CallError::Other(
-                "the local Metro server sent an unexpected token".into(),
+                "the Metro server sent an unexpected token".into(),
             ));
         }
         let Some(etag) = etag.filter(|e| pairing_revision(e).is_some()) else {
             return Err(CallError::Other(
-                "the local Metro server doesn't support guarded pairing".into(),
+                "the Metro server doesn't support guarded pairing".into(),
             ));
         };
         Ok((token, etag))
@@ -438,7 +431,7 @@ impl Hosted {
         }
         let Some(list) = v.get("runners").and_then(Value::as_array) else {
             return Err(CallError::Other(
-                "the local Metro server sent no runner list".into(),
+                "the Metro server sent no runner list".into(),
             ));
         };
         Ok(list.iter().filter_map(RunnerInfo::personal).collect())
@@ -479,7 +472,7 @@ impl Hosted {
             .and_then(RunnerInfo::personal)
             .ok_or_else(|| {
                 lost(CallError::Other(
-                    "the local Metro server sent an unexpected runner".into(),
+                    "the Metro server sent an unexpected runner".into(),
                 ))
             })?;
         Ok((info, token))
@@ -620,15 +613,13 @@ fn take_registered_token(v: &mut Value) -> Result<Secret, CallError> {
             out
         }
         _ => {
-            return Err(CallError::Other(
-                "the local Metro server sent no token".into(),
-            ));
+            return Err(CallError::Other("the Metro server sent no token".into()));
         }
     };
     let t = token.expose();
     if !t.starts_with("metro_rt_v2_") || t.len() > 256 || t.chars().any(|c| !c.is_ascii_graphic()) {
         return Err(CallError::Other(
-            "the local Metro server sent an unexpected token".into(),
+            "the Metro server sent an unexpected token".into(),
         ));
     }
     Ok(token)

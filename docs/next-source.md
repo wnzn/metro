@@ -2,11 +2,25 @@
 
 ## Metro 0.6.2 (in the source, not released)
 
+- **A runner built into the desktop app.** **Settings → Runners → This
+  computer's runner → Set up** makes the app's built-in runner your
+  personal registered runner on whichever server you're signed in to,
+  local or remote, with no separate install. It starts and stops with the
+  app, lists and reads only, and is attached only where you choose.
+  Deleting it there turns it off on this computer. See
+  [install.md](install.md#the-desktops-own-runner).
+- **Write while an agent replies.** The Chat composer stays usable while
+  Metro replies: **Queue** (the default) sends the message after the
+  current reply, **Steer** adds it to the running reply at its next step.
+  In Space rooms and threads, your next message to an agent that is
+  already working on your message there steers that run instead of
+  starting a second one. See [While an agent replies](messages.md#while-an-agent-replies).
 - **Chat threads.** Your personal Chat can have threads: start one with
   **New thread**, or choose **Reply** on a Chat message. Each thread is
-  its own conversation with Metro, with its own history, summaries and
-  **Stop**. Rename or delete a thread from its menu; deleting is
-  permanent and removes everything in it. See [Chat threads](messages.md#chat-threads).
+  its own conversation with Metro, with its own history, summaries,
+  **Stop** and Queue/Steer line. Rename or delete a thread from its menu;
+  deleting is permanent and removes everything in it. See
+  [Chat threads](messages.md#chat-threads).
 
 These changes are in the source planned for Metro 0.6.1, after the
 published [Metro 0.6.0](released-0.6.0.md). See [Acceptance](acceptance.md)

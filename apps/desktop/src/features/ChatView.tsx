@@ -43,12 +43,14 @@ import {
   setDispatchDraft,
   setDispatchRoom,
   setDispatchSpace,
+  setChatDelivery,
   setDraft,
   spaces,
   stopRun,
+  chatDelivery,
 } from "../store";
 import type { Run } from "../store";
-import { Action, ActionBar, Badge, Banner, Chip, Column, Field, Icon, IconButton, Label, Modal, modalOpen, MoreMenu, PanelToggle, ResizeHandle, Row, runsPanel, ScrollArea, Spacer, Surface } from "../ui";
+import { Action, ActionBar, Badge, Banner, Chip, Column, Field, Icon, IconButton, Label, Modal, modalOpen, MoreMenu, PanelToggle, ResizeHandle, Row, runsPanel, ScrollArea, SegmentedControl, Spacer, Surface } from "../ui";
 import { EmptyState, sidePanelFits, SuggestionChip } from "../ui/activity";
 import { runStatusLabel, runTitle, runTone } from "./activity/runs";
 import { Composer, ConnectionBanner, focusComposer, ThreadAnchor, Transcript } from "./Conversation";
@@ -58,6 +60,12 @@ import { ModelOnboarding, needsChatModel } from "./ModelOnboarding";
 import { roomTree } from "./Sidebar";
 import { ChatNotice } from "./meta/ChatNotice";
 import { chatStopBusy, chatStopError, runningChatTurn, stopChatReply } from "./meta/state";
+
+/** What Send does while Metro replies (the composer shows it only then). */
+const DELIVERY_OPTIONS = [
+  { value: "queue", label: "Queue", description: "Send after this reply" },
+  { value: "steer", label: "Steer", description: "Add to this reply" },
+] as const;
 
 /** The task form is open (folded behind "New task" otherwise). */
 const dispatchOpen = signal(false);
@@ -125,13 +133,17 @@ export function ChatView() {
         <ChatNotice />
         <If when={runningChatTurn() && chatStopError()}><Banner tone="danger" message={chatStopError()} /></If>
         <Composer placeholder={activeChatThread() ? "Message this thread" : "Message your Chat"} agentHint="No runner or workspace tools here." disabled={!!chatUnavailable()}
-          stopReply={runningChatTurn() ? <Action testID="chat-stop" compact variant="destructive" label="Stop"
-            accessibilityLabel="Stop Metro's reply" busy={!!chatStopBusy()} busyLabel="Stopping…" onPress={() => {
-              const id = runningChatTurn();
-              if (!id) return;
-              focusComposer();
-              void stopChatReply(id);
-            }} /> : undefined} />
+          stopReply={runningChatTurn() ? <>
+            <SegmentedControl testID="chat-delivery" compact accessibilityLabel="While Metro replies, Send"
+              value={chatDelivery()} onChange={setChatDelivery} options={DELIVERY_OPTIONS} />
+            <Action testID="chat-stop" compact variant="destructive" label="Stop"
+              accessibilityLabel="Stop Metro's reply" busy={chatStopBusy() === runningChatTurn()} busyLabel="Stopping…" onPress={() => {
+                const id = runningChatTurn();
+                if (!id) return;
+                focusComposer();
+                void stopChatReply(id);
+              }} />
+          </> : undefined} />
       </Surface>
       {/* Wide windows keep the runs beside the Chat; narrower ones open them
           in a dialog, so the Chat (and its draft) keeps its full width. */}

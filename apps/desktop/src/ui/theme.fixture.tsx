@@ -5,12 +5,13 @@
 
 import { mount, signal } from "nsh";
 import { AppearanceSettings } from "../features/AppearanceSettings";
-import { Action, ActionsMenu, Banner, Column, Disclosure, Label, NavItem, Picker, Row, Surface } from "./index";
+import { Action, ActionsMenu, AgentAvatar, AskAgentChooser, Banner, BrandPicker, Column, Disclosure, Label, NavItem, Picker, Row, Surface } from "./index";
 
 function Fixture() {
   const last = signal("none");
   const open = signal(false);
   const picked = signal<string | null>(null);
+  const brandPicked = signal<string | null>(null);
   return (
     <Surface variant="app" testID="fx-app">
       <Surface variant="sidebar" pad={2} gap={1} testID="fx-sidebar">
@@ -63,6 +64,39 @@ function Fixture() {
             onChange={(v) => picked.set(v)}
             placeholder="Fixture choose"
           />
+          <Picker
+            testID="fx-grouped-picker"
+            accessibilityLabel="Fixture grouped picker"
+            items={[
+              { value: "a", label: "Fixture plain alpha", group: "Fixture group" },
+              { value: "b", label: "Fixture plain beta", group: "Fixture group", disabled: true },
+            ]}
+            value={picked()}
+            onChange={(v) => picked.set(v)}
+            placeholder="Fixture plain choice"
+            searchable
+          />
+          <BrandPicker
+            testID="fx-brand-picker"
+            accessibilityLabel="Fixture provider"
+            items={[
+              { value: "a", label: "Fixture provider alpha", hint: "Fixture provider hint", mark: { letters: "A", tone: "agent" } },
+              { value: "b", label: "Fixture provider beta", disabled: true, mark: { letters: "B", tone: "warning" } },
+            ]}
+            value={brandPicked()}
+            onChange={(v) => brandPicked.set(v)}
+            placeholder="Choose a provider"
+          />
+          <Row>
+            <AskAgentChooser
+              testID="fx-ask-agent"
+              heading="Fixture agents"
+              choices={[
+                { id: "one", title: "Fixture agent one", accessibilityLabel: "Fixture agent one", checked: true, onSelect: () => {}, leading: <AgentAvatar color="#0891b2" initial="C" size="sm" /> },
+                { id: "two", title: "Fixture agent two", accessibilityLabel: "Fixture agent two", checked: false, onSelect: () => {}, leading: <AgentAvatar color="#4f46e5" initial="I" size="sm" /> },
+              ]}
+            />
+          </Row>
         </Column>
         <AppearanceSettings />
       </Surface>

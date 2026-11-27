@@ -439,7 +439,7 @@ function Install-Metro {
 
         Say "Metro $version is installed in $target"
         $supported = ($m.PSObject.Properties.Name -contains 'local_runner') -and $m.local_runner -eq 'installer-marker'
-        if (-not $enable) { Say 'Local runner support is off (install again with -LocalRunner to turn it on).' }
+        if (-not $enable) { Say 'Local runner support is off: Metro won''t set up its built-in runner on its own. Set it up in Metro under Settings > Runners, or install again with -LocalRunner.' }
         elseif ($supported) {
             Say 'Local runner support is on. Metro sets up your personal on-device runner after you sign in; it is not attached to any Space until you choose it under Manage Space.'
         } else {

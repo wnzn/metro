@@ -10,7 +10,7 @@ import { Button, Menu, MenuItem, MenuSeparator } from "nsh/base";
 import { BrandMark, Icon } from "./chrome";
 import type { Mark } from "./chrome";
 import { Badge, StatusDot } from "./primitives";
-import { cx, disabledClass, focusRingClass, popoverClass, popoverItemClass, popoverMotion, textClass, toneTextClass, tooltipClass, transitionClass } from "./tokens";
+import { cx, disabledClass, focusRingClass, popoverClass, popoverDangerLabelClass, popoverItemClass, popoverLabelClass, popoverMotion, textClass, toneTextClass, tooltipClass, transitionClass } from "./tokens";
 import type { Tone } from "./tokens";
 
 /** The add-connection picker: a quiet card holding its search, filter and rows. */
@@ -250,7 +250,7 @@ export function MoreMenu(props: {
       trigger={
         <Button
           ref={props.triggerRef}
-          class={cx("items-center justify-center size-[32px] rounded-(--radius-sm) hover:bg-muted active:bg-muted aria-expanded:bg-muted", focusRingClass, transitionClass, disabledClass)}
+          class={cx("items-center justify-center size-[32px] rounded-(--radius-sm) hover:bg-muted active:bg-muted aria-expanded:bg-muted disabled:bg-muted", focusRingClass, transitionClass)}
           disabled={props.disabled}
           accessibilityLabel={props.accessibilityLabel}
           testID={props.testID}
@@ -266,7 +266,7 @@ export function MoreMenu(props: {
               <MenuSeparator class="my-[4px] h-px bg-border" />
             </If>
             <MenuItem class={popoverItemClass} disabled={row().item.disabled} onSelect={() => row().item.onPress()} testID={row().item.id}>
-              <Text class={cx(textClass.sm, row().item.destructive ? "text-destructive" : "text-popover-foreground")}>{row().item.label}</Text>
+              <Text class={cx(textClass.sm, row().item.destructive ? popoverDangerLabelClass : popoverLabelClass)}>{row().item.label}</Text>
             </MenuItem>
           </>
         )}

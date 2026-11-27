@@ -1186,7 +1186,7 @@ impl WebContext {
                     })
                     .await;
                 if let Err(e) = r {
-                    tracing::error!(error = %format!("{e:#}"), "appending web tool event");
+                    crate::db::log_append_error(&e, "appending web tool event");
                 }
             }
         }

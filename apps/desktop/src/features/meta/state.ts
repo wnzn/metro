@@ -107,6 +107,50 @@ export const runningChatTurn = computed(() => {
   return null;
 });
 
+/**
+ * Queued Chat turns this session sent, by message id: sent with Queue while
+ * another turn runs, not started, stopped or ended yet.
+ */
+export const queuedChatTurns = computed(() => {
+  const queued = new Map<number, string>();
+  const running = runningChatTurn();
+  if (!running) return queued;
+  const events = chatEvents();
+  const done = new Set(acknowledgedStops());
+  for (const e of events) {
+    if (e.kind === "activity" && e.activity?.id) done.add(e.activity.id);
+    if (e.kind === "error" && e.turnId) done.add(e.turnId);
+  }
+  for (const p of pendingChatTurns()) {
+    if (p.delivery === "queue" && p.id !== running && !done.has(p.id) && events.some(e => e.id === p.eventId)) queued.set(p.eventId, p.id);
+  }
+  return queued;
+});
+
+/** Take a queued turn out of the queue: its message stays, and it never starts. */
+export async function cancelQueuedTurn(id: string) {
+  const c = apiClient();
+  if (!c || chatStopBusy() || mainPlace() !== "chat") return false;
+  const current = sessionGuard();
+  chatStopBusy.set(id);
+  chatStopError.set("");
+  try {
+    await readHostedAccess(c, () => c.stopChatTurn(id));
+  } catch (error) {
+    if (!current()) return false;
+    // Not found: it started or ended meanwhile, and the Chat will show it.
+    if (error instanceof ApiError && error.kind === "not_found") refreshChatEvents();
+    else chatStopError.set(describe(error, "Could not remove it from the queue"));
+    return false;
+  } finally {
+    if (current()) chatStopBusy.set(null);
+  }
+  if (!current()) return false;
+  acknowledgedStops.set(new Set([...acknowledgedStops(), id]));
+  announce("Removed from the queue.");
+  return true;
+}
+
 export async function stopChatReply(id: string) {
   const c = apiClient();
   if (!c || chatStopBusy() || mainPlace() !== "chat" || runningChatTurn() !== id) return false;

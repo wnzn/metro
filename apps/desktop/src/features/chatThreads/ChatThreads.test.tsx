@@ -128,3 +128,69 @@ test("a server without Chat threads shows no thread controls", async () => {
   const plain = f.state.events.get("chat:alice")!.at(-1)!;
   expect(app.shows(`id:reply:${plain.id}`)).toBe(false);
 });
+
+test("Queue and Steer work in a thread, and a reply running there leaves the main Chat free", async () => {
+  const f = world();
+  const ok = (body: unknown, status = 200) => ({ status, body });
+  const live = { id: "chat_live", name: "Metro", source: "agent" as const };
+  f.state.events.set("chat:alice", []);
+  f.state.chatThreads.set("alice", [{ id: "ct-1", title: "Side" }]);
+  f.state.events.set("chat:alice:ct-1", []);
+  f.post("chat:alice:ct-1", { kind: "activity", actor: "agent", text: "", activity: { ...live, phase: "started" } });
+  const sent: { thread: string | null; body: Record<string, unknown> }[] = [];
+  let n = 0;
+  for (const method of ["GET", "POST"]) {
+    const key = `${method} ${BASE}/v1/*`;
+    const fallback = f.network[key]!;
+    f.network[key] = req => {
+      const url = new URL(req.url);
+      if (url.pathname === "/v1/chat/spaces-access" && method === "GET") return ok({ enabled: true, notice_shown: true, excluded_space_ids: [] });
+      if (url.pathname === "/v1/chat/messages" && method === "POST") {
+        const body = JSON.parse(req.body!);
+        const thread = url.searchParams.get("thread");
+        sent.push({ thread, body });
+        const ev = f.post(thread ? `chat:alice:${thread}` : "chat:alice", { kind: "message", actor: "alice", actor_id: "alice", text: body.text, audience: "agent" });
+        return ok({ ...ev, actor_id: "alice", turn_id: `chat_sent${++n}` }, 202);
+      }
+      return fallback(req);
+    };
+  }
+  const app = await open("../../../App.tsx", { modules: launched(), network: f.network as any, platform: "linux", width: 1200, height: 800 });
+  await app.clear("id:server-url");
+  await app.type("id:server-url", BASE);
+  await app.type("id:access-token", TOKENS.alice!);
+  await app.press("id:connect");
+  await app.waitFor("id:chat-view");
+  // The main Chat isn't held up by the thread's reply.
+  await app.waitFor("id:send");
+  await app.wait(300);
+  expect(app.shows("id:chat-stop")).toBe(false);
+
+  await app.waitFor("id:chat-thread:ct-1");
+  await app.press("id:chat-thread:ct-1");
+  await app.waitFor("id:chat-stop");
+  await app.waitFor("id:chat-delivery");
+  await app.type("id:composer", "after that");
+  await app.submit("id:composer");
+  await app.waitUntil(() => sent.length === 1);
+  expect(sent[0]).toMatchObject({ thread: "ct-1" });
+  expect(sent[0]!.body.delivery).toBeUndefined();
+  const queued = f.state.events.get("chat:alice:ct-1")!.at(-1)!.id;
+  await app.waitFor(`id:queued:${queued}`);
+
+  await app.press("id:chat-delivery:steer");
+  await app.type("id:composer", "and the weekend");
+  await app.submit("id:composer");
+  await app.waitUntil(() => sent.length === 2);
+  expect(sent[1]).toMatchObject({ thread: "ct-1", body: { delivery: "steer" } });
+  const steer = f.state.events.get("chat:alice:ct-1")!.at(-1)!.id;
+  f.post("chat:alice:ct-1", { kind: "steered", actor: "agent", text: "", activity: { ...live, steered: steer } as any });
+  await app.waitFor(`id:steered:${steer}`);
+
+  // Back in the main Chat: nothing running, nothing queued.
+  await app.press("id:nav-chat");
+  await app.waitFor("text:Only you can open this chat in Metro.");
+  await app.wait(300);
+  expect(app.shows("id:chat-stop")).toBe(false);
+  expect(app.shows(`id:queued:${queued}`)).toBe(false);
+});

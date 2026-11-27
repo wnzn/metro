@@ -133,13 +133,13 @@ const client: Client | null = env.present ? createClient(env.endpoint) : null;
  * `/v1/local-tools/runner` only. Never reaches a Metro server: the bridge
  * answers, using the session it already holds. Null without the launcher.
  */
-export function localRunnerCall(): ((method: "GET" | "POST", path: string) => Promise<unknown>) | null {
+export function localRunnerCall(): ((method: "GET" | "POST", path: string, body?: { runner_id: string }) => Promise<unknown>) | null {
   if (!client) return null;
-  return (method, path) => {
+  return (method, path, body) => {
     if (path !== "/v1/local-tools/runner" && !path.startsWith("/v1/local-tools/runner/")) {
       return Promise.reject(new BridgeError("invalid", "Not a local runner request."));
     }
-    return client.call(method, path, method === "POST" ? {} : undefined);
+    return client.call(method, path, method === "POST" ? body ?? {} : undefined);
   };
 }
 

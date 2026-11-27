@@ -845,7 +845,7 @@ async fn auto_failed(state: &AppState, run: &Run<'_>, reason: String) {
                 })
                 .await;
             if let Err(e) = r {
-                tracing::error!(error = %format!("{e:#}"), "appending summary failure");
+                crate::db::log_append_error(&e, "appending summary failure");
             }
         }
     }

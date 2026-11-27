@@ -35,7 +35,7 @@
 
 import { announce, batch, computed, effect, signal, Storage, untracked } from "nsh";
 import { ApiError, createClient, isCanonicalMessageRow, parseDeletion, parseReaction } from "./api/client";
-import type { ChatThread, Client, Deletion, Me, Member, Mention, ReplyAddress, Room, RoomEvent, Run, Space, SpaceMessageBody, TurnModelChoice } from "./api/client";
+import type { ChatDelivery, ChatThread, Client, Deletion, Me, Member, Mention, ReplyAddress, Room, RoomEvent, Run, Space, SpaceMessageBody, TurnModelChoice } from "./api/client";
 export { ApiError };
 import { DEFAULT_SERVER_URL, parseServerUrl, serverHost } from "./api/serverUrl";
 import { plainHttpAccepted } from "./plainHttp";
@@ -177,8 +177,30 @@ export const activeEvents = computed(() => eventsByScope()[activeScope()] ?? EMP
 export const chatEvents = computed(() => eventsByScope()[activeChatScope()] ?? EMPTY_EVENTS);
 /** Events of the main Chat, wherever the Chat is. */
 export const mainChatEvents = computed(() => eventsByScope()[CHAT] ?? EMPTY_EVENTS);
-/** Chat turns this session started, by id and their message, before their `started` marker arrives. */
-export const pendingChatTurns = signal<readonly { id: string; eventId: number }[]>([]);
+/** Chat turns this session started, by id and their message, before their `started` (or `steered`) marker arrives. */
+export const pendingChatTurns = signal<readonly { id: string; eventId: number; delivery?: ChatDelivery }[]>([]);
+const CHAT_DELIVERY_KEY = "metro.chatDelivery";
+/** What a Chat message sent while Metro replies does. Device-local; Queue unless the user chose Steer. */
+export const chatDelivery = signal<ChatDelivery>("queue");
+let chatDeliveryChosen = false;
+void Promise.resolve().then(() => Storage.getItem(CHAT_DELIVERY_KEY)).then((saved) => {
+  if (!chatDeliveryChosen && (saved === "queue" || saved === "steer")) chatDelivery.set(saved);
+}).catch(() => { /* storage unavailable: Queue */ });
+export function setChatDelivery(next: ChatDelivery) {
+  chatDeliveryChosen = true;
+  chatDelivery.set(next);
+  Storage.setItem(CHAT_DELIVERY_KEY, next).catch(() => {});
+}
+const steeredCache = new WeakMap<readonly RoomEvent[], ReadonlySet<number>>();
+/** The messages in `events` that were delivered into a running agent turn (their `steered` markers). */
+export function steeredIn(events: readonly RoomEvent[]): ReadonlySet<number> {
+  let ids = steeredCache.get(events);
+  if (!ids) {
+    ids = new Set(events.flatMap((e) => (e.kind === "steered" && e.activity?.steered ? [e.activity.steered] : [])));
+    steeredCache.set(events, ids);
+  }
+  return ids;
+}
 /**
  * A backstop only: a pending turn its server never settles stops offering
  * Stop after this long. Long, so a turn waiting for System One under load
@@ -1955,10 +1977,11 @@ async function sendDraft(intent: DraftSend): Promise<void> {
         await c.saveChatNote(text, ids, thread);
         origin.acknowledge(null);
       } else {
-        const sent = await c.sendChatMessage(text, ids, selected.choice, thread);
+        const delivery = chatDelivery();
+        const sent = await c.sendChatMessage(text, ids, selected.choice, delivery, thread);
         origin.acknowledge(sent.notes);
         if (sent.turn && sameSession()) {
-          const turn = sent.turn;
+          const turn = { ...sent.turn, delivery };
           pendingChatTurns.set([...pendingChatTurns().filter((p) => p.id !== turn.id), turn].slice(-20));
           const sess = session;
           setTimeout(() => { if (sess === session) dropPendingTurn(turn.id); }, PENDING_TURN_MS);
@@ -2815,7 +2838,8 @@ effect(() => {
     if (e.kind === "activity" && e.activity?.id) own.add(e.activity.id);
     if (e.kind === "error" && e.turnId) own.add(e.turnId);
   }
-  const settled = pending.filter((p) => own.has(p.id));
+  const steered = steeredIn(events);
+  const settled = pending.filter((p) => own.has(p.id) || steered.has(p.eventId));
   if (settled.length) untracked(() => pendingChatTurns.set(pending.filter((p) => !settled.includes(p))));
 });
 let mentionScope = "";

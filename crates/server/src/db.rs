@@ -298,6 +298,10 @@ pub struct Activity {
     /// person's message ([`crate::meta`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_post: Option<crate::meta::SpacePost>,
+    /// Only on a `steered` event: the person's message delivered into this
+    /// running turn ([`crate::steering`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steered: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -340,6 +344,7 @@ impl Activity {
             tool: None,
             meta: None,
             space_post: None,
+            steered: None,
         }
     }
 
@@ -371,6 +376,7 @@ impl Activity {
             tool: None,
             meta: None,
             space_post: None,
+            steered: None,
         }
     }
 
@@ -385,6 +391,7 @@ impl Activity {
             tool: None,
             meta: None,
             space_post: None,
+            steered: None,
             ..self.clone()
         }
     }
@@ -398,6 +405,7 @@ impl Activity {
             tool: Some(tool),
             meta: None,
             space_post: None,
+            steered: None,
             ..self.clone()
         }
     }
@@ -411,6 +419,7 @@ impl Activity {
             tool: None,
             meta: Some(note),
             space_post: None,
+            steered: None,
             ..self.clone()
         }
     }
@@ -504,6 +513,10 @@ pub mod kind {
     /// What remains of a deleted message that anchors a reply thread with
     /// replies: no text, recipients or metadata. Never model history.
     pub const DELETED: &str = "deleted";
+    /// A person's message was delivered into a running agent turn
+    /// (`activity.steered` names it; [`crate::steering`]). Empty text.
+    /// Never a message, never model history, never indexed.
+    pub const STEERED: &str = "steered";
 }
 
 /// Actors the server writes for non-human events.
@@ -1498,7 +1511,7 @@ impl Db {
         let mut stmt = conn.prepare_cached(
             "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at FROM space_events
              WHERE space_id = ?1 AND room_id = ?2 AND id < ?3
-               AND kind NOT IN ('activity', 'reasoning_summary', 'page_draft', 'compaction')
+               AND kind NOT IN ('activity', 'reasoning_summary', 'page_draft', 'compaction', 'steered')
              ORDER BY id DESC LIMIT ?4",
         )?;
         let rows = stmt.query_map(params![space_id, room_id, before, limit as i64], row_event)?;
@@ -1709,7 +1722,7 @@ impl Db {
         let mut stmt = conn.prepare_cached(
             "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at FROM personal_events
              WHERE user_id = ?1 AND thread_id IS ?2 AND id < ?3
-               AND kind NOT IN ('activity', 'reasoning_summary', 'compaction')
+               AND kind NOT IN ('activity', 'reasoning_summary', 'compaction', 'steered')
              ORDER BY id DESC LIMIT ?4",
         )?;
         let rows = stmt.query_map(params![user_id, thread, before, limit as i64], row_event)?;
@@ -1733,6 +1746,42 @@ impl Db {
                 |r| Ok((row_event(r)?, r.get::<_, Option<String>>(9)?)),
             )
             .optional()?)
+    }
+
+    /// The agent's replies in `user_id`'s main Chat (`thread` `None`) or
+    /// thread `thread` after event `after`, oldest first, at most `limit`:
+    /// what a turn that waited for earlier ones missed in the history
+    /// before its message.
+    pub fn personal_replies_after(
+        &self,
+        user_id: &str,
+        thread: Option<&str>,
+        after: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Event>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at FROM personal_events
+             WHERE user_id = ?1 AND thread_id IS ?2 AND id > ?3 AND kind = 'agent' ORDER BY id ASC LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(params![user_id, thread, after, limit as i64], row_event)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// [`Db::personal_replies_after`] for a Space room or thread.
+    pub(crate) fn replies_after_in(
+        conn: &Connection,
+        space_id: &str,
+        room_id: &str,
+        after: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Event>> {
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at FROM space_events
+             WHERE space_id = ?1 AND room_id = ?2 AND id > ?3 AND kind = 'agent' ORDER BY id ASC LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(params![space_id, room_id, after, limit as i64], row_event)?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 }
 
@@ -1767,8 +1816,33 @@ pub(crate) fn insert_personal_in(
             metadata,
         ],
     )?;
-    anyhow::ensure!(n == 1, "this Chat thread was deleted");
+    if n != 1 {
+        return Err(ThreadGone.into());
+    }
     Ok(())
+}
+
+/// Nothing was written: the Chat thread was deleted (a turn still running
+/// there when it was is stopped; its last events have nowhere to go).
+#[derive(Debug)]
+pub struct ThreadGone;
+
+impl std::fmt::Display for ThreadGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("this Chat thread was deleted")
+    }
+}
+
+impl std::error::Error for ThreadGone {}
+
+/// Log a failed Chat append as an error, except one refused because its
+/// thread was deleted: that is expected and logged at debug level.
+pub fn log_append_error(e: &anyhow::Error, what: &'static str) {
+    if e.is::<ThreadGone>() {
+        tracing::debug!(what, "Chat thread deleted; event dropped");
+    } else {
+        tracing::error!(error = %format!("{e:#}"), "{what}");
+    }
 }
 
 /// Refuse a database that still holds the single-room build's history. Its

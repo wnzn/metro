@@ -17,8 +17,13 @@ instead: `workspace.list` and `workspace.read` over one private folder per
 Space on that computer, with no check, MCP or commands. They're offered
 only when the Space has no runner, and they never replace one. See
 [apps/desktop/README.md](../apps/desktop/README.md#local-tools-on-this-computer).
-Everything on this page is the separately installed runner, run by an
-operator.
+**The desktop app also has a runner built in** (in the source, not
+released): **Settings → Runners → This computer's runner → Set up** makes it
+your personal registered runner for the server you're signed in to, and it
+runs while Metro is open, with list and read only. See
+[install.md](install.md#the-desktops-own-runner). Everything else on this
+page is the separately installed runner, for another machine, for check and
+MCP, or for one that runs while the app is closed.
 
 ## Two kinds of runner
 

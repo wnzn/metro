@@ -48,7 +48,9 @@ and the reply count under it leads back. Threads are one level deep.
 
 Each thread is its own conversation: Metro sees only that thread's
 messages (and, in a reply thread, the message it replies to), with its
-own summaries, `/compact` and **Stop**. Metro in Chat and web tools work
+own summaries, `/compact`, **Stop** and [Queue / Steer](#while-an-agent-replies)
+line: a reply running in one thread never holds up another thread or the
+main Chat. Metro in Chat and web tools work
 as in the main Chat. Scheduled prompts still post to the main Chat.
 
 Only you see your threads; there is no admin bypass. Use the thread's
@@ -98,6 +100,42 @@ copies the start of its message, so once the message is deleted the run
 lists (**Agent runs**, `/v1/runs`, Pages and Metro in Chat) show the run
 with its status but without that text. Copies already
 forwarded, and anything already sent to a model, aren't affected.
+
+## While an agent replies
+
+**In the source, not released (0.6.2).** You can keep writing while an
+agent replies.
+
+**Personal Chat.** **Send** stays next to **Stop**. While Metro replies,
+the composer shows a small **Queue / Steer** choice. It's kept on this
+device and starts as Queue. The main Chat and each
+[Chat thread](#chat-threads) have their own queue: a reply running in one
+never holds up messages in another, and Steer only goes into the reply
+running in the same thread.
+
+- **Queue:** the message waits, then gets the next reply once the current
+  one ends. Queued messages run one at a time in the order you sent them,
+  also after a server restart. A queued message shows **Queued**;
+  **Cancel** takes it out of the queue (the message stays and never gets a
+  reply). Deleting it does the same. **Stop** ends only the running
+  reply; queued messages still run.
+- **Steer:** the message goes into the running reply. Metro adds it to
+  what the model sees at its next step (for example after a tool call)
+  and the message shows **Steered**. If the reply ends before that, the
+  message gets its own reply instead, after any queued ones.
+
+**Space rooms and threads.** Your message is posted to everyone at once,
+as always. If it asks an agent that is already working on your own
+message in the same room or thread, it steers that run instead of
+starting a second one, and shows **Steered**. The running run's model
+answers it. A message from someone else, for another agent, or with a
+model chosen for that turn starts its own run as usual, and a message
+only to people never reaches a run. Before adding your message, Metro
+checks again that it still exists and that you can still read the room;
+a deleted message never reaches the model. If the run ends first, the
+message starts its own run as usual. If Metro restarts while a message
+waits to steer a run, that run is interrupted and the message may go
+unanswered; send it again.
 
 ## Direct messages and the directory
 
@@ -191,6 +229,20 @@ deletion also removes the
 anchored on it, each with its own `message_deleted` event. DM polls
 include deletions only with `GET /v1/dms/{id}/events?after=&deletions=1`,
 so older clients keep receiving messages only.
+
+### Queue and steer
+
+**In the source, not released (0.6.2).**
+
+- `POST /v1/chat/messages` accepts `delivery`: `"queue"` (the default) or
+  `"steer"`. Older servers reject the field with `422`. A person's Chat
+  turns run one at a time, in send order; each POST still returns its
+  `turn_id`, and `POST /v1/chat/turns/{id}/stop` on a turn that hasn't
+  started takes it out of the queue.
+- When a message is delivered into a running turn (Chat, or a Space room
+  or thread), its conversation gets a `kind: "steered"` event with empty
+  text and the running turn's `activity`, whose `steered` field is the
+  message's event ID. It's never a message, model history or indexed.
 
 ### Forward
 

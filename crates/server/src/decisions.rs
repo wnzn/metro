@@ -768,7 +768,15 @@ pub async fn resume(state: AppState) -> anyhow::Result<usize> {
             }
             // Taken in order now, so the Chat's turns keep their send order.
             Scope::Personal => {
-                let ticket = state.decisions.chat_ticket(&row.user_id);
+                // Its own conversation's line: the main Chat or its thread.
+                let thread =
+                    crate::chat_threads::thread_of_in(&state.db.lock(), &row.user_id, row.event_id)
+                        .ok()
+                        .flatten()
+                        .flatten();
+                let ticket = state
+                    .decisions
+                    .chat_ticket(&chat_line(&row.user_id, thread.as_deref()));
                 tokio::spawn(async move { crate::api::resume_chat_turn(state, row, ticket).await });
             }
         }
@@ -777,6 +785,16 @@ pub async fn resume(state: AppState) -> anyhow::Result<usize> {
 }
 
 // ---- Concurrency and order ----
+
+/// The key of one Chat conversation's turn line: each Chat thread, and the
+/// main Chat, runs its own turns one at a time. A user id never contains
+/// `\0`, so a thread's key never equals anyone's main-Chat key.
+pub fn chat_line(user: &str, thread: Option<&str>) -> String {
+    match thread {
+        Some(t) => format!("{user}\0{t}"),
+        None => user.to_owned(),
+    }
+}
 
 /// Both permits a deferred decision holds while it calls System One.
 pub struct Slot {
@@ -1074,14 +1092,16 @@ impl Pending {
     }
 
     /// Store a Chat message with `store` and give it the next place in
-    /// `user`'s line, both under one lock: line order is storage order.
-    pub fn in_chat_order<T>(&self, user: &str, store: impl FnOnce() -> T) -> (T, Ticket) {
+    /// line `line` ([`chat_line`]), both under one lock: line order is
+    /// storage order.
+    pub fn in_chat_order<T>(&self, line: &str, store: impl FnOnce() -> T) -> (T, Ticket) {
         let _held = self.chat_insert.lock().unwrap_or_else(|e| e.into_inner());
-        let ticket = self.chat_ticket(user);
+        let ticket = self.chat_ticket(line);
         (store(), ticket)
     }
 
-    /// The next place in `user`'s line of Chat turns.
+    /// The next place in line `user` of Chat turns: a person's id for
+    /// their main Chat, or a [`chat_line`] key for one of its threads.
     pub fn chat_ticket(&self, user: &str) -> Ticket {
         let mut lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
         let line = lines.entry(user.to_owned()).or_insert_with(|| Line {

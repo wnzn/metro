@@ -40,10 +40,14 @@ by writing an empty regular file named `enable-local-runner`:
 To leave it off, pass `--no-local-runner` (or `-NoLocalRunner` on Windows).
 An update keeps the previous choice unless you pass `--local-runner` or
 `--no-local-runner`. The installer itself never contacts a server. A
-launcher that supports the marker sets up the person's own registered
-runner after they sign in on this device, with list and read access only
-and no Docker. That runner isn't attached to any Space until the Space
-owner picks it under **Manage Space**.
+launcher that supports the marker sets up the app's built-in personal
+registered runner after the person signs in to the app's own local
+workspace, with list and read access only and no Docker. That runner isn't
+attached to any Space until the Space owner picks it under **Manage
+Space**. The marker only saves a press: in the source (not released), the
+same runner can be set up for any signed-in server from **Settings →
+Runners**, with or without it. The runner is part of the launcher, not a
+separate binary in the package.
 
 ## Desktop: Linux runtime libraries
 

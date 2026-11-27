@@ -51,8 +51,8 @@ or credentials.
 
 ## Runner and server updates
 
-- The desktop's installed runner follows Metro's update; it does not
-  self-update separately.
+- The desktop's built-in runner is part of the app and updates with it; it
+  never self-updates separately.
 - **Settings → Runners** can show version, presence and update status.
   Eligible standalone Linux runners can self-update when the personal
   runner owner or organization admin explicitly requests an update.
