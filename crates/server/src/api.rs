@@ -250,9 +250,21 @@ pub struct AfterQuery {
     after: Option<i64>,
 }
 
+/// `?after=&thread=` of the personal Chat: `thread` names one of the
+/// caller's Chat threads ([`crate::chat_threads`]); absent is the main Chat.
+#[derive(Deserialize, Default)]
+pub struct ChatQuery {
+    pub(crate) after: Option<i64>,
+    pub(crate) thread: Option<String>,
+}
+
 fn after_cursor(query: Result<Query<AfterQuery>, QueryRejection>) -> ApiResult<i64> {
     let Query(query) = query?;
-    let after = query.after.unwrap_or(0);
+    check_after(query.after)
+}
+
+fn check_after(after: Option<i64>) -> ApiResult<i64> {
+    let after = after.unwrap_or(0);
     if after < 0 {
         return Err(ApiError::bad_request(
             "after must be a non-negative integer",
@@ -949,14 +961,20 @@ pub async fn delete_chat_reaction(
 pub async fn chat_events(
     State(state): State<AppState>,
     who: Human,
-    query: Result<Query<AfterQuery>, QueryRejection>,
+    query: Result<Query<ChatQuery>, QueryRejection>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let after = after_cursor(query)?;
+    let Query(query) = query?;
+    let after = check_after(query.after)?;
+    let thread = crate::chat_threads::checked(&state, &who, query.thread).await?;
     let page = state.config.limits.events_page;
     let events = db(&state, move |db| {
-        let mut events = db.personal_after(&who.id, after, page)?;
+        let mut events = db.chat_after(&who.id, thread.as_deref(), after, page)?;
+        if thread.is_none() {
+            crate::chat_threads::hydrate(db, &who.id, &mut events)?;
+        }
         let place = Place::Personal {
             user_id: who.id.clone(),
+            thread,
         };
         attachments::hydrate(db, &who.id, &place, &mut events)?;
         Ok(events)
@@ -1006,9 +1024,12 @@ impl ChatMessage {
 pub async fn chat_message(
     State(state): State<AppState>,
     who: Human,
+    query: Result<Query<ChatQuery>, QueryRejection>,
     body: JsonBody<ChatMessage>,
 ) -> ApiResult<(StatusCode, Json<PostedMessage>)> {
+    let Query(query) = query?;
     let Json(body) = body?;
+    let thread = crate::chat_threads::checked(&state, &who, query.thread).await?;
     let text = check_message(&state, &who.id, None, &body.text, &body.asset_ids).await?;
     let resolved = body.recipients(&text)?;
     let addressing = Addressing::of(&resolved);
@@ -1064,6 +1085,7 @@ pub async fn chat_message(
     let ids = body.asset_ids;
     let place = Place::Personal {
         user_id: uid.clone(),
+        thread: thread.clone(),
     };
     let order = state.decisions.clone();
     // Stored and given its place in the sender's line under one lock, so
@@ -1087,7 +1109,9 @@ pub async fn chat_message(
     .await?;
     let event = match appended {
         Append::Posted(event) => *event,
-        Append::NoRoom | Append::NoAsset | Append::NoRecipient | Append::NoReplyTarget => {
+        // The thread was deleted meanwhile.
+        Append::NoRoom => return Err(ApiError::not_found("no such Chat thread")),
+        Append::NoAsset | Append::NoRecipient | Append::NoReplyTarget => {
             return Err(no_attachment());
         }
     };
@@ -1096,7 +1120,9 @@ pub async fn chat_message(
     if let (Some(how), Some(turn)) = (how, turn_id.clone()) {
         let (state, user, event) = (state.clone(), who.id.clone(), event.clone());
         let watch = crate::decisions::Watch::chat(&state, &user, event.id, Some(&turn));
-        tokio::spawn(chat_turn(state, user, event, how, ticket, turn, watch));
+        tokio::spawn(chat_turn(
+            state, user, thread, event, how, ticket, turn, watch,
+        ));
     }
     Ok((
         StatusCode::ACCEPTED,
@@ -1124,9 +1150,11 @@ pub(crate) enum ChatRoute {
 /// while it waits and routes, so Stop and the busy check see it; one
 /// stopped meanwhile never starts. Its pending decision is settled with its
 /// `started` marker, or here when nothing starts.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn chat_turn(
     state: AppState,
     user: String,
+    thread: Option<String>,
     event: Event,
     how: ChatRoute,
     ticket: crate::decisions::Ticket,
@@ -1135,7 +1163,7 @@ pub(crate) async fn chat_turn(
 ) {
     use crate::decisions::{Scope, forget};
     let turn = crate::db::Activity::agent(turn_id, crate::db::Activity::AGENT_NAME);
-    let (cancel, guard) = state.chat_runs.register(&turn.id, &user);
+    let (cancel, guard) = state.chat_runs.register(&turn.id, &user, thread.as_deref());
     let _in_line = ticket.wait().await;
     let route = match how {
         ChatRoute::Chosen(route) => *route,
@@ -1173,6 +1201,7 @@ pub(crate) async fn chat_turn(
     let (started, written) = tokio::sync::oneshot::channel();
     let start = crate::agent::ChatStart {
         turn,
+        thread,
         cancel,
         guard,
         started,
@@ -1240,6 +1269,14 @@ pub(crate) async fn resume_chat_turn(
     let Some(event) = live_chat_message(&state, &row.user_id, row.event_id).await else {
         return forget(&state, Scope::Personal, row.event_id).await;
     };
+    let (user, eid) = (row.user_id.clone(), row.event_id);
+    let thread = state
+        .db
+        .call(move |db| Ok(crate::chat_threads::thread_of_in(&db.lock(), &user, eid)?))
+        .await
+        .ok()
+        .flatten()
+        .flatten();
     let turn_id = row
         .turn_id
         .clone()
@@ -1272,8 +1309,9 @@ pub(crate) async fn resume_chat_turn(
                          used now: {} No agent ran.",
                         e.message()
                     );
-                    let (user, author, turn) = (
+                    let (user, thread, author, turn) = (
                         row.user_id.clone(),
+                        thread.clone(),
                         Author::server(actor::SYSTEM),
                         turn_id.clone(),
                     );
@@ -1282,6 +1320,7 @@ pub(crate) async fn resume_chat_turn(
                         .call(move |db| {
                             db.append_personal_for_turn(
                                 &user,
+                                thread.as_deref(),
                                 kind::ERROR,
                                 &author,
                                 &message,
@@ -1302,7 +1341,17 @@ pub(crate) async fn resume_chat_turn(
             }
         },
     };
-    chat_turn(state, row.user_id, event, how, ticket, turn_id, watch).await;
+    chat_turn(
+        state,
+        row.user_id,
+        thread,
+        event,
+        how,
+        ticket,
+        turn_id,
+        watch,
+    )
+    .await;
 }
 
 #[cfg(test)]

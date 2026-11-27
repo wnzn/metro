@@ -830,8 +830,13 @@ enum Scope {
 /// search or its history).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PersonalLane {
-    Chat,
-    Page { page_id: String },
+    /// The main Chat (`thread` `None`) or one of its threads.
+    Chat {
+        thread: Option<String>,
+    },
+    Page {
+        page_id: String,
+    },
 }
 
 impl PersonalLane {
@@ -846,9 +851,15 @@ impl PersonalLane {
         activity: Option<&Activity>,
     ) -> anyhow::Result<Event> {
         match self {
-            PersonalLane::Chat => {
-                db.append_personal_with(user_id, kind, author, text, &Addressed::room(), activity)
-            }
+            PersonalLane::Chat { thread } => db.append_personal_with(
+                user_id,
+                thread.as_deref(),
+                kind,
+                author,
+                text,
+                &Addressed::room(),
+                activity,
+            ),
             PersonalLane::Page { page_id } => crate::pages::store::append_page_event(
                 db, page_id, user_id, kind, author, text, activity,
             ),
@@ -863,7 +874,7 @@ impl PersonalLane {
         n: usize,
     ) -> anyhow::Result<Vec<Event>> {
         match self {
-            PersonalLane::Chat => db.personal_before(user_id, before, n),
+            PersonalLane::Chat { thread } => db.chat_before(user_id, thread.as_deref(), before, n),
             PersonalLane::Page { page_id } => {
                 crate::pages::store::page_events_before(db, page_id, user_id, before, n)
             }
@@ -1931,7 +1942,7 @@ pub async fn respond_personal_routed(
         trigger,
         route,
         false,
-        PersonalLane::Chat,
+        PersonalLane::Chat { thread: None },
         Activity::chat(),
         None,
     )
@@ -1954,7 +1965,7 @@ pub async fn start_personal_run(
         trigger.clone(),
         route,
         true,
-        PersonalLane::Chat,
+        PersonalLane::Chat { thread: None },
         Activity::chat(),
         None,
     )
@@ -1966,6 +1977,8 @@ pub async fn start_personal_run(
 /// and a signal sent once its `started` marker is written.
 pub struct ChatStart {
     pub turn: Activity,
+    /// The Chat thread it answers in (`None`: the main Chat).
+    pub thread: Option<String>,
     pub cancel: watch::Receiver<bool>,
     pub guard: crate::meta::TurnGuard,
     /// `true` once the `started` marker is written; `false` when it was
@@ -1984,13 +1997,14 @@ pub async fn start_chat_turn(
     start: ChatStart,
 ) -> Result<(), String> {
     let turn = start.turn.clone();
+    let thread = start.thread.clone();
     run_personal(
         state.clone(),
         user_id.to_owned(),
         trigger.clone(),
         route,
         true,
-        PersonalLane::Chat,
+        PersonalLane::Chat { thread },
         turn,
         Some(start),
     )
@@ -2057,14 +2071,20 @@ async fn run_personal(
     };
     // In Chat a refusal stands alone; on a page it carries the turn, so the
     // page can show that this click failed.
-    let tag = (lane != PersonalLane::Chat).then(|| turn.clone());
+    let in_chat = matches!(lane, PersonalLane::Chat { .. });
+    let tag = (!in_chat).then(|| turn.clone());
     // A Chat turn its sender knows by id (it waited to start): its refusal
     // names that id, so the sender's pending Stop clears.
     let known = chat.as_ref().map(|c| c.turn.id.clone());
+    let lane_thread = match &lane {
+        PersonalLane::Chat { thread } => thread.clone(),
+        PersonalLane::Page { .. } => None,
+    };
     let append = |kind: &'static str, text: String| {
-        let (state, user, known, author, plain) = (
+        let (state, user, thread, known, author, plain) = (
             state.clone(),
             user_id.clone(),
+            lane_thread.clone(),
             known.clone(),
             agent_author.clone(),
             append_as(kind, text.clone(), tag.clone()),
@@ -2075,7 +2095,14 @@ async fn run_personal(
                     let r = state
                         .db
                         .call(move |db| {
-                            db.append_personal_for_turn(&user, kind, &author, &text, &turn)
+                            db.append_personal_for_turn(
+                                &user,
+                                thread.as_deref(),
+                                kind,
+                                &author,
+                                &text,
+                                &turn,
+                            )
                         })
                         .await;
                     if let Err(e) = r {
@@ -2132,11 +2159,13 @@ async fn execute_personal_run(
     let limits = state.config.limits.clone();
     // A Chat turn can be stopped by its owner (`POST /v1/chat/turns/{id}/stop`).
     let (cancel, _registered, started_signal) = match (lane.clone(), chat) {
-        (PersonalLane::Chat, Some(chat)) => {
+        (PersonalLane::Chat { .. }, Some(chat)) => {
             (Some(chat.cancel), Some(chat.guard), Some(chat.started))
         }
-        (PersonalLane::Chat, None) => {
-            let (cancel, guard) = state.chat_runs.register(&turn.id, &user_id);
+        (PersonalLane::Chat { thread }, None) => {
+            let (cancel, guard) = state
+                .chat_runs
+                .register(&turn.id, &user_id, thread.as_deref());
             (Some(cancel), Some(guard), None)
         }
         (PersonalLane::Page { .. }, _) => (None, None, None),
@@ -2170,7 +2199,11 @@ async fn execute_personal_run(
     // deleted since it was sent starts nothing: the check, the marker and
     // settling its pending decision are one transaction.
     let started = turn.at(activity::STARTED).with_route(route.note.clone());
-    if lane == PersonalLane::Chat && trigger.kind == kind::MESSAGE {
+    let thread = match &lane {
+        PersonalLane::Chat { thread } => Some(thread.clone()),
+        PersonalLane::Page { .. } => None,
+    };
+    if thread.is_some() && trigger.kind == kind::MESSAGE {
         let (user, trigger_id, author, marker, epoch) = (
             user_id.clone(),
             trigger.id,
@@ -2214,6 +2247,7 @@ async fn execute_personal_run(
     }
     let end = |phase: &'static str| append_as(kind::ACTIVITY, String::new(), Some(turn.at(phase)));
     let tagged = |kind: &'static str, text: String| append_as(kind, text, Some(turn.clone()));
+    // A Chat reply thread's history begins with its anchor, unless deleted.
     let earlier = {
         let (user, before, n, lane) = (
             user_id.clone(),
@@ -2223,11 +2257,19 @@ async fn execute_personal_run(
         );
         state
             .db
-            .call(move |db| lane.before(db, &user, before, n))
+            .call(move |db| {
+                let anchor = match &lane {
+                    PersonalLane::Chat { thread: Some(t) } => {
+                        crate::chat_threads::anchor_in(&db.lock(), &user, t)?
+                    }
+                    _ => None,
+                };
+                Ok((lane.before(db, &user, before, n)?, anchor))
+            })
             .await
     };
-    let earlier = match earlier {
-        Ok(events) => events,
+    let (earlier, anchor) = match earlier {
+        Ok(loaded) => loaded,
         Err(e) => {
             tracing::error!(error = %format!("{e:#}"), "loading personal history");
             state
@@ -2245,7 +2287,7 @@ async fn execute_personal_run(
     // In Chat only: web tools for a person who turned them on, always on
     // their own computer; Space tools while "Use my Spaces in Chat" is on
     // and its notice was shown (each call checks again).
-    let (web, spaces) = if lane == PersonalLane::Chat {
+    let (web, spaces) = if thread.is_some() {
         let user = user_id.clone();
         state
             .db
@@ -2265,12 +2307,12 @@ async fn execute_personal_run(
         (false, false)
     };
     let lane_rules = match lane {
-        PersonalLane::Chat => crate::meta::chat_preamble(spaces, web),
+        PersonalLane::Chat { .. } => crate::meta::chat_preamble(spaces, web),
         PersonalLane::Page { .. } => PERSONAL_PREAMBLE.to_owned(),
     };
     // Page conversations are never compacted.
-    let window = match lane {
-        PersonalLane::Chat => {
+    let window = match &lane {
+        PersonalLane::Chat { thread } => {
             let name = match &trigger.actor_id {
                 Some(id) if *id == user_id => trigger.actor.as_str(),
                 _ => user_id.as_str(),
@@ -2278,6 +2320,7 @@ async fn execute_personal_run(
             let run = crate::compaction::Run {
                 place: crate::compaction::Place::Chat {
                     user_id: user_id.clone(),
+                    thread: thread.clone(),
                 },
                 user_id: &user_id,
                 user_name: name,
@@ -2299,10 +2342,18 @@ async fn execute_personal_run(
         builder = builder.append_preamble(crate::compaction::PREAMBLE);
     }
     if spaces {
-        let ctx = crate::meta::Ctx::new(&state, &user_id, &turn, &trigger, &earlier);
+        let chat_thread = thread.clone().flatten();
+        let ctx = crate::meta::Ctx::new(
+            &state,
+            &user_id,
+            chat_thread.as_deref(),
+            &turn,
+            &trigger,
+            &earlier,
+        );
         builder = builder.dynamic_tools(crate::meta::tools(&ctx));
     }
-    if lane == PersonalLane::Chat && trigger.text.is_empty() && !trigger.attachments.is_empty() {
+    if thread.is_some() && trigger.text.is_empty() && !trigger.attachments.is_empty() {
         builder = builder.append_preamble(
             "The latest message contains only attachments. You cannot access those files. \
              Ask what the user needs and invite them to paste the relevant text.",
@@ -2313,14 +2364,19 @@ async fn execute_personal_run(
         if matches!(paired, Ok(true)) {
             let ctx = crate::web_tools::WebContext {
                 state: state.clone(),
-                scope: crate::web_tools::WebScope::PersonalChat,
+                scope: crate::web_tools::WebScope::PersonalChat {
+                    thread: thread.clone().flatten(),
+                },
                 initiator: Author {
                     id: Some(user_id.clone()),
                     name: String::new(),
                 },
                 turn: turn.clone(),
                 provenance: Arc::new(crate::web_tools::Provenance::from_messages(
-                    earlier.iter().chain(std::iter::once(&trigger)),
+                    anchor
+                        .iter()
+                        .chain(earlier.iter())
+                        .chain(std::iter::once(&trigger)),
                 )),
                 agent_id: None,
             };
@@ -2334,7 +2390,7 @@ async fn execute_personal_run(
     }
     let mut reacted = Arc::new(AtomicBool::new(false));
     // Reactions are for Chat messages; a page-only conversation has none.
-    if lane == PersonalLane::Chat
+    if thread.is_some()
         && let Some((tool, flag)) = reaction_tool(
             &state,
             ReactionScope::Personal {
@@ -2358,11 +2414,18 @@ async fn execute_personal_run(
             turn: turn.clone(),
         });
     let prompt = user_turn(&trigger, &key);
+    let mut history = history(&window.events, &key);
+    if let Some(anchor) = &anchor {
+        history.insert(
+            0,
+            event_message(anchor, &key).unwrap_or_else(|| user_turn(anchor, &key)),
+        );
+    }
     let phase = match drive(
         &state,
         builder.build(),
         prompt,
-        history(&window.events, &key),
+        history,
         cancel,
         route.note.connection_id.as_deref(),
         false,

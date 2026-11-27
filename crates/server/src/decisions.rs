@@ -465,9 +465,9 @@ pub fn fail_in(
                 .as_ref()
                 .map(|t| serde_json::json!({ "turn_id": t }).to_string());
             conn.execute(
-                "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
-                 SELECT ?1, 'error', ?2, NULL, ?3, '[]', 'room', ?4, ?6
-                 WHERE EXISTS (SELECT 1 FROM personal_events WHERE id = ?5 AND user_id = ?1)",
+                "INSERT INTO personal_events (user_id, thread_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
+                 SELECT ?1, thread_id, 'error', ?2, NULL, ?3, '[]', 'room', ?4, ?6
+                 FROM personal_events WHERE id = ?5 AND user_id = ?1",
                 params![user, crate::db::actor::AGENT, text, crate::db::now_ms(), event_id, meta],
             )?;
         }

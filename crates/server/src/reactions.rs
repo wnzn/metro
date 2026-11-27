@@ -346,11 +346,13 @@ impl Db {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, '[]', 'room', ?7)",
                 params![space_id, room_id, KIND, name, author_id, text, now_ms()],
             )?,
+            // In the target's own thread (or the main Chat).
             ReactionScope::Personal { user_id } => tx.execute(
                 "INSERT INTO personal_events
-                     (user_id, kind, actor, actor_id, text, mentions, audience, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, '[]', 'room', ?6)",
-                params![user_id, KIND, name, author_id, text, now_ms()],
+                     (user_id, thread_id, kind, actor, actor_id, text, mentions, audience, created_at)
+                 VALUES (?1, (SELECT thread_id FROM personal_events WHERE id = ?7 AND user_id = ?1),
+                         ?2, ?3, ?4, ?5, '[]', 'room', ?6)",
+                params![user_id, KIND, name, author_id, text, now_ms(), target],
             )?,
         };
         tx.commit()?;
