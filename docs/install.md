@@ -172,9 +172,11 @@ the app's own local workspace and only when the installer asked for it.
 - **It runs while Metro is open.** Later launches start it again for that
   server and account, without another press. It stops when you sign out,
   switch server or account, or quit Metro. It updates with the app.
-- **List and read only.** It lists and reads files in each attached Space's
-  own folder on this computer. It never runs commands, checks, MCP or
-  Docker, and opens no port.
+- **Tools.** In 0.6.2 it lists and reads files in each attached Space's own
+  folder on this computer, and never runs commands. In the source, not
+  released, it can also write files (`workspace.write`) and run shell
+  commands (`workspace.shell`) there, under the shell policy below. It
+  never runs checks, MCP or Docker, and opens no port.
 - **Installer choice.** The desktop installers still turn on **local runner
   support** for a new install, by placing an empty `enable-local-runner`
   file next to the launcher (on macOS, beside `Metro.app` in its private
@@ -191,7 +193,7 @@ the app's own local workspace and only when the installer asked for it.
   new one.
 
 **Settings → Runners → This computer's runner** (`57409bb`) shows its name,
-its state and its read-only tools. It's hidden without the launcher (for
+its state and its tools. It's hidden without the launcher (for
 example in a browser) or with an older launcher.
 
 - **Choose where to attach it.** You can use the
@@ -201,6 +203,42 @@ example in a browser) or with an older launcher.
   never replace an existing assignment. Each attached Space gets its
   own folder, with **Show folder** and **Copy path** under this computer's
   runner.
+
+### Folders and shell commands (in the source, not released)
+
+- **Folder per Space.** Under this computer's runner, **Change** picks the
+  folder a Space's jobs use, for example an existing project, and **Use
+  default** goes back to the Space's own folder in Metro's data folder.
+  Only Spaces this runner is attached to can get a chosen folder. Metro
+  refuses a folder that doesn't exist, a link or junction, a drive or
+  filesystem root, your home folder itself (a folder inside it is fine),
+  anything inside or containing Metro's data folder, and a folder that is,
+  contains or sits inside another Space's chosen folder. Changing the
+  folder moves no files and applies from the next job. If a chosen folder
+  can't be used later (for example it was deleted), that Space's jobs fail
+  with an error until you change it or choose **Use default**; Metro never
+  falls back to the default folder.
+- **Shell mode.** **Settings → Runners** sets this runner's mode: **Off**,
+  **Ask every time** (the default), **Ask when System One flags it** or
+  **Always allow**, and the **Approver**: **Runner owner** (you, the
+  default) or **Any Space member**. Each Space can override both. **Always
+  allow** applies only while the runner is attached to exactly one Space;
+  with more, it asks every time. When a command needs approval, an
+  approval card with **Approve** and **Deny** appears in the room. See
+  [Shell commands](runner.md#shell-commands-in-the-source-not-released).
+- **What a command can reach.** A shell command runs as you, with your
+  access to this computer. It starts in the Space's folder but can read and
+  change anything you can, including other Spaces' folders, your files and
+  the network. There's no sandbox for the built-in runner. Keep **Ask every
+  time** and **Runner owner** unless you trust every member of the Space
+  with that access. **Ask when System One flags it** relies on a model's
+  judgement, which can be wrong.
+- **Windows.** Shell commands run with `cmd.exe` and are stopped with
+  their Windows job object. A process started in the instant before it is
+  added to the job object may keep running after a stop. The refusal of
+  junctions as chosen folders hasn't been checked on a real Windows
+  machine.
+- Per-Space **Local tools** in **Use locally** stay list and read only.
 - **Recovery is explicit.** If its token is no longer accepted, or setup was
   interrupted, the state says so and nothing is retried on its own.
   **Reconnect…** first explains what it will do, then:

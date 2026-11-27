@@ -435,10 +435,16 @@ in the same or a later pull request, because only a version bump releases.
   what that Space's members may see.
 - **Registered runner:** serves each Space it's attached to, each in its own
   `spaces/<sid>/` root. Members of one Space can't reach another Space's
-  root through it, and it never runs check or MCP commands on the host. Its
-  operator can read every Space root on that machine, so a Space owner who
-  attaches someone's runner is trusting that person with the Space's
-  files.
+  root through its list, read and write tools, and it never runs check or
+  MCP commands on the host. Its operator can read every Space root on that
+  machine, so a Space owner who attaches someone's runner is trusting that
+  person with the Space's files.
+- **Shell commands** (in the source, not released): `workspace.shell` runs
+  as the runner's user. Without the Docker sandbox it can reach everything
+  that user can, including other Spaces' roots on the same runner. Whoever
+  may approve commands, or **Always allow**, decides who effectively has
+  that access. A System One check is a model's judgement, not containment.
+  See [runner.md](runner.md#shell-commands-in-the-source-not-released).
 - **Model provider:** room, thread and Chat history, with author and
   recipient labels, plus tool output (up to 64 KiB per tool call) go to the
   model connection of whoever started the run. That's their device connector,

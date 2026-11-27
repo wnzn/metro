@@ -30,7 +30,8 @@ The guide below is for [Metro 0.6.2](docs/released-0.6.2.md), which builds
 on [Metro 0.6.1](docs/released-0.6.1.md), [Metro 0.6.0](docs/released-0.6.0.md),
 [Metro 0.5.1](docs/released-0.5.1.md)
 and the [Metro 0.5.0 features](docs/released-0.5.0.md).
-For later changes, see [In the source, not released](docs/next-source.md).
+For later changes, such as file writes and shell commands for agents in
+0.6.3, see [In the source, not released](docs/next-source.md).
 
 ## Features
 
