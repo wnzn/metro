@@ -150,7 +150,7 @@ usable in that Space. It is off by default. The rules below are for
   one agent: the same `choice`, without *No agent*. A pick at or above
   `min_route_probability` runs that agent; a weaker one runs the default
   agent. A failed decision posts an error in the room and runs nothing for
-  `@agent`. In the source, not released, the room's marker for a weak pick
+  `@agent`. Since 0.6.1, the room's marker for a weak pick
   says only *Default agent*, without the guessed agent or its score.
 
 For these decisions:
@@ -163,7 +163,7 @@ For these decisions:
 - An unaddressed message that started a run this way is stored with
   `addressed_by: "classifier"`, which no client can send. The run's activity
   shows how its agent was chosen, for example *Picked by classifier: Coder*.
-  In the source, not released, the classifier's output is never stored in
+  Since 0.6.1, the classifier's output is never stored in
   a message's recipients, whether the decision is
   [deferred](#decisions-after-posting) or not: the POST says
   `classified: true`, and the run shows only as the picked agent's run,
@@ -243,7 +243,7 @@ never reach System One.
 
 ### Decisions after posting
 
-**In the source, not released (0.6.1).** A Space message POST with
+**Since 0.6.1.** A Space message POST with
 `"defer_decisions": true` (the desktop always sends it) stores and
 returns the message at once. If it would otherwise wait on System One
 (the sender's opt-in classification, the classifier's pick for `@agent`,

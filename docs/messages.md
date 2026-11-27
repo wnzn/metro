@@ -1,9 +1,9 @@
 # Messages
 
 Markdown, Reply, Forward, the directory and DMs are in the published
-[Metro 0.6.0](released-0.6.0.md). **Delete** is in the source, not
-released, planned for 0.6.1, and **Chat threads** are in the source, not
-released, planned for 0.6.2 ([source overview](next-source.md)).
+[Metro 0.6.0](released-0.6.0.md), and **Delete** in [Metro 0.6.1](released-0.6.1.md).
+**Chat threads** and writing **while an agent replies** are in the source,
+not released, planned for 0.6.2 ([source overview](next-source.md)).
 
 ## Markdown
 
@@ -78,7 +78,7 @@ The server rechecks source and destination access together.
 
 ## Delete
 
-**In the source, not released (0.6.1).** Choose **Delete** in a
+**Since 0.6.1.** Choose **Delete** in a
 message's toolbar and confirm. Deleting is permanent, and there's no
 Trash. You can delete:
 
@@ -208,7 +208,7 @@ stayed for that thread.
 
 ### Deleting messages
 
-**In the source, not released (0.6.1).**
+**Since 0.6.1.**
 
 | Request | Who may delete |
 | --- | --- |

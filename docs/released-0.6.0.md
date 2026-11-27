@@ -153,4 +153,4 @@ A `kind: "compaction"` event has the summary in `text` and a top-level
 `focus` and `previous` (an older summary event ID). A failed automatic
 summary can set `compaction_failure: {message}` on the initiator's run view.
 
-Later changes are [in the source, not released](next-source.md).
+The [0.6.1 changes](released-0.6.1.md) came in the next release.
