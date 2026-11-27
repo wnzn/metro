@@ -1306,12 +1306,13 @@ export function SegmentedControl<T extends string>(
     value: T;
     onChange: (value: T) => void;
     disabled?: boolean;
+    wrap?: boolean;
     testID?: string;
   },
 ) {
   return (
     <RadioGroup
-      class="flex-row self-start gap-[2px] rounded-(--radius-sm) border border-border bg-muted p-[3px]"
+      class={cx("flex-row self-start gap-[2px] rounded-(--radius-sm) border border-border bg-muted p-[3px]", props.wrap && "flex-wrap max-w-full")}
       accessibilityLabel={props.accessibilityLabel}
       testID={props.testID}
     >

@@ -476,7 +476,7 @@ async function chooseProvider(app: App, vendor: string, id: string) {
   await app.press(`id:provider:${id}`);
 }
 
-test("Settings work without any Space; a personal runner's token is shown once, masked, with a Docker template that never holds it", async () => {
+test("Settings work without any Space; a personal runner's setup tabs never include its one-time token", async () => {
   const f = world();
   const app = await openApp(f);
   await signIn(app, "carol");
@@ -499,9 +499,17 @@ test("Settings work without any Space; a personal runner's token is shown once, 
   expect(run).not.toContain(RUNNER_SECRET);
   expect(text(app)).toContain("Get the matching prebuilt runner from Metro Releases, or pull this version's image when available.");
   for (const banned of ["docker build", "cargo", "git clone", "isn't published"]) expect(text(app)).not.toContain(banned);
-  // Docker is the alternative: env file, named volume, never the token.
+  const tabs = "id:runner-install-method:";
+  for (const method of ["linux", "docker-run", "docker-compose", "cloud"]) expect(app.shows(tabs + method)).toBe(true);
+  expect(text(app)).toContain("Cloud · Coming soon");
+  expect(app.enabled(tabs + "cloud")).toBe(false);
+
+  // Docker uses an env file and named volume, never a token in a command.
   expect(app.shows("id:setup-docker")).toBe(false);
-  await app.press("id:setup-docker-toggle");
+  expect(app.shows("id:setup-compose")).toBe(false);
+  await app.press(tabs + "docker-run");
+  await app.waitFor("id:setup-docker");
+  expect(app.shows("id:setup-standalone")).toBe(false);
   const docker = app.texts().find((t) => t.startsWith("docker run")) ?? "";
   expect(docker).toContain("--env-file ./runner.env");
   expect(docker).toContain("-v metro-runner-carol-laptop-workspace:/workspace");
@@ -509,7 +517,25 @@ test("Settings work without any Space; a personal runner's token is shown once, 
   expect(docker).not.toContain(RUNNER_SECRET);
   expect(text(app)).toContain("METRO_RUNNER_TOKEN=<paste the runner token here>");
   await app.press("id:setup-docker-copy");
-  expect(app.clipboard()).not.toContain(RUNNER_SECRET);
+  expect(app.clipboard()).toBe(docker);
+
+  await app.press(tabs + "docker-compose");
+  await app.waitFor("id:setup-compose");
+  expect(app.shows("id:setup-docker")).toBe(false);
+  const compose = app.texts().find((t) => t.startsWith("name: metro-runner-")) ?? "";
+  expect(compose).toContain("env_file: ./runner.env");
+  expect(compose).toContain("network_mode: host");
+  expect(compose).not.toContain(RUNNER_SECRET);
+  await app.press("id:setup-compose-copy");
+  expect(app.clipboard()).toBe(compose);
+  await app.press("id:setup-compose-up-copy");
+  expect(app.clipboard()).toBe("docker compose up -d");
+  await app.waitUntil(() => app.storage()["metro.runner-install.method"] === "docker-compose");
+  const saved = { "metro.runner-install.method": app.storage()["metro.runner-install.method"]! };
+
+  await app.press(tabs + "linux");
+  await app.waitFor("id:setup-standalone-run");
+  expect(app.shows("id:setup-compose")).toBe(false);
   await app.press("id:copy-runner-token");
   expect(app.clipboard()).toContain(RUNNER_SECRET);
   await app.press("id:reveal-toggle");
@@ -521,6 +547,15 @@ test("Settings work without any Space; a personal runner's token is shown once, 
   await app.waitFor("text:Carol laptop");
   expect(text(app)).not.toContain(RUNNER_SECRET);
   expect(JSON.stringify(app.storage())).not.toContain(RUNNER_SECRET);
+
+  const restarted = await openApp(f, saved);
+  await signIn(restarted, "carol");
+  await openSettings(restarted, "runners");
+  await restarted.press("id:runner-add-toggle");
+  await restarted.type("id:runner-name", "Carol builder");
+  await restarted.press("id:add-runner");
+  await restarted.waitFor("id:setup-compose");
+  expect(restarted.shows("id:setup-standalone")).toBe(false);
 });
 
 test("org admins add organization runners; others see them but can't manage them; rotate and delete say which Spaces they affect", async () => {
@@ -533,6 +568,7 @@ test("org admins add organization runners; others see them but can't manage them
   await app.press("id:runner-visibility:organization");
   await app.press("id:add-runner");
   await app.waitFor("id:token-reveal");
+  await app.waitFor("id:runner-install-method:linux");
   await app.press("id:hide-runner-token");
   const org = [...f.state.runners.values()].find((r) => r.name === "Shared CI")!;
   expect(org.visibility).toBe("organization");
@@ -543,6 +579,7 @@ test("org admins add organization runners; others see them but can't manage them
   await app.waitFor("text:/Spaces you belong to that use it: Side project/");
   await app.press(`id:rotate-runner:${org.id}:confirm`);
   await app.waitFor("text:/New token for/");
+  await app.waitFor("id:runner-install-method:docker-compose");
   expect(text(app)).not.toContain(org.token);
   await app.press("id:hide-runner-token");
 

@@ -480,6 +480,11 @@ test("a dedicated token starts masked and cannot be recovered by reopening Runne
   await app.waitFor("id:token-reveal");
   const issued = w.f.state.spaces.get("empty")!.runnerToken!;
   expect(!!issued).toBe(true);
+  await app.waitFor("id:setup-standalone-run");
+  await app.press("id:runner-install-method:docker-compose");
+  await app.waitFor("id:setup-compose");
+  expect(app.shows("text:/The workspace is this Space's folder/")).toBe(true);
+  expect(app.shows("text:/Space owners can attach it/")).toBe(false);
   expect(app.texts().some((t) => t.includes(issued))).toBe(false);
   await app.press("id:space-settings-tab:members");
   await app.press("id:space-settings-tab:runner");

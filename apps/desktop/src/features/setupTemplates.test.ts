@@ -2,6 +2,7 @@ import { expect, test } from "nsh/test";
 import manifest from "../../nsh.json";
 import {
   deviceGuide,
+  dockerComposeFile,
   dockerRunCommand,
   isLoopbackServer,
   releaseTag,
@@ -43,6 +44,21 @@ test("the image is the release workflow's name, tagged with this app's version, 
     "Get the matching prebuilt runner from Metro Releases, or pull this version's image when available. Use the files of the release whose tag matches this app; Metro never asks you to build the runner yourself.",
   );
   for (const claim of ["published", "not yet", "isn't"]) expect(RUNNER_SOURCE_NOTE.includes(claim)).toBe(false);
+});
+
+test("Compose uses the tagged prebuilt image, private env file, and a named workspace volume", () => {
+  const opts = { serverUrl: "https://metro.example.com", runnerName: "Build box #2", appVersion: "v0.2.0" };
+  const compose = dockerComposeFile(opts);
+  expect(compose).toContain("name: metro-runner-build-box-2");
+  expect(compose).toContain("image: ghcr.io/wnzn/metro-runner:v0.2.0");
+  expect(compose).toContain("env_file: ./runner.env");
+  expect(compose).toContain("volumes:\n      - workspace:/workspace\nvolumes:\n  workspace:");
+  expect(compose).toContain("cap_drop: [ALL]");
+  expect(compose).toContain("security_opt: [no-new-privileges:true]");
+  for (const banned of ["network_mode", "METRO_RUNNER_TOKEN", "METRO_SERVER_URL", "build:"]) {
+    expect(compose).not.toContain(banned);
+  }
+  expect(dockerComposeFile({ ...opts, serverUrl: "http://127.0.0.1:8787" })).toContain("network_mode: host");
 });
 
 test("the standalone runner is this version's release archive, checked, with the token read from a mode-600 file", () => {
