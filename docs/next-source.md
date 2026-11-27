@@ -34,10 +34,12 @@ for release records.
   new server test drives the desktop's **Use locally** paths end to end
   (per-Space local tools and an installed runner answering **Test
   runner**, before and after a restart); it passed on Linux and as a
-  Windows build under Wine. It is added to the release workflow's
-  Windows job but hasn't yet run on native Windows. A reported Windows
-  **Test runner** timeout hasn't been reproduced, and this doesn't claim
-  to fix it.
+  Windows build under Wine, and in CI on native Windows (`windows-2025`)
+  in the package smoke job ([record](acceptance.md#source-only-metro-061-lanes-2026-11-27-local)).
+  A **Test runner** timeout reported on one Windows computer still
+  hasn't been reproduced: native CI with a fresh profile passes, so it
+  remains environment-specific and unverified, and this doesn't claim to
+  fix it. Such failures now report a reason (below).
 - **Local runner failures say why.** If the desktop's local tools or
   this computer's runner can't start (for example, its folder can't be
   opened or a pairing can't be read), Space settings shows the reason

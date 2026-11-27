@@ -25,8 +25,8 @@ native desktop check by a person or a publication gate.
   3/60 lib runs and 12/40 `self_update` runs to 0/150 and 0/60. The new
   `tests/desktop_local_runner.rs` passed on Linux and as an
   `x86_64-pc-windows-gnu` build under Wine 10. It is added to the
-  release workflow's Windows job; it hasn't yet run on native Windows.
-  The reported Windows **Test runner** timeout wasn't reproduced.
+  release workflow's Windows job, and it passed on native Windows in CI
+  (below). The reported Windows **Test runner** timeout wasn't reproduced.
 
 **Final gate on the merged branch** (`29912b6` on `fix/061-polish`,
 2026-11-27, Linux, local; source only, not a release):
@@ -47,10 +47,31 @@ native desktop check by a person or a publication gate.
 - Reviews: Opus 5.5 only for this run, by the maintainer's decision,
   plus one earlier Astra 6.2 review whose findings were fixed. The final
   Opus 5.5 review found no blockers or major issues.
-- **Not verified:** native Windows (the new Windows CI step hasn't run,
-  and the reported Windows **Test runner** timeout wasn't reproduced;
-  such failures now report a reason), and real vendor accounts and
-  sign-ins.
+- **Not verified:** the desktop on native Windows by a person (the
+  reported Windows **Test runner** timeout wasn't reproduced; such
+  failures now report a reason), and real vendor accounts and sign-ins.
+
+**CI on PR #20** (GitHub, 2026-11-27). Run
+[45944072172](https://github.com/wnzn/metro/actions/runs/45944072172)
+on head `4fad361` (pull request event) succeeded; every job passed or
+was skipped by design (`release-policy`, `release`, `publish`). The
+native Windows job `package-smoke / desktop-windows` (`windows-2025`,
+05:10:39Z–05:33:20Z) ran the new step
+`cargo test --locked --release --target x86_64-pc-windows-msvc -p metro-server --test desktop_local_runner --test desktop_tools --test desktop_runner`:
+`desktop_local_runner` 2 passed, `desktop_runner` 9 passed and
+`desktop_tools` 11 passed, 0 failed. This is unattended CI with a fresh
+profile, not a desktop run by a person. The earlier run
+[45942687192](https://github.com/wnzn/metro/actions/runs/45942687192)
+(head `dd1952e`) failed `package-smoke / desktop-linux` with
+`unapproved renderer asset: src/ui/icons/trash.svg`, fixed in `4fad361`
+(`ICON_MODULES` in `packaging/package.py`); its Windows job was
+cancelled while building that step, before any of its tests ran.
+
+```sh
+gh run view 45944072172 --repo wnzn/metro --json conclusion,headSha,jobs
+gh api repos/wnzn/metro/actions/jobs/140325090204/logs | grep "test result"
+gh run view 45942687192 --repo wnzn/metro --json conclusion,headSha,jobs
+```
 
 ## Published: Metro 0.6.0 (2026-11-26, GitHub release v0.6.0)
 
