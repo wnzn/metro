@@ -88,6 +88,11 @@ export function groupTranscript(events: readonly RoomEvent[]): TranscriptItem[] 
   const groups = new Map<string, ActivityGroup & { started: boolean; ended: boolean; terminal: GroupOutcome | null }>();
   const memberOf = new Map<number, string>(); // event id -> group key, for events folded into a group
   for (const e of events) {
+    // A message delivered into a running turn: shown on that message, not here.
+    if (e.kind === "steered") {
+      memberOf.set(e.id, "");
+      continue;
+    }
     const meta = e.activity;
     const step = activityOf(e);
     if (!meta) {

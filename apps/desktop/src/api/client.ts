@@ -69,6 +69,8 @@ export type EventActivity = {
   tool?: WebToolNote;
   meta?: MetaNote;
   spacePost?: SpacePost;
+  /** Only on a `steered` event: the person's message delivered into this running turn. */
+  steered?: number;
 };
 /** A Space agent as a run's events show it: enough for its name and avatar. */
 export type EventAgent = { id: string; handle: string; name: string; avatar_version?: string; color: string };
@@ -116,6 +118,8 @@ export type RoomEvent = {
   turnId?: string;
 };
 export type ReplyAddress = { eventId: number; askAgent: boolean; agentId?: string };
+/** What a Chat message sent while Metro replies does: wait for that reply (queue) or join it (steer). */
+export type ChatDelivery = "queue" | "steer";
 /**
  * A Library file attached to a message, or a tombstone for one deleted
  * since (no name, nothing to open). Which library holds a file is the
@@ -981,12 +985,23 @@ export function createClient(options: ClientOptions) {
       return events.filter(isEvent).map(toEvent);
     },
 
-    async sendChatMessage(text: string, assetIds?: readonly string[], choice?: TurnModelChoice): Promise<SentChatMessage> {
+    async sendChatMessage(text: string, assetIds?: readonly string[], choice?: TurnModelChoice, delivery: ChatDelivery = "queue"): Promise<SentChatMessage> {
       // Text sends also ask the agent on servers that require the legacy flag.
       const body: Record<string, unknown> = { text, invoke_agent: true, ...turnModelBody(choice) };
       const ids = assetIdsBody(assetIds);
       if (ids) body.asset_ids = ids;
-      const data = await request("POST", "/v1/chat/messages", body);
+      // Queue is the server's default; only Steer is sent.
+      if (delivery === "steer") body.delivery = "steer";
+      let data: unknown;
+      try {
+        data = await request("POST", "/v1/chat/messages", body);
+      } catch (error) {
+        // Older servers reject the unknown field while decoding the request.
+        if (delivery === "steer" && error instanceof ApiError && error.status === 422) {
+          throw new ApiError("http", "Update Metro Server to steer a running reply, or switch to Queue. Your draft was kept.", 422);
+        }
+        throw error;
+      }
       // The turn it starts, which can be stopped before it starts.
       const turn = isObject(data) && typeof data.turn_id === "string" && /^chat_[A-Za-z0-9]{1,64}$/.test(data.turn_id) &&
         isEventId(data.id) ? { id: data.turn_id, eventId: data.id } : null;
@@ -1422,6 +1437,7 @@ function toEvent(v: RoomEvent): RoomEvent {
         activity.meta = readMetaNote(raw.activity.meta);
       }
     }
+    if (event.kind === "steered" && isObject(raw.activity) && isEventId(raw.activity.steered)) activity.steered = raw.activity.steered;
     if (event.kind === "page_draft" && event.actor === "agent" && activity.source === "agent" && isObject(raw.activity)) {
       const draft = toPageDraftCard(raw.activity.page_draft);
       if (draft) activity.page_draft = draft;

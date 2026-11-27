@@ -1307,6 +1307,8 @@ export function SegmentedControl<T extends string>(
     onChange: (value: T) => void;
     disabled?: boolean;
     testID?: string;
+    /** Smaller, for a composer bar. */
+    compact?: boolean;
   },
 ) {
   return (
@@ -1319,7 +1321,8 @@ export function SegmentedControl<T extends string>(
         {(option) => (
           <Radio
             class={cx(
-              "group flex-row items-center justify-center min-w-[84px] min-h-[28px] rounded-[5px] px-(--space-3) checked:bg-primary",
+              "group flex-row items-center justify-center rounded-[5px] checked:bg-primary",
+              props.compact ? "min-w-[52px] min-h-[22px] px-(--space-2)" : "min-w-[84px] min-h-[28px] px-(--space-3)",
               // Hover only on unchecked options: a hover background would
               // otherwise cover the checked one under the pointer.
               props.value !== option().value && "hover:bg-background/60",
@@ -1335,7 +1338,7 @@ export function SegmentedControl<T extends string>(
           >
             <Text
               class={cx(
-                textClass.sm,
+                props.compact ? textClass.xs : textClass.sm,
                 "font-medium text-muted-foreground group-checked:text-primary-foreground",
                 // As with the background: hover ink only on unchecked options.
                 props.value !== option().value && "group-hover:text-foreground",
