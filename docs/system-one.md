@@ -74,8 +74,8 @@ docs describe it no further than TypeSafe's own docs do:
   ([primitives](https://docs.typesafe.ai/primitives)):
   - `noul`, the probability of yes from 0 to 1, for the search rerank;
   - `choice`, one option with `confidence` and per-option `probabilities`,
-    for choosing a Space agent, for use-case routing and (in the source,
-    not released) for [shell commands](#shell-command-checks-in-the-source-not-released).
+    for choosing a Space agent, for use-case routing and, since 0.6.3,
+    for [shell commands](#shell-command-checks).
 
   Every request Metro sends carries exactly one question, because some
   endpoints accept no more.
@@ -338,7 +338,7 @@ In a local test with a scripted System One taking 1,000 ms, the message
 was visible to another member 1–2 ms after the POST, against about
 1,022 ms before ([record](acceptance.md#source-only-metro-061-lanes-2026-11-27-local)).
 
-## Shell command checks (in the source, not released)
+## Shell command checks
 
 When a runner's shell mode is **Ask when System One flags it**
 (`classify`), each `workspace.shell` command gets one System One Choice

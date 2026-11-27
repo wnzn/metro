@@ -135,13 +135,13 @@ A Space has one or more **agents**, at most 16. Each has:
   `workspace.mcp` and `threads`). With none,
   it can only answer. The allowlist only narrows what the run would have
   anyway: a Space without a runner still has no workspace tools, and a
-  thread never gets thread tools. In the source, not released, the list
+  thread never gets thread tools. Since 0.6.3, the list
   can also hold `workspace.write` and `workspace.shell`, and both are in
   `default_tools`: a new Space's default agent and agents created without
   `tools` get them. Every agent stores its list, so agents created before
   0.6.3 keep their saved list and don't gain them; the owner adds them.
   Shell commands also follow the runner's
-  [shell policy](runner.md#shell-commands-in-the-source-not-released).
+  [shell policy](runner.md#shell-commands).
 
 Exactly one agent is the Space's **default**. Every Space starts with one
 default agent, named *Metro*, with the handle `agent` and the default tools; Spaces
@@ -395,10 +395,10 @@ completion note.
   finished gets 409.
 - Stopping halts the agent's orchestration. A tool job that a runner has
   already claimed may keep running on that machine until it ends or times
-  out. In the source, not released, a running `workspace.shell` command is
+  out. Since 0.6.3, a running `workspace.shell` command is
   killed within a few seconds of the stop, and a pending shell approval is
   cancelled.
-- In the source, not released, shell approvals are run activity in the
+- Shell approvals are run activity in the
   room or thread (`shell_approval`, `shell_approval_resolved`), never
   messages, agent history or search results. See
   [Approvals](runner.md#approvals).
@@ -489,11 +489,11 @@ name, scope and kind), never a credential.
   for the same runner.
 - Without a runner, a Space still works for chat and Ask agent; only the
   workspace tools are missing. Every member can trigger the runner's tools,
-  so every member can read the Space's workspace on it. In the source, not
-  released, an agent with `workspace.write` lets every member change files
+  so every member can read the Space's workspace on it. Since 0.6.3,
+  an agent with `workspace.write` lets every member change files
   there, and `workspace.shell` lets them ask for commands that run as the
   runner's user, subject to the
-  [shell policy](runner.md#shell-commands-in-the-source-not-released). See
+  [shell policy](runner.md#shell-commands). See
   [deploy.md](deploy.md#trust-boundaries).
 
 ## Keeping secrets out of screenshots and logs

@@ -3,11 +3,79 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
-## Source only: Metro 0.6.3 desktop and runner review fixes (2026-11-28, local)
+## Published: Metro 0.6.3 (2026-11-27, GitHub release v0.6.3)
+
+**What was published.** The stable
+[Metro 0.6.3 release](https://github.com/wnzn/metro/releases/tag/v0.6.3)
+was published at `2026-11-27T21:39:56Z` (not a draft or prerelease,
+marked latest). Tag `v0.6.3` points to
+`f5c0cf2221cd7f1c0b6beb076f10ca33a0b6fdc2`, the merge of
+[PR #22](https://github.com/wnzn/metro/pull/22).
+The only Actions run on that commit is the push to `main`,
+[CI 46065803816](https://github.com/wnzn/metro/actions/runs/46065803816)
+(created `2026-11-27T20:45:37Z`), which succeeded, including the
+release Windows desktop and preview jobs, asset and image signing, and
+publication. Windows code signing was skipped.
+
+The [0.6.3 guide](released-0.6.3.md) describes the shipped changes.
+
+**Assets** (18):
+
+| File | Verification |
+| --- | --- |
+| `Metro-0.6.3-linux-x64.tar.gz` + `.sha256` | `Metro-0.6.3-linux-x64.tar.gz.sigstore.json` |
+| `Metro-0.6.3-windows-x64.zip` + `.sha256` | No Authenticode; check against the signed manifest |
+| `Metro-0.6.3-windows-x64.unsigned-preview.msi` + `.sha256` | No Authenticode; check against the signed manifest |
+| `Metro-runner-0.6.3-linux-x64.tar.gz` + `.sha256` | `Metro-runner-0.6.3-linux-x64.tar.gz.sigstore.json` |
+| `install-metro-linux.sh`, `install-metro-runner-linux.sh`, `install-metro-windows.ps1`, `metro-runner-container.sh`, `metro-runner-container.ps1` | Listed in `SHA256SUMS`; the PowerShell scripts have no Authenticode |
+| `IMAGES.txt` | Listed in `SHA256SUMS` |
+| `SHA256SUMS` | `SHA256SUMS.sigstore.json` |
+
+**Images.** Pin by digest; there is no `latest` tag. The release's
+[`IMAGES.txt`](https://github.com/wnzn/metro/releases/download/v0.6.3/IMAGES.txt)
+records these references and the workflow's keyless Sigstore verification
+of each digest against the exact source commit.
+
+| Reference | Digest | Platforms |
+| --- | --- | --- |
+| `ghcr.io/wnzn/metro-server:v0.6.3` | `sha256:6faf7f6cababa941a0026f2102886c734fd424d49cdd7da48a178eb07f3cf753` | `linux/amd64`, `linux/arm64` |
+| `ghcr.io/wnzn/metro-server` | `sha256:7242a3f5fdbcd1f9916ab1e897427ebee399b0c3141099887ae3c9ea4e9b928b` | `linux/amd64` |
+| `ghcr.io/wnzn/metro-server` | `sha256:92c950c87945327fa9c28fa028e2eeb88b2ba1e2629cb4fc39217ecb88cbdba6` | `linux/arm64` |
+| `ghcr.io/wnzn/metro-runner:v0.6.3` | `sha256:a373714163a4dc12a125fc5f0e2a99ad7910d652c24ac121d4529abaf79d6e3a` | `linux/amd64`, `linux/arm64` |
+| `ghcr.io/wnzn/metro-runner` | `sha256:ba101761b6280de2e93ea69bb5ca8c4d9984a0718539ed4c17ffc4cc07988072` | `linux/amd64` |
+| `ghcr.io/wnzn/metro-runner` | `sha256:eccdeec1722193d5357b4e029539efe1279ddac3083394af4a2457d2882a2fd5` | `linux/arm64` |
+| `ghcr.io/wnzn/metro-embeddinggemma2:v0.6.3` | `sha256:d8019c51e63d52b24242f74dd8224f422254fe14aa81af3b038628dc6dc85fc7` | `linux/amd64` (no weights) |
+| `ghcr.io/wnzn/metro-embeddinggemma2` | `sha256:989208510c81c8b4738938938ca27a271463b2c4c42c4de3b2eded81a37354a4` | `linux/amd64` |
+
+**How it was checked** (2026-11-28, read-only):
+
+```sh
+gh release view v0.6.3 --repo wnzn/metro --json tagName,publishedAt,isPrerelease,isDraft,url,assets
+gh api repos/wnzn/metro/releases/latest --jq .tag_name
+gh api repos/wnzn/metro/git/ref/tags/v0.6.3
+gh pr view 22 --repo wnzn/metro --json mergeCommit,url
+gh api "repos/wnzn/metro/actions/runs?head_sha=f5c0cf2221cd7f1c0b6beb076f10ca33a0b6fdc2"
+gh run view 46065803816 --repo wnzn/metro --json headSha,headBranch,createdAt,event,conclusion,jobs
+gh release download v0.6.3 --repo wnzn/metro -p IMAGES.txt -p SHA256SUMS -D <new empty dir>
+```
+
+The release lists all 18 asset names and `IMAGES.txt` matched its
+checksum in `SHA256SUMS`. No release binary or container was run and no
+signature was independently verified in this check. The native Windows
+CI runs were unattended, not a desktop or MSI wizard run by a person.
+Real vendor accounts and sign-ins remain unverified.
+
+**Release record check** (2026-11-28, local):
+`python3 -m unittest discover -s packaging`: 269 tests, 206 passed and
+63 skipped.
+
+## Pre-release gate: Metro 0.6.3 (2026-11-28, local)
+
+Local Linux builds only. The checks below preceded publication and did
+not use release files or include a native desktop check by a person.
 
 **Integrated gate** on `feat/runner-shell-write` at
-`c259b0fe304cb7a97477cb1114eeb13db28c3e50`. Local Linux builds only;
-not a release.
+`c259b0fe304cb7a97477cb1114eeb13db28c3e50`.
 
 - `cargo fmt --check`, Clippy with `-D warnings` and the locked debug
   build passed. `cargo test --locked --workspace`: 1,347 passed, 0
@@ -26,7 +94,7 @@ not a release.
 - **Not verified:** native Windows, junction refusal on real Windows,
   or real vendor runs and sign-ins.
 
-## Source only: Metro 0.6.3 version bump (2026-11-28, local)
+**Version bump checks:**
 
 - `python3 -m unittest discover -s packaging`: 206 passed, 63 skipped.
 - `cargo check --locked` passed.

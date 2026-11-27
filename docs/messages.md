@@ -137,6 +137,9 @@ message starts its own run as usual. If Metro restarts while a message
 waits to steer a run, that run is interrupted and the message may go
 unanswered; send it again.
 
+Since 0.6.3, a request for [shell approval](runner.md#approvals) appears
+as run activity in the room or thread, not as a reply.
+
 ## Direct messages and the directory
 
 Use **Direct messages → New message** to find someone who has signed in to
