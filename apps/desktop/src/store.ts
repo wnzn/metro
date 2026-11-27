@@ -817,6 +817,7 @@ export async function openLocation(target: Location): Promise<boolean> {
   if (target.spaceId === null) {
     // A Chat result's room is its Chat thread; none is the main Chat.
     const thread = target.roomId ?? null;
+    if (thread && !chatThreads().some(t => t.id === thread)) await refreshChatThreads();
     if (thread && !chatThreads().some(t => t.id === thread)) {
       notice.set("That Chat thread isn't available any more.");
       return false;
@@ -2964,9 +2965,10 @@ async function tick(sess: number) {
   try {
     if (Date.now() - lastListsRefresh >= LISTS_REFRESH_MS) await refreshLists();
     if (sess !== session) return;
-    if (Date.now() - lastChatThreadsRefresh >= LISTS_REFRESH_MS) await refreshChatThreads();
-    if (sess !== session) return;
     if (basePlace() === "chat") {
+      // Chat threads are read only while the Chat is open.
+      if (Date.now() - lastChatThreadsRefresh >= LISTS_REFRESH_MS) await refreshChatThreads();
+      if (sess !== session) return;
       if (Date.now() >= chatProbeAfter) await pollChat();
       if (sess === session && Date.now() - lastRunsRefresh >= RUNS_REFRESH_MS) await refreshRuns();
     } else if (basePlace() === "dm") {
