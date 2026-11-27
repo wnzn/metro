@@ -213,17 +213,13 @@ person runs the action again. Stopping a run (`POST /v1/runs/{id}/stop`)
 halts the agent, but a job the runner has already claimed runs until it ends
 or hits its time limit.
 
-In the source, not released: while a `workspace.shell` job runs, the runner
-sends `POST /v1/runner/jobs/{id}/heartbeat` about every 2 seconds. When the
-run stops, the lease runs out or the Space's runner assignment or credential
-changes, the server answers `410` (or `404` for a job it doesn't know), and
-the runner kills the command's process group. Once the runner's credential
-is revoked or rotated the server answers `401`: the desktop's built-in
-runner kills the command then, while `metro-runner` treats it as an error
-and lets the command run until it ends or times out; the server has
-already dropped that job, so its result is discarded. A network error isn't a
-cancellation; the command keeps going until its timeout. A shell command
-that already changed files has changed them.
+In the source, not released: while a `workspace.shell` job runs, both
+`metro-runner` and the desktop's built-in runner send
+`POST /v1/runner/jobs/{id}/heartbeat` about every 2 seconds. Both kill the
+command on `401` (credential revoked or rotated), `404` (job not found),
+`409` (job not claimed) or `410` (job expired or cancelled). A network error
+isn't a cancellation; the command keeps going until its timeout. Killing
+the command does not undo changes it already made.
 
 ## Time limits
 

@@ -21,8 +21,8 @@ use crate::util::{Backoff, sleep_interruptible};
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Asks the server about one running job until dropped; sets
-/// [`crate::JOB_CANCELLED`] when the job is gone (run stopped, lease over,
-/// runner changed). Transport errors never cancel.
+/// [`crate::JOB_CANCELLED`] when the server no longer authorizes the job.
+/// Transport errors never cancel.
 struct Heartbeat {
     stop: Arc<AtomicBool>,
 }
