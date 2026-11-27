@@ -71,8 +71,11 @@ import {
   disabledClass,
   focusRingClass,
   popoverClass,
+  popoverDangerLabelClass,
   popoverItemClass,
+  popoverLabelClass,
   popoverMotion,
+  selectSearchClass,
   spaceTileFor,
   textClass,
   toneSolidClass,
@@ -277,7 +280,7 @@ export function RailButton(props: {
           <Each of={[...items()]} key={(item) => item.id}>
             {(item) => (
               <MenuItem class={popoverItemClass} onSelect={() => item().onPress()} testID={item().id}>
-                <Text class={cx(textClass.sm, "text-popover-foreground")}>{item().label}</Text>
+                <Text class={cx(textClass.sm, popoverLabelClass)}>{item().label}</Text>
               </MenuItem>
             )}
           </Each>
@@ -370,7 +373,7 @@ export function AccountMenu(props: {
       popupClass={cx(popoverClass, "min-w-[232px]")}
       popupStartingClass={still() ? undefined : popoverMotion.starting}
       popupEndingClass={still() ? undefined : popoverMotion.ending}
-      backdropClass="bg-black/40"
+      backdropClass="bg-scrim/40"
       trigger={
         <If
           when={props.compact}
@@ -477,7 +480,7 @@ function AccountEntry(props: { item: AccountMenuItem }) {
     >
       <If when={props.item.icon}>{(name) => <Icon name={name()} color={props.item.destructive ? "danger" : "muted"} />}</If>
       <View class="flex-1 min-w-0 flex-col">
-        <Text class={cx(textClass.sm, props.item.checked && "font-semibold", props.item.destructive ? "text-tone-danger-foreground" : "text-popover-foreground")} style={{ numberOfLines: 1 }}>
+        <Text class={cx(textClass.sm, props.item.checked && "font-semibold", props.item.destructive ? popoverDangerLabelClass : popoverLabelClass)} style={{ numberOfLines: 1 }}>
           {props.item.label}
         </Text>
         <If when={props.item.detail}>
@@ -767,8 +770,8 @@ export function BrandPicker(props: {
       popupStartingClass={reduceMotion() ? undefined : popoverMotion.starting}
       popupEndingClass={reduceMotion() ? undefined : popoverMotion.ending}
       listClass="max-h-[340px]"
-      itemClass={cx("group", popoverItemClass)}
-      searchClass="mb-[4px] rounded-(--radius-sm) border border-input bg-background px-(--space-2) py-(--space-1) text-(length:--text-sm) text-foreground"
+      itemClass={popoverItemClass}
+      searchClass={selectSearchClass}
       empty={<Text class="px-(--space-2) py-(--space-2) text-(length:--text-sm) text-muted-foreground">No provider matches.</Text>}
       testID={props.testID}
       renderItem={(entry) => {
@@ -777,7 +780,7 @@ export function BrandPicker(props: {
           <View class="flex-row items-center gap-(--space-2)" testID={props.testID ? `${props.testID}:${entry.value}` : undefined}>
             <If when={item}>{(i) => <BrandMark mark={i().mark} />}</If>
             <View class="flex-1 min-w-0 flex-col">
-              <Text class="text-(length:--text-sm) font-medium text-popover-foreground" style={{ numberOfLines: 1 }}>
+              <Text class={cx(textClass.sm, "font-medium", popoverLabelClass)} style={{ numberOfLines: 1 }}>
                 {item?.label ?? entry.title}
               </Text>
               <If when={item?.hint}>

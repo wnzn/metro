@@ -10,7 +10,7 @@ import { BrandMark, Icon } from "./chrome";
 import type { Mark } from "./chrome";
 import { createPickerMemory, pickerScopeKey } from "./pickerMemory";
 import type { PickerGroupMemory, PickerKind } from "./pickerMemory";
-import { cx, disabledClass, focusRingClass, popoverClass, popoverItemClass, textClass, toneTextClass, transitionClass } from "./tokens";
+import { cx, focusRingClass, pickerInputInkClass, popoverClass, popoverItemClass, popoverLabelClass, textClass, toneTextClass, transitionClass } from "./tokens";
 
 type Provider = { key: string; name: string; mark: Mark };
 
@@ -92,8 +92,8 @@ export function ModelPicker(props: PickerProps) {
     <View
       ref={anchor.set}
       class={open() ? "w-full" : cx(
-        "flex-row items-center gap-(--space-2) min-h-[40px] w-full rounded-(--radius-sm) border border-input bg-background px-(--space-2) hover:bg-muted",
-        focusRingClass, transitionClass, disabledClass,
+        "flex-row items-center gap-(--space-2) min-h-[40px] w-full rounded-(--radius-sm) border border-input bg-background px-(--space-2) hover:bg-muted disabled:bg-muted",
+        focusRingClass, transitionClass,
       )}
       role={open() ? undefined : "button"}
       disabled={props.disabled}
@@ -128,7 +128,7 @@ export function ModelPicker(props: PickerProps) {
         </If>
         <View class="flex-1 min-w-0 flex-col">
           <Text
-            class={cx(textClass.sm, current() ? "font-medium text-foreground" : props.attention ? toneTextClass.warning : "text-muted-foreground")}
+            class={cx(textClass.sm, props.disabled ? "text-muted-foreground" : current() ? "font-medium text-foreground" : props.attention ? toneTextClass.warning : "text-muted-foreground")}
             style={{ numberOfLines: 1 }}
             testID={props.testID ? `${props.testID}-value` : undefined}
           >
@@ -313,7 +313,7 @@ function ModelPickerMenu(props: {
         accessibilityControls={listRef()}
         accessibilityState={{ expanded: true, hasPopup: true }}
         testID={idOf("-search")}
-        class={cx("min-h-[40px] w-full rounded-(--radius-sm) border border-input bg-background px-(--space-2) text-foreground", textClass.sm, focusRingClass)}
+        class={cx("min-h-[40px] w-full rounded-(--radius-sm) border border-input bg-background px-(--space-2)", pickerInputInkClass, textClass.sm, focusRingClass)}
       />
       <Overlay
         anchor={props.anchor}
@@ -372,7 +372,7 @@ function PickerRow(props: {
 }) {
   // Rows are reachable by arrows, pointer, and assistive technology, but
   // are not extra stops in the native Tab order.
-  const rowClass = () => cx("group", popoverItemClass, props.highlighted ? "bg-accent" : "selected:bg-muted");
+  const rowClass = () => cx(popoverItemClass, props.highlighted ? "bg-accent" : "selected:bg-muted");
   if (props.row.kind === "option") {
     const option = () => (props.row as OptionRow).option;
     const selected = () => option().value === props.selected;
@@ -440,7 +440,7 @@ function ModelRow(props: { option: ModelOption }) {
   return (
     <View class="flex-row items-center gap-(--space-2)">
       <View class="flex-1 min-w-0 flex-col gap-px">
-        <Text class={cx(textClass.sm, "text-popover-foreground group-selected:font-semibold")} style={{ numberOfLines: 1 }}>
+        <Text class={cx(textClass.sm, popoverLabelClass, "group-selected:font-semibold")} style={{ numberOfLines: 1 }}>
           {props.option.model}
         </Text>
         <If when={props.option.modelId !== props.option.model ? props.option.modelId : null}>
@@ -456,7 +456,7 @@ function ModelRow(props: { option: ModelOption }) {
       </View>
       <If when={props.option.thinking}>
         {(thinking) => (
-          <Text class={cx(textClass.xs, "shrink-0 max-w-[45%] text-right text-muted-foreground group-selected:text-foreground")} style={{ numberOfLines: 3 }}>
+          <Text class={cx(textClass.xs, "shrink-0 max-w-[45%] text-right text-muted-foreground", !props.option.disabled && "group-selected:text-foreground")} style={{ numberOfLines: 3 }}>
             {thinking()}
           </Text>
         )}
