@@ -547,7 +547,7 @@ install_app() {
     say "Metro $version is installed in $root/versions/$version"
     say "Start it from your applications menu or run: $root/current/Metro"
     if [ "$local_runner" != yes ]; then
-        say "Local runner support is off (reinstall with --local-runner to turn it on)."
+        say "Local runner support is off: Metro won't set up its built-in runner on its own. Set it up in Metro under Settings > Runners, or reinstall with --local-runner."
     elif [ "$supports_local_runner" = yes ]; then
         say "Local runner support is on. Metro sets up your personal on-device runner after you sign in; it is not attached to any Space until you choose it under Manage Space."
     else

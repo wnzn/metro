@@ -95,6 +95,13 @@ see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
   second Space, and no job goes to a runner its Space didn't explicitly
   choose. Don't add a server-wide runner token, a fallback Space or runner, or
   any implicit cross-Space assignment.
+- The desktop app has a personal registered runner built in (no separate
+  install, binary or terminal). It exists only after an explicit Set up
+  for the signed-in server and account (or, on the app's own local
+  workspace only, the installer's marker), keeps its credential in one
+  mode-600 file, starts and stops with the app, updates with it, and
+  serves list and read only. Reconnect is explicit; deleting it turns it
+  off locally and keeps its folders.
 - The desktop may offer its own eligible personal runner when creating a
   Space or for owner-selected existing Spaces. Submitting the checked
   Create Space choice or pressing Attach is the explicit action. These
@@ -502,7 +509,8 @@ see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
   once its publication is recorded in `docs/acceptance.md`. The desktop app's **Use locally**
   runs a bundled local server with no token, and its owner-only, per-Space,
   read-only local tools (`workspace.list`/`workspace.read`) never stand in
-  for an operator's separately installed runner. It and the other features
+  for an operator's separately installed runner or for the app's built-in
+  runner. It and the other features
   checked in the 0.2.0 Linux candidate are described as verified in that
   local candidate, never as released. Keep unattended native Windows CI
   checks separate from earlier Wine attempts and the still-unverified

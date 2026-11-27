@@ -1,5 +1,15 @@
 # In the source, not released
 
+## Metro 0.6.2 (in the source, not released)
+
+- **A runner built into the desktop app.** **Settings → Runners → This
+  computer's runner → Set up** makes the app's built-in runner your
+  personal registered runner on whichever server you're signed in to,
+  local or remote, with no separate install. It starts and stops with the
+  app, lists and reads only, and is attached only where you choose.
+  Deleting it there turns it off on this computer. See
+  [install.md](install.md#the-desktops-own-runner).
+
 These changes are in the source planned for Metro 0.6.1, after the
 published [Metro 0.6.0](released-0.6.0.md). See [Acceptance](acceptance.md)
 for release records.

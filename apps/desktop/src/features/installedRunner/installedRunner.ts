@@ -1,17 +1,17 @@
-// This computer's personal registered runner, requested by the installer
+// This computer's personal registered runner, built into the desktop app
 // (crates/connector desktop_tools/runner.rs), for Settings › Runners.
 //
 // - Asked only of the packaged launcher's bridge (`/v1/local-tools/runner…`,
 //   see ../localtools/localTools.ts `localRunnerCall`), never of a Metro
-//   server. The bridge answers `available: true` only when the installer
-//   asked for the runner *and* this session is the desktop's own hosted
-//   server; anything else (no launcher, older launcher, a remote server, no
-//   or rejected marker, an unreadable answer) hides the section.
-// - Opening the page only reads. Reconnect (`{}`: rotates the recorded
-//   runner id's token if it's still this person's, else creates a new
-//   runner; never by name) and a Space's folder (which creates it on this
-//   computer) are POSTs, sent only from an explicit press. Adopting a chosen
-//   runner (`{runner_id}`) isn't offered here.
+//   server. The bridge answers `available: true` for whichever server this
+//   session is signed in to; anything else (no launcher, older launcher, no
+//   session, an unreadable answer) hides the section.
+// - Opening the page only reads. Set up (creates the runner), Reconnect
+//   (`{}`: rotates the recorded runner id's token if it's still this
+//   person's, else creates a new runner; never by name) and a Space's folder
+//   (which creates it on this computer) are POSTs, sent only from an
+//   explicit press. Deleting it in Settings also tells the bridge to forget
+//   it (`{runner_id}`), so it's off here until set up again.
 // - Metro never attaches it without an explicit owner action. The
 //   folder is offered only for Spaces this user owns whose runner, by stable
 //   id, is this one.
@@ -26,6 +26,7 @@ import { apiClient, connectedTo, me, onSessionEnd, readHostedAccess, sessionGuar
 import { localRunnerCall } from "../localtools/localTools";
 
 export type InstalledRunnerState =
+  | "not_set_up"
   | "idle"
   | "starting"
   | "online"
@@ -47,18 +48,19 @@ export type InstalledRunner = {
    */
   unconfirmedName: string | null;
   tools: string[];
+  canSetUp: boolean;
   canReconnect: boolean;
 };
 
 export type RunnerFolder = { spaceId: string; folder: string; attached: boolean };
 
-const STATES: readonly string[] = ["idle", "starting", "online", "offline", "revoked", "deleted", "interrupted", "failed", "stopped"];
+const STATES: readonly string[] = ["not_set_up", "idle", "starting", "online", "offline", "revoked", "deleted", "interrupted", "failed", "stopped"];
 const SPACE_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
 /** The bridge's runner status, or null when there's nothing to show here. */
 export function parseInstalledRunner(v: unknown): InstalledRunner | null {
-  if (!isObj(v) || v.requested !== true || v.available !== true) return null;
+  if (!isObj(v) || v.available !== true) return null;
   if (typeof v.state !== "string" || !STATES.includes(v.state)) return null;
   const r = v.runner;
   const runner = isObj(r) && typeof r.id === "string" && typeof r.name === "string" ? { id: r.id, name: scrub(r.name) } : null;
@@ -69,6 +71,7 @@ export function parseInstalledRunner(v: unknown): InstalledRunner | null {
     runner,
     unconfirmedName: runner === null && typeof v.unconfirmed_name === "string" ? scrub(v.unconfirmed_name) : null,
     tools,
+    canSetUp: v.can_set_up === true,
     canReconnect: v.can_reconnect === true,
   };
 }
@@ -80,7 +83,7 @@ export function parseFolder(v: unknown, sid: string): RunnerFolder {
   return { spaceId: sid, folder: v.folder, attached: v.attached };
 }
 
-/** The status, or null (hidden: no launcher, not requested, not the own server, unknown). */
+/** The status, or null (hidden: no launcher, no session, unknown). */
 export const installedRunner = signal<InstalledRunner | null>(null);
 /** A bridge id verified against the current account's personal runners. */
 export const ownedInstalledRunner = signal<{ id: string; attachIfEmpty: boolean } | null>(null);
@@ -93,7 +96,7 @@ export const installedRunnerSeen = signal(false);
 export const runnerSpaces = signal<{ id: string; name: string }[]>([]);
 /** Serial of the last complete folder read for the current verified runner, if any. */
 export const installedFolderSnapshot = signal<number | null>(null);
-export const installedBusy = signal<null | "reconnect" | `folder:${string}`>(null);
+export const installedBusy = signal<null | "setup" | "reconnect" | `folder:${string}`>(null);
 export const installedError = signal<string | null>(null);
 export const installedNotice = signal<string | null>(null);
 export const folders = signal<Record<string, RunnerFolder>>({});
@@ -207,14 +210,23 @@ onSpaceRunnerObserved((sid, runner, allowFolderAdd) => {
   }
 });
 
-/** The owner deleted this registration. An older bridge read can't revive its controls. */
+/** The owner deleted this registration: turn it off here too. An older bridge read can't revive its controls. */
 export function refreshAfterInstalledRunnerDeletion(id: string) {
   if (ownedInstalledRunner()?.id !== id) return;
   gen++;
   inflight = null;
   ownedInstalledRunner.set(null);
   clearAttached();
-  void loadInstalledRunner();
+  const call = localRunnerCall();
+  const valid = stillValid();
+  void (async () => {
+    try {
+      if (call) await call("POST", "/v1/local-tools/runner/forget", { runner_id: id });
+    } catch {
+      // The bridge keeps its state (revoked or deleted) and offers Reconnect.
+    }
+    if (valid()) void loadInstalledRunner();
+  })();
 }
 
 type FolderRead = { runnerId: string | undefined; wanted: () => boolean };
@@ -268,9 +280,9 @@ async function readBridgeStatus(): Promise<{ runner: InstalledRunner | null; wat
   try {
     const body = await call("GET", "/v1/local-tools/runner");
     const runner = parseInstalledRunner(body);
-    // A definitive "not installed / not this workspace" doesn't need another
-    // read. An empty or incomprehensible answer may be transient.
-    const unavailable = isObj(body) && (body.requested === false || body.available === false);
+    // A definitive "no session here" doesn't need another read. An empty
+    // or incomprehensible answer may be transient.
+    const unavailable = isObj(body) && body.available === false;
     return { runner, watchable: !unavailable };
   } catch (error) {
     const unsupported = error instanceof BridgeError && [404, 405].includes(error.status ?? 0);
@@ -298,6 +310,32 @@ async function loadInstalledScope(runnerId: string, valid: () => boolean) {
     }
   } finally {
     if (valid()) checkingInstalledScope.set(false);
+  }
+}
+
+/** The person pressed Set up. */
+export async function setupInstalledRunner(): Promise<void> {
+  const call = localRunnerCall();
+  if (!call || installedBusy() || !installedRunner()?.canSetUp) return;
+  const valid = stillValid();
+  installedBusy.set("setup");
+  installedError.set(null);
+  installedNotice.set(null);
+  try {
+    const next = parseInstalledRunner(await call("POST", "/v1/local-tools/runner/setup"));
+    if (!valid()) return;
+    clearAttached();
+    installedRunner.set(next);
+    installedRunnerStatusWatchable.set(true);
+    installedNotice.set("Set up. Choose Spaces without a runner below to attach it.");
+    if (next?.runner) {
+      await loadInstalledScope(next.runner.id, valid);
+      await loadAttached(next.runner.id, valid);
+    }
+  } catch (error) {
+    if (valid()) installedError.set(message(error, "Setting up this computer's runner"));
+  } finally {
+    if (valid()) installedBusy.set(null);
   }
 }
 
