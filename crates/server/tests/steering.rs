@@ -509,6 +509,43 @@ async fn in_a_room_a_message_the_run_never_took_starts_its_own_run() {
 }
 
 #[tokio::test]
+async fn a_handed_back_message_sees_only_its_agents_late_replies_to_its_sender() {
+    let h = H::start().await;
+    let sid = h.space().await;
+    h.sent("alice", &sid, json!({"text": "@agent [slow] one"}))
+        .await;
+    h.calls_reach(1).await;
+    h.sent("bob", &sid, json!({"text": "@agent [slow] bobs"}))
+        .await;
+    h.calls_reach(2).await;
+    h.sent("alice", &sid, json!({"text": "@agent msg-two"}))
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    h.model.open();
+    h.model.open();
+    let room = h.until(|| h.room(&sid), |e| replies(e).len() == 3).await;
+    assert!(steered(&room).is_empty());
+    let alices_run = phase(&room, "started")[0]["activity"]["id"].clone();
+    let reply_of = |run: &Value| {
+        room.iter()
+            .find(|e| e["kind"] == "agent" && e["activity"]["id"] == *run)
+            .map(|e| e["text"].as_str().unwrap().to_owned())
+            .unwrap()
+    };
+    let alices = reply_of(&alices_run);
+    let bobs_run = phase(&room, "started")[1]["activity"]["id"].clone();
+    let bobs = reply_of(&bobs_run);
+    let call = h
+        .model
+        .calls()
+        .into_iter()
+        .find(|c| position(c, "msg-two").is_some())
+        .unwrap();
+    assert!(position(&call, &alices).is_some(), "{call}");
+    assert!(position(&call, &bobs).is_none(), "{call}");
+}
+
+#[tokio::test]
 async fn a_steer_not_delivered_before_a_restart_starts_its_run_once() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("metro.sqlite3");

@@ -430,6 +430,27 @@ fn user_turn(e: &Event, key: &TurnKey) -> Message {
     }
 }
 
+/// Of the replies written after a room run's message, before it started,
+/// only `agent`'s answers to `initiator`'s messages (runs this process
+/// knows): never the agent's work for someone else, nor another agent's.
+fn late_replies(
+    state: &AppState,
+    late: Vec<Event>,
+    agent: &SpaceAgent,
+    initiator: &Author,
+) -> Vec<Event> {
+    late.into_iter()
+        .filter(|e| {
+            let Some(a) = &e.activity else { return false };
+            a.agent.as_ref().is_some_and(|b| b.id == agent.id)
+                && state.runs.get(&a.id).is_some_and(|r| {
+                    initiator.id.as_deref() == Some(r.actor.as_str())
+                        && r.agent_id.as_deref() == Some(agent.id.as_str())
+                })
+        })
+        .collect()
+}
+
 fn history(events: &[Event], key: &TurnKey) -> Vec<Message> {
     events
         .iter()
@@ -1471,7 +1492,9 @@ async fn execute_room_run(
             }
             let prompt = user_turn(trigger, &key);
             let mut window = window;
-            window.events.extend(late);
+            window
+                .events
+                .extend(late_replies(state, late, agent, initiator));
             let mut history = history(&window.events, &key);
             if let Some(anchor) = &anchor {
                 history.insert(
