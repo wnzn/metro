@@ -1,6 +1,7 @@
 import { Text, View, batch, keymap, mount, signal } from "nsh";
 import { Button } from "nsh/base";
 import { connectedTo, me } from "../store";
+import "./appearance";
 import { Modal } from "./chrome";
 import { ModelPicker } from "./modelPicker";
 import type { ModelOption } from "./modelPicker";
@@ -57,15 +58,15 @@ function Fixture() {
   };
 
   return (
-    <View class="flex-1">
+    <View class="flex-1 bg-background">
       <Button onPress={() => open.set(true)} accessibilityLabel="Open fixture" testID="open">
-        <Text>Open fixture</Text>
+        <Text class="text-foreground">Open fixture</Text>
       </Button>
       <Modal title="Picker fixture" size="compact" open={open()} onClose={() => open.set(false)}>
         <View class="gap-(--space-2)">
           <View role="button" testID="outside" onPress={() => preceding.set(preceding() + 1)}
             onFocus={() => parentFocus.set("previous")} onBlur={() => blur("previous")}>
-            <Text>{`Previous control: ${preceding()}`}</Text>
+            <Text class="text-foreground">{`Previous control: ${preceding()}`}</Text>
           </View>
           <ModelPicker
             options={options()}
@@ -78,10 +79,10 @@ function Fixture() {
           />
           <View role="button" testID="next" onPress={() => trailing.set(trailing() + 1)}
             onFocus={() => parentFocus.set("next")} onBlur={() => blur("next")}>
-            <Text>{`Next control: ${trailing()}`}</Text>
+            <Text class="text-foreground">{`Next control: ${trailing()}`}</Text>
           </View>
-          <Text>{`Parent focus: ${parentFocus() ?? "neither"}`}</Text>
-          <Text>{`Choices: ${calls()}`}</Text>
+          <Text class="text-foreground">{`Parent focus: ${parentFocus() ?? "neither"}`}</Text>
+          <Text class="text-foreground">{`Choices: ${calls()}`}</Text>
         </View>
       </Modal>
     </View>

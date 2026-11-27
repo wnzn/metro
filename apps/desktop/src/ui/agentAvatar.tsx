@@ -15,19 +15,22 @@ type Testable = { testID?: string; accessibilityLabel?: string };
 
 export type AgentAvatarSize = "xs" | "sm" | "md" | "lg";
 
-/** The server's palette, in its order, with each colour's fill and a name for screen readers. */
-export const AGENT_PALETTE: readonly { value: string; name: string; fill: string }[] = [
-  { value: "#4f46e5", name: "Indigo", fill: "bg-[#4f46e5]" },
-  { value: "#0891b2", name: "Cyan", fill: "bg-[#0891b2]" },
-  { value: "#059669", name: "Green", fill: "bg-[#059669]" },
-  { value: "#ca8a04", name: "Amber", fill: "bg-[#ca8a04]" },
-  { value: "#ea580c", name: "Orange", fill: "bg-[#ea580c]" },
-  { value: "#dc2626", name: "Red", fill: "bg-[#dc2626]" },
-  { value: "#db2777", name: "Pink", fill: "bg-[#db2777]" },
-  { value: "#7c3aed", name: "Violet", fill: "bg-[#7c3aed]" },
-];
+const lightInk = "text-agent-avatar-ink-light";
+const darkInk = "text-agent-avatar-ink-dark";
 
-const fillOf = (color: string) => (AGENT_PALETTE.find((c) => c.value === color.toLowerCase()) ?? AGENT_PALETTE[0]!).fill;
+/** The server's palette, in its order, with readable initial ink and a name for screen readers. */
+export const AGENT_PALETTE = [
+  { value: "#4f46e5", name: "Indigo", fill: "bg-[#4f46e5]", ink: lightInk },
+  { value: "#0891b2", name: "Cyan", fill: "bg-[#0891b2]", ink: darkInk },
+  { value: "#059669", name: "Green", fill: "bg-[#059669]", ink: darkInk },
+  { value: "#ca8a04", name: "Amber", fill: "bg-[#ca8a04]", ink: darkInk },
+  { value: "#ea580c", name: "Orange", fill: "bg-[#ea580c]", ink: darkInk },
+  { value: "#dc2626", name: "Red", fill: "bg-[#dc2626]", ink: lightInk },
+  { value: "#db2777", name: "Pink", fill: "bg-[#db2777]", ink: lightInk },
+  { value: "#7c3aed", name: "Violet", fill: "bg-[#7c3aed]", ink: lightInk },
+] as const;
+
+const paletteEntry = (color: string) => AGENT_PALETTE.find((c) => c.value === color.toLowerCase()) ?? AGENT_PALETTE[0];
 
 const box: Record<AgentAvatarSize, string> = {
   xs: "size-[16px] rounded-[4px]",
@@ -57,15 +60,16 @@ export function AgentAvatar(
   },
 ) {
   const size = () => props.size ?? "md";
+  const palette = () => paletteEntry(props.color);
   return (
     <View
-      class={cx("shrink-0 items-center justify-center overflow-hidden", box[size()], fillOf(props.color))}
+      class={cx("shrink-0 items-center justify-center overflow-hidden", box[size()], palette().fill)}
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel}
       accessibilityElementsHidden={props.accessibilityLabel ? undefined : true}
       role={props.accessibilityLabel ? "image" : undefined}
     >
-      <If when={props.src} else={<Text class={cx("font-semibold text-white", ink[size()])}>{props.initial}</Text>}>
+      <If when={props.src} else={<Text class={cx("font-semibold", palette().ink, ink[size()])}>{props.initial}</Text>}>
         {(src) => (
           <Image
             src={src()}

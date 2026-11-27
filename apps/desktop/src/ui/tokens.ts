@@ -180,9 +180,21 @@ export const disabledTextClass = "group-disabled:text-muted-foreground";
 /** A floating surface one step above cards: menus, pickers, tooltips. */
 export const popoverClass = cx("rounded-(--radius-lg) border border-border bg-popover p-[6px] shadow-lg", popoverMotion.base);
 
-/** One row of a popover list (a menu item, a picker option). */
+/** One row of a popover list (a menu item, a picker option). Keep disabled text legible. */
 export const popoverItemClass =
-  "rounded-(--radius-sm) px-(--space-2) py-[7px] text-(length:--text-sm) leading-(--leading-sm) text-popover-foreground hover:bg-muted focus:bg-accent disabled:opacity-50 transition-colors duration-150 ease-out motion-reduce:transition-none";
+  "group rounded-(--radius-sm) px-(--space-2) py-[7px] text-(length:--text-sm) leading-(--leading-sm) text-popover-foreground hover:bg-muted focus:bg-accent disabled:text-muted-foreground transition-colors duration-150 ease-out motion-reduce:transition-none";
+
+/** Explicit ink for a menu/option label, including when the parent row is disabled. */
+export const popoverLabelClass = cx("text-popover-foreground", disabledTextClass);
+export const popoverDangerLabelClass = cx("text-destructive", disabledTextClass);
+
+/** Input ink is explicit for both native Select search fields and app-rendered pickers. */
+export const pickerInputInkClass = "text-foreground placeholder:text-muted-foreground";
+export const selectSearchClass = cx(
+  "mb-[4px] rounded-(--radius-sm) border border-input bg-background px-(--space-2) py-(--space-1)",
+  textClass.sm,
+  pickerInputInkClass,
+);
 
 /** A tooltip's bubble (also a popover step). */
 export const tooltipClass =

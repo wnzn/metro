@@ -5,8 +5,9 @@
 import { expect, open, test } from "nsh/test";
 import type { App, ColorScheme } from "nsh/test";
 import theme from "../../theme/theme.json";
+import { AGENT_PALETTE } from "./agentAvatar";
 import { APPEARANCE_KEY } from "./appearance";
-import { spaceTileClass, spaceTileFor } from "./tokens";
+import { pickerInputInkClass, popoverClass, popoverDangerLabelClass, popoverItemClass, popoverLabelClass, selectSearchClass, spaceTileClass, spaceTileFor } from "./tokens";
 import { launched } from "../../test/launched";
 
 type Palette = Record<string, string>;
@@ -128,7 +129,9 @@ const TEXT_PAIRS: [string, string][] = [
   ["muted-foreground", "card"],
   ["muted-foreground", "popover"],
   ["muted-foreground", "muted"], // disabled Actions, segmented track
+  ["muted-foreground", "accent"], // menu and picker details on the focused row
   ["card-foreground", "card"],
+  ["foreground", "popover"], // selected model's thinking level, search field
   ["popover-foreground", "popover"],
   ["popover-foreground", "muted"], // menu item hover
   ["popover-foreground", "accent"], // menu item keyboard focus
@@ -145,6 +148,8 @@ const TEXT_PAIRS: [string, string][] = [
   ["destructive", "background"], // Label color="danger", destructive Action, menu items
   ["destructive", "card"],
   ["destructive", "popover"],
+  ["destructive", "muted"], // destructive menu item hover
+  ["destructive", "accent"], // destructive menu item keyboard focus
   ["destructive", "tone-danger"], // destructive Action hover
   ["sidebar-foreground", "sidebar"],
   ["sidebar-foreground", "sidebar-hover"],
@@ -322,6 +327,82 @@ test("Picker: a detail shows as a second line, and the trigger shows only the la
   expect(app.shows("text:Fixture alpha detail")).toBe(false);
   expect(app.shows("id:fx-picker >> text:Fixture alpha")).toBe(true);
 });
+
+test("dropdown recipes use palette tokens, not fixed text or surface colors", () => {
+  const classes = [
+    popoverClass, popoverItemClass, popoverLabelClass, popoverDangerLabelClass,
+    pickerInputInkClass, selectSearchClass,
+  ].join(" ").split(/\s+/).map((c) => c.replace(/^(?:[\w-]+:)+/, ""));
+  const colors = classes.filter((c) => /^(?:text|bg|border)-/.test(c) && !/^text-\(length:/.test(c));
+  expect(colors.length > 0).toBe(true);
+  expect(colors.filter((c) => {
+    const name = c.replace(/^(?:text|bg|border)-/, "");
+    return !Object.hasOwn(light, name) || !Object.hasOwn(dark, name);
+  })).toEqual([]);
+});
+
+test("agent avatar initials in mention and agent menus contrast with every avatar color", () => {
+  const tokens = theme.cssVars.theme as Palette;
+  for (const color of AGENT_PALETTE) {
+    const ink = tokens[color.ink.replace(/^text-/, "")];
+    expect(!!ink && contrast(ink, color.value) >= 4.5).toBe(true);
+  }
+});
+
+for (const [scheme, palette] of [["dark", dark], ["light", light]] as const) {
+  test(`menus and Select rows render themed text in ${scheme}`, async () => {
+    const app = await openFixture({ [APPEARANCE_KEY]: scheme });
+    await expectScheme(app, palette);
+    const ink = (selector: string, token: string) => expect(fg(app, selector)).toBe(rgba(palette[token]));
+
+    ink("id:fx-grouped-picker >> text:Fixture plain choice", "muted-foreground");
+    await app.press("id:fx-grouped-picker");
+    await app.waitFor("text:Fixture group");
+    ink("text:Fixture group", "muted-foreground");
+    ink("text:Fixture plain alpha", "popover-foreground");
+    ink("text:Fixture plain beta", "muted-foreground");
+    await app.press("text:Fixture plain alpha");
+    await app.waitFor("text:Fixture group", { state: "gone" });
+    ink("id:fx-grouped-picker >> text:Fixture plain alpha", "foreground");
+
+    await app.press("id:fx-brand-picker");
+    await app.waitFor("id:fx-brand-picker:b");
+    ink("id:fx-brand-picker:a >> text:Fixture provider alpha", "popover-foreground");
+    ink("text:Fixture provider hint", "muted-foreground");
+    ink("text:Fixture provider beta", "muted-foreground");
+    await app.keyboard.press("escape");
+    await app.waitFor("id:fx-brand-picker:b", { state: "gone" });
+
+    await app.press("id:fx-menu");
+    await app.waitFor("id:fx-menu-rename");
+    ink("text:Fixture rename", "popover-foreground");
+    await app.waitUntil(() => app.viewStyle("id:fx-menu-off")?.effectiveOpacity === 1);
+    ink("text:Fixture unavailable", "muted-foreground");
+    ink("text:Fixture delete item", "destructive");
+    await app.hover("id:fx-menu-delete");
+    ink("text:Fixture delete item", "destructive");
+    await app.keyboard.press("escape");
+    await app.waitFor("id:fx-menu-delete", { state: "gone" });
+
+    await app.press("id:fx-ask-agent");
+    await app.waitFor("id:fx-ask-agent:one");
+    ink("text:Fixture agent one", "popover-foreground");
+    expect(fg(app, "id:fx-ask-agent:one >> text:C")).toBe(rgba(theme.cssVars.theme["agent-avatar-ink-dark"]));
+    expect(fg(app, "id:fx-ask-agent:two >> text:I")).toBe(rgba(theme.cssVars.theme["agent-avatar-ink-light"]));
+  });
+
+  test(`model picker renders themed group, selected and disabled text in ${scheme}`, async () => {
+    const app = await open("./modelPicker.fixture.tsx", { platform: "linux", storage: { [APPEARANCE_KEY]: scheme } });
+    await app.press("id:open");
+    await app.press("id:picker");
+    await app.waitFor("id:picker:beta");
+    expect(fg(app, "id:picker: >> text:Default model")).toBe(rgba(palette["popover-foreground"]));
+    expect(fg(app, "text:OpenAI · 2")).toBe(rgba(palette["muted-foreground"]));
+    expect(fg(app, "text:Alpha")).toBe(rgba(palette["popover-foreground"]));
+    expect(fg(app, "text:alpha-1")).toBe(rgba(palette["muted-foreground"]));
+    expect(fg(app, "text:Beta")).toBe(rgba(palette["muted-foreground"]));
+  });
+}
 
 test("menus open and close with and without reduced motion (fade + 0.98 scale, none when reduced)", async () => {
   for (const reducedMotion of [false, true]) {
