@@ -23,6 +23,7 @@ MODULE_ICONS = {
     "activity.tsx": ["check.svg"],
     "chatControls.tsx": ["send.svg"],
     "library.tsx": ["play.svg"],
+    "messageDelete.tsx": ["trash.svg"],
 }
 
 
@@ -177,8 +178,8 @@ class PackageTests(unittest.TestCase):
             asset = packaged_icons / "check.svg"
             with self.assertRaisesRegex(ValueError, "missing renderer assets"):
                 package.nsh_resources(ui, source, "0.2.0")
-            for name in ("check.svg", "send.svg", "play.svg"):
-                package.copy(icons / name, packaged_icons / name)
+            for icon in icons.iterdir():
+                package.copy(icon, packaged_icons / icon.name)
             bundle_font(source, resources / "assets")
             self.assertIn(Path("assets/src/ui/icons/check.svg"), package.nsh_resources(ui, source, "0.2.0"))
             # The final packager supplies its own exact renderer sidecar, not an
@@ -221,15 +222,18 @@ class PackageTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, r"missing renderer assets: src/ui/icons/play\.svg"):
                 package.nsh_assets(actual, source)
             package.copy(icons / "play.svg", bundled / "play.svg")
-            self.assertEqual(set(package.nsh_assets(actual, source)),
-                             {Path("src/ui/icons") / n for n in ("check.svg", "send.svg", "play.svg")}
-                             | {package.INTER_FONT})
+            with self.assertRaisesRegex(ValueError, r"missing renderer assets: src/ui/icons/trash\.svg"):
+                package.nsh_assets(actual, source)
+            package.copy(icons / "trash.svg", bundled / "trash.svg")
+            expected = {Path("src/ui/icons") / n for n in ("check.svg", "send.svg", "play.svg", "trash.svg")}
+            expected.add(package.INTER_FONT)
+            self.assertEqual(set(package.nsh_assets(actual, source)), expected)
 
             # A test, fixture or unlisted module never approves an icon, even an exact copy.
             (icons / "stray.svg").write_text("<svg id='stray'/>")
             for module in ("theme.fixture.tsx", "QuickSearch.test.tsx", "extra.tsx"):
                 (icons.parent / module).write_text('import stray from "./icons/stray.svg";\n')
-            self.assertEqual(len(package.nsh_assets(actual, source)), 4)  # unbundled: fine
+            self.assertEqual(set(package.nsh_assets(actual, source)), expected)  # unbundled: fine
             package.copy(icons / "stray.svg", bundled / "stray.svg")
             with self.assertRaisesRegex(ValueError, r"unapproved renderer asset: src/ui/icons/stray\.svg"):
                 package.nsh_assets(actual, source)

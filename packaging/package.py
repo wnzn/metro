@@ -73,7 +73,7 @@ WINDOWS_ICON = "ui/nsh/icon.ico"
 WINDOWS_EXECUTABLES = {"Metro.exe", "ui/Metro.exe", "metro-server.exe", TUI_NAMES["windows"]}
 # Production modules in apps/desktop/src/ui that import bundled SVG icons. Only
 # these approve renderer assets: a test or fixture module never does.
-ICON_MODULES = ("chrome.tsx", "activity.tsx", "chatControls.tsx", "library.tsx")
+ICON_MODULES = ("chrome.tsx", "activity.tsx", "chatControls.tsx", "library.tsx", "messageDelete.tsx")
 BRIDGE_ENV = {"METRO_DESKTOP_BRIDGE_URL", "METRO_DESKTOP_BRIDGE_TOKEN"}
 
 
