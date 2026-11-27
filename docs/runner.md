@@ -153,17 +153,22 @@ The server decides for each call, before any job reaches the runner:
 | `classify` | Ask when System One flags it | System One judges the command. It runs at once only when System One says *safe* with probability at least 0.8; otherwise an approval card appears with the reason. |
 | `allow` | Always allow | The command runs without asking. |
 
-The **Approver** is either **Runner owner** (default) or **Any Space
-member**. *Runner owner* means the personal runner's owner, any org admin
-for an organization runner, or the Space owner for a dedicated runner. An
-approver must be a current member of the Space when they decide; nobody
-approves from outside the Space.
+Who approves is either the owner (default) or **Any Space member**. The
+owner choice is labelled **Runner owner** for a personal runner (its
+owner), **Org admin** for an organization runner (any org admin) and
+**Space owner** for a dedicated runner. An approver must be a current
+member of the Space when they decide; nobody approves from outside the
+Space.
 
 - A registered runner has one default policy and an optional override per
-  attached Space. Only whoever manages the runner reads or changes them.
-  Overrides are dropped when the runner is detached or the Space deleted.
-- A dedicated runner has one policy per Space, set by the Space owner.
-- Every member can see the effective policy for their Space.
+  attached Space (**Inherit** uses the default), under **Settings →
+  Runners → Shell commands** for that runner. Only whoever manages the
+  runner reads or changes them. Overrides are dropped when the runner is
+  detached or the Space deleted.
+- A dedicated runner has one policy per Space, set by the Space owner
+  under **Space settings → Runner → Shell commands**.
+- Every member sees the effective policy for their Space under **Space
+  settings → Runner → Shell commands**, read-only.
 - Organization runners can't use *Ask when System One flags it*, because
   there's no one owner whose System One connection would be used.
 - On the desktop's built-in runner, *Always allow* takes effect only while

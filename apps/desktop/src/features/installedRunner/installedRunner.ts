@@ -491,6 +491,29 @@ export async function showRunnerFolder(sid: string): Promise<void> {
   }
 }
 
+const folderChecks = new Set<string>();
+
+/**
+ * Reads a chosen folder's view once, so a folder that can't be used now
+ * (`folder_problem`) shows beside its Space without a press. Quiet: no busy
+ * latch, no banner; a failure leaves the row as it was.
+ */
+export async function checkChosenFolder(sid: string): Promise<void> {
+  const call = localRunnerCall();
+  const row = runnerSpaces().find((s) => s.id === sid);
+  if (!call || !row || !SPACE_ID_RE.test(sid) || folders()[sid] || folderChecks.has(sid)) return;
+  const valid = stillValid();
+  folderChecks.add(sid);
+  try {
+    const f = parseFolder(await call("POST", `/v1/local-tools/runner/spaces/${sid}/folder`), sid);
+    if (valid() && runnerSpaces().includes(row) && f.attached && !folders()[sid]) folders.set({ ...folders(), [sid]: f });
+  } catch {
+    // Unknown stays unknown; Show folder still reports the reason.
+  } finally {
+    folderChecks.delete(sid);
+  }
+}
+
 function setFolderError(sid: string, message: string | null) {
   const next = { ...folderErrors() };
   if (message) next[sid] = message;

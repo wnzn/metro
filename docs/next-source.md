@@ -23,8 +23,9 @@ release, and no release files contain them yet.
   tools to them.
 - **Shell policy.** Each runner has a shell mode: **Off**, **Ask every
   time** (the default), **Ask when System One flags it** or **Always
-  allow**, and an **Approver**: **Runner owner** (the default) or **Any
-  Space member**. A registered runner's manager sets its default and can
+  allow**, and who approves: the runner's owner (the default; **Org
+  admin** for an organization runner, **Space owner** for a dedicated one)
+  or **Any Space member**. A registered runner's manager sets its default and can
   override it per Space; a dedicated runner's policy is set by the Space
   owner. On the desktop's built-in runner, **Always allow** applies only
   while it's attached to exactly one Space. Organization runners can't use

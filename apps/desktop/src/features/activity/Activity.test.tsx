@@ -125,6 +125,8 @@ test("a thread member without approval rights sees the request and its expiry wi
   await app.waitUntil(() => reads() > 0);
   expect(shown(app, `id:shell-approve:${pending.approval_id}`)).toBe(false);
   expect(shown(app, `id:shell-deny:${pending.approval_id}`)).toBe(false);
+  expect(shown(app, `id:shell-approval-waiting:${pending.approval_id}`)).toBe(true);
+  expect(app.texts()).toContain("Waiting for an approver.");
   resolve("expired");
   await app.waitFor("text:/Expired/i");
   expect(decisions).toEqual([]);

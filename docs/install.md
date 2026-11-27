@@ -215,13 +215,14 @@ example in a browser) or with an older launcher.
   anything inside or containing Metro's data folder, and a folder that is,
   contains or sits inside another Space's chosen folder. Changing the
   folder moves no files and applies from the next job. If a chosen folder
-  can't be used later (for example it was deleted), that Space's jobs fail
-  with an error until you change it or choose **Use default**; Metro never
-  falls back to the default folder.
-- **Shell mode.** **Settings → Runners** sets this runner's mode: **Off**,
-  **Ask every time** (the default), **Ask when System One flags it** or
-  **Always allow**, and the **Approver**: **Runner owner** (you, the
-  default) or **Any Space member**. Each Space can override both. **Always
+  can't be used later (for example it was deleted), the Space's row says
+  why, and that Space's jobs fail with an error until you change it or
+  choose **Use default**; Metro never falls back to the default folder.
+- **Shell mode.** **Settings → Runners → Shell commands** sets this
+  runner's mode: **Off**, **Ask every time** (the default), **Ask when
+  System One flags it** or **Always allow**, and who approves: **Runner
+  owner** (you, the default) or **Any Space member**. Each Space can
+  override both or **Inherit** the default. **Always
   allow** applies only while the runner is attached to exactly one Space;
   with more, it asks every time. When a command needs approval, an
   approval card with **Approve** and **Deny** appears in the room. See

@@ -14,7 +14,7 @@ export const MODE_LABEL: Record<ShellMode, string> = {
 export const MODE_HELP: Record<ShellMode, string> = {
   off: "Agents can't run commands.",
   approve: "Each command waits for an approver.",
-  classify: "System One checks each command on the owner's System One connection. Flagged or unclear ones wait for an approver.",
+  classify: "System One checks each command on the runner owner's connection. Flagged or unclear ones wait for an approver.",
   allow: "Commands run without asking.",
 };
 
@@ -29,10 +29,16 @@ export const DEDICATED_APPROVER_LABEL: Record<ShellApprover, string> = {
   members: "Any Space member",
 };
 
+/** For an organization runner the owner is any org admin. */
+export const ORG_APPROVER_LABEL: Record<ShellApprover, string> = {
+  owner: "Org admin",
+  members: "Any Space member",
+};
+
 export function downgradeText(reason: ShellDowngrade): string {
   return reason === "built_in_multiple_spaces"
-    ? "Always allow works only while this computer's runner serves exactly one Space, so commands ask every time."
-    : "Organization runners can't use System One checks, so commands ask every time.";
+    ? "A built-in runner allows commands only while it serves exactly one Space, so each command asks."
+    : "Organization runners can't use System One checks, so each command asks.";
 }
 
 export const CLASSIFY_UNAVAILABLE = "Not available for organization runners.";

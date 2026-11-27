@@ -36,8 +36,10 @@ function resolutionTone(r: ShellResolution): Tone {
   return r.decision === "approve" ? "success" : r.decision === "deny" ? "danger" : "neutral";
 }
 
+// "owner" is the runner's owner, an org admin or, for a dedicated runner,
+// the Space owner: the card can't tell which, so it doesn't name one.
 const approverText = (a: ShellApprovalRequest["approver"]) =>
-  a === "members" ? "Waiting for a member of this Space." : "Waiting for the runner's owner.";
+  a === "members" ? "Any member of this Space can approve." : "Waiting for an approver.";
 
 /**
  * `roomId`: the room or thread the transcript shows. Only a system event in
@@ -131,7 +133,7 @@ function Card(props: { request: ShellApprovalRequest; resolution: ShellResolutio
         </If>
       }>
         <Column gap={1}>
-          <Label variant="caption" color="muted">Approving runs the command once on the runner, in this Space's folder.</Label>
+          <Label variant="caption" color="muted">Approve runs it once, in this Space's folder on the runner.</Label>
           <Row gap={2} wrap>
             <Action compact variant="primary" testID={`shell-approve:${id()}`} label="Approve" busyLabel="Sending…"
               busy={busy()} disabled={!!decidingApproval()} accessibilityLabel={`Approve command: ${display()}`}

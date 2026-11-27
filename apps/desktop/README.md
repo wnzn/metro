@@ -204,13 +204,15 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
     Space's own folder. Links and junctions, roots, the home folder
     itself, anything inside or containing Metro's data folder, and folders
     overlapping another Space's chosen folder are refused. Nothing is
-    moved. A chosen folder that stops working fails that Space's jobs
-    visibly; there's no fallback to the default.
-  - **Shell mode.** **Settings → Runners** sets **Off**, **Ask every
-    time** (default), **Ask when System One flags it** or **Always
-    allow**, and the **Approver**, **Runner owner** (default) or **Any
-    Space member**, with a per-Space override. **Always allow** applies
-    only while the runner is attached to exactly one Space.
+    moved. A chosen folder that stops working shows why on its row and
+    fails that Space's jobs visibly; there's no fallback to the default.
+  - **Shell mode.** **Settings → Runners → Shell commands** sets **Off**,
+    **Ask every time** (default), **Ask when System One flags it** or
+    **Always allow**, and who approves, **Runner owner** (default) or
+    **Any Space member**, with a per-Space override or **Inherit**.
+    **Always allow** applies only while the runner is attached to exactly
+    one Space. Members see the effective policy, read-only, under **Space
+    settings → Runner → Shell commands**.
   - **Approval cards.** A command that needs approval shows a card with
     the command in the room's run activity, with **Approve** and **Deny**
     for eligible approvers. It expires after 10 minutes.

@@ -13,13 +13,14 @@ import type { RunnerShellPolicy, RunnerSpaceShell, ShellApprover, ShellMode, Spa
 import { Action, Badge, Banner, Column, Disclosure, Label, Picker, Row, SettingRow, SettingsGroup } from "../../ui";
 import {
   APPROVER_LABEL, approverItems, DEDICATED_APPROVER_LABEL, downgradeText, effectiveText, MODE_HELP, MODE_LABEL, modeItems,
+  ORG_APPROVER_LABEL,
 } from "./copy";
 import { loadRunnerShell, runnerShell, runnerShellBusy, runnerShellNotice, saveRunnerShellDefault, saveRunnerShellSpace } from "./runnerShellState";
 import {
   isSettingsOwner, runnerBusy, runnerSnapshot, saveSpaceShell, shellBusy, shellNotice,
 } from "../space/spaceSettingsState";
 
-const BUILT_IN_ALLOW = "On this computer's runner, Always allow applies only while it serves exactly one Space.";
+const BUILT_IN_ALLOW = "On a built-in runner, Always allow applies only while it serves exactly one Space.";
 const isMode = (v: string | null): v is ShellMode => v === "off" || v === "approve" || v === "classify" || v === "allow";
 const isApprover = (v: string | null): v is ShellApprover => v === "owner" || v === "members";
 
@@ -35,7 +36,8 @@ export function RunnerShellSection(props: { runner: RegisteredRunner; builtIn?: 
   };
   return (
     <Disclosure title="Shell commands" testID={`runner-shell:${id()}`} open={open()} onToggle={toggle}
-      summary={entry()?.policy ? effectiveText(entry()!.policy!.default.mode, entry()!.policy!.default.approver) : undefined}>
+      summary={entry()?.policy ? effectiveText(entry()!.policy!.default.mode, entry()!.policy!.default.approver,
+        entry()!.policy!.visibility === "organization" ? ORG_APPROVER_LABEL : APPROVER_LABEL) : undefined}>
       <If when={open()}>
         <Column gap={3} testID={`runner-shell-panel:${id()}`}>
           <If when={entry()?.error}>
@@ -59,6 +61,7 @@ export function RunnerShellSection(props: { runner: RegisteredRunner; builtIn?: 
 function RunnerShellEditor(props: { policy: RunnerShellPolicy; builtIn: boolean }) {
   const id = () => props.policy.runnerId;
   const organization = () => props.policy.visibility === "organization";
+  const labels = () => (organization() ? ORG_APPROVER_LABEL : APPROVER_LABEL);
   const mode = signal<ShellMode>(props.policy.default.mode);
   const approver = signal<ShellApprover>(props.policy.default.approver);
   // A new answer from the server replaces any unsaved draft.
@@ -77,7 +80,7 @@ function RunnerShellEditor(props: { policy: RunnerShellPolicy; builtIn: boolean 
         <Row gap={2} wrap align="center">
           <Picker testID={`runner-shell-mode:${id()}`} accessibilityLabel="Shell commands" items={modeItems(organization())}
             value={mode()} disabled={!!runnerShellBusy()} onChange={(v) => { if (isMode(v)) mode.set(v); }} />
-          <Picker testID={`runner-shell-approver:${id()}`} accessibilityLabel="Who approves" items={approverItems(APPROVER_LABEL)}
+          <Picker testID={`runner-shell-approver:${id()}`} accessibilityLabel="Who approves" items={approverItems(labels())}
             value={approver()} disabled={!!runnerShellBusy()}
             onChange={(v) => { if (isApprover(v)) approver.set(v); }} />
           <Action testID={`runner-shell-save:${id()}`} label="Save" busyLabel="Saving…" variant="primary" compact
@@ -87,9 +90,6 @@ function RunnerShellEditor(props: { policy: RunnerShellPolicy; builtIn: boolean 
         <Label variant="caption" color="muted" testID={`runner-shell-help:${id()}`}>{MODE_HELP[mode()]}</Label>
         <If when={props.builtIn && mode() === "allow"}>
           <Label variant="caption" color="muted" testID={`runner-shell-builtin-note:${id()}`}>{BUILT_IN_ALLOW}</Label>
-        </If>
-        <If when={organization()}>
-          <Label variant="caption" color="muted">Runner owner means any org admin who is a member of the Space.</Label>
         </If>
       </Column>
       <Column gap={2} testID={`runner-shell-spaces:${id()}`}>
@@ -119,12 +119,13 @@ function SpaceOverride(props: { runnerId: string; space: RunnerSpaceShell; defau
   const draftMode = () => sendMode() ?? props.defaults.mode;
   const busy = () => runnerShellBusy() === `space:${key()}`;
   const name = () => props.space.spaceName ?? "A Space you're not a member of";
+  const labels = () => (props.organization ? ORG_APPROVER_LABEL : APPROVER_LABEL);
   return (
     <Column gap={2} testID={`runner-shell-space:${key()}`}>
       <Row gap={2} align="center" wrap>
         <Label variant="body">{name()}</Label>
         <Badge testID={`runner-shell-effective:${key()}`} tone={props.space.effectiveMode === "allow" ? "warning" : "neutral"}
-          label={effectiveText(props.space.effectiveMode, props.space.effectiveApprover)} />
+          label={effectiveText(props.space.effectiveMode, props.space.effectiveApprover, labels())} />
       </Row>
       <If when={props.space.downgradedReason}>
         {(reason) => <Label variant="caption" color="muted" testID={`runner-shell-downgrade:${key()}`}>{downgradeText(reason())}</Label>}
@@ -134,7 +135,7 @@ function SpaceOverride(props: { runnerId: string; space: RunnerSpaceShell; defau
           items={modeItems(props.organization, props.defaults.mode)} value={mode()} disabled={!!runnerShellBusy()}
           onChange={(v) => { if (v) mode.set(v); }} />
         <Picker testID={`runner-shell-space-approver:${key()}`} accessibilityLabel={`Who approves in ${name()}`}
-          items={approverItems(APPROVER_LABEL, props.defaults.approver)} value={approver()}
+          items={approverItems(labels(), props.defaults.approver)} value={approver()}
           disabled={!!runnerShellBusy()}
           onChange={(v) => { if (v) approver.set(v); }} />
         <Action testID={`runner-shell-space-save:${key()}`} label="Save" busyLabel="Saving…" compact
@@ -160,11 +161,13 @@ export function SpaceShellSection() {
   const runner = () => runnerSnapshot()?.runner;
   const shell = () => runnerSnapshot()?.shell ?? null;
   const dedicated = () => runner()?.kind === "dedicated";
-  const labels = () => (dedicated() ? DEDICATED_APPROVER_LABEL : APPROVER_LABEL);
+  const labels = () => {
+    const r = runner();
+    return r?.kind === "dedicated" ? DEDICATED_APPROVER_LABEL : r?.visibility === "organization" ? ORG_APPROVER_LABEL : APPROVER_LABEL;
+  };
   return (
     <If when={runner()}>
-      <SettingsGroup title="Shell commands" testID="space-shell"
-        description="What happens when an agent here asks the runner to run a command.">
+      <SettingsGroup title="Shell commands" testID="space-shell">
         <If when={shell()} else={<SettingRow label="Policy unknown" testID="space-shell-unknown" description="This server didn't report a shell policy." />}>
           {(s) => (
             <Column>

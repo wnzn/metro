@@ -25,6 +25,7 @@ function bridgeWithRunner(f: F, runnerId: string | null, name: string, opts: Opt
   const log: { method: string; path: string; body: string | null | undefined }[] = [];
   const t = { log };
   const folders = new Map<string, string>();
+  const problems = new Map<string, string>();
   const st = { state: opts.state ?? "online", canReconnect: opts.canReconnect ?? false, runnerId, delay: 0, status: 200, available: opts.available ?? true };
   const status = () => ({
     marker: opts.requested === false ? "absent" : "accepted",
@@ -82,7 +83,7 @@ function bridgeWithRunner(f: F, runnerId: string | null, name: string, opts: Opt
       const defaultFolder = `${ROOT}/${sid}`;
       return { status: 200, body: {
         space_id: sid, folder: folders.get(sid) ?? defaultFolder, default_folder: defaultFolder,
-        custom: folders.has(sid), folder_problem: null, ...(req.method === "DELETE" ? {} : { attached }),
+        custom: folders.has(sid), folder_problem: folders.has(sid) ? problems.get(sid) ?? null : null, ...(req.method === "DELETE" ? {} : { attached }),
         tools: ["workspace.list", "workspace.read", "workspace.write", "workspace.shell"],
       } };
     }
@@ -97,7 +98,7 @@ function bridgeWithRunner(f: F, runnerId: string | null, name: string, opts: Opt
     const inner = (b.network as any)[`${method} ${BRIDGE}/v1/*`];
     network[`${method} ${BRIDGE}/v1/*`] = (req: Req) => (new URL(req.url).pathname.startsWith("/v1/local-tools") ? handle(req) : inner(req));
   }
-  return { log, network, st, folders };
+  return { log, network, st, folders, problems };
 }
 
 async function openWith(f: F, t: ReturnType<typeof bridgeWithRunner> | null, manualClock = false) {
@@ -177,6 +178,22 @@ test("a chosen folder isn't offered as detached while its assignment check is pe
   await app.waitFor("id:installed-runner-space:target");
   expect(app.shows("id:installed-runner-folder-default:target")).toBe(true);
   expect(app.shows("id:installed-runner-stale-default:target")).toBe(false);
+});
+
+test("a chosen folder that can't be used shows its problem without a press", async () => {
+  const f = world();
+  const mine = f.addRunner("This PC", "personal", "alice");
+  f.addSpace("target", "Target", "alice");
+  f.state.attached.set("target", mine.id);
+  const t = bridgeWithRunner(f, mine.id, mine.name);
+  t.folders.set("target", "/home/me/gone");
+  t.problems.set("target", "The chosen folder doesn't exist.");
+  const app = await openWith(f, t);
+  await signInToRunners(app, "alice");
+  await app.waitFor("id:installed-runner-folder-problem:target");
+  expect(app.texts()).toContain("Jobs fail until this is fixed: The chosen folder doesn't exist.");
+  const reads = t.log.filter(entry => entry.path === "/v1/local-tools/runner/spaces/target/folder");
+  expect(reads.map(entry => entry.method)).toEqual(["POST"]);
 });
 
 test("a chosen folder on a verified detached Space can be cleared", async () => {

@@ -20,15 +20,15 @@ use crate::util::{Backoff, sleep_interruptible};
 /// How often a running shell job asks whether the server still wants it.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Asks the server about one running job until dropped; sets
-/// [`crate::JOB_CANCELLED`] when the server no longer authorizes the job.
-/// Transport errors never cancel.
+/// Asks the server about one running job until dropped; cancels that job
+/// (by its serial in [`crate::JOBS`]) when the server no longer authorizes
+/// it. Transport errors never cancel.
 struct Heartbeat {
     stop: Arc<AtomicBool>,
 }
 
 impl Heartbeat {
-    fn start(client: ServerClient, id: String) -> Self {
+    fn start(client: ServerClient, id: String, serial: u64) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         // Not joined: a request in flight must not delay the result.
@@ -42,10 +42,12 @@ impl Heartbeat {
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 let gone = matches!(client.heartbeat(&id), Ok(Liveness::Gone));
-                // A late answer for a finished job must not touch the next one.
-                if gone && !flag.load(Ordering::SeqCst) {
-                    eprintln!("metro-runner: job {id}: cancelled by the server; stopping it");
-                    crate::JOB_CANCELLED.store(true, Ordering::SeqCst);
+                if gone {
+                    // Keyed by serial: a late answer can't cancel the next job.
+                    crate::JOBS.cancel(serial);
+                    if !flag.load(Ordering::SeqCst) {
+                        eprintln!("metro-runner: job {id}: cancelled by the server; stopping it");
+                    }
                     return;
                 }
             }
@@ -209,12 +211,12 @@ impl Runner {
                     _ => eprintln!("metro-runner: job {} tool {}", job.id, job.tool),
                 }
                 let started = Instant::now();
-                crate::JOB_CANCELLED.store(false, Ordering::SeqCst);
+                let serial = crate::JOBS.begin();
                 let beat = (job.tool == "workspace.shell")
-                    .then(|| Heartbeat::start(self.client.clone(), job.id.clone()));
+                    .then(|| Heartbeat::start(self.client.clone(), job.id.clone(), serial));
                 let r = self.dispatch.run(&job);
                 drop(beat);
-                crate::JOB_CANCELLED.store(false, Ordering::SeqCst);
+                crate::JOBS.end(serial);
                 eprintln!(
                     "metro-runner: job {} finished ok={} in {:.1}s ({} bytes)",
                     job.id,

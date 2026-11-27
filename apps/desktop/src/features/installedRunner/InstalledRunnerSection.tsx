@@ -1,7 +1,8 @@
 // Settings › Runners: "This computer's runner", the personal registered
 // runner built into Metro, for the server this session is signed in to.
 // Shown only when the launcher's bridge says so (see installedRunner.ts).
-// Opening reads; Set up, Reconnect and Show folder act only when pressed.
+// Opening reads (including each chosen folder's state); Set up, Reconnect,
+// Show folder, Change and Use default act only when pressed.
 
 import { Clipboard, effect, signal, untracked } from "nsh";
 import type { JSX } from "nsh";
@@ -11,6 +12,7 @@ import { sessionGuard, spaces } from "../../store";
 import { Action, Badge, Banner, Checkbox, Column, ConfirmInline, Field, Label, Row, SettingRow, SettingsGroup } from "../../ui";
 import type { Tone } from "../../ui";
 import {
+  checkChosenFolder,
   chosenFolders,
   clearRunnerFolder,
   folderErrors,
@@ -210,6 +212,10 @@ function FolderRow(props: { space: { id: string; name: string }; copied: string 
   const save = async () => {
     if (await setRunnerFolder(sid(), draft())) editing.set(false);
   };
+  // A chosen folder may have stopped working: read it so its problem shows.
+  effect(() => {
+    if (chosen() !== undefined && !loaded()) untracked(() => void checkChosenFolder(sid()));
+  });
   return (
     <Column gap={1} testID={`installed-runner-space:${sid()}`}>
       <Row align="center" gap={2} wrap>

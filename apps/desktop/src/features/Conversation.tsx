@@ -289,7 +289,8 @@ function TranscriptRowView(props: { row: () => TranscriptRow; actions: Transcrip
     const entry = as("event"), where = mainPlace();
     if (!entry) return null;
     if (entry.event.compaction) return entry;
-    if (entry.event.kind === "shell_approval" && where === "space" && isSystemEvent(entry.event)) return entry;
+    // Run activity, never a message: a card wherever it appears (decisions only in a Space).
+    if (entry.event.kind === "shell_approval" && isSystemEvent(entry.event)) return entry;
     if (entry.event.kind === "page_draft" && (where === "space" || where === "chat")) return entry;
     return where === "chat" && entry.event.kind === "space_post" && entry.event.activity?.spacePost ? entry : null;
   };

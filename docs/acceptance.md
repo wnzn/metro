@@ -3,6 +3,14 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Source only: Metro 0.6.3 desktop and runner review fixes (2026-11-28, local)
+
+Local Linux builds of `feat/runner-shell-write` only; not a release.
+
+- `nsh check` passed; desktop `nsh test` 1015/1015.
+- `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings` passed.
+- `cargo test -p metro-runner`: 102 passed.
+
 ## Source only: Metro 0.6.3 version bump (2026-11-28, local)
 
 - `python3 -m unittest discover -s packaging`: 206 passed, 63 skipped.

@@ -110,6 +110,13 @@ test("organization managers do not get a System One option", async () => {
     expect(app.enabled(classify)).toBe(false);
     await app.keyboard.press("escape");
   }
+  // For an organization runner, "owner" is any org admin.
+  await app.waitFor(`id:runner-shell-effective:${runner.id}:project >> text:Ask every time · Org admin approves`);
+  await app.press(`id:runner-shell-approver:${runner.id}`);
+  await app.waitFor("text:Any Space member");
+  expect(app.texts()).toContain("Org admin");
+  expect(app.texts()).not.toContain("Runner owner");
+  await app.keyboard.press("escape");
   expect(writes).toEqual([]);
 });
 
@@ -134,7 +141,7 @@ test("a built-in runner shows the server's effective mode and downgrade", async 
     await app.waitFor(`id:runner-shell-effective:${runner.id}:${space} >> text:/Ask every time/`);
     await app.waitFor(`id:runner-shell-downgrade:${runner.id}:${space}`);
   }
-  expect(app.texts().some(s => /exactly one Space.*ask every time/i.test(s))).toBe(true);
+  expect(app.texts()).toContain("A built-in runner allows commands only while it serves exactly one Space, so each command asks.");
   await app.press(`id:runner-shell-approver:${runner.id}`);
   await app.press("text:Any Space member");
   await app.press(`id:runner-shell-save:${runner.id}`);
