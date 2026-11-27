@@ -74,8 +74,7 @@ pub fn all_tools() -> Vec<String> {
         .collect()
 }
 
-/// Pages, web, write and shell tools are opt-in, even for the Space's
-/// built-in agent.
+/// Pages and web tools are opt-in, even for the Space's built-in agent.
 pub(crate) fn default_tools() -> Vec<String> {
     RunnerTool::DEFAULT
         .iter()
@@ -612,7 +611,7 @@ pub struct CreateBody {
     description: String,
     #[serde(default)]
     instructions: String,
-    /// Default: the original workspace and thread tools.
+    /// Default: [`default_tools`].
     #[serde(default)]
     tools: Option<Vec<String>>,
     #[serde(default)]

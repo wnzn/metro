@@ -42,11 +42,13 @@ impl RunnerTool {
         RunnerTool::Mcp,
     ];
 
-    /// The tools an agent gets without an explicit list. Write and shell are
-    /// opt-in.
-    pub const DEFAULT: [RunnerTool; 5] = [
+    /// The tools an agent gets without an explicit list. Shell stays gated by
+    /// the runner's shell policy.
+    pub const DEFAULT: [RunnerTool; 7] = [
         RunnerTool::List,
         RunnerTool::Read,
+        RunnerTool::Write,
+        RunnerTool::Shell,
         RunnerTool::Check,
         RunnerTool::McpList,
         RunnerTool::Mcp,
@@ -503,9 +505,8 @@ mod tests {
         ] {
             assert!(RunnerTool::Write.runner_arguments(&bad).is_err());
         }
-        // Write and shell are offered but never on by default.
-        assert!(!RunnerTool::DEFAULT.contains(&RunnerTool::Shell));
-        assert!(!RunnerTool::DEFAULT.contains(&RunnerTool::Write));
+        assert!(RunnerTool::DEFAULT.contains(&RunnerTool::Shell));
+        assert!(RunnerTool::DEFAULT.contains(&RunnerTool::Write));
         assert!(
             RunnerTool::DEFAULT
                 .iter()
