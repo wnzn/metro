@@ -20,6 +20,7 @@ import type { JSX } from "nsh";
 import { activeRoom, activeSpaceId, isActiveRun, mainPlace, me, runBusy, runs, stopRun } from "../../store";
 import { webSearchSettingsAction } from "../../webSearch";
 import { WEB_PROVIDERS } from "../../api/webSearch";
+import { visibleCommand } from "../../api/shell";
 import type { WebToolNote } from "../../api/webSearch";
 import { Action, Badge, Column, Label, Row } from "../../ui";
 import { AgentMark, CodeOutput, DisclosureToggle, SummaryParts, ThinkingIndicator, TimelineEntry } from "../../ui/activity";
@@ -27,7 +28,7 @@ import { stepPhase } from "./classify";
 import { disclosureKey, disclosureScope, isOpen, toggle } from "./disclosure";
 import { failureText } from "./failure";
 import type { ActivityGroup, Step, TimelineItem } from "./group";
-import { COMPACTION_MISS, groupAccessibleLabel, liveTitle, groupOutcomeText, routeText, summaryParts, timeline } from "./group";
+import { COMPACTION_MISS, groupAccessibleLabel, liveTitle, groupOutcomeText, routeText, splitCall, summaryParts, timeline } from "./group";
 import { FOLD_LINES, outputView } from "./output";
 import { webAttemptRows, webFailureText } from "./web";
 
@@ -168,8 +169,23 @@ function TimelineView(props: { groupKey: string; item: TimelineItem; last: boole
 /** A tool call: its name and short arguments, then its output (or failure) in a bounded code view. */
 function ToolView(props: { groupKey: string; item: Extract<TimelineItem, { type: "tool" }>; last: boolean }) {
   const first = () => (props.item.call ?? props.item.result)!;
-  const phase = () => (props.item.failed ? "failed" : props.item.result ? "complete" : "called");
+  const result = () => props.item.result;
+  const notRun = () => !props.item.failed && !!result() && stepPhase(result()!.activity) === "stopped";
+  const phase = () => (props.item.failed ? "failed" : notRun() ? "stopped" : result() ? "complete" : "called");
   const metaResult = () => props.item.result?.activity.details;
+  // A shell command is shown whole and wrapped: the short args line cuts it.
+  const command = () => {
+    const call = props.item.call?.activity;
+    if (!call || call.web || call.meta) return null;
+    const { tool, args } = splitCall(call.details);
+    if (tool.replace(/^workspace_/, "workspace.") !== "workspace.shell") return null;
+    try {
+      const v = JSON.parse(args) as unknown;
+      return v && typeof v === "object" && typeof (v as { command?: unknown }).command === "string" ? (v as { command: string }).command : null;
+    } catch {
+      return null;
+    }
+  };
   const stateKey = (s: Step) => disclosureKey(disclosureScope(), props.groupKey, `all:${s.eventId}`);
   return (
     <TimelineEntry
@@ -181,7 +197,7 @@ function ToolView(props: { groupKey: string; item: Extract<TimelineItem, { type:
       <If when={first().activity.meta} else={<If when={first().activity.web} else={<>
       <Row align="center" gap={2} wrap>
         <Label variant="strong">{props.item.name}</Label>
-        <If when={props.item.args}>
+        <If when={!command() && props.item.args}>
           {(a) => (
             <Label variant="mono" color="muted" lines={1} testID={`activity-args:${first().eventId}`}>
               {a()}
@@ -193,11 +209,22 @@ function ToolView(props: { groupKey: string; item: Extract<TimelineItem, { type:
             failed
           </Label>
         </If>
+        <If when={notRun()}>
+          <Label variant="caption" color="muted">
+            not run
+          </Label>
+        </If>
       </Row>
+      <If when={command()}>
+        {(c) => <Label variant="mono" color="muted" testID={`activity-command:${first().eventId}`}>{visibleCommand(c())}</Label>}
+      </If>
       <If when={props.item.result && props.item.call ? props.item.result : null}>
         {(r) => (
           <Column testID={`activity-step:${r().eventId}`}>
-            <If when={r().activity.details.length > 0}>
+            <If when={!r().activity.mono && r().activity.details.length > 0}>
+              <Label variant="caption" color="muted" testID={`activity-not-run:${r().eventId}`}>{r().activity.details}</Label>
+            </If>
+            <If when={r().activity.mono && r().activity.details.length > 0}>
               <StepOutput text={r().activity.details} stateKey={stateKey(r())} testID={`activity-output:${r().eventId}`} />
             </If>
           </Column>

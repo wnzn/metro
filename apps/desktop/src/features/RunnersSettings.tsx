@@ -29,6 +29,7 @@ import { createAttachSelection, InstalledRunnerSection } from "./installedRunner
 import { installedBusy, installedRunner, ownedInstalledRunner, refreshAfterInstalledRunnerDeletion } from "./installedRunner/installedRunner";
 import { relativeTime } from "./discovery/time";
 import { RELEASES_URL } from "./setupTemplates";
+import { RunnerShellSection } from "./shellPolicy/ShellPolicySettings";
 
 export function RunnersSettings() {
   watchInstalledRunner(true);
@@ -65,7 +66,10 @@ export function RunnersSettings() {
             <If when={adding()}><AddRunner onAdded={() => adding.set(false)} /></If>
             <InstalledRunnerSection picks={picks} management={
               <If when={installedRegistration()}>
-                {(runner) => <Column padX={4} gap={2}><RunnerManagement runner={runner()} installed /></Column>}
+                {(runner) => <Column padX={4} gap={2}>
+                  <RunnerShellSection runner={runner()} builtIn />
+                  <RunnerManagement runner={runner()} installed />
+                </Column>}
               </If>
             } />
             <RunnerList visibility="personal" />
@@ -187,7 +191,10 @@ function RunnerRow(props: { runner: RegisteredRunner }) {
       </SettingRow>
       <Column padX={4} gap={2}>
         <RunnerUpdateControls runner={r()} scope={registrationScope(r())} />
-        <If when={r().canManage}><RunnerManagement runner={r()} /></If>
+        <If when={r().canManage}>
+          <RunnerShellSection runner={r()} builtIn={r().builtIn} />
+          <RunnerManagement runner={r()} />
+        </If>
       </Column>
     </Column>
   );

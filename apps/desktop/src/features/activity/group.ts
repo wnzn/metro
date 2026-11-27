@@ -58,6 +58,8 @@ const TERMINAL: Record<Exclude<ActivityPhase, "started">, GroupOutcome> = {
   interrupted: "interrupted",
 };
 
+/** Posted by the server itself (`actor: "system"`), never by a person. */
+export const isSystemEvent = (e: RoomEvent) => e.actor === "system" && !e.actorId;
 const isLifecycle = (e: RoomEvent) => e.kind.trim().toLowerCase() === "activity";
 export const COMPACTION_MISS = "Couldn't summarize earlier messages";
 export const isRoomCompactionMiss = (e: RoomEvent) => e.activity?.source === "agent" &&
@@ -90,6 +92,17 @@ export function groupTranscript(events: readonly RoomEvent[]): TranscriptItem[] 
   for (const e of events) {
     // A message delivered into a running turn: shown on that message, not here.
     if (e.kind === "steered") {
+      memberOf.set(e.id, "");
+      continue;
+    }
+    // How a shell approval ended: shown on its approval card, not as a row.
+    if (e.kind === "shell_approval_resolved") {
+      memberOf.set(e.id, "");
+      continue;
+    }
+    // A shell approval request is only ever posted by the system. Any other
+    // author's event of that kind is not shown at all: no card, no raw text.
+    if (e.kind === "shell_approval" && !isSystemEvent(e)) {
       memberOf.set(e.id, "");
       continue;
     }
@@ -339,7 +352,7 @@ export function shortArgs(raw: string): string {
     const v = JSON.parse(text) as unknown;
     if (v && typeof v === "object" && !Array.isArray(v)) {
       const o = v as Record<string, unknown>;
-      const first = o.path ?? o.file ?? o.name ?? o.tool ?? o.query;
+      const first = o.path ?? o.file ?? o.name ?? o.tool ?? o.query ?? o.command;
       const values = Object.values(o).filter((x) => typeof x === "string" || typeof x === "number");
       out = typeof first === "string" ? first : values.length ? values.join(" ") : Object.keys(o).length ? text : "";
     }
@@ -370,6 +383,10 @@ export function currentStep(g: ActivityGroup): string {
         return what ? `Reading ${what}…` : "Reading a file…";
       case "workspace.list":
         return !what || what === "." ? "Listing the workspace…" : `Listing ${what}…`;
+      case "workspace.write":
+        return what ? `Writing ${what}…` : "Writing a file…";
+      case "workspace.shell":
+        return "Command requested…";
       case "workspace.check":
         return "Running a check…";
       case "workspace.mcp_list":
@@ -401,7 +418,7 @@ export function timeline(g: ActivityGroup): TimelineItem[] {
       const { tool, args } = splitCall(a.details);
       out.push({ type: "tool", key: `step:${step.eventId}`, call: step, result: null, name: tool ? toolName(tool) : "Tool", args: shortArgs(args), failed: false });
     } else if (a.kind === "tool_result") {
-      const name = a.web || a.meta ? a.summary : /^Tool · (.+) · (?:complete|failed)$/.exec(a.summary)?.[1] ?? "Tool";
+      const name = a.web || a.meta ? a.summary : /^Tool · (.+) · (?:complete|failed|not run)$/.exec(a.summary)?.[1] ?? "Tool";
       const open = a.web && webRefusal(a.web.note) ? undefined :
         [...out].reverse().find((i): i is Extract<TimelineItem, { type: "tool" }> =>
           i.type === "tool" && !i.result && i.name === name &&

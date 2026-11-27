@@ -14,6 +14,7 @@
 import { batch, cleanup, computed, effect, Picker as SystemPicker, signal, untracked } from "nsh";
 import { ApiError } from "../../api/client";
 import type { AvailableCatalog, Client, Member, RegisteredRunner, SpaceRunner } from "../../api/client";
+import type { ShellPolicy, SpaceShell } from "../../api/shell";
 import { AVATAR_EXTENSIONS, MAX_AVATAR_BYTES, sniffAvatar } from "../../api/profile";
 import type { AvatarMime } from "../../api/profile";
 import {
@@ -63,14 +64,24 @@ export const rosterError = signal<string | null>(null);
 export const memberBusy = signal<string | null>(null);
 export const memberNotice = signal<{ ok: boolean; message: string } | null>(null);
 
-type RunnerSnapshot = { runner: SpaceRunner | null; legacy: boolean; guardedTokenChanges: boolean };
-const runnerSource = signal<(Omit<RunnerSnapshot, "runner"> & { sid: string }) | null>(null);
+type RunnerSnapshot = { runner: SpaceRunner | null; legacy: boolean; guardedTokenChanges: boolean; shell: SpaceShell | null };
+type RunnerSource = Omit<RunnerSnapshot, "runner"> & { sid: string; shellFor: string | null };
+const runnerSource = signal<RunnerSource | null>(null);
+/** Which assignment a shell policy read describes: kind, id and revision. */
+const assignmentKey = (r: SpaceRunner | null | undefined) =>
+  r ? JSON.stringify([r.kind, r.kind === "registered" ? r.id : null, r.assignmentRevision ?? null]) : null;
 export const runnerSnapshot = computed<RunnerSnapshot | null>(() => {
   const source = runnerSource();
   if (!source) return null;
   const runner = spaceRunners()[source.sid];
-  return runner === undefined ? null : { runner, legacy: source.legacy, guardedTokenChanges: source.guardedTokenChanges };
+  if (runner === undefined) return null;
+  // A policy read for another assignment is never shown for this one.
+  const shell = source.shellFor !== null && source.shellFor === assignmentKey(runner) ? source.shell : null;
+  return { runner, legacy: source.legacy, guardedTokenChanges: source.guardedTokenChanges, shell };
 });
+/** While the dedicated runner's shell policy is being saved. */
+export const shellBusy = signal(false);
+export const shellNotice = signal<{ ok: boolean; message: string } | null>(null);
 export const runnerError = signal<string | null>(null);
 export const runnerInventory = signal<{ attachIfEmpty: boolean; runners: RegisteredRunner[] } | null>(null);
 export const runnerInventoryError = signal<string | null>(null);
@@ -162,6 +173,8 @@ function resetSection() {
   runnerBusy.set(null);
   runnerNotice.set(null);
   runnerAdvanced.set(false);
+  shellBusy.set(false);
+  shellNotice.set(null);
   clearLocalToolsMessages();
   if (untracked(revealed)?.kind === "dedicated") dismissReveal();
 }
@@ -364,7 +377,7 @@ async function readRunner(api: Client, sid: string, exact: boolean): Promise<Run
     const space = (await api.listSpaces()).find((s) => s.id === sid);
     if (!space) throw error;
     if (spaceRunnerExactPending(sid)) throw new ApiError("protocol", "The current runner assignment could not be confirmed.");
-    return { runner: space.runnerPaired ? dedicatedRunner : null, legacy: true, guardedTokenChanges: false };
+    return { runner: space.runnerPaired ? dedicatedRunner : null, legacy: true, guardedTokenChanges: false, shell: null };
   }
 }
 
@@ -380,7 +393,10 @@ async function refreshAssignment(
     batch(() => {
       observation.publish(next.runner, options?.allowFolderAdd?.(next.runner) === true, !next.legacy);
       if (show()) {
-        runnerSource.set({ sid, legacy: next.legacy, guardedTokenChanges: next.guardedTokenChanges });
+        runnerSource.set({
+          sid, legacy: next.legacy, guardedTokenChanges: next.guardedTokenChanges,
+          shell: next.shell, shellFor: assignmentKey(next.runner),
+        });
         runnerError.set(null);
       }
     });
@@ -607,6 +623,45 @@ export async function changeRunner(action: RunnerAction): Promise<void> {
     await loadRunner(pendingWrite ? writeCurrent : undefined);
   } finally {
     if (page()) runnerBusy.set(null);
+  }
+}
+
+/**
+ * The Space owner saves the dedicated runner's shell policy. Only for the
+ * dedicated assignment shown; the server answers 409 once it's gone, and the
+ * result is applied only to the same assignment.
+ */
+export async function saveSpaceShell(policy: ShellPolicy): Promise<void> {
+  const api = apiClient();
+  const sid = spaceSettingsFor();
+  const before = runnerSnapshot();
+  if (!api || !sid || !before || before.runner?.kind !== "dedicated" || !isSettingsOwner() || shellBusy() ||
+      runnerBusy() || localToolsBusy() || spaceSettingsSection() !== "runner") return;
+  const page = guardPage(sid, "runner");
+  const key = assignmentKey(before.runner);
+  const live = () => page() && isSettingsOwner();
+  const sameAssignment = () => live() && assignmentKey(spaceRunners()[sid]) === key;
+  shellBusy.set(true);
+  shellNotice.set(null);
+  try {
+    const shell = await api.setSpaceShellPolicy(sid, policy);
+    if (!sameAssignment()) return;
+    const source = runnerSource();
+    if (source?.sid === sid) runnerSource.set({ ...source, shell, shellFor: key });
+    shellNotice.set({ ok: true, message: "Shell policy saved." });
+  } catch (error) {
+    if (!live() || isAborted(error) || lost(error, sid)) return;
+    const status = error instanceof ApiError ? error.status : null;
+    shellNotice.set({
+      ok: false,
+      message: status === 409 ? "This Space no longer has a dedicated runner. Nothing was saved."
+        : status === 403 ? "Only the owner can change this."
+          : status === 400 ? "The server refused this policy."
+            : "The server did not confirm the change. Check the policy before trying again.",
+    });
+    await loadRunner();
+  } finally {
+    if (page()) shellBusy.set(false);
   }
 }
 

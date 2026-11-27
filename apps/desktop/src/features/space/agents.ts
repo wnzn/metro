@@ -21,6 +21,8 @@ export const AGENTS_RECHECK_MS = 60_000;
 export const TOOL_LABELS: Readonly<Record<string, { label: string; description: string; group: "workspace" | "web" | "pages" }>> = {
   "workspace.list": { label: "List files", description: "List files in this Space's folder.", group: "workspace" },
   "workspace.read": { label: "Read files", description: "Read files in this Space's folder.", group: "workspace" },
+  "workspace.write": { label: "Write files", description: "Create or replace files in this Space's folder.", group: "workspace" },
+  "workspace.shell": { label: "Run shell commands", description: "Run commands in this Space's folder, as the runner's shell policy allows.", group: "workspace" },
   "workspace.check": { label: "Run checks", description: "Run checks defined by the runner operator.", group: "workspace" },
   "workspace.mcp_list": { label: "List MCP tools", description: "See the operator's MCP tools.", group: "workspace" },
   "workspace.mcp": { label: "Use MCP tools", description: "Call the operator's MCP tools.", group: "workspace" },

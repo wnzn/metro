@@ -29,6 +29,8 @@ export type Activity = {
 const TOOL_NAMES: Record<string, string> = {
   "workspace.list": "List workspace",
   "workspace.read": "Read file",
+  "workspace.write": "Write file",
+  "workspace.shell": "Run shell commands",
   "workspace.check": "Run check",
   "workspace.mcp_list": "List MCP tools",
   "workspace.mcp": "Call MCP tool",
@@ -57,7 +59,7 @@ const PROGRESS_KINDS = new Set(["progress", "working", "agent_progress", "agent_
 export function stepPhase(a: Activity): "called" | "complete" | "failed" | "thinking" | "progress" | "stopped" {
   if (a.tone === "danger") return "failed";
   if (a.kind === "tool_call") return "called";
-  if (a.kind === "tool_result") return "complete";
+  if (a.kind === "tool_result") return a.tone === "warning" ? "stopped" : "complete";
   if (a.kind === "thinking") return "thinking";
   return a.tone === "warning" ? "stopped" : "progress";
 }
@@ -110,6 +112,11 @@ export function activityOf(event: { kind: string; text: string; actorId?: string
         details: output,
         mono: true,
       };
+    }
+    // Nothing ran (shell policy off, denied, expired, cancelled): "<tool> not run: <why>".
+    const notRun = /^(\S+) not run: ([\s\S]*)$/.exec(text.trim());
+    if (notRun) {
+      return { kind: "tool_result", summary: `Tool · ${toolName(notRun[1]!)} · not run`, tone: "warning", details: notRun[2]!.trim(), mono: false };
     }
     return { kind: "tool_result", summary: "Tool · output", tone: "runner", details: text.replace(/\s+$/, ""), mono: true };
   }

@@ -7,6 +7,7 @@ import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, TOKENS, world } from "../../../test/fakeServer";
 import { launched } from "../../../test/launched";
+import { readShellApproval } from "../../api/shell";
 
 type F = ReturnType<typeof world>;
 type Act = { id: string; name: string; source: "agent" | "demo"; phase?: string };
@@ -42,6 +43,183 @@ function finishTurn(f: F, a: Act) {
 }
 
 const shown = (app: App, s: string) => app.shows(s);
+
+function shellApproval(f: F, options: {
+  room?: string; canDecide?: boolean; refuse?: number; actor?: string; command?: string;
+  listOverride?: { command?: string; room_id?: string; run_id?: string };
+} = {}) {
+  const room = options.room ?? "lobby";
+  const key = `acme/${room}`;
+  const activity = turn("run-shell");
+  const pending = {
+    approval_id: "sa-0123456789abcdef",
+    run_id: activity.id,
+    command: options.command ?? "printf 'Hello from Metro'",
+    requested_by: { id: "bob", name: "Bob" },
+    runner_name: "Build box",
+    approver: "owner",
+    reason_code: "policy",
+    reason: "Shell commands on this runner need approval.",
+    expires_at: new Date(Date.now() + 600_000).toISOString(),
+  };
+  post(f, { kind: "activity", actor: "agent", text: "", activity: phase(activity, "started") }, key);
+  post(f, { kind: "tool_call", actor: "agent", text: `workspace.shell ${JSON.stringify({ command: pending.command, timeout_secs: 120 })}`, activity }, key);
+  post(f, { kind: "shell_approval", actor: options.actor ?? "system", text: JSON.stringify(pending), activity }, key);
+  let done = false;
+  let canDecide = options.canDecide ?? true;
+  let reads = 0;
+  const decisions: unknown[] = [];
+  const resolve = (decision: string, by: { id: string; name: string } | null = null) => {
+    done = true;
+    const result = { approval_id: pending.approval_id, decision, by };
+    post(f, { kind: "shell_approval_resolved", actor: "system", text: JSON.stringify(result), activity }, key);
+    return result;
+  };
+  const path = "/v1/spaces/acme/shell-approvals";
+  const getKey = `GET ${BASE}/v1/*`, postKey = `POST ${BASE}/v1/*`;
+  const get = f.network[getKey]!, send = f.network[postKey]!;
+  f.network[getKey] = req => {
+    if (new URL(req.url).pathname !== path) return get(req);
+    reads++;
+    return { status: 200, body: { approvals: done ? [] : [{ ...pending, room_id: room, can_decide: canDecide, ...options.listOverride }] } };
+  };
+  f.network[postKey] = req => {
+    if (new URL(req.url).pathname !== `${path}/${pending.approval_id}`) return send(req);
+    const body = JSON.parse(req.body ?? "{}");
+    decisions.push(body);
+    if (options.refuse) {
+      canDecide = false;
+      done = options.refuse === 409;
+      return { status: options.refuse, body: { error: "Approval refused." } };
+    }
+    return { status: 200, body: resolve(body.decision, { id: "alice", name: "Alice" }) };
+  };
+  return { pending, decisions, resolve, reads: () => reads };
+}
+
+test("shell approval uses the server eligibility, posts one decision and displays the approver", async () => {
+  const f = world();
+  const { pending, decisions } = shellApproval(f);
+  const app = await signedIntoAcme(f);
+  const approve = `id:shell-approve:${pending.approval_id}`;
+  const deny = `id:shell-deny:${pending.approval_id}`;
+  await app.waitFor(approve);
+  expect(shown(app, `id:shell-approval-command:${pending.approval_id} >> text:${pending.command}`)).toBe(true);
+  expect(app.texts()).toContain(`Requested by Bob · Runner: ${pending.runner_name}`);
+  expect(app.texts()).toContain(pending.reason);
+  await app.press(approve);
+  await app.waitFor("text:Approved by you.");
+  expect(decisions).toEqual([{ decision: "approve" }]);
+  expect(shown(app, approve)).toBe(false);
+  expect(shown(app, deny)).toBe(false);
+});
+
+test("a thread member without approval rights sees the request and its expiry without actions", async () => {
+  const f = world();
+  f.addRoom("acme", { id: "work", name: "Work", parent_room_id: "lobby" });
+  const { pending, decisions, resolve, reads } = shellApproval(f, { room: "work", canDecide: false });
+  const app = await signedIntoAcme(f, "bob");
+  expect(shown(app, `text:${pending.reason}`)).toBe(false);
+  await app.press("id:room:work");
+  await app.waitFor(`text:${pending.reason}`);
+  await app.waitUntil(() => reads() > 0);
+  expect(shown(app, `id:shell-approve:${pending.approval_id}`)).toBe(false);
+  expect(shown(app, `id:shell-deny:${pending.approval_id}`)).toBe(false);
+  resolve("expired");
+  await app.waitFor("text:/Expired/i");
+  expect(decisions).toEqual([]);
+});
+
+for (const listOverride of [{ command: "pwd" }, { room_id: "other" }, { run_id: "run-other" }]) {
+  test(`a pending approval with mismatched ${Object.keys(listOverride)[0]} cannot authorize the card`, async () => {
+    const f = world();
+    const { pending, reads } = shellApproval(f, { listOverride });
+    const app = await signedIntoAcme(f);
+    await app.waitFor(`id:shell-approval:${pending.approval_id}`);
+    await app.waitUntil(() => reads() > 0);
+    expect(shown(app, `id:shell-approve:${pending.approval_id}`)).toBe(false);
+    expect(shown(app, `id:shell-deny:${pending.approval_id}`)).toBe(false);
+  });
+}
+
+test("a non-system event cannot create a shell approval card", async () => {
+  const f = world();
+  const { pending } = shellApproval(f, { actor: "bob" });
+  const app = await signedIntoAcme(f);
+  expect(shown(app, `id:shell-approval:${pending.approval_id}`)).toBe(false);
+  expect(shown(app, `id:shell-approve:${pending.approval_id}`)).toBe(false);
+});
+
+test("an approved command renders hidden formatting visibly without invalidating its raw match", async () => {
+  const f = world();
+  const command = "printf 'before\u202eafter\u200b'";
+  const { pending } = shellApproval(f, { command });
+  const app = await signedIntoAcme(f);
+  await app.waitFor(`id:shell-approve:${pending.approval_id}`);
+  expect(shown(app, `id:shell-approval-command:${pending.approval_id} >> text:/before.*after/`)).toBe(true);
+  expect(app.texts().some(s => s.includes("\u202e") || s.includes("\u200b"))).toBe(false);
+});
+
+test("shell approval limits count UTF-8 bytes and refuse NUL", () => {
+  const { pending } = shellApproval(world());
+  const parse = (command: string) => readShellApproval(JSON.stringify({ ...pending, command }));
+  const limit = "é".repeat(8192);
+  expect(parse(limit)?.command).toBe(limit);
+  expect(parse(`${limit}x`)).toBe(null);
+  expect(parse("x\0y")).toBe(null);
+  expect(parse("")).toBe(null);
+});
+
+for (const refuse of [403, 409]) {
+  test(`HTTP ${refuse} after an approval check does not claim the command was denied`, async () => {
+    const f = world();
+    const { pending, decisions, resolve } = shellApproval(f, { refuse });
+    const app = await signedIntoAcme(f);
+    const deny = `id:shell-deny:${pending.approval_id}`;
+    await app.waitFor(deny);
+    await app.press(deny);
+    await app.waitFor(`id:shell-approval-error:${pending.approval_id}`);
+    expect(decisions).toEqual([{ decision: "deny" }]);
+    expect(shown(app, "text:/Denied by/")).toBe(false);
+    expect(shown(app, deny) && app.enabled(deny)).toBe(false);
+    resolve("deny", { id: "bob", name: "Bob" });
+    await app.waitFor("text:/Denied by Bob/i");
+    expect(shown(app, deny)).toBe(false);
+  });
+}
+
+test("write and shell calls and runner output stay in their activity group", async () => {
+  const f = world();
+  const activity = turn("run-two-tools");
+  post(f, { kind: "activity", actor: "agent", text: "", activity: phase(activity, "started") });
+  const write = post(f, { kind: "tool_call", actor: "agent", text: 'workspace.write {"path":"notes.txt","content":"hello"}', activity });
+  const wrote = post(f, { kind: "tool_result", actor: "runner", text: "workspace.write ok\nwrote 5 bytes to notes.txt", activity });
+  const shell = post(f, { kind: "tool_call", actor: "agent", text: 'workspace.shell {"command":"pwd","timeout_secs":120}', activity });
+  const result = post(f, { kind: "tool_result", actor: "runner", text: "workspace.shell ok\nexit: 0\n--- stdout ---\n/workspace", activity });
+  post(f, { kind: "activity", actor: "agent", text: "", activity: phase(activity, "completed") });
+  const app = await signedIntoAcme(f);
+  const scope = "id:activity-details:agent:run-two-tools";
+  await app.press("id:activity-toggle:agent:run-two-tools");
+  await app.waitFor(scope);
+  for (const call of [write, shell]) expect(shown(app, `${scope} >> id:activity-step:${call.id}`)).toBe(true);
+  for (const output of [wrote, result]) expect(shown(app, `${scope} >> id:activity-output:${output.id}`)).toBe(true);
+  expect(shown(app, "text:wrote 5 bytes to notes.txt")).toBe(true);
+  expect(shown(app, "text:/exit: 0/")).toBe(true);
+});
+
+test("a denied shell tool is shown as not run, not a runner failure", async () => {
+  const f = world();
+  const activity = turn("run-denied-tool");
+  post(f, { kind: "activity", actor: "agent", text: "", activity: phase(activity, "started") });
+  post(f, { kind: "tool_call", actor: "agent", text: 'workspace.shell {"command":"pwd","timeout_secs":120}', activity });
+  post(f, { kind: "tool_result", actor: "system", text: "workspace.shell not run: the command was denied by Bob.", activity });
+  post(f, { kind: "activity", actor: "agent", text: "", activity: phase(activity, "completed") });
+  const app = await signedIntoAcme(f);
+  await app.press("id:activity-toggle:agent:run-denied-tool");
+  await app.waitFor("text:not run");
+  expect(shown(app, "text:the command was denied by Bob.")).toBe(true);
+  expect(shown(app, "id:activity-outcome:agent:run-denied-tool")).toBe(false);
+});
 
 test("a live turn is one line with its current step that settles into the summary", async () => {
   const f = world();

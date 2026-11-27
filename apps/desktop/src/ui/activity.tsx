@@ -230,6 +230,18 @@ export function CodeOutput(props: {
   );
 }
 
+/**
+ * One command shown whole: monospace, wrapped (never cut to one line) and
+ * selectable, in the same quiet box as code output.
+ */
+export function CommandBlock(props: { text: string; testID?: string; accessibilityLabel?: string }) {
+  return (
+    <View class="flex-col overflow-hidden rounded-(--radius-sm) border border-border bg-muted/50 px-(--space-3) py-(--space-2)" selectable testID={props.testID}>
+      <Text class="text-(length:--text-sm) font-mono text-foreground" accessibilityLabel={props.accessibilityLabel}>{props.text}</Text>
+    </View>
+  );
+}
+
 // ---------------------------------------------------------------- layout
 
 /**

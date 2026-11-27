@@ -52,7 +52,18 @@ export type InstalledRunner = {
   canReconnect: boolean;
 };
 
-export type RunnerFolder = { spaceId: string; folder: string; attached: boolean };
+export type RunnerFolder = {
+  spaceId: string;
+  /** What the next job uses. */
+  folder: string;
+  /** Absent on a Clear answer (DELETE), which doesn't check the server. */
+  attached: boolean | null;
+  defaultFolder: string | null;
+  /** A folder the person chose, not the default one. */
+  custom: boolean;
+  /** One line: the chosen folder can't be used now, and jobs fail until it's changed or cleared. */
+  problem: string | null;
+};
 
 const STATES: readonly string[] = ["not_set_up", "idle", "starting", "online", "offline", "revoked", "deleted", "interrupted", "failed", "stopped"];
 const SPACE_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -76,11 +87,31 @@ export function parseInstalledRunner(v: unknown): InstalledRunner | null {
   };
 }
 
-export function parseFolder(v: unknown, sid: string): RunnerFolder {
-  if (!isObj(v) || v.space_id !== sid || typeof v.folder !== "string" || typeof v.attached !== "boolean") {
+export function parseFolder(v: unknown, sid: string, requireAttached = true): RunnerFolder {
+  if (!isObj(v) || v.space_id !== sid || typeof v.folder !== "string" ||
+      (requireAttached ? typeof v.attached !== "boolean" : v.attached !== undefined && typeof v.attached !== "boolean")) {
     throw new BridgeError("protocol", "Metro's device helper sent folder data this app doesn't understand.");
   }
-  return { spaceId: sid, folder: v.folder, attached: v.attached };
+  return {
+    spaceId: sid,
+    folder: v.folder,
+    attached: typeof v.attached === "boolean" ? v.attached : null,
+    defaultFolder: typeof v.default_folder === "string" ? v.default_folder : null,
+    custom: v.custom === true,
+    problem: typeof v.folder_problem === "string" && v.folder_problem.trim() ? scrub(v.folder_problem) : null,
+  };
+}
+
+/** GET …/runner/folders: every chosen folder, attached or not. */
+export function parseChosenFolders(v: unknown): Record<string, string> {
+  if (!isObj(v) || !Array.isArray(v.folders)) {
+    throw new BridgeError("protocol", "Metro's device helper sent folder data this app doesn't understand.");
+  }
+  const out: Record<string, string> = {};
+  for (const f of v.folders) {
+    if (isObj(f) && typeof f.space_id === "string" && SPACE_ID_RE.test(f.space_id) && typeof f.folder === "string") out[f.space_id] = f.folder;
+  }
+  return out;
 }
 
 /** The status, or null (hidden: no launcher, no session, unknown). */
@@ -96,13 +127,26 @@ export const installedRunnerSeen = signal(false);
 export const runnerSpaces = signal<{ id: string; name: string }[]>([]);
 /** Serial of the last complete folder read for the current verified runner, if any. */
 export const installedFolderSnapshot = signal<number | null>(null);
-export const installedBusy = signal<null | "setup" | "reconnect" | `folder:${string}`>(null);
+export const installedBusy = signal<null | "setup" | "reconnect" | `folder:${string}` | `folder-set:${string}` | `folder-clear:${string}`>(null);
 export const installedError = signal<string | null>(null);
 export const installedNotice = signal<string | null>(null);
 export const folders = signal<Record<string, RunnerFolder>>({});
+/** Every folder this person chose here (space id → path), attached or not; null until read. */
+export const chosenFolders = signal<Record<string, string> | null>(null);
+/**
+ * Owned Spaces a complete, current attachment scan read successfully and
+ * found not served by this runner, for the snapshot `serial`. Null without
+ * such a scan. Never inferred from a missing, denied or failed read.
+ */
+export const verifiedDetached = signal<{ serial: number; runnerId: string; ids: ReadonlySet<string> } | null>(null);
+/** Per Space: why the last Change or Use default didn't work, said beside it. */
+export const folderErrors = signal<Record<string, string>>({});
 
 let gen = 0;
+/** The folder action that owns `installedBusy`; only it releases it. */
+let busyOp: object | null = null;
 let folderRoot = 0;
+let chosenRead = 0;
 let folderSnapshotSerial = 0;
 const sessionKey = () => `${connectedTo() ?? ""}\n${me() ?? ""}`;
 
@@ -114,10 +158,30 @@ function stillValid(): () => boolean {
   return () => mine === gen && key === sessionKey() && ok();
 }
 
+/**
+ * Takes `installedBusy` for one folder action. The release clears it only if
+ * no newer action (or a session change) took it since, even when the action's
+ * own result was dropped as stale.
+ */
+function beginFolderBusy(value: `folder:${string}` | `folder-set:${string}` | `folder-clear:${string}`): () => void {
+  const op = {};
+  busyOp = op;
+  installedBusy.set(value);
+  return () => {
+    if (busyOp !== op) return;
+    busyOp = null;
+    installedBusy.set(null);
+  };
+}
+
 function clearAttached() {
   folderRoot++;
+  chosenRead++;
   runnerSpaces.set([]);
   folders.set({});
+  chosenFolders.set(null);
+  folderErrors.set({});
+  verifiedDetached.set(null);
   installedFolderSnapshot.set(null);
 }
 
@@ -132,6 +196,7 @@ function reset() {
 
 onSessionEnd(() => {
   gen++;
+  busyOp = null;
   inflight = null;
   installedRunnerStatusWatchable.set(false);
   installedRunnerSeen.set(false);
@@ -174,13 +239,32 @@ async function loadAttached(runnerId: string, scanWanted: () => boolean): Promis
   batch(() => {
     // Merge successful exact observations independently. Individual
     // denials already settled; transient failures leave existing rows alone.
+    // Which reads were accepted as the Space's current assignment: publish
+    // refuses one a newer read or write already superseded.
+    const accepted = new Set<string>();
     for (const check of checks) {
-      if (check.ok && stillOwned.has(check.id)) check.observation.publish(check.runner);
+      if (check.ok && stillOwned.has(check.id) && check.observation.publish(check.runner)) accepted.add(check.id);
     }
     for (const { id } of runnerSpaces()) if (!stillOwned.has(id)) removeFolder(id);
     // Keep U5's complete-snapshot signal for the bounded refresh demand;
     // individual Space updates don't satisfy or restart that demand.
-    if (checks.every((check) => check.ok || check.denied)) installedFolderSnapshot.set(++folderSnapshotSerial);
+    if (checks.every((check) => check.ok || check.denied)) {
+      const serial = ++folderSnapshotSerial;
+      installedFolderSnapshot.set(serial);
+      // Proof of "not this runner" needs every owned Space read successfully
+      // and accepted as current: a denial, failure or superseded read proves
+      // nothing. (`isCurrent()` turns false once its own read is published.)
+      const complete = checks.every((check) => check.ok && (accepted.has(check.id) || !stillOwned.has(check.id)));
+      const detached = new Set<string>();
+      if (complete) {
+        for (const check of checks) {
+          if (!check.ok || !accepted.has(check.id)) continue;
+          const r = check.runner;
+          if (!(r?.kind === "registered" && r.id === runnerId)) detached.add(check.id);
+        }
+      }
+      verifiedDetached.set(complete ? { serial, runnerId, ids: detached } : null);
+    }
   });
 }
 
@@ -207,6 +291,13 @@ onSpaceRunnerObserved((sid, runner, allowFolderAdd) => {
     removeFolder(sid);
   } else if (allowFolderAdd && !runnerSpaces().some((s) => s.id === sid)) {
     runnerSpaces.set([...runnerSpaces(), { id: sid, name: space.name }]);
+  }
+  // Any later sign that it serves this Space withdraws the "detached" proof.
+  const proof = verifiedDetached();
+  if (proof?.ids.has(sid) && runner?.kind === "registered" && runner.id === id) {
+    const ids = new Set(proof.ids);
+    ids.delete(sid);
+    verifiedDetached.set({ ...proof, ids });
   }
 });
 
@@ -318,6 +409,7 @@ export async function setupInstalledRunner(): Promise<void> {
   const call = localRunnerCall();
   if (!call || installedBusy() || !installedRunner()?.canSetUp) return;
   const valid = stillValid();
+  busyOp = null; // a folder action's late release must not clear this
   installedBusy.set("setup");
   installedError.set(null);
   installedNotice.set(null);
@@ -344,6 +436,7 @@ export async function reconnectInstalledRunner(): Promise<void> {
   const call = localRunnerCall();
   if (!call || installedBusy() || !installedRunner()?.canReconnect) return;
   const valid = stillValid();
+  busyOp = null;
   installedBusy.set("reconnect");
   installedError.set(null);
   installedNotice.set(null);
@@ -374,7 +467,7 @@ export async function showRunnerFolder(sid: string): Promise<void> {
   if (!row) return;
   const valid = stillValid();
   const stillRow = () => valid() && runnerSpaces().includes(row);
-  installedBusy.set(`folder:${sid}`);
+  const release = beginFolderBusy(`folder:${sid}`);
   installedError.set(null);
   installedNotice.set(null);
   try {
@@ -394,6 +487,106 @@ export async function showRunnerFolder(sid: string): Promise<void> {
       installedError.set(message(error, "Opening the Space's folder"));
     }
   } finally {
-    if (valid()) installedBusy.set(null);
+    release();
+  }
+}
+
+function setFolderError(sid: string, message: string | null) {
+  const next = { ...folderErrors() };
+  if (message) next[sid] = message;
+  else delete next[sid];
+  folderErrors.set(next);
+}
+
+/** Reads which folders this person chose (a GET, no side effects). */
+export async function loadChosenFolders(): Promise<void> {
+  const call = localRunnerCall();
+  if (!call || !installedRunner()?.runner) return;
+  const mine = ++chosenRead;
+  const key = sessionKey();
+  const ok = sessionGuard();
+  try {
+    const chosen = parseChosenFolders(await call("GET", "/v1/local-tools/runner/folders"));
+    if (ok() && key === sessionKey() && mine === chosenRead) chosenFolders.set(chosen);
+  } catch {
+    // Unknown: offer no Use default for folders it can't show.
+  }
+}
+
+/**
+ * The person typed a folder for an attached Space and pressed Save. The
+ * bridge checks it (and again before every job); nothing is moved.
+ */
+export async function setRunnerFolder(sid: string, path: string): Promise<boolean> {
+  const call = localRunnerCall();
+  if (!call || installedBusy() || !SPACE_ID_RE.test(sid)) return false;
+  const row = runnerSpaces().find((s) => s.id === sid);
+  if (!row) return false;
+  const trimmed = path.trim();
+  if (!trimmed) {
+    setFolderError(sid, "Enter the full path of an existing folder.");
+    return false;
+  }
+  const valid = stillValid();
+  const stillRow = () => valid() && runnerSpaces().includes(row);
+  const release = beginFolderBusy(`folder-set:${sid}`);
+  setFolderError(sid, null);
+  installedError.set(null);
+  installedNotice.set(null);
+  try {
+    const f = parseFolder(await call("PUT", `/v1/local-tools/runner/spaces/${sid}/folder`, { path: trimmed }), sid);
+    if (!stillRow()) return false;
+    batch(() => {
+      folders.set({ ...folders(), [sid]: f });
+      if (chosenFolders()) chosenFolders.set({ ...chosenFolders(), [sid]: f.folder });
+    });
+    return true;
+  } catch (error) {
+    if (stillRow()) {
+      // Not a member, or this runner no longer serves the Space: the row is
+      // stale. Drop it and say why above the list, where it stays visible.
+      if (error instanceof BridgeError && ((error.status === 404 && error.code === "not_found") ||
+          (error.status === 409 && error.code === "not_attached"))) {
+        batch(() => {
+          removeFolder(sid);
+          setFolderError(sid, null);
+          installedError.set(error.code === "not_attached"
+            ? `${row.name} no longer uses this computer's runner. Nothing was changed.`
+            : message(error, "Changing the folder"));
+        });
+      } else setFolderError(sid, message(error, "Changing the folder"));
+    }
+    return false;
+  } finally {
+    release();
+  }
+}
+
+/** Use default: back to the Space's own folder. Works for Spaces no longer attached too. */
+export async function clearRunnerFolder(sid: string): Promise<void> {
+  const call = localRunnerCall();
+  if (!call || installedBusy() || !SPACE_ID_RE.test(sid)) return;
+  const valid = stillValid();
+  const release = beginFolderBusy(`folder-clear:${sid}`);
+  setFolderError(sid, null);
+  installedError.set(null);
+  installedNotice.set(null);
+  try {
+    const f = parseFolder(await call("DELETE", `/v1/local-tools/runner/spaces/${sid}/folder`), sid, false);
+    if (!valid()) return;
+    batch(() => {
+      const before = folders()[sid];
+      if (before || runnerSpaces().some((s) => s.id === sid)) folders.set({ ...folders(), [sid]: { ...f, attached: before?.attached ?? null } });
+      const chosen = chosenFolders();
+      if (chosen && Object.prototype.hasOwnProperty.call(chosen, sid)) {
+        const next = { ...chosen };
+        delete next[sid];
+        chosenFolders.set(next);
+      }
+    });
+  } catch (error) {
+    if (valid()) setFolderError(sid, message(error, "Using the default folder"));
+  } finally {
+    release();
   }
 }

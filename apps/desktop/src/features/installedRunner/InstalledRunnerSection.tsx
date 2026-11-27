@@ -8,10 +8,17 @@ import type { JSX } from "nsh";
 import { runnerBusy, runners } from "../../settings";
 import { attachMany, eligibleSpaces, installedFolderRefreshExhausted, installedRunnerChoice, retryInstalledFolderRefresh, runnerAttachBusy, runnerSessionKey } from "../../runnersState";
 import { sessionGuard, spaces } from "../../store";
-import { Action, Badge, Banner, Checkbox, Column, ConfirmInline, Label, Row, SettingRow, SettingsGroup } from "../../ui";
+import { Action, Badge, Banner, Checkbox, Column, ConfirmInline, Field, Label, Row, SettingRow, SettingsGroup } from "../../ui";
 import type { Tone } from "../../ui";
 import {
+  chosenFolders,
+  clearRunnerFolder,
+  folderErrors,
   folders,
+  installedFolderSnapshot,
+  verifiedDetached,
+  loadChosenFolders,
+  setRunnerFolder,
   installedBusy,
   installedError,
   installedNotice,
@@ -84,7 +91,7 @@ export function InstalledRunnerSection(props: { management?: JSX.Element; picks:
   );
 }
 
-const DESCRIPTION = "Built into Metro and runs while Metro is open. Agents in Spaces you attach it to can list and read files in each Space's own folder here.";
+const DESCRIPTION = "Built into Metro and runs while Metro is open. Agents in Spaces you attach it to work in each Space's folder on this computer. Commands follow its shell policy.";
 
 function Notes() {
   return (
@@ -132,6 +139,12 @@ function Section(props: { r: InstalledRunner; management?: JSX.Element; picks: A
   const r = () => props.r;
   const badge = () => installedRunnerBadge(r());
   const version = () => runners()?.find((item) => item.id === ownedInstalledRunner()?.id)?.presence?.version;
+  // Which folders were chosen: a read, so rows can show them and offer Use default.
+  effect(() => {
+    const id = r().runner?.id;
+    if (!id || ownedInstalledRunner()?.id !== id || chosenFolders() !== null) return;
+    untracked(() => void loadChosenFolders());
+  });
   return (
     <SettingsGroup
       title="This computer's runner"
@@ -140,7 +153,7 @@ function Section(props: { r: InstalledRunner; management?: JSX.Element; picks: A
     >
       <SettingRow
         label={r().runner?.name ?? (r().unconfirmedName ? `Not confirmed (asked for “${r().unconfirmedName}”)` : "Not registered yet")}
-        description={`${installedRunnerNote(r())}${version() ? `v${version()}` : "Version unknown until it connects"}. Updates with Metro. Read-only: ${r().tools.join(", ") || "workspace.list, workspace.read"}. It never changes files, runs commands or MCP servers.`}
+        description={`${installedRunnerNote(r())}${version() ? `v${version()}` : "Version unknown until it connects"}. Updates with Metro.${r().tools.length ? ` Tools: ${r().tools.join(", ")}.` : ""} It never runs checks or MCP servers.`}
       >
         <Badge testID="installed-runner-state" tone={badge().tone} label={badge().label} />
       </SettingRow>
@@ -156,59 +169,19 @@ function Section(props: { r: InstalledRunner; management?: JSX.Element; picks: A
       <AttachPicks picks={props.picks} />
       <SettingRow
         label="Folders on this computer"
-        description={runnerSpaces().length ? "Each Space gets its own folder on this computer."
+        description={runnerSpaces().length ? "Each Space uses its own folder here unless you choose one. Changing it moves no files and applies to the next job."
           : installedFolderRefreshExhausted() ? "Couldn’t verify attached Spaces." : "Attached Spaces will appear here."}
         stacked
       >
         <If when={runnerSpaces().length > 0}>
-          <Column gap={2} testID="installed-runner-spaces">
+          <Column gap={3} testID="installed-runner-spaces">
             <Each of={runnerSpaces()} key={(s) => s.id}>
-              {(s) => (
-                <Column gap={1} testID={`installed-runner-space:${s().id}`}>
-                  <Row align="center" gap={2}>
-                    <Column grow>
-                      <Label variant="strong">{s().name}</Label>
-                    </Column>
-                    <If
-                      when={folders()[s().id]}
-                      else={
-                        <Action
-                          testID={`installed-runner-folder:${s().id}`}
-                          label="Show folder"
-                          busyLabel="Opening…"
-                          busy={installedBusy() === `folder:${s().id}`}
-                          disabled={!!installedBusy() || runnerAttachBusy() || !!runnerBusy()}
-                          variant="ghost"
-                          onPress={() => void showRunnerFolder(s().id)}
-                        />
-                      }
-                    >
-                      {(f) => (
-                        <Action
-                          testID={`installed-runner-copy:${s().id}`}
-                          label={copied() === s().id ? "Copied" : "Copy path"}
-                          variant="ghost"
-                          onPress={() => {
-                            Clipboard.writeText(f().folder);
-                            copied.set(s().id);
-                          }}
-                        />
-                      )}
-                    </If>
-                  </Row>
-                  <If when={folders()[s().id]}>
-                    {(f) => (
-                      <Label variant="mono" lines={2} testID={`installed-runner-path:${s().id}`}>
-                        {f().folder}
-                      </Label>
-                    )}
-                  </If>
-                </Column>
-              )}
+              {(s) => <FolderRow space={s()} copied={copied()} onCopied={copied.set} />}
             </Each>
           </Column>
         </If>
       </SettingRow>
+      <StaleFolders />
       <Notes />
       <If when={r().canReconnect}>
         <Column padX={4} padY={3} gap={2}>
@@ -220,6 +193,129 @@ function Section(props: { r: InstalledRunner; management?: JSX.Element; picks: A
       </If>
       {props.management}
     </SettingsGroup>
+  );
+}
+
+const folderBusy = () => !!installedBusy() || runnerAttachBusy() || !!runnerBusy();
+
+/** One attached Space's folder: show it, change it by typing a path, or go back to the default. */
+function FolderRow(props: { space: { id: string; name: string }; copied: string | null; onCopied: (id: string) => void }) {
+  const sid = () => props.space.id;
+  const editing = signal(false);
+  const draft = signal("");
+  const loaded = () => folders()[sid()];
+  const chosen = () => chosenFolders()?.[sid()];
+  const shown = () => loaded()?.folder ?? chosen() ?? null;
+  const custom = () => loaded() ? loaded()!.custom : chosen() !== undefined;
+  const save = async () => {
+    if (await setRunnerFolder(sid(), draft())) editing.set(false);
+  };
+  return (
+    <Column gap={1} testID={`installed-runner-space:${sid()}`}>
+      <Row align="center" gap={2} wrap>
+        <Column grow>
+          <Label variant="strong">{props.space.name}</Label>
+        </Column>
+        <If when={shown()} else={
+          <Action testID={`installed-runner-folder:${sid()}`} label="Show folder" busyLabel="Opening…"
+            busy={installedBusy() === `folder:${sid()}`} disabled={folderBusy()} variant="ghost"
+            onPress={() => void showRunnerFolder(sid())} />
+        }>
+          {(path) => (
+            <Action testID={`installed-runner-copy:${sid()}`} label={props.copied === sid() ? "Copied" : "Copy path"} variant="ghost"
+              onPress={() => {
+                Clipboard.writeText(path());
+                props.onCopied(sid());
+              }} />
+          )}
+        </If>
+        <If when={!editing()}>
+          <Action testID={`installed-runner-folder-change:${sid()}`} label="Change…" variant="ghost" disabled={folderBusy()}
+            accessibilityLabel={`Change the folder for ${props.space.name}`}
+            onPress={() => {
+              draft.set(custom() ? shown() ?? "" : "");
+              editing.set(true);
+            }} />
+        </If>
+        <If when={custom()}>
+          <Action testID={`installed-runner-folder-default:${sid()}`} label="Use default" busyLabel="Resetting…" variant="ghost"
+            busy={installedBusy() === `folder-clear:${sid()}`} disabled={folderBusy()}
+            accessibilityLabel={`Use the default folder for ${props.space.name}`}
+            onPress={() => void clearRunnerFolder(sid())} />
+        </If>
+      </Row>
+      <If when={shown()}>
+        {(path) => (
+          <Label variant="mono" lines={2} testID={`installed-runner-path:${sid()}`}>
+            {path()}
+          </Label>
+        )}
+      </If>
+      <If when={shown() && custom()}>
+        <Label variant="caption" color="muted" testID={`installed-runner-folder-chosen:${sid()}`}>Chosen folder</Label>
+      </If>
+      <If when={loaded()?.problem}>
+        {(problem) => <Label variant="caption" color="danger" testID={`installed-runner-folder-problem:${sid()}`}>{`Jobs fail until this is fixed: ${problem()}`}</Label>}
+      </If>
+      <If when={editing()}>
+        <Column gap={2} testID={`installed-runner-folder-editor:${sid()}`}>
+          <Field testID={`installed-runner-folder-input:${sid()}`} accessibilityLabel={`Folder for ${props.space.name}`}
+            value={draft()} onChange={draft.set} placeholder="/full/path/to/folder" disabled={folderBusy()}
+            onSubmit={() => void save()} />
+          <Label variant="caption" color="muted">An existing folder. Not your home folder, a drive root, Metro's data folder, or another Space's folder.</Label>
+          <Row gap={2}>
+            <Action testID={`installed-runner-folder-save:${sid()}`} label="Save" busyLabel="Saving…" variant="primary" compact
+              busy={installedBusy() === `folder-set:${sid()}`} disabled={folderBusy() || !draft().trim()}
+              onPress={() => void save()} />
+            <Action testID={`installed-runner-folder-cancel:${sid()}`} label="Cancel" variant="ghost" compact
+              disabled={installedBusy() === `folder-set:${sid()}`} onPress={() => editing.set(false)} />
+          </Row>
+        </Column>
+      </If>
+      <If when={folderErrors()[sid()]}>
+        {(message) => <Label variant="caption" color="danger" testID={`installed-runner-folder-error:${sid()}`}>{message()}</Label>}
+      </If>
+    </Column>
+  );
+}
+
+/** Folders chosen for Spaces this runner no longer serves still count as taken until cleared. */
+function StaleFolders() {
+  const stale = () => {
+    const chosen = chosenFolders();
+    const proof = verifiedDetached();
+    // Only Spaces a complete, current scan proved this runner doesn't serve.
+    if (!chosen || !proof || proof.serial !== installedFolderSnapshot() || proof.runnerId !== ownedInstalledRunner()?.id) return [];
+    const attached = new Set(runnerSpaces().map((s) => s.id));
+    return Object.entries(chosen).filter(([sid]) => proof.ids.has(sid) && !attached.has(sid)).map(([sid, folder]) => ({
+      sid, folder, name: spaces().find((s) => s.id === sid)?.name ?? sid,
+    }));
+  };
+  return (
+    <If when={stale().length > 0}>
+      <SettingRow label="Folders for Spaces it no longer serves" testID="installed-runner-stale-folders" stacked
+        description="Other Spaces can't use these folders until you clear them.">
+        <Column gap={2}>
+          <Each of={stale()} key={(f) => f.sid}>
+            {(f) => (
+              <Column gap={1} testID={`installed-runner-stale-folder:${f().sid}`}>
+                <Row align="center" gap={2} wrap>
+                  <Column grow><Label variant="strong">{f().name}</Label></Column>
+                  <Action testID={`installed-runner-stale-default:${f().sid}`} label="Use default" busyLabel="Clearing…" variant="ghost"
+                    busy={installedBusy() === `folder-clear:${f().sid}`} disabled={folderBusy()}
+                    accessibilityLabel={`Clear the chosen folder for ${f().name}`}
+                    onPress={() => void clearRunnerFolder(f().sid)} />
+                </Row>
+                <Label variant="mono" lines={2}>{f().folder}</Label>
+                <If when={folderErrors()[f().sid]}>
+                  {(message) => <Label variant="caption" color="danger">{message()}</Label>}
+                </If>
+              </Column>
+            )}
+          </Each>
+        </Column>
+      </SettingRow>
+    </If>
   );
 }
 
@@ -277,7 +373,7 @@ function AttachPicks(props: { picks: AttachSelection }) {
     if (!installedRunnerChoice()) return "This computer's runner isn't available to attach for this account.";
     if (eligibleSpaces().length === 0) return spaces().some((s) => s.role === "owner" && s.runnerPaired === null)
       ? "Some runner assignments haven’t been confirmed yet." : "Every Space you own has a runner.";
-    return "Agents in the Spaces you choose can list and read files in their own folders on this computer.";
+    return "Agents in the Spaces you choose work in their own folders on this computer.";
   };
   return (
     <SettingRow label="Spaces without a runner" description={state()} stacked testID="runner-attach-list">
