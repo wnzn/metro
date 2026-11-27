@@ -1115,17 +1115,20 @@ fn agent_question(agents: &[(String, String)], with_none: bool) -> Question {
     if with_none {
         criteria.insert(
             NO_AGENT_KEY.to_owned(),
-            json!({"label": "No agent", "description": "Clearly only conversation between people, \
-                   with nothing an agent could usefully add."}),
+            json!({"label": "No agent", "description": "`message` is directed at or about another \
+                   person (not the sender, not an agent), or the sender says no agent should answer it."}),
         );
     }
     Question::Choice {
         instructions: json!(if with_none {
-            "Metro may let one agent decide whether to answer `message`. Pick the agent that would be \
-             most useful to see it: anything that is a question, request, task, or a remark an agent could help with, \
-             or a follow-up to an agent's recent reply in `previous`. Pick No agent only when `message` is clearly \
-             people talking only to each other (greetings, social chat, a reply to another person) and no agent could \
-             usefully add anything. When unsure, pick an agent."
+            "`sender` wrote `message` in a shared room without addressing anyone. Decide whether one \
+             agent should answer it. Lean strongly toward an agent: any question, request, task or remark \
+             to the room, and any follow-up to an agent in `previous`, gets the agent that fits it best. \
+             Pick No agent in only two cases: (1) another person is the addressee or the subject of \
+             `message`, for example it talks to someone by name, replies to or continues a conversation \
+             with another person in `previous` (see each excerpt's `speaker` and `to`), or is about what a \
+             person in `people` said or did; (2) the sender says an agent shouldn't respond (for example \
+             \"just noting\", \"not for the bot\", \"agent, don't reply\"). When unsure, pick an agent."
         } else {
             "`message` asks an agent to answer or do something. Which agent fits it best?"
         }),
@@ -1221,16 +1224,34 @@ pub async fn pick_agent(
     Decision::Answered(answer)
 }
 
-/// The room context of a classification: up to three messages or agent
-/// replies before event `before` (the message being classified, which may
-/// be stored already), never it or anything after it.
+/// Most earlier messages or agent replies a classification sees.
+const CONTEXT_EXCERPTS: usize = 8;
+/// Longest earlier excerpt, in characters.
+const CONTEXT_EXCERPT_CHARS: usize = 400;
+/// All earlier excerpts together, in characters; the newest come first.
+const CONTEXT_TOTAL_CHARS: usize = 2_400;
+/// Most other members named in `people`.
+const CONTEXT_PEOPLE: usize = 32;
+/// Longest display name sent, in characters.
+const CONTEXT_NAME_CHARS: usize = 80;
+
+fn clip(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+/// The room context of a classification, as display names only (no ids):
+/// the sender, the Space's other members, and up to [`CONTEXT_EXCERPTS`]
+/// messages or agent replies before event `before` (the message being
+/// classified, which may be stored already), never it or anything after it.
+/// Each excerpt says who wrote it, whether a person or an agent, and whom
+/// it explicitly addressed (`to`, when it named anyone).
 fn classifier_context(
     conn: &Connection,
     user: &str,
     space: &str,
     room: &str,
     before: i64,
-) -> anyhow::Result<Option<[(&'static str, Value); 3]>> {
+) -> anyhow::Result<Option<Vec<(&'static str, Value)>>> {
     if !crate::db::Db::room_member_in(conn, space, room, user)? {
         return Ok(None);
     }
@@ -1240,30 +1261,106 @@ fn classifier_context(
         params![space, room],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
+    // Current members' names; one without any name is left out, never
+    // replaced by its id.
+    let members: BTreeMap<String, String> = conn
+        .prepare_cached(
+            "SELECT m.user_id, coalesce(p.display_name, mu.name, p.default_name)
+             FROM space_members m
+             LEFT JOIN profiles p ON p.user_id = m.user_id
+             LEFT JOIN managed_users mu ON mu.id = m.user_id
+             WHERE m.space_id = ?1",
+        )?
+        .query_map([space], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?
+        .filter_map(|r| match r {
+            Ok((id, Some(n))) => Some(Ok((id, clip(&n, CONTEXT_NAME_CHARS)))),
+            Ok((_, None)) => None,
+            Err(e) => Some(Err(e)),
+        })
+        .collect::<Result<_, _>>()?;
+    let agents: BTreeMap<String, String> = conn
+        .prepare_cached("SELECT id, name FROM space_agents WHERE space_id = ?1")?
+        .query_map([space], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
     let mut stmt = conn.prepare_cached(
-        "SELECT kind, actor, substr(text, 1, 400), json_extract(activity, '$.agent.name')
+        "SELECT kind, actor, substr(text, 1, ?4), mentions, json_extract(activity, '$.agent.name')
          FROM space_events WHERE space_id = ?1 AND room_id = ?2 AND kind IN ('message', 'agent')
            AND id < ?3
-         ORDER BY id DESC LIMIT 3",
+         ORDER BY id DESC LIMIT ?5",
     )?;
-    let mut previous = stmt
-        .query_map(params![space, room, before], |r| {
-            let kind: String = r.get(0)?;
-            let actor: String = r.get(1)?;
-            let text: String = r.get(2)?;
-            let agent: Option<String> = r.get(3)?;
-            Ok(json!({
-                "speaker_kind": if kind == crate::db::kind::AGENT { "agent" } else { "person" },
-                "speaker": agent.unwrap_or(actor),
-                "text": text,
-            }))
-        })?
+    let rows = stmt
+        .query_map(
+            params![
+                space,
+                room,
+                before,
+                CONTEXT_EXCERPT_CHARS as i64,
+                CONTEXT_EXCERPTS as i64
+            ],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )?
         .collect::<Result<Vec<_>, _>>()?;
+    let mut budget = CONTEXT_TOTAL_CHARS;
+    let mut previous = Vec::new();
+    for (kind, actor, text, mentions, agent) in rows {
+        if budget == 0 {
+            break;
+        }
+        let text = clip(&text, budget);
+        budget -= text.chars().count();
+        let mut to: Vec<String> = Vec::new();
+        for m in serde_json::from_str::<Vec<Value>>(&mentions).unwrap_or_default() {
+            let named = match (m["kind"].as_str(), m["id"].as_str(), m["agent_id"].as_str()) {
+                (Some("user"), Some(id), _) => members.get(id).cloned(),
+                (Some("agent"), _, Some(id)) => agents.get(id).map(|n| clip(n, CONTEXT_NAME_CHARS)),
+                (Some("agent"), _, None) => Some("agent".to_owned()),
+                _ => None,
+            };
+            if let Some(n) = named
+                && !to.contains(&n)
+            {
+                to.push(n);
+            }
+        }
+        let is_agent = kind == crate::db::kind::AGENT;
+        let mut excerpt = json!({
+            "speaker_kind": if is_agent { "agent" } else { "person" },
+            "speaker": clip(&agent.filter(|_| is_agent).unwrap_or(actor), CONTEXT_NAME_CHARS),
+            "text": text,
+        });
+        if !to.is_empty() {
+            excerpt["to"] = json!(to);
+        }
+        previous.push(excerpt);
+    }
     previous.reverse();
-    let description: String = description.chars().take(300).collect();
-    Ok(Some([
-        ("space", json!({"name": name, "description": description})),
+    let sender = members.get(user).cloned();
+    let mut people: Vec<&String> = members
+        .iter()
+        .filter(|(id, _)| id.as_str() != user)
+        .map(|(_, n)| n)
+        .collect();
+    people.sort();
+    people.dedup();
+    people.truncate(CONTEXT_PEOPLE);
+    Ok(Some(vec![
+        (
+            "space",
+            json!({"name": name, "description": clip(&description, 300)}),
+        ),
         ("room", json!(room_name)),
+        ("sender", json!(sender)),
+        ("people", json!(people)),
         ("previous", json!(previous)),
     ]))
 }
@@ -1633,5 +1730,176 @@ mod tests {
         let default = Route::inherited(&Route::default_for(AddressedBy::Explicit));
         assert_eq!(default.connection_id, None);
         assert_eq!(default.note.source, RouteSource::Default);
+    }
+
+    #[test]
+    fn classifier_context_is_bounded_ordered_and_named() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let space = db.create_space("alice", "S", 10).unwrap();
+        let sid = space.id.clone();
+        for who in ["bob", "carol", "nameless"] {
+            db.add_member(&sid, who, 10).unwrap();
+        }
+        let author = |id: &str, name: &str| Author {
+            id: Some(id.into()),
+            name: name.into(),
+        };
+        let addressed = |mentions: Value| Addressed {
+            mentions,
+            audience: "room".into(),
+            spans: None,
+        };
+        {
+            let conn = db.lock();
+            for (id, name) in [("alice", "Alice"), ("bob", "Bob"), ("carol", "Carol")] {
+                conn.execute(
+                    "INSERT INTO profiles (user_id, display_name, updated_at) VALUES (?1, ?2, 0)",
+                    params![id, name],
+                )
+                .unwrap();
+            }
+        }
+        let agent_id: String = db
+            .lock()
+            .query_row(
+                "SELECT id FROM space_agents WHERE space_id = ?1",
+                [&sid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let post = |a: &Author, text: &str, mentions: Value| {
+            db.append_event(&sid, "lobby", kind::MESSAGE, a, text, &addressed(mentions))
+                .unwrap()
+                .id
+        };
+        let (alice, bob) = (author("alice", "Alice"), author("bob", "Bob"));
+        post(&alice, "too old", json!([]));
+        let deleted = post(&bob, "deleted", json!([]));
+        let tomb = post(&bob, "tombstone", json!([]));
+        for i in 0..4 {
+            post(&bob, &format!("m{i}"), json!([]));
+        }
+        post(
+            &alice,
+            "@carol @bob @agent look",
+            json!([{"kind": "user", "id": "carol"}, {"kind": "user", "id": "bob"},
+                   {"kind": "user", "id": "carol"}, {"kind": "agent"},
+                   {"kind": "agent", "agent_id": agent_id}, {"kind": "user", "id": "gone"}]),
+        );
+        let reply = db
+            .append_event(
+                &sid,
+                "lobby",
+                kind::AGENT,
+                &author("x", "agent"),
+                &"r".repeat(500),
+                &Addressed::room(),
+            )
+            .unwrap()
+            .id;
+        db.lock()
+            .execute(
+                "UPDATE space_events SET activity = json_object('agent', json_object('name', 'Metro'))
+                 WHERE id = ?1",
+                [reply],
+            )
+            .unwrap();
+        post(&bob, &"b".repeat(2_000), json!([]));
+        post(&bob, &"c".repeat(2_000), json!([]));
+        let before = post(&alice, "the message", json!([]));
+        post(&bob, "after", json!([]));
+        {
+            let conn = db.lock();
+            conn.execute("DELETE FROM space_events WHERE id = ?1", [deleted])
+                .unwrap();
+            conn.execute(
+                "UPDATE space_events SET kind = 'deleted' WHERE id = ?1",
+                [tomb],
+            )
+            .unwrap();
+        }
+
+        let context = |user: &str, before: i64| {
+            classifier_context(&db.lock(), user, &sid, "lobby", before)
+                .unwrap()
+                .map(|c| c.into_iter().collect::<BTreeMap<_, _>>())
+        };
+        assert!(
+            context("mallory", before).is_none(),
+            "non-members get nothing"
+        );
+        let c = context("alice", before).unwrap();
+        assert_eq!(c["sender"], "Alice");
+        // Nameless members are left out, never sent as their id.
+        assert_eq!(c["people"], json!(["Bob", "Carol"]));
+        let previous = c["previous"].as_array().unwrap();
+        // The newest eight, oldest first; the total budget clips the oldest.
+        let texts: Vec<&str> = previous
+            .iter()
+            .map(|e| e["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(previous.len(), CONTEXT_EXCERPTS);
+        assert!(
+            !texts
+                .iter()
+                .any(|t| ["too old", "deleted", "tombstone", "the message", "after"].contains(t))
+        );
+        assert_eq!(&texts[..4], ["m0", "m1", "m2", "m3"]);
+        assert_eq!(texts[6].chars().count(), CONTEXT_EXCERPT_CHARS);
+        assert_eq!(
+            previous
+                .iter()
+                .map(|e| e["text"].as_str().unwrap().chars().count())
+                .sum::<usize>(),
+            CONTEXT_TOTAL_CHARS.min(4 * 2 + 23 + 3 * CONTEXT_EXCERPT_CHARS)
+        );
+        assert_eq!(previous[4]["to"], json!(["Carol", "Bob", "agent", "Metro"]));
+        assert_eq!(
+            (&previous[4]["speaker"], &previous[4]["speaker_kind"]),
+            (&json!("Alice"), &json!("person"))
+        );
+        assert_eq!(
+            (&previous[5]["speaker"], &previous[5]["speaker_kind"]),
+            (&json!("Metro"), &json!("agent"))
+        );
+        assert!(previous[5].get("to").is_none());
+
+        // A tight budget keeps the newest excerpts and stops.
+        for i in 0..8 {
+            post(&bob, &"z".repeat(400 + i), json!([]));
+        }
+        let c = context("bob", i64::MAX).unwrap();
+        let previous = c["previous"].as_array().unwrap();
+        assert_eq!(previous.len(), CONTEXT_TOTAL_CHARS / CONTEXT_EXCERPT_CHARS);
+        assert_eq!(c["sender"], "Bob");
+        assert_eq!(c["people"], json!(["Alice", "Carol"]));
+    }
+
+    #[test]
+    fn agent_question_leans_to_an_agent_except_for_other_people() {
+        let agents = [("Metro".to_owned(), "Helps.".to_owned())];
+        let Question::Choice {
+            instructions,
+            criteria,
+        } = agent_question(&agents, true)
+        else {
+            panic!("not a choice");
+        };
+        let text = instructions.as_str().unwrap();
+        for needle in [
+            "Lean strongly toward an agent",
+            "another person",
+            "subject",
+            "`to`",
+            "shouldn't respond",
+            "When unsure, pick an agent.",
+        ] {
+            assert!(text.contains(needle), "{needle}");
+        }
+        assert_eq!(criteria.keys().collect::<Vec<_>>(), ["agent_1", "no_agent"]);
+        let Question::Choice { criteria, .. } = agent_question(&agents, false) else {
+            panic!("not a choice");
+        };
+        assert_eq!(criteria.keys().collect::<Vec<_>>(), ["agent_1"]);
     }
 }
