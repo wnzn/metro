@@ -423,6 +423,16 @@ see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
   agent history and do not mirror to the parent. Personal Chat has no
   direct runner, workspace or agent-thread tools; reactions and web
   tools keep their separate rules.
+- **Chat threads** belong to the Chat's owner alone (no admin bypass;
+  unknown is 404): a new thread, or a reply thread anchored to a
+  main-Chat message or reply, one level deep. Each is its own Chat-agent
+  conversation with its own history, summaries, turns and Stop; a reply
+  thread's history starts with its anchor unless deleted. Only the owner
+  renames one. Deleting a thread is permanent and in one transaction
+  removes its events, reactions, attachment links, search vectors,
+  summaries and pending decisions, and stops its turns; a deleted anchor
+  stays as a tombstone while its thread exists. Scheduled prompts
+  target the main Chat only.
 - The database is pinned to one identity namespace. Never assign legacy or
   foreign history to anyone.
 - Desktop startup can show the Shell after verifying identity and

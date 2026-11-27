@@ -1,5 +1,13 @@
 # In the source, not released
 
+## Metro 0.6.2 (in the source, not released)
+
+- **Chat threads.** Your personal Chat can have threads: start one with
+  **New thread**, or choose **Reply** on a Chat message. Each thread is
+  its own conversation with Metro, with its own history, summaries and
+  **Stop**. Rename or delete a thread from its menu; deleting is
+  permanent and removes everything in it. See [Chat threads](messages.md#chat-threads).
+
 These changes are in the source planned for Metro 0.6.1, after the
 published [Metro 0.6.0](released-0.6.0.md). See [Acceptance](acceptance.md)
 for release records.

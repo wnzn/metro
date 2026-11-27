@@ -2,7 +2,8 @@
 
 Markdown, Reply, Forward, the directory and DMs are in the published
 [Metro 0.6.0](released-0.6.0.md). **Delete** is in the source, not
-released, planned for 0.6.1 ([source overview](next-source.md)).
+released, planned for 0.6.1, and **Chat threads** are in the source, not
+released, planned for 0.6.2 ([source overview](next-source.md)).
 
 ## Markdown
 
@@ -33,8 +34,31 @@ without agent attribution use the default agent. If the original agent
 was deleted, only the sender gets a notice, and no agent substitutes for
 it. Normal addressing rules still apply to other explicit recipients.
 
-In a DM, Reply quotes a message inline. Personal Chat has Forward but
-no Reply control.
+In a DM, Reply quotes a message inline. In your personal Chat, **Reply**
+opens a Chat thread (below).
+
+## Chat threads
+
+**In the source, not released (0.6.2).** Your personal Chat can have
+threads: separate conversations with Metro, listed under **Chat** in the
+navigation while the Chat is open. Use **New thread** and give it a title,
+or choose **Reply** on a message or reply in the main Chat to open the
+thread for that message; the same message always opens the same thread,
+and the reply count under it leads back. Threads are one level deep.
+
+Each thread is its own conversation: Metro sees only that thread's
+messages (and, in a reply thread, the message it replies to), with its
+own summaries, `/compact` and **Stop**. Metro in Chat and web tools work
+as in the main Chat. Scheduled prompts still post to the main Chat.
+
+Only you see your threads; there is no admin bypass. Use the thread's
+**⋯** menu to **Rename** it, or to **Delete** it after a confirmation.
+Deleting a thread is permanent: its messages, replies, reactions,
+attachment links (the Library files stay), search index entries and
+summaries are removed, so no later run sends them to a model, and a
+reply Metro is still writing there stops. Deleting a main-Chat message
+that has a thread leaves a **Message deleted** line while the thread
+exists.
 
 ## Forward
 
@@ -120,6 +144,30 @@ conversations and messages generally return `404`.
   `addressing_note.kind: "reply_agent_unavailable"` on the POST response.
   Messages sent by Metro expose `via: "metro"` at top level.
 
+### Chat threads
+
+**In the source, not released (0.6.2).** Only the Chat's owner can use
+these; anyone else, and an unknown thread, gets `404`.
+
+| Request | Does |
+| --- | --- |
+| `GET /v1/chat/threads` | `{threads}`, most recently active first |
+| `POST /v1/chat/threads` with `{title?}` | Creates a thread (`201`); the title defaults to `New thread` |
+| `POST /v1/chat/events/{eid}/thread` with `{}` | The reply thread of main-Chat `message` or `agent` event `eid`: `201` if created, `200` if it exists; an event in a thread or of another kind gives `409` |
+| `PATCH /v1/chat/threads/{tid}` with `{title}` | Renames it |
+| `DELETE /v1/chat/threads/{tid}` | Deletes it and everything in it: `{deleted: true, events}` |
+
+A thread has `id`, `title`, `anchor_event_id` (reply threads only),
+`created_at`, `last_at` and `count` (messages and replies). Titles are 1
+to 80 printable characters; a Chat has at most 500 threads.
+`GET /v1/chat/events`, `POST /v1/chat/messages` and `POST /v1/chat/compact`
+take `?thread={tid}` for a thread; without it they use the main Chat.
+On a main-Chat anchor, `replies` gives the thread's id as `room_id` and
+its `count`. A Chat search hit in a thread has `space_id: null` and the
+thread's id as `room_id`. The `events` of a thread deletion are
+`message_deleted` events of the main Chat, for a deleted anchor that only
+stayed for that thread.
+
 ### Deleting messages
 
 **In the source, not released (0.6.1).**
@@ -137,7 +185,8 @@ gets `403`; anything other than a `message` or `agent` event gives `409`.
 A `message_deleted` event arrives through the normal `after` poll; its
 `text` is JSON `{target_event_id, tombstone}`. With `tombstone: true`,
 the target stays as a `kind: "deleted"` event with no text, recipients
-or metadata, anchoring its reply thread. A deletion also removes the
+or metadata, anchoring its reply thread (in a Space or your Chat). A
+deletion also removes the
 `compaction` events that cover it in its own room and in the reply thread
 anchored on it, each with its own `message_deleted` event. DM polls
 include deletions only with `GET /v1/dms/{id}/events?after=&deletions=1`,
