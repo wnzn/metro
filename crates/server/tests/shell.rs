@@ -302,26 +302,16 @@ impl Server {
         .0
     }
 
-    /// Give the Space's default agent the shell and write tools.
-    async fn allow_tools(&self, sid: &str) {
+    /// Set the Space's default agent's explicit tool allowlist.
+    async fn set_tools(&self, sid: &str, tools: &[&str]) {
         let (_, body) = self.get(ALICE, &format!("/v1/spaces/{sid}/agents")).await;
-        assert!(
-            !body["default_tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|t| t == "workspace.shell" || t == "workspace.write"),
-            "{body}"
-        );
-        let catalog = body["tools"].as_array().unwrap();
-        assert!(catalog.iter().any(|t| t == "workspace.shell"));
         let aid = body["agents"][0]["id"].as_str().unwrap().to_owned();
         let (status, body) = self
             .send(
                 reqwest::Method::PATCH,
                 ALICE,
                 &format!("/v1/spaces/{sid}/agents/{aid}"),
-                Some(json!({"tools": ["workspace.list", "workspace.shell", "workspace.write"]})),
+                Some(json!({"tools": tools})),
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -514,7 +504,6 @@ async fn dedicated_space(s: &Server) -> (String, String) {
     let sid = s.space(ALICE, "Team").await;
     s.add(ALICE, &sid, "bob").await;
     let token = s.dedicated(ALICE, &sid).await;
-    s.allow_tools(&sid).await;
     (sid, token)
 }
 
@@ -815,7 +804,6 @@ async fn classify_uses_the_runner_owners_system_one_and_falls_back_to_approval()
         .register(ALICE, json!({"name": "laptop", "visibility": "personal"}))
         .await;
     assert_eq!(s.attach(ALICE, &sid, &rid).await, StatusCode::OK);
-    s.allow_tools(&sid).await;
     let (status, body) = s
         .put(
             ALICE,
@@ -1156,7 +1144,6 @@ async fn org_admins_approve_only_in_spaces_they_belong_to() {
         .register(CAROL, json!({"name": "farm", "visibility": "organization"}))
         .await;
     assert_eq!(s.attach(ALICE, &sid, &org).await, StatusCode::OK);
-    s.allow_tools(&sid).await;
     s.ask(BOB, &sid, "@agent list").await;
     let a = s.approval(&sid).await;
     let id = a["approval_id"].as_str().unwrap();
@@ -1182,25 +1169,27 @@ async fn org_admins_approve_only_in_spaces_they_belong_to() {
 }
 
 #[tokio::test]
-async fn write_needs_no_approval_and_both_tools_are_opt_in() {
+async fn write_needs_no_approval_and_an_explicit_list_drops_both_tools() {
     let s = Server::start().await;
     let sid = s.space(ALICE, "Docs").await;
     let token = s.dedicated(ALICE, &sid).await;
-    // Without the tools on the agent, the model is never offered them.
-    s.ask(ALICE, &sid, "@agent please write").await;
-    s.completed(&sid).await;
-    s.idle().await;
-    {
-        let reqs = s.model.lock().unwrap();
-        let names = reqs[0]["tools"].to_string();
+    let (_, body) = s.get(ALICE, &format!("/v1/spaces/{sid}/agents")).await;
+    for tool in ["workspace.write", "workspace.shell"] {
         assert!(
-            names.contains("workspace_list")
-                && !names.contains("workspace_shell")
-                && !names.contains("workspace_write"),
-            "{names}"
+            body["default_tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t == tool)
+                && body["agents"][0]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t == tool),
+            "{body}"
         );
     }
-    s.allow_tools(&sid).await;
+    // The default agent has both; write runs without approval.
     s.ask(ALICE, &sid, "@agent please write").await;
     let job = s.claim(&token).await;
     assert_eq!(job["tool"], "workspace.write");
@@ -1217,11 +1206,31 @@ async fn write_needs_no_approval_and_both_tools_are_opt_in() {
         e["kind"] == "agent" && e["text"].as_str().unwrap().contains("wrote 2 bytes")
     })
     .await;
+    s.idle().await;
     assert!(
         !s.events(ALICE, &sid)
             .await
             .iter()
             .any(|e| e["kind"] == "shell_approval")
+    );
+    // An explicit list without them: the model is never offered them.
+    s.set_tools(&sid, &["workspace.list"]).await;
+    let before = s.model.lock().unwrap().len();
+    s.ask(ALICE, &sid, "@agent please write").await;
+    for _ in 0..400 {
+        if s.model.lock().unwrap().len() > before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    s.idle().await;
+    let reqs = s.model.lock().unwrap();
+    let names = reqs[before]["tools"].to_string();
+    assert!(
+        names.contains("workspace_list")
+            && !names.contains("workspace_shell")
+            && !names.contains("workspace_write"),
+        "{names}"
     );
 }
 

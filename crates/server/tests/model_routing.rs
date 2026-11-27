@@ -1722,7 +1722,7 @@ async fn space_agents_are_owner_managed_and_member_readable() {
     assert_eq!(agents[0]["name"], "Metro");
     assert_eq!(agents[0]["handle"], "agent");
     assert_eq!(agents[0]["is_default"], true);
-    assert_eq!(agents[0]["tools"].as_array().unwrap().len(), 6);
+    assert_eq!(agents[0]["tools"].as_array().unwrap().len(), 8);
     // Outsiders: 404; members: 403.
     let (s, _) = h.req(reqwest::Method::GET, "carol", &path, None).await;
     assert_eq!(s, StatusCode::NOT_FOUND);

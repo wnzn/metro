@@ -76,10 +76,9 @@ def run_shell(server, runner, timeout):
         room = f"{space}/rooms/lobby"
         call(alice, "POST", f"{space}/members", body={"user_id": "bob"})
         agents = call(alice, "GET", f"{space}/agents", read_json=True)
-        require("workspace.shell" not in agents["default_tools"], "shell is on by default")
-        aid = agents["agents"][0]["id"]
-        call(alice, "PATCH", f"{space}/agents/{aid}",
-             body={"tools": ["workspace.list", "workspace.write", "workspace.shell"]})
+        for tool in ("workspace.write", "workspace.shell"):
+            require(tool in agents["default_tools"] and tool in agents["agents"][0]["tools"],
+                    f"{tool} is not on by default")
         token = issue_token(call, alice, f"{space}/runner-token", "issue the runner token")
         children.append(start_child(stack, "runner", runner, state, env | {
             "METRO_RUNNER_TOKEN": token,
