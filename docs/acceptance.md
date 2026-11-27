@@ -3,6 +3,11 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Source only: Metro 0.6.3 version bump (2026-11-28, local)
+
+- `python3 -m unittest discover -s packaging`: 206 passed, 63 skipped.
+- `cargo check --locked` passed.
+
 ## Published: Metro 0.6.2 (2026-11-27, GitHub release v0.6.2)
 
 **What was published.** The stable
