@@ -218,9 +218,15 @@ see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
   "No agent" for an unaddressed message (without "No agent" for the
   generic `@agent`). The options are keyed internally, so model text
   never becomes an agent id. For unaddressed text, send the new text,
-  Space and room names, Space description and up to three preceding
-  human or agent excerpts to the sender's System One connection. Lean
-  toward a useful agent: below the directedness threshold or on failure,
+  Space and room names, Space description, the display names of the
+  sender and the Space's other members (never ids), and up to eight
+  preceding human or agent excerpts (400 characters each, 2,400 in
+  total, newest kept), each with its author's name, whether a person or
+  an agent, and the names it explicitly addressed, to the sender's
+  System One connection. In a reply thread the anchor (unless deleted)
+  is the first excerpt, within those bounds and always kept. Lean strongly toward a useful agent; "No agent"
+  is for text directed at or about another person, or that says no
+  agent should answer. Below the directedness threshold or on failure,
   start nothing; at or above it, "No agent" uses the strongest agent
   option. Default is 0.35 (range 0.2–1); migrate stored 0.85 values once.
   Failure on unaddressed text returns an unstored `addressing_note` to

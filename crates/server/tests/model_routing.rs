@@ -723,11 +723,11 @@ async fn addressing_inference_is_opt_in_thresholded_and_abstains() {
     h.quiet_after("alice", Some(&sid), e["id"].as_i64().unwrap())
         .await;
     assert_eq!(h.fake.calls(), 0);
-    for text in [
-        "context one".to_owned(),
-        "文".repeat(401),
-        "context three".to_owned(),
-    ] {
+    // Nine earlier messages: the oldest (alice's) falls outside the window.
+    let mut earlier: Vec<String> = (0..6).map(|i| format!("context {i}")).collect();
+    earlier.push("文".repeat(401));
+    earlier.push("@alice what do you think?".to_owned());
+    for text in &earlier {
         h.say("bob", Some(&sid), json!({"text": text})).await;
     }
     let (s, v) = h
@@ -767,7 +767,7 @@ async fn addressing_inference_is_opt_in_thresholded_and_abstains() {
         .route_after("alice", Some(&sid), e["id"].as_i64().unwrap())
         .await;
     assert_eq!(route["addressed_by"], "classifier");
-    // The message and up to three earlier messages, with no metadata IDs.
+    // The message and up to eight earlier messages, with names and no ids.
     let (user, space, conn, payload, questions) = h.fake.last_call();
     assert_eq!(
         (user.as_str(), space.as_deref()),
@@ -782,10 +782,18 @@ async fn addressing_inference_is_opt_in_thresholded_and_abstains() {
             "where": "a shared room",
             "space": {"name": "infer", "description": ""},
             "room": "lobby",
+            "sender": "alice",
+            "people": ["bob"],
             "previous": [
-                {"speaker_kind": "person", "speaker": "bob", "text": "context one"},
+                {"speaker_kind": "person", "speaker": "bob", "text": "context 0"},
+                {"speaker_kind": "person", "speaker": "bob", "text": "context 1"},
+                {"speaker_kind": "person", "speaker": "bob", "text": "context 2"},
+                {"speaker_kind": "person", "speaker": "bob", "text": "context 3"},
+                {"speaker_kind": "person", "speaker": "bob", "text": "context 4"},
+                {"speaker_kind": "person", "speaker": "bob", "text": "context 5"},
                 {"speaker_kind": "person", "speaker": "bob", "text": "文".repeat(400)},
-                {"speaker_kind": "person", "speaker": "bob", "text": "context three"}
+                {"speaker_kind": "person", "speaker": "bob", "text": "@alice what do you think?",
+                 "to": ["alice"]}
             ]
         })
     );
@@ -800,6 +808,12 @@ async fn addressing_inference_is_opt_in_thresholded_and_abstains() {
             .as_str()
             .unwrap()
             .contains("When unsure, pick an agent.")
+    );
+    assert!(
+        options["no_agent"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("another person")
     );
     assert!(questions.get("use_case").is_none(), "routing is off");
 
@@ -872,10 +886,61 @@ async fn addressing_inference_is_opt_in_thresholded_and_abstains() {
     assert!(started.get("pick").is_none(), "{started}");
     assert_eq!(started["agent"]["id"], coder);
     let (_, _, _, payload, _) = h.fake.last_call();
-    assert_eq!(payload["previous"][2]["speaker_kind"], "agent");
-    assert_eq!(payload["previous"][2]["speaker"], "Metro");
+    let previous = payload["previous"].as_array().unwrap();
+    assert_eq!(previous.len(), 8);
+    let last = previous.last().unwrap();
+    assert_eq!(
+        (&last["speaker_kind"], &last["speaker"]),
+        (&json!("agent"), &json!("Metro"))
+    );
+    let to = |text: &str| {
+        previous
+            .iter()
+            .find(|e| e["text"] == text)
+            .map(|e| e["to"].clone())
+    };
+    assert_eq!(to("@bob [yes] can you look?"), Some(json!(["bob"])));
+    assert_eq!(to("@agent [no] hi"), Some(json!(["agent"])));
+    assert_eq!(to("lunch?"), Some(Value::Null));
     h.answer_after("alice", Some(&sid), e["id"].as_i64().unwrap())
         .await;
+
+    // In a reply thread, its anchor in the parent room comes first.
+    let anchor = h
+        .events("alice", Some(&sid))
+        .await
+        .into_iter()
+        .find(|e| e["text"] == "@alice what do you think?")
+        .unwrap();
+    let (s, thread) = h
+        .post(
+            "alice",
+            &format!(
+                "/v1/spaces/{sid}/rooms/lobby/events/{}/thread",
+                anchor["id"]
+            ),
+            json!({}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{thread}");
+    let (s, e) = h
+        .post(
+            "alice",
+            &format!(
+                "/v1/spaces/{sid}/rooms/{}/messages",
+                thread["id"].as_str().unwrap()
+            ),
+            json!({"text": "noted, thanks"}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{e}");
+    let (_, _, _, payload, _) = h.fake.last_call();
+    assert_eq!(payload["message"], "noted, thanks");
+    assert_eq!(
+        payload["previous"],
+        json!([{"speaker_kind": "person", "speaker": "bob", "text": "@alice what do you think?",
+                "to": ["alice"], "anchor": true}])
+    );
 }
 
 #[tokio::test]

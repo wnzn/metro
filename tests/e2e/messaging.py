@@ -23,7 +23,11 @@ class Classifier(Vendor):
         state = body["state"]
         require(state["message"] == CLASSIFY, "classifier received an explicitly addressed or forwarded turn")
         require(state["space"]["name"] == "Messaging Lab" and state["room"]
-                and state["previous"][-1]["text"] == ANCHOR,
+                and state["previous"][-1]["text"] == ANCHOR
+                and state["previous"][-1]["speaker_kind"] == "agent"
+                and len(state["previous"]) <= 8
+                and not any(e.get("anchor") for e in state["previous"])
+                and isinstance(state["sender"], str) and isinstance(state["people"], list),
                 "classifier did not get recent room context")
         question = body["questions"]
         require(set(question) == {"agent"} and question["agent"]["type"] == "choice"
