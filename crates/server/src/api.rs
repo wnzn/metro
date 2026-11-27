@@ -985,6 +985,22 @@ pub struct ChatMessage {
     /// The sender's own personal library files to attach.
     #[serde(default)]
     asset_ids: Vec<String>,
+    /// What happens while an earlier turn is running: `queue` (default)
+    /// waits for it to end, `steer` joins it ([`crate::steering`]).
+    #[serde(default)]
+    delivery: Delivery,
+}
+
+/// How a Chat message sent while a turn runs is handled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Delivery {
+    /// Its own turn, once every earlier one has ended.
+    #[default]
+    Queue,
+    /// Into the running turn, at its next model call; if that turn ends
+    /// first, its own turn as with `queue`.
+    Steer,
 }
 
 fn chat_invokes_agent() -> bool {
@@ -1051,17 +1067,20 @@ pub async fn chat_message(
         scope: crate::decisions::Scope::Personal,
         user_id: who.id.clone(),
         place: None,
-        payload: json!({"choice": body.provider_connection_id.as_ref().map(|id| json!({
-            "provider_connection_id": id,
-            "model_id": body.model_id,
-            "reasoning_effort": body.reasoning_effort,
-        }))}),
+        payload: json!({
+            "choice": body.provider_connection_id.as_ref().map(|id| json!({
+                "provider_connection_id": id,
+                "model_id": body.model_id,
+                "reasoning_effort": body.reasoning_effort,
+            })),
+            "delivery": body.delivery,
+        }),
         claimed_by: state.decisions.epoch().to_owned(),
         turn_id: Some(turn.clone()),
     });
     let addressed = addressed(&resolved);
     let (uid, author, stored) = (who.id.clone(), who.author(), text.clone());
-    let ids = body.asset_ids;
+    let (ids, delivery) = (body.asset_ids, body.delivery);
     let place = Place::Personal {
         user_id: uid.clone(),
     };
@@ -1096,7 +1115,9 @@ pub async fn chat_message(
     if let (Some(how), Some(turn)) = (how, turn_id.clone()) {
         let (state, user, event) = (state.clone(), who.id.clone(), event.clone());
         let watch = crate::decisions::Watch::chat(&state, &user, event.id, Some(&turn));
-        tokio::spawn(chat_turn(state, user, event, how, ticket, turn, watch));
+        tokio::spawn(chat_turn(
+            state, user, event, how, ticket, turn, watch, delivery,
+        ));
     }
     Ok((
         StatusCode::ACCEPTED,
@@ -1120,10 +1141,14 @@ pub(crate) enum ChatRoute {
 }
 
 /// Route and start the Chat turn answering `event` once `ticket` is served,
-/// so a person's turns start in send order. The turn is registered first,
-/// while it waits and routes, so Stop and the busy check see it; one
-/// stopped meanwhile never starts. Its pending decision is settled with its
-/// `started` marker, or here when nothing starts.
+/// that is once every earlier turn of the person has ended: turns run one
+/// at a time, in send order. The turn is registered first, while it waits
+/// and routes, so Stop and the busy check see it; one stopped meanwhile
+/// never starts. Its pending decision is settled with its `started` marker
+/// (or its `steered` marker), or here when nothing starts. With
+/// [`Delivery::Steer`] it's first offered to the running turn
+/// ([`crate::steering`]); handed back, it waits its turn like any other.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn chat_turn(
     state: AppState,
     user: String,
@@ -1132,11 +1157,24 @@ pub(crate) async fn chat_turn(
     ticket: crate::decisions::Ticket,
     turn_id: String,
     watch: crate::decisions::Watch,
+    delivery: Delivery,
 ) {
     use crate::decisions::{Scope, forget};
     let turn = crate::db::Activity::agent(turn_id, crate::db::Activity::AGENT_NAME);
     let (cancel, guard) = state.chat_runs.register(&turn.id, &user);
-    let _in_line = ticket.wait().await;
+    if delivery == Delivery::Steer {
+        let place = crate::steering::Place::Chat { user: user.clone() };
+        if let Some(taken) = state
+            .steering
+            .offer(&place, event.id, false, Some(cancel.clone()))
+            && taken.await.is_ok()
+        {
+            // In the running turn now; its marker settled the pending turn.
+            watch.done();
+            return;
+        }
+    }
+    let in_line = ticket.wait().await;
     let route = match how {
         ChatRoute::Chosen(route) => *route,
         ChatRoute::Routing(settings) => {
@@ -1176,6 +1214,7 @@ pub(crate) async fn chat_turn(
         cancel,
         guard,
         started,
+        line: Some(in_line),
     };
     // A turn that cannot start says why in the Chat.
     if crate::agent::start_chat_turn(&state, &user, &event, route, start)
@@ -1188,8 +1227,23 @@ pub(crate) async fn chat_turn(
     // Hold the line until this turn's `started` marker is written (or it
     // found its message deleted, or the turn stopped first). Anything else
     // (the start failed or panicked before its marker) is said in the Chat.
-    if written.await.is_ok() {
-        watch.done();
+    match written.await {
+        Ok(true) => watch.done(),
+        // Not started. Stopped just before its marker: its pending turn is
+        // dropped too (another process's is left alone).
+        Ok(false) => {
+            watch.done();
+            let id = event.id;
+            let stopped = state
+                .db
+                .call(move |db| crate::decisions::cancelled(db, id))
+                .await
+                .unwrap_or(false);
+            if stopped {
+                forget(&state, Scope::Personal, event.id).await;
+            }
+        }
+        Err(_) => {}
     }
 }
 
@@ -1302,7 +1356,18 @@ pub(crate) async fn resume_chat_turn(
             }
         },
     };
-    chat_turn(state, row.user_id, event, how, ticket, turn_id, watch).await;
+    let delivery = serde_json::from_value(row.payload["delivery"].clone()).unwrap_or_default();
+    chat_turn(
+        state,
+        row.user_id,
+        event,
+        how,
+        ticket,
+        turn_id,
+        watch,
+        delivery,
+    )
+    .await;
 }
 
 #[cfg(test)]

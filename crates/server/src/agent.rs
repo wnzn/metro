@@ -401,6 +401,7 @@ fn event_message(e: &Event, key: &TurnKey) -> Option<Message> {
 /// (or flatten their parts into one string), so the part boundary alone
 /// cannot tell Metro's context from text that imitates it; the key can,
 /// since nobody writing a message knows it.
+#[derive(Clone)]
 struct TurnKey(String);
 
 impl TurnKey {
@@ -947,6 +948,22 @@ impl AgentHook for ReasoningSummaries {
     }
 }
 
+/// The [`crate::steering::Steer`] hook of a run keyed `key`.
+fn steer_hook(
+    state: &AppState,
+    inbox: &Arc<crate::steering::Inbox>,
+    turn: &Activity,
+    key: &TurnKey,
+) -> crate::steering::Steer {
+    let key = key.clone();
+    crate::steering::Steer::new(
+        state,
+        inbox.clone(),
+        turn,
+        Arc::new(move |e| user_turn(e, &key)),
+    )
+}
+
 // ---- Space rooms ----
 
 /// Start an agent run in `room` of `space_id` answering `trigger` (already
@@ -1194,6 +1211,23 @@ async fn execute_room_run(
 ) {
     let built_from = model.built_from.clone();
     let limits = state.config.limits.clone();
+    // A run answering a person's own message takes the messages that person
+    // then sends this agent in the same room or thread. Held until the run's
+    // reply is stored (see execute_personal_run).
+    let inbox = match &initiator.id {
+        Some(user) if trigger.kind == kind::MESSAGE && trigger.actor_id.as_ref() == Some(user) => {
+            state
+                .steering
+                .open(crate::steering::Place::Room {
+                    space: space_id.to_owned(),
+                    room: room.id.clone(),
+                    agent: agent.id.clone(),
+                    user: user.clone(),
+                })
+                .map(Arc::new)
+        }
+        _ => None,
+    };
     let loaded = {
         let (space, room_id, before, n, agent_id, user, fetch) = (
             space_id.to_owned(),
@@ -1257,6 +1291,9 @@ async fn execute_room_run(
                     parent_events,
                     anchor,
                     context,
+                    // Replies written after the message, before this run
+                    // started (it waited for a decision or a running run).
+                    Db::replies_after_in(&tx, &space, &room_id, before, n)?,
                 ))
             })
             .await
@@ -1270,7 +1307,7 @@ async fn execute_room_run(
                 Code::AgentHistoryUnavailable,
             )
         }
-        Ok((earlier, paired, parent_events, anchor, context)) => {
+        Ok((earlier, paired, parent_events, anchor, context, late)) => {
             let agent_rules = agent_preamble(agent);
             let window = crate::compaction::window(
                 state,
@@ -1418,7 +1455,12 @@ async fn execute_room_run(
                     turn: turn.clone(),
                 });
             }
+            if let Some(inbox) = &inbox {
+                builder = builder.add_hook(steer_hook(state, inbox, turn, &key));
+            }
             let prompt = user_turn(trigger, &key);
+            let mut window = window;
+            window.events.extend(late);
             let mut history = history(&window.events, &key);
             if let Some(anchor) = &anchor {
                 history.insert(
@@ -1972,6 +2014,9 @@ pub struct ChatStart {
     /// deliberately not started (stopped, its message deleted, or another
     /// process holds it). Dropped unsent: the start failed (or panicked).
     pub started: tokio::sync::oneshot::Sender<bool>,
+    /// The turn's place in its sender's line, held until it ends: the next
+    /// message waits (it is queued) until then.
+    pub line: Option<crate::decisions::Turn>,
 }
 
 /// [`start_personal_run`] for a turn registered already. It starts only if
@@ -2131,16 +2176,30 @@ async fn execute_personal_run(
     let built_from = model.built_from.clone();
     let limits = state.config.limits.clone();
     // A Chat turn can be stopped by its owner (`POST /v1/chat/turns/{id}/stop`).
-    let (cancel, _registered, started_signal) = match (lane.clone(), chat) {
-        (PersonalLane::Chat, Some(chat)) => {
-            (Some(chat.cancel), Some(chat.guard), Some(chat.started))
-        }
+    let (cancel, _registered, started_signal, _line) = match (lane.clone(), chat) {
+        (PersonalLane::Chat, Some(chat)) => (
+            Some(chat.cancel),
+            Some(chat.guard),
+            Some(chat.started),
+            Some(chat.line),
+        ),
         (PersonalLane::Chat, None) => {
             let (cancel, guard) = state.chat_runs.register(&turn.id, &user_id);
-            (Some(cancel), Some(guard), None)
+            (Some(cancel), Some(guard), None, None)
         }
-        (PersonalLane::Page { .. }, _) => (None, None, None),
+        (PersonalLane::Page { .. }, _) => (None, None, None, None),
     };
+    // A turn from the sender's line takes the messages they steer into it.
+    // Held until the turn's reply is stored: what it never took then waits
+    // its turn, which sees that reply.
+    let inbox = _line.as_ref().and_then(|_| {
+        state
+            .steering
+            .open(crate::steering::Place::Chat {
+                user: user_id.clone(),
+            })
+            .map(Arc::new)
+    });
     // Stopped before it started: nothing to show.
     if cancel.as_ref().is_some_and(|c| *c.borrow()) {
         if let Some(signal) = started_signal {
@@ -2291,6 +2350,20 @@ async fn execute_personal_run(
         }
         PersonalLane::Page { .. } => crate::compaction::Window::today(earlier.clone()),
     };
+    // A turn that waited in line also sees the replies written after its
+    // message, before it started.
+    let mut window = window;
+    if lane == PersonalLane::Chat {
+        let (user, after, n) = (user_id.clone(), trigger.id, limits.agent_history);
+        match state
+            .db
+            .call(move |db| db.personal_replies_after(&user, after, n))
+            .await
+        {
+            Ok(late) => window.events.extend(late),
+            Err(e) => tracing::error!(error = %format!("{e:#}"), "loading later Chat replies"),
+        }
+    }
     let mut builder = model
         .builder()
         .preamble(PREAMBLE)
@@ -2357,6 +2430,9 @@ async fn execute_personal_run(
             },
             turn: turn.clone(),
         });
+    if let Some(inbox) = &inbox {
+        builder = builder.add_hook(steer_hook(&state, inbox, &turn, &key));
+    }
     let prompt = user_turn(&trigger, &key);
     let phase = match drive(
         &state,

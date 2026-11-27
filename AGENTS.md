@@ -210,6 +210,17 @@ see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
 
   The same routing below still applies to choose each run's answering
   model. The agent's history shows each message's author and recipients.
+- **Steering.** A message that would start agent A for sender S in a
+  Space room or thread where A is running a run S started from S's own
+  message (or, in Chat, a steer while S's turn runs) is delivered into
+  that run at its next model call instead of starting another. Space
+  messages always steer this way unless they carry an explicit model for
+  the turn; another person's message or one for another agent starts its
+  own run, and people-only messages never reach a run. Delivery rechecks
+  in one transaction that it's still S's message, S may still read the
+  room and (Chat) it wasn't stopped, and writes a `steered` marker (never
+  a message, history or indexed). Anything not delivered when the run
+  ends starts as it would have. Inboxes are memory only.
 - The desktop sends verified Space mentions as stable IDs and validated
   text ranges. Never silently retarget an ambiguous, changed or stale
   mention; keep the original draft when send is refused. Manual Dispatch
@@ -290,7 +301,11 @@ see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
   decision, registered before it routes, started in storage order, and
   never started if its message was deleted. Stop works before it starts:
   it's saved in the pending row before it's acknowledged, so a restart
-  doesn't start it.
+  doesn't start it. A person's turns run one at a time (**Queue**, the
+  default): the next starts when the running one ends, and Stop ends
+  only the running one. With `delivery: "steer"` the message goes into
+  the running turn at its next model call instead; if that turn ends
+  first, it is queued like any other (see Steering below).
 - **Metro in Chat** can read and act as the user in their eligible
   Spaces. The per-account switch is on by default but gated on showing
   the notice, with per-Space exclusions and live access checks. Space

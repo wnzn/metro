@@ -203,3 +203,14 @@ test("short arguments, the live step, and the summary's parts", () => {
   expect(durationText({ ...g, firstMs: 0, lastMs: 400 })).toBe(null);
   expect(durationText({ ...g, outcome: "live", firstMs: 0, lastMs: 9_000 })).toBe(null);
 });
+
+test("a steered marker is no row and leaves its running turn live", () => {
+  const items = groupTranscript([
+    ev("message", "alice", "@agent go"),
+    ev("activity", "agent", "", run("r9", "Metro", "started")),
+    ev("message", "alice", "also this"),
+    ev("steered", "agent", "", { ...run("r9"), steered: 3 }),
+  ]);
+  expect(shape(items)).toEqual(["message:@agent go", "[agent:r9 0]", "message:also this"]);
+  expect(groups(items)[0]!.outcome).toBe("live");
+});

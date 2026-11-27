@@ -2180,14 +2180,15 @@ async fn the_runs_source_lists_the_newest_run_first() {
     })
     .await;
     let s = Server::start(Some(m.config.clone())).await;
-    let sid = s.space(ALICE, "Team", &[]).await;
+    let sid = s.space(ALICE, "Team", &["bob"]).await;
     let src = r#"export default <Page title="R"><Data name="runs" source="runs" limit={1}/><RunList key="l" from={runs}/></Page>"#;
     let p = s.create_page(ALICE, space_scope(&sid), src).await;
     let pid = p["id"].as_str().unwrap().to_owned();
-    for text in ["@agent first run", "@agent second run"] {
+    // Two senders: one sender's second message would steer the first run.
+    for (who, text) in [(ALICE, "@agent first run"), (BOB, "@agent second run")] {
         let (st, v) = s
             .post(
-                ALICE,
+                who,
                 &format!("/v1/spaces/{sid}/rooms/lobby/messages"),
                 json!({"text": text}),
             )

@@ -43,6 +43,7 @@ pub mod space_agents;
 mod space_context;
 pub mod space_prefs;
 pub mod spaces;
+pub mod steering;
 pub mod tools;
 pub mod updates;
 pub mod web_devices;
@@ -103,6 +104,8 @@ pub struct AppState {
     pub compaction: Arc<crate::compaction::Compaction>,
     /// Outcomes of decisions made after a message was stored (memory only).
     pub decisions: Arc<crate::decisions::Pending>,
+    /// Inboxes of running turns that take steering (memory only).
+    pub steering: Arc<crate::steering::Steering>,
 }
 
 impl AppState {
@@ -149,6 +152,7 @@ impl AppState {
             chat_runs: Arc::default(),
             compaction: Arc::default(),
             decisions: Arc::default(),
+            steering: Arc::default(),
             meta_waits: Arc::new(Semaphore::new((limits.max_agent_runs / 2).max(1))),
             managed,
             library,
