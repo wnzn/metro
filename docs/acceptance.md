@@ -5,11 +5,26 @@ hasn't been demonstrated.
 
 ## Source only: Metro 0.6.3 desktop and runner review fixes (2026-11-28, local)
 
-Local Linux builds of `feat/runner-shell-write` only; not a release.
+**Integrated gate** on `feat/runner-shell-write` at
+`c259b0fe304cb7a97477cb1114eeb13db28c3e50`. Local Linux builds only;
+not a release.
 
-- `nsh check` passed; desktop `nsh test` 1015/1015.
-- `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings` passed.
-- `cargo test -p metro-runner`: 102 passed.
+- `cargo fmt --check`, Clippy with `-D warnings` and the locked debug
+  build passed. `cargo test --locked --workspace`: 1,347 passed, 0
+  failed, 3 ignored, across 82 suites.
+- E2e 18/18 passed: `agent_pages`, `attachments`, `compaction`,
+  `device_connector`, `intelligence`, `library`, `library_reference`,
+  `message_lifecycle`, `messaging`, `meta_agent`, `pages`, `schedules`,
+  `settings`, `shell`, `smoke`, `threads`, `updates` and `web_search`.
+  The reference worker ran locally with a test-only encoder; `updates`
+  used separate fixture binaries. The TUI PTY test also passed.
+- Packaging: 250 passed, 19 skipped with PyYAML (206 passed, 63 skipped
+  without it).
+- Desktop: `nsh check` passed; full `nsh test` 1015/1015 on the same
+  commit, not rerun for this gate.
+- Reviews: Opus 5.5; review fixes are included in the tested commit.
+- **Not verified:** native Windows, junction refusal on real Windows,
+  or real vendor runs and sign-ins.
 
 ## Source only: Metro 0.6.3 version bump (2026-11-28, local)
 
