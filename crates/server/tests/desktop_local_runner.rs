@@ -2,8 +2,8 @@
 //! launcher's `LocalServer` starts this crate's real `metro-server` binary
 //! (Unix: inherited fd; Windows: the socket description on stdin), the real
 //! bridge binds the session, and `DesktopTools` serves the Space either with
-//! its per-Space local tools or with this computer's installed (registered)
-//! runner. Each case presses Test runner, restarts the app on the same data
+//! its per-Space local tools or with this computer's built-in (registered)
+//! runner, set up by the installer's marker or by pressing Set up. Each case presses Test runner, restarts the app on the same data
 //! and presses it again. No model is involved.
 //!
 //! Native Windows CI runs this file (release.yml, desktop-windows), because
@@ -252,5 +252,56 @@ async fn the_installed_runner_answers_test_runner_before_and_after_a_restart() {
         "runner-marker.txt",
         "after restart",
     );
+    app.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_built_in_runner_set_up_by_a_press_answers_test_runner_after_a_restart() {
+    let t = tempfile::tempdir().unwrap();
+    let app = App::launch(t.path(), Marker::Absent).await;
+    let (_, v) = app.ui("GET", "/v1/local-tools/runner", None).await;
+    assert_eq!(v["state"], "not_set_up", "{v}");
+    let (s, v) = app
+        .ui("POST", "/v1/local-tools/runner/setup", Some(json!({})))
+        .await;
+    assert_eq!(s, 200, "{v}");
+    assert!(
+        !v.to_string().contains("metro_rt_"),
+        "no token in the answer"
+    );
+    let start = Instant::now();
+    let runner = loop {
+        let (_, v) = app.ui("GET", "/v1/local-tools/runner", None).await;
+        if v["state"] == "online" {
+            break v["runner"]["id"].as_str().unwrap().to_owned();
+        }
+        assert!(start.elapsed() < Duration::from_secs(30), "runner: {v}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let sid = new_space(&app, "Built-in runner").await;
+    let (s, v) = app
+        .server(
+            "POST",
+            &format!("/v1/spaces/{sid}/runner/attach-if-empty"),
+            Some(json!({"runner_id": runner})),
+        )
+        .await;
+    assert_eq!(s, 200, "{v}");
+    let (s, v) = app
+        .ui(
+            "POST",
+            &format!("/v1/local-tools/runner/spaces/{sid}/folder"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!((s, &v["attached"]), (200, &json!(true)), "{v}");
+    let folder = v["folder"].as_str().unwrap().to_owned();
+    std::fs::write(Path::new(&folder).join("pressed.txt"), b"x").unwrap();
+    assert_listing(&app.test_runner(&sid).await, "pressed.txt", "first launch");
+    app.close().await;
+
+    // Starts with the app again, without the marker or another press.
+    let app = App::launch(t.path(), Marker::Absent).await;
+    assert_listing(&app.test_runner(&sid).await, "pressed.txt", "after restart");
     app.close().await;
 }

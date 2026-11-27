@@ -1,10 +1,11 @@
-//! The desktop's installer-requested personal registered runner
+//! The desktop's built-in personal registered runner
 //! (`metro_connector::desktop_tools::runner`) against this real server over
-//! HTTP, with throwaway accounts: created once and resumed, never attached
-//! by Metro, Space isolation across two Spaces, revocation and deletion not
-//! undone automatically, explicit reconnect, interrupted creation, account
-//! switch, and nothing at all without the installer's marker. No model is
-//! involved, and no token is ever printed.
+//! HTTP, with throwaway accounts: set up by an explicit press on any
+//! signed-in server (or by the installer's marker on the own hosted server),
+//! created once and resumed, never attached by Metro, Space isolation across
+//! two Spaces, revocation and deletion not undone automatically, explicit
+//! reconnect, delete then forget, interrupted creation, and account switch.
+//! No model is involved, and no token is ever printed.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,7 +14,7 @@ use std::time::Duration;
 
 use metro_connector::Secret;
 use metro_connector::desktop_tools::runner::{self, Marker, Record, RecordState};
-use metro_connector::desktop_tools::{DesktopTools, HostedSession, store};
+use metro_connector::desktop_tools::{BoundSession, DesktopTools, store};
 use metro_server::auth::{AuthFailure, AuthFuture, HumanAuth, UserIdentity};
 use metro_server::db::Db;
 use metro_server::{AppState, Config, Limits, router};
@@ -225,9 +226,14 @@ impl Server {
         panic!("no tool_result #{n} in {sid}");
     }
 
-    fn hosted(&self, bearer: &str, account: &str) -> HostedSession {
+    fn hosted(&self, bearer: &str, account: &str) -> BoundSession {
         let t = Secret::new(bearer);
-        HostedSession::verify(Some(&self.base), Some(&t), &self.base, &t, account).unwrap()
+        BoundSession::verify(Some(&self.base), Some(&t), &self.base, &t, account).unwrap()
+    }
+
+    /// A session of a server that isn't this app's own (as a remote one).
+    fn signed_in(&self, bearer: &str, account: &str) -> BoundSession {
+        BoundSession::signed_in(&self.base, &Secret::new(bearer), account).unwrap()
     }
 }
 
@@ -235,7 +241,7 @@ fn tools(root: &Path, marker: Marker) -> DesktopTools {
     DesktopTools::new(root.to_path_buf()).with_local_runner(marker)
 }
 
-async fn runner_status(t: &DesktopTools, h: Option<&HostedSession>) -> Value {
+async fn runner_status(t: &DesktopTools, h: Option<&BoundSession>) -> Value {
     let (s, v) = t
         .handle("GET", "/v1/local-tools/runner", b"", h.cloned())
         .await;
@@ -244,7 +250,7 @@ async fn runner_status(t: &DesktopTools, h: Option<&HostedSession>) -> Value {
     v
 }
 
-async fn wait_state(t: &DesktopTools, h: &HostedSession, want: &str) -> Value {
+async fn wait_state(t: &DesktopTools, h: &BoundSession, want: &str) -> Value {
     for _ in 0..400 {
         let v = runner_status(t, Some(h)).await;
         if v["state"] == want {
@@ -258,7 +264,7 @@ async fn wait_state(t: &DesktopTools, h: &HostedSession, want: &str) -> Value {
     );
 }
 
-async fn reconnect(t: &DesktopTools, h: &HostedSession) -> (u16, Value) {
+async fn reconnect(t: &DesktopTools, h: &BoundSession) -> (u16, Value) {
     t.handle(
         "POST",
         "/v1/local-tools/runner/reconnect",
@@ -268,8 +274,19 @@ async fn reconnect(t: &DesktopTools, h: &HostedSession) -> (u16, Value) {
     .await
 }
 
+async fn press(t: &DesktopTools, h: &BoundSession, action: &str, body: Value) -> (u16, Value) {
+    let body = body.to_string();
+    t.handle(
+        "POST",
+        &format!("/v1/local-tools/runner/{action}"),
+        body.as_bytes(),
+        Some(h.clone()),
+    )
+    .await
+}
+
 /// Reconnect to a runner the person picked by id.
-async fn reconnect_to(t: &DesktopTools, h: &HostedSession, id: &str) -> (u16, Value) {
+async fn reconnect_to(t: &DesktopTools, h: &BoundSession, id: &str) -> (u16, Value) {
     let body = json!({"runner_id": id}).to_string();
     t.handle(
         "POST",
@@ -281,7 +298,7 @@ async fn reconnect_to(t: &DesktopTools, h: &HostedSession, id: &str) -> (u16, Va
 }
 
 /// A record as a crash right after the create call leaves it.
-fn plant(root: &Path, h: &HostedSession, state: RecordState, name: &str, id: Option<&str>) {
+fn plant(root: &Path, h: &BoundSession, state: RecordState, name: &str, id: Option<&str>) {
     let r = store::open_root(root).unwrap();
     let rec = Record {
         server_url: h.server_url().to_owned(),
@@ -294,7 +311,7 @@ fn plant(root: &Path, h: &HostedSession, state: RecordState, name: &str, id: Opt
     runner::save(&r, h, &rec).unwrap();
 }
 
-async fn folder(t: &DesktopTools, h: &HostedSession, sid: &str) -> (u16, Value) {
+async fn folder(t: &DesktopTools, h: &BoundSession, sid: &str) -> (u16, Value) {
     t.handle(
         "POST",
         &format!("/v1/local-tools/runner/spaces/{sid}/folder"),
@@ -304,12 +321,12 @@ async fn folder(t: &DesktopTools, h: &HostedSession, sid: &str) -> (u16, Value) 
     .await
 }
 
-fn record(root: &Path, h: &HostedSession) -> Option<Record> {
+fn record(root: &Path, h: &BoundSession) -> Option<Record> {
     let r = store::open_root(root).unwrap();
     runner::load(&r, h).unwrap()
 }
 
-fn record_path(root: &Path, h: &HostedSession) -> PathBuf {
+fn record_path(root: &Path, h: &BoundSession) -> PathBuf {
     root.join("runner")
         .join(runner::identity_dir(h.server_url(), h.account_id()))
         .join("runner.json")
@@ -332,8 +349,8 @@ async fn created_once_resumed_and_serves_only_attached_spaces() {
     let t = tools(&root, Marker::Accepted);
     t.resume(alice.clone()).await;
     let st = wait_state(&t, &alice, "online").await;
-    assert_eq!(st["requested"], true);
     assert_eq!(st["available"], true);
+    assert_eq!(st["can_set_up"], false);
     assert_eq!(st["tools"], json!(["workspace.list", "workspace.read"]));
     let runners = s.personal_runners(ALICE).await;
     assert_eq!(runners.len(), 1, "exactly one runner");
@@ -678,41 +695,170 @@ async fn a_known_id_is_kept_and_reconnect_rotates_only_that_runner() {
 }
 
 #[tokio::test]
-async fn nothing_without_the_marker_or_the_own_server_and_account_switch_stops() {
+async fn set_up_by_a_press_on_any_signed_in_server_then_deleted_and_forgotten() {
+    let s = Server::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("local-tools");
+    // Not this app's own server, and no installer marker.
+    let alice = s.signed_in(ALICE, "alice");
+    let a = s.space(ALICE, "remote").await;
+
+    // Signed in: offered, but nothing is created until the press.
+    let t = tools(&root, Marker::Absent);
+    t.resume(alice.clone()).await;
+    let v = runner_status(&t, Some(&alice)).await;
+    assert_eq!(v["state"], "not_set_up", "{v}");
+    assert_eq!(v["available"], true);
+    assert_eq!(v["can_set_up"], true);
+    assert_eq!(v["can_reconnect"], false);
+    let (st, v) = reconnect(&t, &alice).await;
+    assert_eq!(
+        (st, &v["error"]["code"]),
+        (409, &json!("not_set_up")),
+        "{v}"
+    );
+    assert!(s.personal_runners(ALICE).await.is_empty());
+    assert!(record(&root, &alice).is_none());
+    // A marker counts only on the own hosted server.
+    let t = tools(&root, Marker::Accepted);
+    t.resume(alice.clone()).await;
+    assert_eq!(runner_status(&t, Some(&alice)).await["state"], "not_set_up");
+    assert!(s.personal_runners(ALICE).await.is_empty());
+    // Per-Space local tools stay the own server's only.
+    let (st, v) = t
+        .handle(
+            "POST",
+            &format!("/v1/local-tools/spaces/{a}/enable"),
+            b"{}",
+            Some(alice.clone()),
+        )
+        .await;
+    assert_eq!((st, &v["error"]["code"]), (409, &json!("not_local")), "{v}");
+    let (_, all) = t
+        .handle("GET", "/v1/local-tools", b"", Some(alice.clone()))
+        .await;
+    assert_eq!(all["available"], false, "{all}");
+    assert_eq!(all["local_runner"]["state"], "not_set_up", "{all}");
+
+    // Set up: one runner, attached to nothing, token kept privately.
+    let (st, v) = press(&t, &alice, "setup", json!({})).await;
+    assert_eq!(st, 200, "{v}");
+    let v = wait_state(&t, &alice, "online").await;
+    let rid = v["runner"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(s.personal_runners(ALICE).await.len(), 1);
+    assert!(s.space_runner(ALICE, &a).await.is_null());
+    let (st, v) = press(&t, &alice, "setup", json!({})).await;
+    assert_eq!(st, 200, "idempotent while it runs: {v}");
+    assert_eq!(s.personal_runners(ALICE).await.len(), 1);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let m = std::fs::metadata(record_path(&root, &alice)).unwrap();
+        assert_eq!(m.permissions().mode() & 0o777, 0o600);
+    }
+
+    // Attached by the owner, it serves the Space's own folder; it starts
+    // again with the next launch without a press.
+    assert_eq!(s.attach(ALICE, &a, &rid).await, StatusCode::OK);
+    let (code, f) = folder(&t, &alice, &a).await;
+    assert_eq!((code, &f["attached"]), (200, &json!(true)), "{f}");
+    let f = PathBuf::from(f["folder"].as_str().unwrap());
+    std::fs::write(f.join("remote.txt"), "hi").unwrap();
+    t.stop_all().await;
+    assert_eq!(t.local_runner_id().await, None, "stops with the app");
+    let t = tools(&root, Marker::Absent);
+    t.resume(alice.clone()).await;
+    wait_state(&t, &alice, "online").await;
+    let (st, v) = s.demo(ALICE, &a).await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+    let r = s.wait_tool_result(ALICE, &a, 1).await.to_string();
+    assert!(r.contains("remote.txt"), "{r}");
+
+    // Forget is refused while the server still has it, and for another id.
+    let (st, v) = press(&t, &alice, "forget", json!({"runner_id": rid})).await;
+    assert_eq!(
+        (st, &v["error"]["code"]),
+        (409, &json!("runner_exists")),
+        "{v}"
+    );
+    let (st, _) = press(&t, &alice, "forget", json!({})).await;
+    assert_eq!(st, 422);
+    // Deleted in Settings, then forgotten: off here, folders kept.
+    let (st, _) = s
+        .send(
+            reqwest::Method::DELETE,
+            ALICE,
+            &format!("/v1/runners/{rid}"),
+            None,
+        )
+        .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (st, v) = press(&t, &alice, "forget", json!({"runner_id": "rn-other"})).await;
+    assert_eq!(
+        (st, &v["error"]["code"]),
+        (409, &json!("runner_changed")),
+        "{v}"
+    );
+    let (st, v) = press(&t, &alice, "forget", json!({"runner_id": rid})).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["state"], "not_set_up", "{v}");
+    assert_eq!(v["can_set_up"], true);
+    assert!(v["runner"].is_null(), "{v}");
+    assert_eq!(t.local_runner_id().await, None);
+    assert_eq!(record(&root, &alice).unwrap().state, RecordState::Off);
+    assert!(f.join("remote.txt").is_file(), "the Space's folder stays");
+    // Off survives a restart and the marker, and nothing is recreated.
+    t.stop_all().await;
+    let hosted = s.hosted(ALICE, "alice");
+    let t = tools(&root, Marker::Accepted);
+    t.resume(hosted.clone()).await;
+    assert_eq!(
+        runner_status(&t, Some(&hosted)).await["state"],
+        "not_set_up"
+    );
+    assert!(s.personal_runners(ALICE).await.is_empty());
+    // Set up again: a new runner.
+    let (st, v) = press(&t, &hosted, "setup", json!({})).await;
+    assert_eq!(st, 200, "{v}");
+    let v = wait_state(&t, &hosted, "online").await;
+    assert_ne!(v["runner"]["id"], rid.as_str());
+    t.stop_all().await;
+}
+
+#[tokio::test]
+async fn the_marker_sets_it_up_on_the_own_server_and_account_switch_stops() {
     let s = Server::start().await;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("local-tools");
     let alice = s.hosted(ALICE, "alice");
 
-    // No marker, or an untrusted one: nothing is created.
+    // No marker, or an untrusted one: nothing is created without a press.
     for m in [Marker::Absent, Marker::Rejected("not empty".into())] {
         let t = tools(&root, m);
         t.resume(alice.clone()).await;
         let v = runner_status(&t, Some(&alice)).await;
-        assert_eq!(v["state"], "not_requested", "{v}");
-        assert_eq!(v["requested"], false);
-        let (st, v) = reconnect(&t, &alice).await;
-        assert_eq!(st, 409, "{v}");
+        assert_eq!(v["state"], "not_set_up", "{v}");
+        assert_eq!(v["can_set_up"], true);
         assert!(s.personal_runners(ALICE).await.is_empty());
     }
     assert!(record(&root, &alice).is_none());
 
-    // Marker, but not this app's own server session: unavailable.
+    // No session bound: unavailable.
     let t = tools(&root, Marker::Accepted);
     let v = runner_status(&t, None).await;
     assert_eq!(v["state"], "unavailable", "{v}");
     let (st, v) = t
-        .handle("POST", "/v1/local-tools/runner/reconnect", b"{}", None)
+        .handle("POST", "/v1/local-tools/runner/setup", b"{}", None)
         .await;
     assert_eq!(st, 409, "{v}");
-    assert_eq!(v["error"]["code"], "not_local");
+    assert_eq!(v["error"]["code"], "no_session");
     let (st, v) = t.handle("GET", "/v1/local-tools", b"", None).await;
     assert_eq!(st, 200);
     assert_eq!(v["local_runner"]["state"], "unavailable");
     assert!(s.personal_runners(ALICE).await.is_empty());
 
-    // Own server: created. Then another account binds: Alice's worker
-    // stops; Bob's is separate (own record and folders).
+    // Own server with the marker: created. Then another account binds:
+    // Alice's worker stops; Bob's is separate (own record and folders).
     t.resume(alice.clone()).await;
     wait_state(&t, &alice, "online").await;
     let alice_rid = t.local_runner_id().await.unwrap();

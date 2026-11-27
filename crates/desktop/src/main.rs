@@ -480,11 +480,12 @@ async fn launch(
     Ok(Launched::Exit(exit_code(status)))
 }
 
-/// Local workspace tools (read-only folders per hosted Space), primary
-/// instance only. With the installer's `enable-local-runner` marker (next to
-/// this launcher; on macOS beside the outer Metro.app in its private install
-/// folder), also this computer's personal registered runner on the own
-/// hosted server.
+/// Local workspace tools (read-only folders per hosted Space) and this
+/// computer's built-in personal registered runner, primary instance only.
+/// The runner is set up from Settings › Runners for any signed-in server;
+/// the installer's `enable-local-runner` marker (next to this launcher; on
+/// macOS beside the outer Metro.app in its private install folder) also sets
+/// it up without a press on the own hosted server.
 fn tools_hook(root: &Path, primary: bool) -> Option<Arc<dyn ToolsHook>> {
     use metro_connector::desktop_tools::runner;
     primary.then(|| {

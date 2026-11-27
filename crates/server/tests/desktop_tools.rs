@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use metro_connector::Secret;
-use metro_connector::desktop_tools::{DesktopTools, HostedSession, store};
+use metro_connector::desktop_tools::{BoundSession, DesktopTools, store};
 use metro_server::auth::{AuthFailure, AuthFuture, HumanAuth, UserIdentity};
 use metro_server::db::Db;
 use metro_server::{AppState, Config, Limits, router};
@@ -195,13 +195,13 @@ impl Server {
 
     /// What the launcher does: the local server's URL and bearer are the
     /// session's, so verification succeeds.
-    fn hosted(&self, bearer: &str, account: &str) -> HostedSession {
+    fn hosted(&self, bearer: &str, account: &str) -> BoundSession {
         let t = Secret::new(bearer);
-        HostedSession::verify(Some(&self.base), Some(&t), &self.base, &t, account).unwrap()
+        BoundSession::verify(Some(&self.base), Some(&t), &self.base, &t, account).unwrap()
     }
 }
 
-async fn enable(tools: &DesktopTools, h: &HostedSession, sid: &str) -> (u16, Value) {
+async fn enable(tools: &DesktopTools, h: &BoundSession, sid: &str) -> (u16, Value) {
     tools
         .handle(
             "POST",
@@ -212,7 +212,7 @@ async fn enable(tools: &DesktopTools, h: &HostedSession, sid: &str) -> (u16, Val
         .await
 }
 
-async fn disable(tools: &DesktopTools, h: &HostedSession, sid: &str) -> (u16, Value) {
+async fn disable(tools: &DesktopTools, h: &BoundSession, sid: &str) -> (u16, Value) {
     tools
         .handle(
             "POST",
@@ -223,7 +223,7 @@ async fn disable(tools: &DesktopTools, h: &HostedSession, sid: &str) -> (u16, Va
         .await
 }
 
-async fn status(tools: &DesktopTools, h: Option<&HostedSession>) -> Value {
+async fn status(tools: &DesktopTools, h: Option<&BoundSession>) -> Value {
     let (s, v) = tools
         .handle("GET", "/v1/local-tools", b"", h.cloned())
         .await;
@@ -231,7 +231,7 @@ async fn status(tools: &DesktopTools, h: Option<&HostedSession>) -> Value {
     v
 }
 
-async fn wait_worker(tools: &DesktopTools, h: &HostedSession, sid: &str, want: &str) -> Value {
+async fn wait_worker(tools: &DesktopTools, h: &BoundSession, sid: &str, want: &str) -> Value {
     for _ in 0..400 {
         let v = status(tools, Some(h)).await;
         if let Some(e) = v["spaces"]
@@ -759,7 +759,7 @@ async fn owner_only_member_isolation_and_account_switch() {
     // A session that isn't this desktop's own server gets nothing.
     let t = Secret::new(ALICE);
     assert!(
-        HostedSession::verify(Some("http://127.0.0.1:1"), Some(&t), &s.base, &t, "alice").is_none()
+        BoundSession::verify(Some("http://127.0.0.1:1"), Some(&t), &s.base, &t, "alice").is_none()
     );
     let v = status(&tools, None).await;
     assert_eq!(v["available"], false);

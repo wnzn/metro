@@ -5,11 +5,12 @@
 //! What this is and isn't:
 //!
 //! - Only for the desktop's **own** hosted server. The bridge builds a
-//!   [`HostedSession`] with [`HostedSession::verify`], which succeeds only
-//!   when the bound session's URL and bearer are exactly the ones the
+//!   [`BoundSession`] with [`BoundSession::verify`], which marks it hosted
+//!   only when the bound session's URL and bearer are exactly the ones the
 //!   desktop's local server manager handed out for the server it is running
-//!   now. Any other server (a remote one, another localhost process, another
-//!   account) gets no tools: there is no fallback and no global token.
+//!   now. Any other session ([`BoundSession::signed_in`]: a remote server,
+//!   another localhost process) gets no per-Space local tools: there is no
+//!   fallback and no global token.
 //! - Explicit, per Space, owner only. The Space owner turns it on for one
 //!   Space. The real server checks ownership; this module only asks it.
 //!   Pairing uses `POST /v1/spaces/{sid}/runner-token/issue-if-empty`,
@@ -26,8 +27,8 @@
 //! - Never model auth, and never anything for personal Chat: a dedicated
 //!   runner token serves only its Space's jobs, and personal Chat has no
 //!   runner tools on the server.
-//! - Workers run only while the bridge has the desktop's own server bound,
-//!   and stop on sign-out, server or account switch, and app exit
+//! - Pairing workers run only while the bridge has the desktop's own server
+//!   bound, and stop on sign-out, server or account switch, and app exit
 //!   ([`DesktopTools::stop_all`]).
 //!
 //! Bridge integration (launcher lane):
@@ -35,15 +36,17 @@
 //! ```text
 //! let tools = DesktopTools::new(desktop_root.join("local-tools"));
 //! // GET /v1/local-tools, POST /v1/local-tools/spaces/{sid}/enable|disable-if-current:
-//! let (status, json) = tools.handle(method, path, body, hosted_session_or_none).await;
-//! tools.resume(hosted).await;   // after POST /v1/session bound the local server
+//! let (status, json) = tools.handle(method, path, body, bound_session_or_none).await;
+//! tools.resume(session).await;  // after POST /v1/session bound a server
 //! tools.stop_all().await;       // DELETE /v1/session, switch, shutdown
 //! ```
 //!
-//! Separately, and only when the installer asked for it, [`runner`] keeps
-//! one **personal registered runner** for this computer on the same own
-//! hosted server (`DesktopTools::new(..).with_local_runner(marker)`). It is
-//! a different thing from the per-Space dedicated pairings above: neither
+//! Separately, [`runner`] keeps one **personal registered runner** for
+//! this computer, built into the app, on whichever server the person is
+//! signed in to: set up by an explicit action in Settings (or, on the own
+//! hosted server, automatically when the installer's marker asked for it),
+//! then resumed with every session of that server and account. It is a
+//! different thing from the per-Space dedicated pairings above: neither
 //! stands in for the other, and Metro never attaches it to a Space.
 
 pub mod folder;
@@ -65,22 +68,28 @@ use hosted::{CallError, Hosted, SpaceRunner};
 use store::{Pairing, PairingState};
 use worker::WorkerState;
 
-/// Proof that the bridge's current session is the desktop's own hosted
-/// server, as it runs now. Only [`HostedSession::verify`] makes one.
+/// The bridge's bound session (server, bearer, account), and whether it is
+/// the desktop's own hosted server as it runs now ([`BoundSession::verify`]).
 #[derive(Clone)]
-pub struct HostedSession {
+pub struct BoundSession {
     server_url: String,
     token: Secret,
     account_id: String,
+    hosted: bool,
 }
 
-impl std::fmt::Debug for HostedSession {
+impl std::fmt::Debug for BoundSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HostedSession")
+        f.debug_struct("BoundSession")
             .field("server_url", &self.server_url)
             .field("account_id", &self.account_id)
+            .field("hosted", &self.hosted)
             .finish_non_exhaustive()
     }
+}
+
+fn valid_account(account_id: &str) -> bool {
+    !account_id.is_empty() && account_id.len() <= 256 && !account_id.chars().any(char::is_control)
 }
 
 /// `http://127.0.0.1:<port>`, nothing else (no path, query or user info).
@@ -99,7 +108,7 @@ fn is_local_server_url(raw: &str) -> bool {
         && !raw.ends_with('/')
 }
 
-impl HostedSession {
+impl BoundSession {
     /// `Some` only when the local server manager reports a running server
     /// (`local_url`, `local_token` from its `LocalWorkspace`) and the bound
     /// session uses exactly that URL and that bearer. `account_id` is the
@@ -122,17 +131,37 @@ impl HostedSession {
         if a.is_empty() || a.len() != b.len() || !bool::from(a.ct_eq(b)) {
             return None;
         }
-        if account_id.is_empty()
-            || account_id.len() > 256
-            || account_id.chars().any(char::is_control)
-        {
+        if !valid_account(account_id) {
             return None;
         }
-        Some(HostedSession {
+        Some(BoundSession {
             server_url: session_url.to_owned(),
             token: session_token.clone(),
             account_id: account_id.to_owned(),
+            hosted: true,
         })
+    }
+
+    /// Any other bound session: the bridge already validated the server URL
+    /// (and the person's consent for plain HTTP) and learned `account_id`
+    /// from that server's `GET /v1/me`. Serves this computer's runner only,
+    /// never per-Space local tools.
+    pub fn signed_in(session_url: &str, session_token: &Secret, account_id: &str) -> Option<Self> {
+        let t = session_token.expose();
+        if session_url.is_empty() || t.is_empty() || !valid_account(account_id) {
+            return None;
+        }
+        Some(BoundSession {
+            server_url: session_url.trim_end_matches('/').to_owned(),
+            token: session_token.clone(),
+            account_id: account_id.to_owned(),
+            hosted: false,
+        })
+    }
+
+    /// The desktop's own hosted server.
+    pub fn is_hosted(&self) -> bool {
+        self.hosted
     }
 
     pub fn server_url(&self) -> &str {
@@ -166,6 +195,8 @@ impl ToolsError {
     }
 }
 
+const NO_SESSION: &str = "Sign in to a Metro server to use this computer's runner.";
+
 const NOT_LOCAL: &str = "Local tools work only in this computer's own Metro workspace. \
      Open the local workspace to use them; other servers use their own runners.";
 
@@ -174,7 +205,7 @@ fn from_call(e: CallError) -> ToolsError {
         CallError::Unauthorized => ToolsError::new(
             422,
             "session_rejected",
-            "The local Metro server didn't accept this sign-in. Open the local workspace again.",
+            "The Metro server didn't accept this sign-in. Sign in again.",
         ),
         CallError::Unreachable(m) => ToolsError::new(502, "server_unreachable", m),
         CallError::Forbidden(m) => ToolsError::new(403, "not_owner", m),
@@ -205,7 +236,7 @@ struct Inner {
     /// (server URL, account id) the workers belong to.
     bound: Option<(String, String)>,
     workers: HashMap<String, worker::Handle>,
-    /// The installer-requested personal runner (see [`runner`]).
+    /// This computer's personal runner (see [`runner`]).
     runner: runner::Slot,
     /// Why the last start didn't serve every pairing (`None`: it did).
     /// Shown in the status; the next session bind tries again.
@@ -243,7 +274,7 @@ impl DesktopTools {
 
     /// What the installer asked for ([`runner::installer_marker`]): with
     /// [`runner::Marker::Accepted`], this computer's personal registered
-    /// runner is created once and resumed on the own hosted server.
+    /// runner is also set up without a press on the own hosted server.
     pub fn with_local_runner(mut self, marker: runner::Marker) -> Self {
         self.marker = marker;
         self
@@ -278,7 +309,7 @@ impl DesktopTools {
         let f = match opened {
             Ok(f) => Arc::new(f),
             Err(why) => {
-                runner::start_failed(&mut inner.runner, &self.marker, &why);
+                runner::start_failed(&mut inner.runner, &why);
                 inner.problem = Some(why.clone());
                 inner.problem_is_root = true;
                 return Err(why);
@@ -294,9 +325,9 @@ impl DesktopTools {
         Ok(f)
     }
 
-    /// Stop workers that belong to another server or account than `hosted`.
-    async fn rebind(inner: &mut Inner, hosted: Option<&HostedSession>) {
-        let key = hosted.map(|h| (h.server_url.clone(), h.account_id.clone()));
+    /// Stop workers that belong to another server or account than `session`.
+    async fn rebind(inner: &mut Inner, session: Option<&BoundSession>) {
+        let key = session.map(|h| (h.server_url.clone(), h.account_id.clone()));
         if inner.bound != key {
             for (_, w) in inner.workers.drain() {
                 w.stop().await;
@@ -309,16 +340,16 @@ impl DesktopTools {
     }
 
     /// Route a bridge request under `/v1/local-tools`. The bridge has
-    /// already checked its own bearer, Host and Origin. `hosted` is `None`
-    /// unless the bound session is the desktop's own running server.
+    /// already checked its own bearer, Host and Origin. `session` is the
+    /// bound session, if any; per-Space local tools need it to be hosted.
     pub async fn handle(
         &self,
         method: &str,
         path: &str,
         body: &[u8],
-        hosted: Option<HostedSession>,
+        session: Option<BoundSession>,
     ) -> (u16, Value) {
-        let r = self.route(method, path, body, hosted).await;
+        let r = self.route(method, path, body, session).await;
         match r {
             Ok(v) => (200, v),
             Err(e) => (e.status, e.body()),
@@ -330,7 +361,7 @@ impl DesktopTools {
         method: &str,
         path: &str,
         body: &[u8],
-        hosted: Option<HostedSession>,
+        session: Option<BoundSession>,
     ) -> Result<Value, ToolsError> {
         let rest = path
             .strip_prefix("/v1/local-tools")
@@ -339,11 +370,12 @@ impl DesktopTools {
             if method != "GET" {
                 return Err(ToolsError::new(405, "method_not_allowed", "use GET"));
             }
-            return self.status(hosted.as_ref()).await;
+            return self.status(session.as_ref()).await;
         }
         if let Some(r) = rest.strip_prefix("/runner") {
-            return self.runner_route(method, r, body, hosted).await;
+            return self.runner_route(method, r, body, session).await;
         }
+        let hosted = session.clone().filter(BoundSession::is_hosted);
         let Some((sid, action)) = rest
             .strip_prefix("/spaces/")
             .and_then(|r| r.split_once('/'))
@@ -388,8 +420,11 @@ impl DesktopTools {
             return Err(ToolsError::new(422, "invalid", "the body must be {}"));
         }
         let Some(hosted) = hosted else {
-            // Not our own server: make sure nothing keeps running.
-            self.stop_all().await;
+            // Not our own server: make sure no pairing keeps running.
+            match &session {
+                None => self.stop_all().await,
+                Some(s) => Self::rebind(&mut *self.inner.lock().await, Some(s)).await,
+            }
             return Err(ToolsError::new(409, "not_local", NOT_LOCAL));
         };
         if action == "enable" {
@@ -434,8 +469,8 @@ impl DesktopTools {
         })
     }
 
-    fn runner_status(&self, inner: &Inner, hosted: Option<&HostedSession>) -> Value {
-        let Some(h) = hosted else {
+    fn runner_status(&self, inner: &Inner, session: Option<&BoundSession>) -> Value {
+        let Some(h) = session else {
             return runner::status(&inner.runner, &self.marker, None);
         };
         let rec = inner.root.as_ref().and_then(|root| {
@@ -451,33 +486,35 @@ impl DesktopTools {
         method: &str,
         rest: &str,
         body: &[u8],
-        hosted: Option<HostedSession>,
+        session: Option<BoundSession>,
     ) -> Result<Value, ToolsError> {
         if rest.is_empty() {
             if method != "GET" {
                 return Err(ToolsError::new(405, "method_not_allowed", "use GET"));
             }
             let mut inner = self.inner.lock().await;
-            Self::rebind(&mut inner, hosted.as_ref()).await;
-            if hosted.is_some() {
+            Self::rebind(&mut inner, session.as_ref()).await;
+            if session.is_some() {
                 // On failure the reason is recorded: say why instead of
                 // failing the status read.
                 let _ = self.root_or_problem(&mut inner);
             }
-            return Ok(self.runner_status(&inner, hosted.as_ref()));
+            return Ok(self.runner_status(&inner, session.as_ref()));
         }
         let folder_sid = rest
             .strip_prefix("/spaces/")
             .and_then(|r| r.strip_suffix("/folder"))
             .filter(|s| !s.contains('/'));
-        if rest != "/reconnect" && folder_sid.is_none() {
+        let action = rest.strip_prefix('/').unwrap_or_default();
+        if !matches!(action, "setup" | "reconnect" | "forget") && folder_sid.is_none() {
             return Err(ToolsError::new(404, "not_found", "unknown path"));
         }
         if method != "POST" {
             return Err(ToolsError::new(405, "method_not_allowed", "use POST"));
         }
-        // `{}`, or for reconnect `{"runner_id": "<id>"}`: a runner the
-        // person chose from their own list, named by its id.
+        // `{}`, or `{"runner_id": "<id>"}`: for reconnect, a runner the
+        // person chose from their own list; for forget, the one they just
+        // deleted. Always by id.
         let fields = if body.iter().all(u8::is_ascii_whitespace) {
             serde_json::Map::new()
         } else {
@@ -486,7 +523,9 @@ impl DesktopTools {
         };
         let choice = match fields.get("runner_id") {
             None => None,
-            Some(Value::String(id)) if rest == "/reconnect" && hosted::valid_job_id(id) => {
+            Some(Value::String(id))
+                if matches!(action, "reconnect" | "forget") && hosted::valid_job_id(id) =>
+            {
                 Some(id.clone())
             }
             Some(_) => return Err(ToolsError::new(422, "invalid", "invalid runner_id")),
@@ -494,9 +533,9 @@ impl DesktopTools {
         if fields.keys().any(|k| k != "runner_id") {
             return Err(ToolsError::new(422, "invalid", "unknown field"));
         }
-        let Some(h) = hosted else {
+        let Some(h) = session else {
             self.stop_all().await;
-            return Err(ToolsError::new(409, "not_local", NOT_LOCAL));
+            return Err(ToolsError::new(409, "no_session", NO_SESSION));
         };
         let mut inner = self.inner.lock().await;
         Self::rebind(&mut inner, Some(&h)).await;
@@ -507,7 +546,7 @@ impl DesktopTools {
             marker: &self.marker,
             root: &root,
             root_path: &self.root_path,
-            hosted: &h,
+            session: &h,
             api: &api,
             store_lock: &self.store_lock,
         };
@@ -517,19 +556,30 @@ impl DesktopTools {
             runner::ensure(&mut inner.runner, &cx).await;
             return runner::folder_for(&cx, sid).await;
         }
-        runner::reconnect(&mut inner.runner, &cx, choice).await?;
+        match action {
+            "setup" => runner::setup(&mut inner.runner, &cx).await?,
+            "forget" => {
+                let id = choice
+                    .ok_or_else(|| ToolsError::new(422, "invalid", "runner_id is required"))?;
+                runner::forget(&mut inner.runner, &cx, &id).await?
+            }
+            _ => runner::reconnect(&mut inner.runner, &cx, choice).await?,
+        }
         Ok(self.runner_status(&inner, Some(&h)))
     }
 
-    async fn status(&self, hosted: Option<&HostedSession>) -> Result<Value, ToolsError> {
+    async fn status(&self, session: Option<&BoundSession>) -> Result<Value, ToolsError> {
         let mut inner = self.inner.lock().await;
-        Self::rebind(&mut inner, hosted).await;
-        let Some(h) = hosted else {
+        Self::rebind(&mut inner, session).await;
+        let Some(h) = session.filter(|s| s.is_hosted()) else {
+            if session.is_some() {
+                let _ = self.root_or_problem(&mut inner);
+            }
             return Ok(json!({
                 "available": false,
                 "reason": NOT_LOCAL,
                 "spaces": [],
-                "local_runner": self.runner_status(&inner, None),
+                "local_runner": self.runner_status(&inner, session),
             }));
         };
         let root = match self.root_or_problem(&mut inner) {
@@ -562,8 +612,8 @@ impl DesktopTools {
         }))
     }
 
-    /// The session must still be this account on the hosted server.
-    async fn check_account(api: &Hosted, h: &HostedSession) -> Result<(), ToolsError> {
+    /// The session must still be this account on its server.
+    async fn check_account(api: &Hosted, h: &BoundSession) -> Result<(), ToolsError> {
         let id = api.me(&h.token).await.map_err(from_call)?;
         if id != h.account_id {
             return Err(ToolsError::new(
@@ -597,7 +647,7 @@ impl DesktopTools {
         Ok(())
     }
 
-    async fn enable(&self, h: &HostedSession, sid: &str) -> Result<Value, ToolsError> {
+    async fn enable(&self, h: &BoundSession, sid: &str) -> Result<Value, ToolsError> {
         let mut inner = self.inner.lock().await;
         Self::rebind(&mut inner, Some(h)).await;
         let root = self.root(&mut inner)?;
@@ -681,7 +731,7 @@ impl DesktopTools {
 
     async fn disable(
         &self,
-        h: &HostedSession,
+        h: &BoundSession,
         sid: &str,
         expected: Option<&str>,
     ) -> Result<Value, ToolsError> {
@@ -763,13 +813,15 @@ impl DesktopTools {
 
     /// Start the workers of this account's active pairings. Call after the
     /// bridge bound the desktop's own server. Nothing is issued here.
-    pub async fn resume(&self, hosted: HostedSession) {
+    pub async fn resume(&self, session: BoundSession) {
         let mut inner = self.inner.lock().await;
-        Self::rebind(&mut inner, Some(&hosted)).await;
-        let problem = self.start(&mut inner, &hosted).await;
+        Self::rebind(&mut inner, Some(&session)).await;
+        let problem = self.start(&mut inner, &session).await;
         if let Some(why) = &problem {
-            eprintln!("metro-desktop: local tools didn't fully start: {why}");
-            runner::start_failed(&mut inner.runner, &self.marker, why);
+            eprintln!(
+                "metro-desktop: local tools or this computer's runner didn't fully start: {why}"
+            );
+            runner::start_failed(&mut inner.runner, why);
         }
         // Still only the folder (set by `root_or_problem`), or something else.
         inner.problem_is_root &= problem.is_some();
@@ -779,57 +831,44 @@ impl DesktopTools {
         inner.problem = problem;
     }
 
-    /// Start every active pairing's worker and this computer's runner.
-    /// `Some(reason)` when something can't be served; nothing here stays
-    /// silent, and the next session bind tries again.
-    async fn start(&self, inner: &mut Inner, hosted: &HostedSession) -> Option<String> {
+    /// Start every active pairing's worker (own hosted server only) and
+    /// this computer's runner. `Some(reason)` when something can't be
+    /// served; nothing here stays silent, and the next session bind tries
+    /// again.
+    async fn start(&self, inner: &mut Inner, session: &BoundSession) -> Option<String> {
         let root = match self.root_or_problem(inner) {
             Ok(r) => r,
             Err(why) => return Some(why),
         };
-        let Ok(api) = Hosted::new(&hosted.server_url) else {
-            return Some("Metro couldn't set up its connection to the local Metro server.".into());
+        let Ok(api) = Hosted::new(&session.server_url) else {
+            return Some("Metro couldn't set up its connection to the Metro server.".into());
         };
-        if let Err(e) = Self::check_account(&api, hosted).await {
+        if let Err(e) = Self::check_account(&api, session).await {
             for (_, w) in inner.workers.drain() {
                 w.stop().await;
             }
             inner.runner.stop().await;
-            return Some(format!("Local tools didn't start: {}", e.message));
+            return Some(format!(
+                "This computer's runner didn't start: {}",
+                e.message
+            ));
         }
-        let listed = {
-            let _g = self.store_lock.lock();
-            store::list_all(&root, &hosted.account_id)
-        };
-        let (records, unreadable) = match listed {
-            Ok(l) => l,
-            Err(e) => {
-                return Some(crate::secret::clean_line(
-                    &format!(
-                        "Metro couldn't read its local tools settings in {}: {e}",
-                        self.root_path.display()
-                    ),
-                    300,
-                ));
+        let unreadable = if session.is_hosted() {
+            match self.start_pairings(inner, &api, &root, session) {
+                Ok(u) => u,
+                Err(why) => return Some(why),
             }
+        } else {
+            Vec::new()
         };
-        for p in records.iter().filter(|p| p.state == PairingState::Active) {
-            let running = inner
-                .workers
-                .get(&p.space_id)
-                .map(|w| w.etag == p.etag && !w.is_finished())
-                .unwrap_or(false);
-            if !running {
-                let _ = self.spawn_worker(inner, &api, &root, p);
-            }
-        }
-        // This computer's personal runner, if the installer asked for it:
-        // resumed, or created the first time; never recreated.
+        // This computer's personal runner: resumed once set up (or, with the
+        // installer's marker on the own server, created the first time);
+        // never recreated on its own.
         let cx = runner::Ctx {
             marker: &self.marker,
             root: &root,
             root_path: &self.root_path,
-            hosted,
+            session,
             api: &api,
             store_lock: &self.store_lock,
         };
@@ -845,6 +884,44 @@ impl DesktopTools {
                 }
             )
         })
+    }
+
+    /// Start the active per-Space pairings; the Spaces whose pairing can't
+    /// be read.
+    fn start_pairings(
+        &self,
+        inner: &mut Inner,
+        api: &Hosted,
+        root: &Arc<File>,
+        hosted: &BoundSession,
+    ) -> Result<Vec<String>, String> {
+        let listed = {
+            let _g = self.store_lock.lock();
+            store::list_all(root, &hosted.account_id)
+        };
+        let (records, unreadable) = match listed {
+            Ok(l) => l,
+            Err(e) => {
+                return Err(crate::secret::clean_line(
+                    &format!(
+                        "Metro couldn't read its local tools settings in {}: {e}",
+                        self.root_path.display()
+                    ),
+                    300,
+                ));
+            }
+        };
+        for p in records.iter().filter(|p| p.state == PairingState::Active) {
+            let running = inner
+                .workers
+                .get(&p.space_id)
+                .map(|w| w.etag == p.etag && !w.is_finished())
+                .unwrap_or(false);
+            if !running {
+                let _ = self.spawn_worker(inner, api, root, p);
+            }
+        }
+        Ok(unreadable)
     }
 
     /// Stop every worker (sign-out, server or account switch, app exit).
@@ -873,12 +950,12 @@ mod tests {
     fn hosted_session_requires_the_local_server_exactly() {
         let tok = Secret::new("local-bearer-1");
         let url = "http://127.0.0.1:41234";
-        assert!(HostedSession::verify(Some(url), Some(&tok), url, &tok, "alice").is_some());
+        assert!(BoundSession::verify(Some(url), Some(&tok), url, &tok, "alice").is_some());
         // No running local server, or a different URL or bearer: refused.
-        assert!(HostedSession::verify(None, Some(&tok), url, &tok, "alice").is_none());
-        assert!(HostedSession::verify(Some(url), None, url, &tok, "alice").is_none());
+        assert!(BoundSession::verify(None, Some(&tok), url, &tok, "alice").is_none());
+        assert!(BoundSession::verify(Some(url), None, url, &tok, "alice").is_none());
         assert!(
-            HostedSession::verify(
+            BoundSession::verify(
                 Some(url),
                 Some(&tok),
                 "http://127.0.0.1:41235",
@@ -888,7 +965,7 @@ mod tests {
             .is_none()
         );
         let other = Secret::new("local-bearer-2");
-        assert!(HostedSession::verify(Some(url), Some(&tok), url, &other, "alice").is_none());
+        assert!(BoundSession::verify(Some(url), Some(&tok), url, &other, "alice").is_none());
         // Only plain loopback http with a port.
         for bad in [
             "https://127.0.0.1:41234",
@@ -901,17 +978,17 @@ mod tests {
             "http://127.0.0.1",
         ] {
             assert!(
-                HostedSession::verify(Some(bad), Some(&tok), bad, &tok, "alice").is_none(),
+                BoundSession::verify(Some(bad), Some(&tok), bad, &tok, "alice").is_none(),
                 "{bad}"
             );
         }
         let empty = Secret::new("");
-        assert!(HostedSession::verify(Some(url), Some(&empty), url, &empty, "alice").is_none());
-        assert!(HostedSession::verify(Some(url), Some(&tok), url, &tok, "").is_none());
+        assert!(BoundSession::verify(Some(url), Some(&empty), url, &empty, "alice").is_none());
+        assert!(BoundSession::verify(Some(url), Some(&tok), url, &tok, "").is_none());
         assert!(
             !format!(
                 "{:?}",
-                HostedSession::verify(Some(url), Some(&tok), url, &tok, "a")
+                BoundSession::verify(Some(url), Some(&tok), url, &tok, "a")
             )
             .contains("local-bearer")
         );
