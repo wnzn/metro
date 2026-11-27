@@ -42,7 +42,10 @@ An update keeps the previous choice unless you pass `--local-runner` or
 `--no-local-runner`. The installer itself never contacts a server. A
 launcher that supports the marker sets up the app's built-in personal
 registered runner after the person signs in to the app's own local
-workspace, with list and read access only and no Docker. That runner isn't
+workspace, with no Docker. In 0.6.2 it lists and reads only; in the source,
+not released, it also writes files and runs shell commands under the
+runner's shell policy ([install.md](../docs/install.md#folders-and-shell-commands-in-the-source-not-released)).
+That runner isn't
 attached to any Space until the Space owner picks it under **Manage
 Space**. Since Metro 0.6.2, the marker only saves a press: the
 same runner can be set up for any signed-in server from **Settings →

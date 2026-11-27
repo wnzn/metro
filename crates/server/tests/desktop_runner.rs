@@ -17,7 +17,7 @@ use metro_connector::desktop_tools::runner::{self, Marker, Record, RecordState};
 use metro_connector::desktop_tools::{BoundSession, DesktopTools, store};
 use metro_server::auth::{AuthFailure, AuthFuture, HumanAuth, UserIdentity};
 use metro_server::db::Db;
-use metro_server::{AppState, Config, Limits, router};
+use metro_server::{AppState, Config, Limits, ModelConfig, router};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
@@ -47,6 +47,10 @@ struct Server {
 
 impl Server {
     async fn start() -> Self {
+        Self::start_with(None).await
+    }
+
+    async fn start_with(model: Option<ModelConfig>) -> Self {
         let user = |id: &str, actor: &str| UserIdentity {
             id: id.to_owned(),
             actor: actor.to_owned(),
@@ -58,7 +62,7 @@ impl Server {
         let config = Config {
             bind: "127.0.0.1:0".parse().unwrap(),
             db_path: ":memory:".into(),
-            model: None,
+            model,
             limits: Limits {
                 claim_timeout: Duration::from_secs(5),
                 run_timeout: Duration::from_secs(5),
@@ -351,7 +355,15 @@ async fn created_once_resumed_and_serves_only_attached_spaces() {
     let st = wait_state(&t, &alice, "online").await;
     assert_eq!(st["available"], true);
     assert_eq!(st["can_set_up"], false);
-    assert_eq!(st["tools"], json!(["workspace.list", "workspace.read"]));
+    assert_eq!(
+        st["tools"],
+        json!([
+            "workspace.list",
+            "workspace.read",
+            "workspace.write",
+            "workspace.shell"
+        ])
+    );
     let runners = s.personal_runners(ALICE).await;
     assert_eq!(runners.len(), 1, "exactly one runner");
     let rid = runners[0]["id"].as_str().unwrap().to_owned();
@@ -948,5 +960,321 @@ async fn a_folder_problem_clears_when_a_later_status_read_opens_it() {
     let v = runner_status(&t, Some(&alice)).await;
     assert_ne!(v["state"], "failed", "{v}");
     assert!(v["detail"].is_null(), "{v}");
+    t.stop_all().await;
+}
+
+/// A scripted model: the newest person's text names the tool call (the last
+/// `cmd[[<command>]]`, otherwise a write); the next turn quotes the result.
+async fn tool_model() -> ModelConfig {
+    use axum::Json;
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(|Json(body): Json<Value>| async move {
+            let messages = body["messages"].as_array().cloned().unwrap_or_default();
+            let text = |m: &Value| match &m["content"] {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            let message = if let Some(reply) = messages.last().filter(|m| m["role"] == "tool") {
+                json!({"role": "assistant", "content": format!("tool said: {}", text(reply))})
+            } else {
+                let ask = messages
+                    .iter()
+                    .rev()
+                    .find(|m| m["role"] == "user")
+                    .map(text)
+                    .unwrap_or_default();
+                let (name, args) = match ask.rsplit_once("cmd[[") {
+                    Some((_, rest)) => (
+                        "workspace_shell",
+                        json!({"command": rest.split("]]").next().unwrap(), "timeout_secs": 60}),
+                    ),
+                    None => (
+                        "workspace_write",
+                        json!({"path": "notes/a.md", "content": "hello\n"}),
+                    ),
+                };
+                json!({"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": name, "arguments": args.to_string()}}]})
+            };
+            let finish = if message["tool_calls"].is_array() {
+                "tool_calls"
+            } else {
+                "stop"
+            };
+            Json(json!({
+                "id": "chatcmpl-1", "object": "chat.completion", "created": 0, "model": "mock",
+                "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    ModelConfig {
+        base_url,
+        model: "mock".into(),
+        api_key: "test-key".into(),
+    }
+}
+
+impl Server {
+    async fn ask(&self, sid: &str, text: &str) {
+        let (s, v) = self
+            .post(
+                ALICE,
+                &format!("/v1/spaces/{sid}/rooms/lobby/messages"),
+                json!({"text": format!("@agent {text}"), "invoke_agent": true}),
+            )
+            .await;
+        assert!(s.is_success(), "{v}");
+    }
+
+    async fn events(&self, sid: &str) -> Vec<Value> {
+        let (_, v) = self
+            .get(ALICE, &format!("/v1/spaces/{sid}/rooms/lobby/events"))
+            .await;
+        v["events"].as_array().unwrap().clone()
+    }
+
+    /// The first event after `after` events that matches.
+    async fn wait_event(&self, sid: &str, after: usize, pred: impl Fn(&Value) -> bool) -> Value {
+        for _ in 0..600 {
+            if let Some(e) = self.events(sid).await.iter().skip(after).find(|e| pred(e)) {
+                return e.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("no matching event: {:#?}", self.events(sid).await);
+    }
+
+    /// Ask, then wait for the agent's reply; its text.
+    async fn reply(&self, sid: &str, text: &str) -> String {
+        let n = self.events(sid).await.len();
+        self.ask(sid, text).await;
+        let e = self.wait_event(sid, n, |e| e["kind"] == "agent").await;
+        self.idle().await;
+        e["text"].as_str().unwrap().to_owned()
+    }
+
+    async fn idle(&self) {
+        for _ in 0..400 {
+            let (_, v) = self.get(ALICE, "/v1/runs").await;
+            if v["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["status"] != "running")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("a run is still running");
+    }
+
+    async fn built_in(&self, rid: &str) -> Value {
+        self.personal_runners(ALICE)
+            .await
+            .into_iter()
+            .find(|r| r["id"] == rid)
+            .unwrap()["built_in"]
+            .clone()
+    }
+}
+
+async fn choose(t: &DesktopTools, h: &BoundSession, sid: &str, path: &Path) -> (u16, Value) {
+    let body = json!({"path": path}).to_string();
+    t.handle(
+        "PUT",
+        &format!("/v1/local-tools/runner/spaces/{sid}/folder"),
+        body.as_bytes(),
+        Some(h.clone()),
+    )
+    .await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn built_in_runner_writes_runs_shell_in_the_chosen_folder_and_stops_on_cancel() {
+    let s = Server::start_with(Some(tool_model().await)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("local-tools");
+    let alice = s.hosted(ALICE, "alice");
+    let a = s.space(ALICE, "first").await;
+    let b = s.space(ALICE, "second").await;
+    let t = tools(&root, Marker::Accepted);
+    t.resume(alice.clone()).await;
+    wait_state(&t, &alice, "online").await;
+    let rid = t.local_runner_id().await.unwrap();
+    // Set up marks it built-in; one made in Settings isn't.
+    assert_eq!(s.built_in(&rid).await, true);
+    let (other, _) = s.create_runner(ALICE, "elsewhere").await;
+    assert_eq!(s.built_in(&other).await, false);
+    assert_eq!(s.attach(ALICE, &a, &rid).await, StatusCode::OK);
+
+    // Write: no approval, into the default folder.
+    let (_, fa) = folder(&t, &alice, &a).await;
+    let default = PathBuf::from(fa["folder"].as_str().unwrap());
+    let reply = s.reply(&a, "write the note").await;
+    assert!(reply.contains("wrote 6 bytes to notes/a.md"), "{reply}");
+    assert_eq!(
+        std::fs::read_to_string(default.join("notes/a.md")).unwrap(),
+        "hello\n"
+    );
+
+    // `allow` on a built-in runner attached to one Space runs at once.
+    let (st, v) = s
+        .send(
+            reqwest::Method::PUT,
+            ALICE,
+            &format!("/v1/runners/{rid}/shell-policy"),
+            Some(json!({"shell_mode": "allow", "approver": "owner"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["built_in"], true);
+    let reply = s.reply(&a, "cmd[[pwd; echo $TERM; cat notes/a.md]]").await;
+    let d = default.display().to_string();
+    assert!(
+        reply.contains(&format!("exit: 0\n--- stdout ---\n{d}\ndumb\nhello\n")),
+        "{reply}"
+    );
+
+    // A chosen folder takes effect on the next job; nothing moves.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let chosen = std::fs::canonicalize(elsewhere.path())
+        .unwrap()
+        .join("project");
+    std::fs::create_dir(&chosen).unwrap();
+    let (code, v) = choose(&t, &alice, &a, &chosen).await;
+    assert_eq!(code, 200, "{v}");
+    assert_eq!(v["custom"], true);
+    let reply = s.reply(&a, "cmd[[pwd; ls notes 2>&1 || true]]").await;
+    assert!(
+        reply.contains(&format!("{}\n", chosen.display())),
+        "{reply}"
+    );
+    assert!(default.join("notes/a.md").exists());
+    s.reply(&a, "write it here").await;
+    assert!(chosen.join("notes/a.md").exists());
+
+    // Attached to a second Space, `allow` becomes `approve`.
+    assert_eq!(s.attach(ALICE, &b, &rid).await, StatusCode::OK);
+    let (_, v) = s.get(ALICE, &format!("/v1/spaces/{a}/runner")).await;
+    assert_eq!(v["shell"]["shell_mode"], "allow", "{v}");
+    assert_eq!(v["shell"]["effective_mode"], "approve", "{v}");
+    assert_eq!(v["shell"]["downgraded_reason"], "built_in_multiple_spaces");
+    let n = s.events(&a).await.len();
+    s.ask(&a, "cmd[[echo approved]]").await;
+    let e = s.wait_event(&a, n, |e| e["kind"] == "shell_approval").await;
+    let ap: Value = serde_json::from_str(e["text"].as_str().unwrap()).unwrap();
+    assert_eq!(ap["reason_code"], "built_in_multiple_spaces", "{ap}");
+    let (st, v) = s
+        .post(
+            ALICE,
+            &format!(
+                "/v1/spaces/{a}/shell-approvals/{}",
+                ap["approval_id"].as_str().unwrap()
+            ),
+            json!({"decision": "approve"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let e = s.wait_event(&a, n, |e| e["kind"] == "agent").await;
+    assert!(e["text"].as_str().unwrap().contains("approved\n"), "{e}");
+    s.idle().await;
+
+    // Back to one Space; stopping the run kills the command through the
+    // heartbeat.
+    let (st, _) = s
+        .send(
+            reqwest::Method::DELETE,
+            ALICE,
+            &format!("/v1/spaces/{b}/runner"),
+            None,
+        )
+        .await;
+    assert!(st.is_success(), "{st}");
+    s.ask(
+        &a,
+        "cmd[[sleep 60 & echo $! > bg.pid; touch started; wait; touch finished]]",
+    )
+    .await;
+    for _ in 0..400 {
+        if chosen.join("started").exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(chosen.join("started").exists(), "the command never started");
+    let (_, v) = s.get(ALICE, "/v1/runs").await;
+    let run = v["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["status"] == "running")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (st, v) = s
+        .post(ALICE, &format!("/v1/runs/{run}/stop"), json!({}))
+        .await;
+    assert!(st.is_success(), "{v}");
+    let pid: i32 = std::fs::read_to_string(chosen.join("bg.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let mut gone = false;
+    for _ in 0..200 {
+        // SAFETY: signal 0 only checks for existence.
+        let alive = unsafe { libc::kill(pid, 0) } == 0
+            && !std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map(|s| s.contains(") Z "))
+                .unwrap_or(true);
+        if !alive {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(gone, "the stopped command kept running");
+    assert!(!chosen.join("finished").exists());
+    s.idle().await;
+
+    let reply = s.reply(&a, "cmd[[echo after-stop]]").await;
+    assert!(reply.contains("after-stop\n"), "{reply}");
+
+    // Rotated elsewhere without the marker: the runner stops; Reconnect
+    // sets it again. Clearing the folder returns to the default.
+    let (st, _) = s
+        .post(
+            ALICE,
+            &format!("/v1/runners/{rid}/token"),
+            json!({"built_in": false}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(s.built_in(&rid).await, false);
+    wait_state(&t, &alice, "revoked").await;
+    let (code, v) = reconnect(&t, &alice).await;
+    assert_eq!(code, 200, "{v}");
+    wait_state(&t, &alice, "online").await;
+    assert_eq!(s.built_in(&rid).await, true);
+    let (code, _) = t
+        .handle(
+            "DELETE",
+            &format!("/v1/local-tools/runner/spaces/{a}/folder"),
+            b"",
+            Some(alice.clone()),
+        )
+        .await;
+    assert_eq!(code, 200);
+    let reply = s.reply(&a, "cmd[[pwd]]").await;
+    assert!(reply.contains(&format!("{d}\n")), "{reply}");
     t.stop_all().await;
 }

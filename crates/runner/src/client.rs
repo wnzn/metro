@@ -100,7 +100,7 @@ pub struct ResultBody<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Liveness {
     Live,
-    /// The server no longer wants the job (404/410): stop it.
+    /// The server no longer authorizes the job (401/404/409/410): stop it.
     Gone,
 }
 
@@ -220,7 +220,7 @@ impl ServerClient {
 }
 
 impl ServerClient {
-    /// POST /v1/runner/jobs/{id}/heartbeat {} -> 200 live, 404/410 gone.
+    /// POST /v1/runner/jobs/{id}/heartbeat {} -> 2xx live, 401/404/409/410 gone.
     /// Anything else is an error, never a cancellation.
     pub fn heartbeat(&self, id: &str) -> Result<Liveness, ClientError> {
         if !valid_job_id(id) {
@@ -235,7 +235,7 @@ impl ServerClient {
             .read_to_vec();
         match status {
             200..=299 => Ok(Liveness::Live),
-            404 | 410 => Ok(Liveness::Gone),
+            401 | 404 | 409 | 410 => Ok(Liveness::Gone),
             _ => Err(retryable(format!("heartbeat: HTTP {status}"))),
         }
     }
@@ -426,6 +426,57 @@ mod tests {
             proxy.accept().is_err(),
             "the proxy was used for a loopback server"
         );
+    }
+
+    #[test]
+    fn heartbeat_classifies_live_cancelled_and_retryable_responses() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let responses = [
+            ("200 OK", Some(Liveness::Live)),
+            ("401 Unauthorized", Some(Liveness::Gone)),
+            ("404 Not Found", Some(Liveness::Gone)),
+            ("409 Conflict", Some(Liveness::Gone)),
+            ("410 Gone", Some(Liveness::Gone)),
+            ("503 Service Unavailable", None),
+        ];
+        let handle = std::thread::spawn(move || {
+            for (status, _) in responses {
+                let (mut stream, _) = server.accept().unwrap();
+                let mut request = BufReader::new(&mut stream);
+                let mut line = String::new();
+                request.read_line(&mut line).unwrap();
+                assert_eq!(line, "POST /v1/runner/jobs/j1/heartbeat HTTP/1.1\r\n");
+                loop {
+                    line.clear();
+                    assert_ne!(request.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let mut body = [0; 2];
+                request.read_exact(&mut body).unwrap();
+                assert_eq!(&body, b"{}");
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            }
+        });
+        let client = ServerClient::with_proxy(&base, "tok", Duration::from_secs(5), None);
+        for (status, expected) in responses {
+            let result = client.heartbeat("j1");
+            if let Some(expected) = expected {
+                assert_eq!(result.unwrap(), expected, "{status}");
+            } else {
+                assert!(result.unwrap_err().retryable, "{status}");
+            }
+        }
+        handle.join().unwrap();
     }
 
     #[test]

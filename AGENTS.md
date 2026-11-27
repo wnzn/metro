@@ -100,8 +100,16 @@ see [New in Metro 0.6.2](docs/released-0.6.2.md); for later changes, see
   for the signed-in server and account (or, on the app's own local
   workspace only, the installer's marker), keeps its credential in one
   mode-600 file, starts and stops with the app, updates with it, and
-  serves list and read only. Reconnect is explicit; deleting it turns it
-  off locally and keeps its folders.
+  serves list, read, write and shell (never check or MCP). Reconnect is
+  explicit; deleting it turns it off locally and keeps its folders. Set up
+  and Reconnect mark it `built_in` on the server.
+- Its owner may choose each attached Space's folder (Change / Use
+  default). A chosen folder is an existing absolute directory, not a link
+  or reparse point, a root, the home folder itself, nor inside, equal to
+  or containing Metro's data folder, and it never equals, contains or
+  sits inside another Space's chosen folder for that runner. The checks
+  rerun before every job; a failing one fails the job visibly, never
+  falling back to the default folder. Changing or clearing moves no files.
 - The desktop may offer its own eligible personal runner when creating a
   Space or for owner-selected existing Spaces. Submitting the checked
   Create Space choice or pressing Attach is the explicit action. These
@@ -123,10 +131,50 @@ see [New in Metro 0.6.2](docs/released-0.6.2.md); for later changes, see
   listing as Runner activity in the open Space room, not privately in
   Settings, and never calls a model.
 - A registered runner never runs check or MCP commands as unsandboxed host
-  processes, because they could read sibling Spaces' roots. By default it
-  offers only list and read. Check and MCP need `METRO_SANDBOX=docker`, which
-  mounts only the claiming Space's root. Dedicated runners keep their
-  existing behaviour.
+  processes, because they could read sibling Spaces' roots. Check and MCP
+  need `METRO_SANDBOX=docker`, which mounts only the claiming Space's root
+  read-only. `workspace.shell` is the exception: it runs on every runner,
+  gated by the shell policy below; with `docker` it runs in the same
+  container with the root mounted read-write and no network, without it
+  as the runner's user in the Space root. Dedicated runners keep their
+  existing check and MCP behaviour.
+- `workspace.write` (one UTF-8 file, at most 1 MiB, parents created,
+  atomic replace) is jailed like read: Space-root relative, no absolute
+  path, `..`, symlink anywhere in the path or hard link. It never needs
+  approval. Write and shell are in `default_tools`: new agents and agents
+  created without a list get them. Every agent stores its list, so agents
+  from before 0.6.3 keep theirs and gain them only when the owner adds
+  them; there's no migration. Shell stays gated by the policy below.
+- **Shell policy**: `shell_mode` `off` / `approve` (default) / `classify`
+  / `allow`, `approver` `owner` (default) / `members`. A registered
+  runner has one default plus per-Space overrides (null inherits), read
+  and changed only by its manager; a dedicated runner has one per Space,
+  set by the Space owner. Members read the effective policy. `allow` on
+  a built-in runner takes effect only while it's attached to exactly one
+  Space, else it's `approve` with `downgraded_reason`. Organization
+  runners can't save `classify`. `owner` means the personal runner's
+  owner, any org admin, or the dedicated Space's owner; every approver
+  must be a current Space member at decision time (no admin bypass).
+- `classify` is one System One Choice (`shell_risk`, keyed `safe` /
+  `unsafe`) on the runner owner's System One connection (dedicated: the
+  Space owner's), sent only the command, Space name and the run's
+  trigger text (4,000 characters). Only `safe` at probability ≥ 0.8 runs
+  without asking; anything else, including no usable connection or a
+  failure, asks for approval with the reason. Never call it containment.
+- Approvals are `shell_approval` and `shell_approval_resolved` run
+  activity events: never messages, model history, indexed or searchable.
+  The decision rechecks membership, eligibility and the assignment in one
+  transaction; first decision wins (later 409). Pending ones expire after
+  10 minutes or at restart, and are cancelled on stop, any assignment
+  change or Space deletion, not on token rotation. Only an approved or
+  allowed command reaches a runner. Waiting and running shell jobs don't
+  count against the run's time limit. A shell job is killed on timeout
+  (max 600 s; commands at most 16 KiB), stop and heartbeat
+  `401`/`404`/`409`/`410` on both runners; on Windows a process
+  started just before job-object assignment can escape (known limit).
+- Shell runs with the runner user's access, including other Spaces'
+  folders on that machine unless sandboxed. Docs must say so, and that
+  the approver choice matters.
 - Model connections are personal by default. A run uses the sender's own
   usable connections (or ones shared with them there), and so do the child
   threads that run starts, in this order: the model explicitly chosen for
@@ -478,6 +526,11 @@ see [New in Metro 0.6.2](docs/released-0.6.2.md); for later changes, see
 - *Demo* must stay deterministic and must never call a model.
 - Sandboxing is opt-in, and `docker` mode fails closed. Check and MCP commands
   are operator-defined JSON argv and are never run through a shell.
+  `workspace.shell` is the one tool that uses a shell (`/bin/sh -c`,
+  Windows `cmd.exe`), in the Space root, with a cleared environment
+  (never a Metro token).
+- A standalone runner without `METRO_WORKSPACE` uses its current
+  directory, and refuses `/`.
 - Status: [docs/system-one.md](docs/system-one.md) tracks each part.
   - Every part is implemented: scheduled prompts
     ([docs/schedules.md](docs/schedules.md)), capabilities and sharing
@@ -544,7 +597,8 @@ see [New in Metro 0.6.2](docs/released-0.6.2.md); for later changes, see
   "in the source, not released". A newer release is named in docs only
   once its publication is recorded in `docs/acceptance.md`. The desktop app's **Use locally**
   runs a bundled local server with no token, and its owner-only, per-Space,
-  read-only local tools (`workspace.list`/`workspace.read`) never stand in
+  read-only local tools (`workspace.list`/`workspace.read`, still list
+  and read only in 0.6.3 source) never stand in
   for an operator's separately installed runner or for the app's built-in
   runner. It and the other features
   checked in the 0.2.0 Linux candidate are described as verified in that

@@ -74,7 +74,8 @@ docs describe it no further than TypeSafe's own docs do:
   ([primitives](https://docs.typesafe.ai/primitives)):
   - `noul`, the probability of yes from 0 to 1, for the search rerank;
   - `choice`, one option with `confidence` and per-option `probabilities`,
-    for choosing a Space agent and for use-case routing.
+    for choosing a Space agent, for use-case routing and (in the source,
+    not released) for [shell commands](#shell-command-checks-in-the-source-not-released).
 
   Every request Metro sends carries exactly one question, because some
   endpoints accept no more.
@@ -336,6 +337,28 @@ reads).
 In a local test with a scripted System One taking 1,000 ms, the message
 was visible to another member 1–2 ms after the POST, against about
 1,022 ms before ([record](acceptance.md#source-only-metro-061-lanes-2026-11-27-local)).
+
+## Shell command checks (in the source, not released)
+
+When a runner's shell mode is **Ask when System One flags it**
+(`classify`), each `workspace.shell` command gets one System One Choice
+before it runs. See [Shell policy](runner.md#shell-policy).
+
+- The question is `shell_risk`, with the keyed options `safe` and
+  `unsafe`. *Safe* means a low risk of damage or data exposure, not only
+  that the command stays in the Space's folder.
+- It uses the runner owner's System One connection; for a dedicated
+  runner, the Space owner's. It never uses the person who started the run.
+  Organization runners can't use this mode, because no single person owns
+  them.
+- It sends only the command, the Space's name and the text of the message
+  that started the run (at most 4,000 characters).
+- The command runs at once only when the answer is `safe` with a
+  probability of at least 0.8. `unsafe`, a weaker `safe`, no usable System
+  One connection, or any failure asks for approval instead, and the
+  approval card says why.
+- This is a model's judgement, not containment. A command System One
+  calls safe runs with the runner user's full access.
 
 ## Use-case routing
 

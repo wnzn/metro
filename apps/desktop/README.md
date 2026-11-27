@@ -161,7 +161,7 @@ They never stand in for each other.
 | Server | This app's own local workspace | Any Metro server you're signed in to | Any Metro server, local or remote |
 | Who turns it on | The Space owner, under **Space settings → Runner** | You, with **Set up** in **Settings → Runners** (or the installer's choice, for the local workspace) | Its operator |
 | Attached to Spaces | That one Space | Only the Spaces the owner [explicitly chooses](../../docs/released-0.5.0.md#this-computers-runner) | As its owner or the Space owners choose |
-| Tools | List and read | List and read | List and read; check and MCP when configured ([runners.md](../../docs/runners.md)) |
+| Tools | List and read | List and read; write and shell in the source, not released | List and read; check and MCP when configured ([runners.md](../../docs/runners.md)); write and shell in the source, not released |
 | Runs while | Metro is open | Metro is open and signed in to that server | Its process or container runs |
 
 **The app's personal runner** (`baff3f0`, `e0982d7`, installers at
@@ -192,11 +192,34 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   token if it's still one of your personal runners, or otherwise creates a
   new, unattached personal runner. (The launcher's local API can also take
   a runner ID you choose; the screen doesn't offer that.)
-- Each job must name a Space, and reads only that Space's own folder under
-  the app's data folder. It refuses checks, MCP and commands, uses no
-  Docker, and opens no inbound port. It starts with the app once set up,
-  and stops on sign-out, on switching server or account, and when Metro
-  quits.
+- Each job must name a Space, and works only in that Space's folder. In
+  0.6.2 that is its own folder under the app's data folder, and it refuses
+  commands. It refuses checks and MCP, uses no Docker, and opens no
+  inbound port. It starts with the app once set up, and stops on
+  sign-out, on switching server or account, and when Metro quits.
+- In the source, not released, it also runs `workspace.write` and
+  `workspace.shell`:
+  - **Folder per Space.** **Change** under this computer's runner picks an
+    existing folder for an attached Space; **Use default** returns to the
+    Space's own folder. Links and junctions, roots, the home folder
+    itself, anything inside or containing Metro's data folder, and folders
+    overlapping another Space's chosen folder are refused. Nothing is
+    moved. A chosen folder that stops working fails that Space's jobs
+    visibly; there's no fallback to the default.
+  - **Shell mode.** **Settings → Runners** sets **Off**, **Ask every
+    time** (default), **Ask when System One flags it** or **Always
+    allow**, and the **Approver**, **Runner owner** (default) or **Any
+    Space member**, with a per-Space override. **Always allow** applies
+    only while the runner is attached to exactly one Space.
+  - **Approval cards.** A command that needs approval shows a card with
+    the command in the room's run activity, with **Approve** and **Deny**
+    for eligible approvers. It expires after 10 minutes.
+  - **Access.** A shell command runs as you, with your access to this
+    computer, including other Spaces' folders. There's no sandbox. See
+    [install.md](../../docs/install.md#folders-and-shell-commands-in-the-source-not-released).
+  - On Windows, commands run with `cmd.exe` in a job object; a process
+    started just before it joins the job object may survive a stop.
+- **Local tools** in **Use locally** stay list and read only.
 
 ### Not verified yet
 
