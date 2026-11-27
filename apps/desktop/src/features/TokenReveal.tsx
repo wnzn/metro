@@ -9,31 +9,16 @@
 // panel shows in-app setup on this computer (src/device/DeviceSetup.tsx), and
 // the launcher's bridge gets the device token from the server itself.
 
-import { Clipboard, openUrl, signal } from "nsh";
-import type { JSX } from "nsh";
+import { Clipboard } from "nsh";
 import manifest from "../../nsh.json";
 import { connectedTo } from "../store";
 import { DeviceSetup } from "../device/DeviceSetup";
 import { localBadge, localConnections, packaged } from "../device/state";
 import { deviceStatuses, dismissReveal, fetchModels, modelListings, revealCopied, revealed, revealShown } from "../settings";
 import type { Reveal } from "../settings";
-import { Action, Badge, Banner, Column, Label, Row, SecretValue, SettingRow, SettingsGroup, Surface } from "../ui";
+import { Action, Badge, Banner, Column, CopyBlock, Label, Row, RunnerInstall, SecretValue, SettingRow, SettingsGroup } from "../ui";
 import type { Tone } from "../ui";
-import {
-  deviceGuide,
-  dockerRunCommand,
-  PRIVATE_ENV_FILE_COMMAND,
-  releaseTag,
-  RELEASES_URL,
-  runnerArchive,
-  runnerDownloadCommand,
-  runnerEnvTemplate,
-  runnerImage,
-  RUNNER_SOURCE_NOTE,
-  RUNNER_TOKEN_FILE_COMMAND,
-  RUNNER_TOOLS_NOTE,
-  standaloneRunCommand,
-} from "./setupTemplates";
+import { deviceGuide } from "./setupTemplates";
 
 /** This app's release version: the runner image of the same release goes with it. */
 const APP_VERSION: string = (manifest as { version: string }).version;
@@ -43,41 +28,6 @@ type RunnerReveal = Extract<Reveal, { kind: "runner" }>;
 type DeviceReveal = Extract<Reveal, { kind: "device" }>;
 /** A device reveal of the packaged app: in-app setup, no token. */
 const nativeSetup = (r: Reveal): DeviceReveal | null => (r.kind === "device" && r.token === null ? r : null);
-
-/** Copyable, non-secret text (a command or a file's lines). */
-export function CopyBlock(props: { text: string; testID: string; label: string }) {
-  const copied = signal(false);
-  return (
-    <Column gap={1}>
-      <Surface variant="card" padX={3} padY={2} testID={props.testID} accessibilityLabel={props.label}>
-        <Column selectable>
-          <Label variant="mono">{props.text}</Label>
-        </Column>
-      </Surface>
-      <Row>
-        <Action
-          testID={`${props.testID}-copy`}
-          label={copied() ? "Copied" : "Copy"}
-          accessibilityLabel={`Copy ${props.label}`}
-          variant="ghost"
-          onPress={() => {
-            Clipboard.writeText(props.text)
-              .then(() => copied.set(true))
-              .catch(() => {});
-          }}
-        />
-      </Row>
-    </Column>
-  );
-}
-
-function Step(props: { n: number; text: string; children?: JSX.Element }) {
-  return (
-    <SettingRow label={`${props.n}. ${props.text}`} stacked>
-      {props.children}
-    </SettingRow>
-  );
-}
 
 function titleOf(r: Reveal): string {
   if (r.kind === "runner") return r.reason === "created" ? `Connect “${r.runnerName}”` : `New token for “${r.runnerName}”`;
@@ -100,6 +50,7 @@ function subtitleOf(r: Reveal): string {
 }
 
 export function TokenReveal() {
+  const serverUrl = () => connectedTo() ?? "https://metro.example.com";
   const copy = () => {
     const r = revealed();
     if (!r || r.token === null) return;
@@ -151,14 +102,11 @@ export function TokenReveal() {
             )}
           </If>
 
-          <If when={r().kind === "runner" ? (r() as RunnerReveal) : null}>{(rr) => <RunnerSteps name={rr().runnerName} />}</If>
-          <If when={r().kind === "dedicated"}>
-            <SettingsGroup title="Use it">
-              <SettingRow
-                label="Save it in a file only you can read (chmod 600) and point the runner's METRO_RUNNER_TOKEN at it."
-                description="A dedicated token serves this Space only, with the runner's workspace as this Space's folder."
-              />
-            </SettingsGroup>
+          <If when={r().kind === "runner" ? (r() as RunnerReveal) : null}>
+            {(rr) => <RunnerInstall serverUrl={serverUrl()} runnerName={rr().runnerName} appVersion={APP_VERSION} />}
+          </If>
+          <If when={r().kind === "dedicated" ? (r() as Extract<Reveal, { kind: "dedicated" }>) : null}>
+            {(rr) => <RunnerInstall serverUrl={serverUrl()} runnerName={rr().spaceName} appVersion={APP_VERSION} dedicated />}
           </If>
           <If when={r().kind === "device" && !nativeSetup(r()) ? (r() as DeviceReveal) : null}>
             {(d) => <DeviceSteps connectionId={d().connectionId} connectionName={d().connectionName} providerId={d().providerId} />}
@@ -166,60 +114,6 @@ export function TokenReveal() {
         </Column>
       )}
     </If>
-  );
-}
-
-function RunnerSteps(props: { name: string }) {
-  const server = () => connectedTo() ?? "https://metro.example.com";
-  const docker = signal(false);
-  return (
-    <Column gap={6}>
-      <SettingsGroup
-        title="Run the prebuilt runner"
-        description={`Linux x64, kernel 5.6 or newer. No line below contains the token. ${RUNNER_SOURCE_NOTE}`}
-        testID="setup-standalone"
-      >
-        <SettingRow label={`Metro Releases · ${releaseTag(APP_VERSION)}`} description={`${runnerArchive(APP_VERSION)} and its .sha256`}>
-          <Action testID="setup-releases" label="Open Metro Releases" variant="ghost" onPress={() => void openUrl(RELEASES_URL).catch(() => {})} />
-        </SettingRow>
-        <Step n={1} text={`Download the runner for ${releaseTag(APP_VERSION)}, check it and unpack it:`}>
-          <CopyBlock testID="setup-download" label="the download commands" text={runnerDownloadCommand(APP_VERSION)} />
-        </Step>
-        <Step n={2} text="Create runner.token, readable only by you, then open it in an editor and paste the token as its only line:">
-          <CopyBlock testID="setup-tokenfile" label="the command that creates runner.token" text={RUNNER_TOKEN_FILE_COMMAND} />
-        </Step>
-        <Step n={3} text="Start it. Its workspace holds a separate folder for each Space it serves (spaces/<space id>/):">
-          <CopyBlock testID="setup-standalone-run" label="the command that starts the runner" text={standaloneRunCommand({ serverUrl: server(), runnerName: props.name, appVersion: APP_VERSION })} />
-        </Step>
-        <Step n={4} text="Attach it to a Space you own: Space settings › Runner." />
-        <SettingRow label="What it can do" description={RUNNER_TOOLS_NOTE} />
-      </SettingsGroup>
-
-      <Row>
-        <Action
-          testID="setup-docker-toggle"
-          label="Or run it with Docker"
-          accessibilityLabel={docker() ? "Hide the Docker steps" : "Show the Docker steps"}
-          variant="ghost"
-          expanded={docker()}
-          onPress={() => docker.set(!docker())}
-        />
-      </Row>
-      <If when={docker()}>
-        <SettingsGroup title="Run it with Docker" description={`Image ${runnerImage(APP_VERSION)}, when available. No line below contains the token.`} testID="setup-docker-steps">
-          <Step n={1} text="Create runner.env, readable only by you:">
-            <CopyBlock testID="setup-envfile" label="the command that creates runner.env" text={PRIVATE_ENV_FILE_COMMAND} />
-          </Step>
-          <Step n={2} text="Open runner.env in an editor, add these lines, and replace the placeholder with the token:">
-            <CopyBlock testID="setup-env" label="the runner.env lines" text={runnerEnvTemplate(server())} />
-          </Step>
-          <Step n={3} text="Start the runner from the image. Its named volume holds a separate folder for each Space it serves (spaces/<space id>/):">
-            <CopyBlock testID="setup-docker" label="the docker run command" text={dockerRunCommand({ serverUrl: server(), runnerName: props.name, appVersion: APP_VERSION })} />
-          </Step>
-          <Step n={4} text="Attach it to a Space you own, as above." />
-        </SettingsGroup>
-      </If>
-    </Column>
   );
 }
 

@@ -37,7 +37,7 @@ don't affect which model Metro calls at runtime.
 ## Rules
 
 The rules below describe the current source. For the published changes,
-see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
+see [New in Metro 0.6.1](docs/released-0.6.1.md); for later changes, see
 [In the source, not released](docs/next-source.md).
 
 - Stay inside the files you were assigned. Don't edit another lane's files;
@@ -95,6 +95,13 @@ see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
   second Space, and no job goes to a runner its Space didn't explicitly
   choose. Don't add a server-wide runner token, a fallback Space or runner, or
   any implicit cross-Space assignment.
+- The desktop app has a personal registered runner built in (no separate
+  install, binary or terminal). It exists only after an explicit Set up
+  for the signed-in server and account (or, on the app's own local
+  workspace only, the installer's marker), keeps its credential in one
+  mode-600 file, starts and stops with the app, updates with it, and
+  serves list and read only. Reconnect is explicit; deleting it turns it
+  off locally and keeps its folders.
 - The desktop may offer its own eligible personal runner when creating a
   Space or for owner-selected existing Spaces. Submitting the checked
   Create Space choice or pressing Attach is the explicit action. These
@@ -203,6 +210,18 @@ see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
 
   The same routing below still applies to choose each run's answering
   model. The agent's history shows each message's author and recipients.
+- **Steering.** A message that would start agent A for sender S in a
+  Space room or thread where A is running a run S started from S's own
+  message (or, in Chat, a steer while S's turn runs in the same Chat
+  thread or the main Chat, never another) is delivered into
+  that run at its next model call instead of starting another. Space
+  messages always steer this way unless they carry an explicit model for
+  the turn; another person's message or one for another agent starts its
+  own run, and people-only messages never reach a run. Delivery rechecks
+  in one transaction that it's still S's message, S may still read the
+  room and (Chat) it wasn't stopped, and writes a `steered` marker (never
+  a message, history or indexed). Anything not delivered when the run
+  ends starts as it would have. Inboxes are memory only.
 - The desktop sends verified Space mentions as stable IDs and validated
   text ranges. Never silently retarget an ambiguous, changed or stale
   mention; keep the original draft when send is refused. Manual Dispatch
@@ -218,13 +237,21 @@ see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
   "No agent" for an unaddressed message (without "No agent" for the
   generic `@agent`). The options are keyed internally, so model text
   never becomes an agent id. For unaddressed text, send the new text,
-  Space and room names, Space description and up to three preceding
-  human or agent excerpts to the sender's System One connection. Lean
-  toward a useful agent: below the directedness threshold or on failure,
-  start nothing; at or above it, "No agent" uses the strongest agent
-  option. Default is 0.35 (range 0.2–1); migrate stored 0.85 values once.
-  Failure on unaddressed text returns an unstored `addressing_note` to
-  the sender only, not a room event. The selected run acts as the sender.
+  Space and room names, Space description, the display names of the
+  sender and the Space's other members (never ids), and up to eight
+  preceding human or agent excerpts (400 characters each, 2,400 in
+  total, newest kept), each with its author's name, whether a person or
+  an agent, and the names it explicitly addressed, to the sender's
+  System One connection. In a reply thread the anchor (unless deleted)
+  is the first excerpt, within those bounds and always kept. Lean
+  strongly toward a useful agent, including for a request to the room
+  about another person; "No agent" is for text that talks to another
+  person, is only conversation about someone with no request for the
+  room, or says no agent should answer. Below the directedness threshold
+  or on failure, start nothing; at or above it, "No agent" uses the
+  strongest agent option. Default is 0.35 (range 0.2–1); migrate
+  stored 0.85 values once. Failure on unaddressed text returns an
+  unstored `addressing_note` to the sender only, not a room event. The selected run acts as the sender.
   With `defer_decisions` (what the desktop sends), the message is stored
   and shown first and the decision follows; the pick is run activity and
   is never written into the stored recipients (in no path: the POST says
@@ -277,7 +304,13 @@ see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
   decision, registered before it routes, started in storage order, and
   never started if its message was deleted. Stop works before it starts:
   it's saved in the pending row before it's acknowledged, so a restart
-  doesn't start it.
+  doesn't start it. A person's turns run one at a time per conversation
+  (the main Chat and each Chat thread have their own line; **Queue**, the
+  default): the next starts when the running one there ends, a turn in
+  one never holds up another, and Stop ends only the running one. With
+  `delivery: "steer"` the message goes into the turn running in the same
+  conversation at its next model call instead; if that turn ends first,
+  it is queued like any other (see Steering below).
 - **Metro in Chat** can read and act as the user in their eligible
   Spaces. The per-account switch is on by default but gated on showing
   the notice, with per-Space exclusions and live access checks. Space
@@ -423,6 +456,18 @@ see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
   agent history and do not mirror to the parent. Personal Chat has no
   direct runner, workspace or agent-thread tools; reactions and web
   tools keep their separate rules.
+- **Chat threads** belong to the Chat's owner alone (no admin bypass;
+  unknown is 404): a new thread, or a reply thread anchored to a
+  main-Chat message or reply, one level deep. Each is its own Chat-agent
+  conversation with its own history, summaries, turns, Stop and
+  Queue/Steer line and inbox; a reply
+  thread's history starts with its anchor unless deleted. Only the owner
+  renames one. Deleting a thread is permanent and in one transaction
+  removes its events, reactions, attachment links, search vectors,
+  summaries and pending decisions, and stops its turns (their later
+  events are dropped, not logged as errors); a deleted anchor
+  stays as a tombstone while its thread exists. Scheduled prompts
+  target the main Chat only.
 - The database is pinned to one identity namespace. Never assign legacy or
   foreign history to anyone.
 - Desktop startup can show the Shell after verifying identity and
@@ -447,15 +492,17 @@ see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
     Documents & media gate (497 Rust tests, the 83 hardened media-service
     tests, `nsh test` 106/106) and the earlier 403-test gate are historical
     milestones.
-  - **Metro 0.6.0 is published**: stable GitHub release `v0.6.0`
-    (2026-11-26T03:13:02Z), tag on `430c835` (PR #19), made by CI run
-    45737693549, with 18 assets, Sigstore-signed `SHA256SUMS`, unsigned
-    Windows files and signed GHCR images (see [release record](docs/acceptance.md#published-metro-060-2026-11-26-github-release-v060)).
+  - **Metro 0.6.1 is published**: stable GitHub release `v0.6.1`
+    (2026-11-27T06:52:28Z), tag on `5384e8a` (PR #20), made by CI run
+    45949761195, with 18 assets, Sigstore-signed `SHA256SUMS`, unsigned
+    Windows files and signed GHCR images (see [release record](docs/acceptance.md#published-metro-061-2026-11-27-github-release-v061)).
     Native Windows by a person, real vendor accounts and real sign-ins
-    remain unverified. [0.6.0 work](docs/released-0.6.0.md) is
-    released; [0.6.1 work](docs/next-source.md) is not.
-  - The previous release was [Metro 0.5.1](docs/acceptance.md#published-metro-051-2026-11-26-github-release-v051)
-    (`v0.5.1` on `5120c52`, CI run 45725172627), and before it
+    remain unverified. [0.6.1 work](docs/released-0.6.1.md) is
+    released; [0.6.2 work](docs/next-source.md) is not.
+  - The previous release was [Metro 0.6.0](docs/acceptance.md#published-metro-060-2026-11-26-github-release-v060)
+    (`v0.6.0` on `430c835`, CI run 45737693549), and before it
+    [Metro 0.5.1](docs/acceptance.md#published-metro-051-2026-11-26-github-release-v051)
+    (`v0.5.1` on `5120c52`, CI run 45725172627) and
     [Metro 0.5.0](docs/acceptance.md#published-metro-050-2026-11-25-github-release-v050).
     Before them, Metro 0.4.0: GitHub release `v0.4.0` (2026-11-25),
     tag on `1a743e5`, made by CI run 45560122825, with Sigstore-signed
@@ -480,23 +527,24 @@ see [New in Metro 0.6.0](docs/released-0.6.0.md); for later changes, see
   sidecar next to the desktop app. Source builds live only in
   [docs/development.md](docs/development.md). Docs point to the published
   release by the names and URLs recorded in `docs/acceptance.md`: the
-  current one is **Metro 0.6.0**
-  (https://github.com/wnzn/metro/releases/tag/v0.6.0, tag `v0.6.0` on
-  `430c835`), with `Metro-0.6.0-linux-x64.tar.gz`,
-  `Metro-0.6.0-windows-x64.zip`,
-  `Metro-0.6.0-windows-x64.unsigned-preview.msi`,
-  `Metro-runner-0.6.0-linux-x64.tar.gz` (each with `.sha256`), the
+  current one is **Metro 0.6.1**
+  (https://github.com/wnzn/metro/releases/tag/v0.6.1, tag `v0.6.1` on
+  `5384e8a`), with `Metro-0.6.1-linux-x64.tar.gz`,
+  `Metro-0.6.1-windows-x64.zip`,
+  `Metro-0.6.1-windows-x64.unsigned-preview.msi`,
+  `Metro-runner-0.6.1-linux-x64.tar.gz` (each with `.sha256`), the
   installer scripts, `SHA256SUMS` with its Sigstore bundle, `IMAGES.txt`,
-  and the images `ghcr.io/wnzn/metro-server:v0.6.0`,
-  `ghcr.io/wnzn/metro-runner:v0.6.0` and
-  `ghcr.io/wnzn/metro-embeddinggemma2:v0.6.0` (pinned by digest). Windows
+  and the images `ghcr.io/wnzn/metro-server:v0.6.1`,
+  `ghcr.io/wnzn/metro-runner:v0.6.1` and
+  `ghcr.io/wnzn/metro-embeddinggemma2:v0.6.1` (pinned by digest). Windows
   files are **unsigned** (no Authenticode). Docs never present source
   that came after a release's commit as part of that release; label it
   "in the source, not released". A newer release is named in docs only
   once its publication is recorded in `docs/acceptance.md`. The desktop app's **Use locally**
   runs a bundled local server with no token, and its owner-only, per-Space,
   read-only local tools (`workspace.list`/`workspace.read`) never stand in
-  for an operator's separately installed runner. It and the other features
+  for an operator's separately installed runner or for the app's built-in
+  runner. It and the other features
   checked in the 0.2.0 Linux candidate are described as verified in that
   local candidate, never as released. Keep unattended native Windows CI
   checks separate from earlier Wine attempts and the still-unverified

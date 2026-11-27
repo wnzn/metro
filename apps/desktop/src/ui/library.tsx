@@ -14,7 +14,7 @@ import fileVideoIcon from "./icons/file-video.svg";
 import pauseIcon from "./icons/pause.svg";
 import playIcon from "./icons/play.svg";
 import uploadIcon from "./icons/upload.svg";
-import { cx, popoverClass, popoverItemClass } from "./tokens";
+import { cx, disabledTextClass, popoverClass, popoverItemClass } from "./tokens";
 
 type Testable = { testID?: string; accessibilityLabel?: string };
 
@@ -189,14 +189,14 @@ export function UploadMenu(
       popupClass={cx(popoverClass, "min-w-[260px] max-w-[360px]")}
       trigger={
         <Button
-          class={cx("flex-row items-center gap-(--space-2) min-h-[32px] rounded-(--radius-sm) px-(--space-3) py-(--space-2) bg-primary hover:bg-primary/90 active:bg-primary/85 disabled:opacity-50", focusRing)}
+          class={cx("group flex-row items-center gap-(--space-2) min-h-[32px] rounded-(--radius-sm) px-(--space-3) py-(--space-2)", props.busy ? "bg-muted" : "bg-primary hover:bg-primary-hover active:bg-primary-hover", focusRing)}
           disabled={props.busy}
           testID={props.testID}
           accessibilityLabel={props.accessibilityLabel ?? props.label}
         >
-          <MediaGlyphIcon name="upload" tone="primary-foreground" />
-          <Text class="text-(length:--text-sm) font-medium text-primary-foreground">{props.busy ? props.busyLabel ?? props.label : props.label}</Text>
-          <Text class="text-(length:--text-xs) text-primary-foreground">▾</Text>
+          <MediaGlyphIcon name="upload" tone={props.busy ? "muted" : "primary-foreground"} />
+          <Text class={cx("text-(length:--text-sm) font-medium text-primary-foreground", disabledTextClass)}>{props.busy ? props.busyLabel ?? props.label : props.label}</Text>
+          <Text class={cx("text-(length:--text-xs) text-primary-foreground", disabledTextClass)}>▾</Text>
         </Button>
       }
     >

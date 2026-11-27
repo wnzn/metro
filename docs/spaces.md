@@ -152,7 +152,7 @@ always means "the default agent, or the one the classifier picks" (below).
   (`activity.agent`: id, handle, name, picture version and colour). Its
   `started` marker also says how the agent was chosen (`activity.pick`, for
   example *Addressed: @coder*, *Default agent* or *Picked by classifier:
-  Coder*). In the source, not released, a run the classifier picked has no
+  Coder*). Since 0.6.1, a run the classifier picked has no
   `activity.pick`: it shows only as that agent's run, and a weak pick that
   fell back says only *Default agent*.
 - Threads an agent's run creates keep that agent.
@@ -198,7 +198,7 @@ The table and rules below describe 0.5.0. **Since 0.6.0,**
 [replying to an agent](messages.md#reply) adds an explicit recipient, and
 the [opt-in classifier](system-one.md#classification-since-060)
 uses a lower threshold and brief room context for unaddressed text.
-In the source, not released (0.6.1), a message is stored and shown before
+**Since 0.6.1,** a message is stored and shown before
 [System One decides](system-one.md#decisions-after-posting), and members
 can [delete messages](messages.md#delete).
 
@@ -319,7 +319,7 @@ a question or request. An empty final answer or `METRO_NO_REPLY` completes
 the run without an agent message; a reaction followed by
 `METRO_REACTION_ONLY` can acknowledge a message without a text reply.
 The completed activity metadata distinguishes replies, reactions and no
-reply. In the source, not released (0.6.1), the desktop shows nothing in the
+reply. Since 0.6.1, the desktop shows nothing in the
 transcript for a run that ends without an agent message.
 
 New Spaces get a default agent instructed to help the whole room,

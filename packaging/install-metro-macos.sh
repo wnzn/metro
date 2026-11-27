@@ -231,7 +231,7 @@ install_app() {
     [ -z "$old" ] || rm -rf -- "$old"
     say "Metro $version is installed: $root/Metro.app"
     if [ "$local_runner" != yes ]; then
-        say "Local runner support is off (reinstall with --local-runner to turn it on)."
+        say "Local runner support is off: Metro won't set up its built-in runner on its own. Set it up in Metro under Settings > Runners, or reinstall with --local-runner."
     elif [ "$(json_field "$state/RELEASE.json" local_runner)" = installer-marker ]; then
         say "Local runner support is on. Metro sets up your personal on-device runner after you sign in; it is not attached to any Space until you choose it under Manage Space."
     else

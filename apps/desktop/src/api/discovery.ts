@@ -24,7 +24,7 @@ export type SearchScope = { kind: "all" } | { kind: "chat" } | { kind: "space"; 
  */
 export type SearchRanking = "classifier" | "embeddings" | "mixed";
 
-/** One hit. `spaceId` and `roomId` are null for the personal Chat. */
+/** One hit. `spaceId` is null for the personal Chat; `roomId` is then its Chat thread, or null for the main Chat. */
 export type SearchHit = { spaceId: string | null; roomId: string | null; eventId: number; actor: string; text: string; score: number };
 
 export type SearchResponse = { results: SearchHit[]; ranking: SearchRanking; partial: boolean; notice: string | null };
@@ -203,8 +203,9 @@ const text = (v: unknown): string | null => (typeof v === "string" && v.trim() ?
 
 function isHit(v: unknown): v is Record<string, unknown> & { event_id: number; actor: string; text: string } {
   if (!isObject(v) || typeof v.event_id !== "number" || !Number.isFinite(v.event_id) || typeof v.actor !== "string" || typeof v.text !== "string") return false;
-  // Chat hits have neither id; room hits have both. Anything else has no place to open.
-  const chat = v.space_id == null && v.room_id == null;
+  // Chat hits have no Space (a room id there is the Chat thread); room hits have both.
+  // Anything else has no place to open.
+  const chat = v.space_id == null && (v.room_id == null || isId(v.room_id));
   return chat || (isId(v.space_id) && isId(v.room_id));
 }
 

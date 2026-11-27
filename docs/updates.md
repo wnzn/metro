@@ -23,7 +23,7 @@ release, not just a newer version string.
 | --- | --- |
 | Managed Linux desktop | **Update to … → Download and verify** downloads and verifies the signed checksums and archive against the pinned Sigstore workflow identity. **Restart now** starts the trial. Metro can roll back when safe; uncertain recovery blocks startup instead of overwriting live data. The bundled runner updates with the app. |
 | Portable copy or older, unmigrated Linux install | Shows a notice and an official download link. Metro doesn't overwrite a portable folder or silently migrate old install locks. |
-| Windows MSI, script install or ZIP | Manual only. Metro doesn't start an MSI or install helper, or offer Windows rollback. Verify the matching prebuilt files before updating manually. The published 0.6.0 Windows files are unsigned; no native Windows desktop run by a person is recorded. |
+| Windows MSI, script install or ZIP | Manual only. Metro doesn't start an MSI or install helper, or offer Windows rollback. Verify the matching prebuilt files before updating manually. The published 0.6.1 Windows files are unsigned; no native Windows desktop run by a person is recorded. |
 
 An older Linux install needs a one-time, explicit lock migration to use
 managed updates. Use the matching verified prebuilt archive and Linux installer
@@ -42,7 +42,7 @@ gate, live database and backup. Don't remove locks or records, change the
 workspace, or run install, update or uninstall to clear the condition.
 
 Run `sh install-metro-linux.sh status` with the **verified official
-installer** from 0.6.0 for a read-only check. Use the same install and data locations
+installer** from 0.6.1 for a read-only check. Use the same install and data locations
 as the affected app. A reported phase isn't proof that recovery is safe.
 Contact the
 [Metro maintainers](https://github.com/wnzn/metro/issues) with the
@@ -51,8 +51,8 @@ or credentials.
 
 ## Runner and server updates
 
-- The desktop's installed runner follows Metro's update; it does not
-  self-update separately.
+- The desktop's built-in runner is part of the app and updates with it; it
+  never self-updates separately.
 - **Settings → Runners** can show version, presence and update status.
   Eligible standalone Linux runners can self-update when the personal
   runner owner or organization admin explicitly requests an update.

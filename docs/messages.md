@@ -1,8 +1,9 @@
 # Messages
 
 Markdown, Reply, Forward, the directory and DMs are in the published
-[Metro 0.6.0](released-0.6.0.md). **Delete** is in the source, not
-released, planned for 0.6.1 ([source overview](next-source.md)).
+[Metro 0.6.0](released-0.6.0.md), and **Delete** in [Metro 0.6.1](released-0.6.1.md).
+**Chat threads** and writing **while an agent replies** are in the source,
+not released, planned for 0.6.2 ([source overview](next-source.md)).
 
 ## Markdown
 
@@ -33,8 +34,33 @@ without agent attribution use the default agent. If the original agent
 was deleted, only the sender gets a notice, and no agent substitutes for
 it. Normal addressing rules still apply to other explicit recipients.
 
-In a DM, Reply quotes a message inline. Personal Chat has Forward but
-no Reply control.
+In a DM, Reply quotes a message inline. In your personal Chat, **Reply**
+opens a Chat thread (below).
+
+## Chat threads
+
+**In the source, not released (0.6.2).** Your personal Chat can have
+threads: separate conversations with Metro, listed under **Chat** in the
+navigation while the Chat is open. Use **New thread** and give it a title,
+or choose **Reply** on a message or reply in the main Chat to open the
+thread for that message; the same message always opens the same thread,
+and the reply count under it leads back. Threads are one level deep.
+
+Each thread is its own conversation: Metro sees only that thread's
+messages (and, in a reply thread, the message it replies to), with its
+own summaries, `/compact`, **Stop** and [Queue / Steer](#while-an-agent-replies)
+line: a reply running in one thread never holds up another thread or the
+main Chat. Metro in Chat and web tools work
+as in the main Chat. Scheduled prompts still post to the main Chat.
+
+Only you see your threads; there is no admin bypass. Use the thread's
+**⋯** menu to **Rename** it, or to **Delete** it after a confirmation.
+Deleting a thread is permanent: its messages, replies, reactions,
+attachment links (the Library files stay), search index entries and
+summaries are removed, so no later run sends them to a model, and a
+reply Metro is still writing there stops. Deleting a main-Chat message
+that has a thread leaves a **Message deleted** line while the thread
+exists.
 
 ## Forward
 
@@ -52,7 +78,7 @@ The server rechecks source and destination access together.
 
 ## Delete
 
-**In the source, not released (0.6.1).** Choose **Delete** in a
+**Since 0.6.1.** Choose **Delete** in a
 message's toolbar and confirm. Deleting is permanent, and there's no
 Trash. You can delete:
 
@@ -74,6 +100,42 @@ copies the start of its message, so once the message is deleted the run
 lists (**Agent runs**, `/v1/runs`, Pages and Metro in Chat) show the run
 with its status but without that text. Copies already
 forwarded, and anything already sent to a model, aren't affected.
+
+## While an agent replies
+
+**In the source, not released (0.6.2).** You can keep writing while an
+agent replies.
+
+**Personal Chat.** **Send** stays next to **Stop**. While Metro replies,
+the composer shows a small **Queue / Steer** choice. It's kept on this
+device and starts as Queue. The main Chat and each
+[Chat thread](#chat-threads) have their own queue: a reply running in one
+never holds up messages in another, and Steer only goes into the reply
+running in the same thread.
+
+- **Queue:** the message waits, then gets the next reply once the current
+  one ends. Queued messages run one at a time in the order you sent them,
+  also after a server restart. A queued message shows **Queued**;
+  **Cancel** takes it out of the queue (the message stays and never gets a
+  reply). Deleting it does the same. **Stop** ends only the running
+  reply; queued messages still run.
+- **Steer:** the message goes into the running reply. Metro adds it to
+  what the model sees at its next step (for example after a tool call)
+  and the message shows **Steered**. If the reply ends before that, the
+  message gets its own reply instead, after any queued ones.
+
+**Space rooms and threads.** Your message is posted to everyone at once,
+as always. If it asks an agent that is already working on your own
+message in the same room or thread, it steers that run instead of
+starting a second one, and shows **Steered**. The running run's model
+answers it. A message from someone else, for another agent, or with a
+model chosen for that turn starts its own run as usual, and a message
+only to people never reaches a run. Before adding your message, Metro
+checks again that it still exists and that you can still read the room;
+a deleted message never reaches the model. If the run ends first, the
+message starts its own run as usual. If Metro restarts while a message
+waits to steer a run, that run is interrupted and the message may go
+unanswered; send it again.
 
 ## Direct messages and the directory
 
@@ -120,9 +182,33 @@ conversations and messages generally return `404`.
   `addressing_note.kind: "reply_agent_unavailable"` on the POST response.
   Messages sent by Metro expose `via: "metro"` at top level.
 
+### Chat threads
+
+**In the source, not released (0.6.2).** Only the Chat's owner can use
+these; anyone else, and an unknown thread, gets `404`.
+
+| Request | Does |
+| --- | --- |
+| `GET /v1/chat/threads` | `{threads}`, most recently active first |
+| `POST /v1/chat/threads` with `{title?}` | Creates a thread (`201`); the title defaults to `New thread` |
+| `POST /v1/chat/events/{eid}/thread` with `{}` | The reply thread of main-Chat `message` or `agent` event `eid`: `201` if created, `200` if it exists; an event in a thread or of another kind gives `409` |
+| `PATCH /v1/chat/threads/{tid}` with `{title}` | Renames it |
+| `DELETE /v1/chat/threads/{tid}` | Deletes it and everything in it: `{deleted: true, events}` |
+
+A thread has `id`, `title`, `anchor_event_id` (reply threads only),
+`created_at`, `last_at` and `count` (messages and replies). Titles are 1
+to 80 printable characters; a Chat has at most 500 threads.
+`GET /v1/chat/events`, `POST /v1/chat/messages` and `POST /v1/chat/compact`
+take `?thread={tid}` for a thread; without it they use the main Chat.
+On a main-Chat anchor, `replies` gives the thread's id as `room_id` and
+its `count`. A Chat search hit in a thread has `space_id: null` and the
+thread's id as `room_id`. The `events` of a thread deletion are
+`message_deleted` events of the main Chat, for a deleted anchor that only
+stayed for that thread.
+
 ### Deleting messages
 
-**In the source, not released (0.6.1).**
+**Since 0.6.1.**
 
 | Request | Who may delete |
 | --- | --- |
@@ -137,11 +223,26 @@ gets `403`; anything other than a `message` or `agent` event gives `409`.
 A `message_deleted` event arrives through the normal `after` poll; its
 `text` is JSON `{target_event_id, tombstone}`. With `tombstone: true`,
 the target stays as a `kind: "deleted"` event with no text, recipients
-or metadata, anchoring its reply thread. A deletion also removes the
+or metadata, anchoring its reply thread (in a Space or your Chat). A
+deletion also removes the
 `compaction` events that cover it in its own room and in the reply thread
 anchored on it, each with its own `message_deleted` event. DM polls
 include deletions only with `GET /v1/dms/{id}/events?after=&deletions=1`,
 so older clients keep receiving messages only.
+
+### Queue and steer
+
+**In the source, not released (0.6.2).**
+
+- `POST /v1/chat/messages` accepts `delivery`: `"queue"` (the default) or
+  `"steer"`. Older servers reject the field with `422`. A person's Chat
+  turns run one at a time, in send order; each POST still returns its
+  `turn_id`, and `POST /v1/chat/turns/{id}/stop` on a turn that hasn't
+  started takes it out of the queue.
+- When a message is delivered into a running turn (Chat, or a Space room
+  or thread), its conversation gets a `kind: "steered"` event with empty
+  text and the running turn's `activity`, whose `steered` field is the
+  message's event ID. It's never a message, model history or indexed.
 
 ### Forward
 

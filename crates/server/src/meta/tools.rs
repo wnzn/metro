@@ -64,7 +64,7 @@ pub(super) fn args<T: DeserializeOwned>(v: Value) -> Result<T, String> {
 }
 
 pub(super) fn internal(e: anyhow::Error) -> String {
-    tracing::error!(error = %format!("{e:#}"), "Metro in Chat tool");
+    crate::db::log_append_error(&e, "Metro in Chat tool");
     "the operation couldn't be completed".to_owned()
 }
 
@@ -366,8 +366,9 @@ async fn record(ctx: &Ctx, event_kind: &'static str, text: &str, note: MetaNote)
     } else {
         actor::AGENT
     });
-    let (user, text, activity) = (
+    let (user, thread, text, activity) = (
         ctx.user.clone(),
+        ctx.thread.clone(),
         truncate(text, 2_000),
         ctx.turn.with_meta(note),
     );
@@ -377,6 +378,7 @@ async fn record(ctx: &Ctx, event_kind: &'static str, text: &str, note: MetaNote)
         .call(move |db| {
             db.append_personal_with(
                 &user,
+                thread.as_deref(),
                 event_kind,
                 &author,
                 &text,
@@ -386,7 +388,7 @@ async fn record(ctx: &Ctx, event_kind: &'static str, text: &str, note: MetaNote)
         })
         .await;
     if let Err(e) = r {
-        tracing::error!(error = %format!("{e:#}"), "appending Metro in Chat event");
+        crate::db::log_append_error(&e, "appending Metro in Chat event");
     }
 }
 
@@ -768,13 +770,14 @@ async fn page_propose(ctx: &Ctx, a: Value) -> R {
     // The card in the person's Chat; only they can open or apply the draft.
     let mut activity = ctx.turn.clone();
     activity.page_draft = Some(card.clone());
-    let (user, summary) = (ctx.user.clone(), card.summary.clone());
+    let (user, thread, summary) = (ctx.user.clone(), ctx.thread.clone(), card.summary.clone());
     if let Err(e) = ctx
         .state
         .db
         .call(move |db| {
             db.append_personal_with(
                 &user,
+                thread.as_deref(),
                 kind::PAGE_DRAFT,
                 &Author::server(actor::AGENT),
                 &summary,
@@ -784,7 +787,7 @@ async fn page_propose(ctx: &Ctx, a: Value) -> R {
         })
         .await
     {
-        tracing::error!(error = %format!("{e:#}"), "appending a Chat page draft card");
+        crate::db::log_append_error(&e, "appending a Chat page draft card");
     }
     let base_spaces = base
         .as_ref()

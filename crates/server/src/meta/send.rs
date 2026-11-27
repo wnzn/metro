@@ -273,13 +273,14 @@ async fn parent_name(ctx: &Ctx, space: &str, room: &str) -> String {
 async fn record_post(ctx: &Ctx, text: &str, post: SpacePost) {
     let mut activity: Activity = ctx.turn.clone();
     activity.space_post = Some(post);
-    let (user, text) = (ctx.user.clone(), text.to_owned());
+    let (user, thread, text) = (ctx.user.clone(), ctx.thread.clone(), text.to_owned());
     if let Err(e) = ctx
         .state
         .db
         .call(move |db| {
             db.append_personal_with(
                 &user,
+                thread.as_deref(),
                 kind::SPACE_POST,
                 &Author::server(actor::AGENT),
                 &text,

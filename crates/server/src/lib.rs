@@ -11,6 +11,7 @@ pub mod agent_dispatch;
 pub mod api;
 pub mod attachments;
 pub mod auth;
+pub mod chat_threads;
 pub mod compaction;
 pub mod config;
 pub mod db;
@@ -43,6 +44,7 @@ pub mod space_agents;
 mod space_context;
 pub mod space_prefs;
 pub mod spaces;
+pub mod steering;
 pub mod tools;
 pub mod updates;
 pub mod web_devices;
@@ -103,6 +105,8 @@ pub struct AppState {
     pub compaction: Arc<crate::compaction::Compaction>,
     /// Outcomes of decisions made after a message was stored (memory only).
     pub decisions: Arc<crate::decisions::Pending>,
+    /// Inboxes of running turns that take steering (memory only).
+    pub steering: Arc<crate::steering::Steering>,
 }
 
 impl AppState {
@@ -149,6 +153,7 @@ impl AppState {
             chat_runs: Arc::default(),
             compaction: Arc::default(),
             decisions: Arc::default(),
+            steering: Arc::default(),
             meta_waits: Arc::new(Semaphore::new((limits.max_agent_runs / 2).max(1))),
             managed,
             library,
@@ -361,6 +366,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::compaction::router())
         // Deleting a message: Space rooms and threads, personal Chat, DMs.
         .merge(crate::deletion::router())
+        .merge(crate::chat_threads::router())
         .layer(DefaultBodyLimit::max(HUMAN_BODY_LIMIT));
     // Room for the largest result plus JSON escaping.
     let runner_limit = state.config.limits.max_result_bytes * 2 + 1024;

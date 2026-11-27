@@ -293,6 +293,35 @@ pub async fn post_room_message(
     recipients.extend(plan.targets.iter().map(|target| Mention::AgentId {
         agent_id: target.agent.id.clone(),
     }));
+    // A target whose agent already runs for the sender here gets the
+    // message in that run: durable with it, so a restart before delivery
+    // starts it as usual, and only once.
+    let steered: Vec<String> = plan
+        .targets
+        .iter()
+        .filter(|t| {
+            steer_place(&space.id, &room.id, &author, &t.agent.id, &chosen)
+                .is_some_and(|p| state.steering.is_open(&p))
+        })
+        .map(|t| t.agent.id.clone())
+        .collect();
+    let planned = (!steered.is_empty()).then(|| crate::decisions::NewTargets {
+        epoch: state.decisions.epoch().to_owned(),
+        space: space.id.clone(),
+        room: room.id.clone(),
+        user: who.id.clone(),
+        targets: plan
+            .targets
+            .iter()
+            .filter(|t| steered.contains(&t.agent.id))
+            .map(|t| crate::decisions::PlannedTarget {
+                agent_id: t.agent.id.clone(),
+                pick: t.pick.clone(),
+                addressed_by: t.addressed_by,
+            })
+            .collect(),
+        choice: None,
+    });
     let event = match db(state, move |db| {
         attachments::append_message(
             db,
@@ -304,6 +333,7 @@ pub async fn post_room_message(
             &recipients,
             &meta,
             pending.as_ref(),
+            planned.as_ref(),
         )
     })
     .await?
@@ -353,7 +383,7 @@ pub async fn post_room_message(
         });
     }
     let started = finish(
-        state, &space.id, &room, &author, &event, plan, chosen, &settings, &prefs,
+        state, &space.id, &room, &author, &event, plan, &steered, chosen, &settings, &prefs,
     )
     .await;
     Ok(Posted {
@@ -405,6 +435,8 @@ pub(crate) struct Finished {
 }
 
 /// Post the plan's room errors, then start its runs answering `event`.
+/// The targets in `steered` were stored as planned runs with the message:
+/// each goes to its agent's running turn, or starts as planned.
 #[allow(clippy::too_many_arguments)]
 async fn finish(
     state: &AppState,
@@ -413,6 +445,7 @@ async fn finish(
     author: &Author,
     event: &Event,
     plan: crate::agent_dispatch::Plan,
+    steered: &[String],
     chosen: Option<crate::model_routing::Route>,
     settings: &RoutingSettings,
     prefs: &crate::space_prefs::SpacePrefs,
@@ -433,19 +466,31 @@ async fn finish(
             .targets
             .iter()
             .any(|t| t.addressed_by == crate::model_routing::AddressedBy::Classifier);
+    let (planned, targets): (Vec<_>, Vec<_>) = plan
+        .targets
+        .into_iter()
+        .partition(|t| steered.contains(&t.agent.id));
     // Mentioning only people never starts agent work.
-    let started = crate::agent_dispatch::start_runs(
+    let mut started = crate::agent_dispatch::start_runs(
         state,
         space,
         room,
         author,
         event,
-        plan.targets,
-        chosen,
+        targets,
+        chosen.clone(),
         settings,
         prefs,
     )
     .await;
+    if !planned.is_empty() {
+        let more = dispatch_planned(
+            state, space, room, author, event.id, planned, chosen, settings, prefs,
+        )
+        .await;
+        started.runs.extend(more.runs);
+        started.note = started.note.or(more.note);
+    }
     Finished {
         addressing_note: plan.addressing_note.map(SenderNote::Addressing),
         routing_note: started.note,
@@ -667,13 +712,123 @@ async fn dispatch_planned(
     settings: &RoutingSettings,
     prefs: &crate::space_prefs::SpacePrefs,
 ) -> crate::agent_dispatch::Started {
-    let user = author.id.clone().unwrap_or_default();
     let mut started = crate::agent_dispatch::Started::default();
     for t in targets {
         let Some(event) = live_message(state, space, &room.id, event_id).await else {
             crate::decisions::forget(state, crate::decisions::Scope::Space, event_id).await;
             break;
         };
+        // As in `finish`; the planned run stays stored until it is taken
+        // (claimed with the `steered` marker) or started.
+        if let Some(taken) = steer(state, space, &room.id, author, event_id, &t, &chosen, true) {
+            let (state, space, room, author, settings, prefs) = (
+                state.clone(),
+                space.to_owned(),
+                room.clone(),
+                author.clone(),
+                settings.clone(),
+                prefs.clone(),
+            );
+            tokio::spawn(async move {
+                if taken.await.is_ok() {
+                    return;
+                }
+                match live_message(&state, &space, &room.id, event_id).await {
+                    Some(event) => {
+                        let mut started = crate::agent_dispatch::Started::default();
+                        start_planned(
+                            &state,
+                            &space,
+                            &room,
+                            &author,
+                            &event,
+                            t,
+                            None,
+                            &settings,
+                            &prefs,
+                            &mut started,
+                        )
+                        .await;
+                    }
+                    None => {
+                        crate::decisions::forget(&state, crate::decisions::Scope::Space, event_id)
+                            .await
+                    }
+                }
+            });
+            continue;
+        }
+        start_planned(
+            state,
+            space,
+            room,
+            author,
+            &event,
+            t,
+            chosen.clone(),
+            settings,
+            prefs,
+            &mut started,
+        )
+        .await;
+    }
+    started
+}
+
+/// Offer `event_id` to the run of `t`'s agent that `author` has running in
+/// `room_id` ([`crate::steering`]). Never for a message with an explicit
+/// model for the turn: that one starts its own run.
+#[allow(clippy::too_many_arguments)]
+fn steer(
+    state: &AppState,
+    space: &str,
+    room_id: &str,
+    author: &Author,
+    event_id: i64,
+    t: &crate::agent_dispatch::Target,
+    chosen: &Option<crate::model_routing::Route>,
+    planned: bool,
+) -> Option<tokio::sync::oneshot::Receiver<()>> {
+    let place = steer_place(space, room_id, author, &t.agent.id, chosen)?;
+    state.steering.offer(&place, event_id, planned, None)
+}
+
+/// Where `author`'s message for `agent` would steer; `None` for a message
+/// with an explicit model for the turn.
+fn steer_place(
+    space: &str,
+    room_id: &str,
+    author: &Author,
+    agent: &str,
+    chosen: &Option<crate::model_routing::Route>,
+) -> Option<crate::steering::Place> {
+    if chosen.is_some() {
+        return None;
+    }
+    Some(crate::steering::Place::Room {
+        space: space.to_owned(),
+        room: room_id.to_owned(),
+        agent: agent.to_owned(),
+        user: author.id.clone()?,
+    })
+}
+
+/// Start one planned run of `event` ([`dispatch_planned`]).
+#[allow(clippy::too_many_arguments)]
+async fn start_planned(
+    state: &AppState,
+    space: &str,
+    room: &crate::db::Room,
+    author: &Author,
+    event: &Event,
+    t: crate::agent_dispatch::Target,
+    chosen: Option<crate::model_routing::Route>,
+    settings: &RoutingSettings,
+    prefs: &crate::space_prefs::SpacePrefs,
+    started: &mut crate::agent_dispatch::Started,
+) {
+    let (user, event_id) = (author.id.clone().unwrap_or_default(), event.id);
+    {
         let route = match &chosen {
             Some(route) => route.clone(),
             None => {
@@ -696,7 +851,7 @@ async fn dispatch_planned(
             }
         };
         match crate::agent::start_room_run_claimed(
-            state, space, room, author, &event, route, &t.agent, t.pick, true,
+            state, space, room, author, event, route, &t.agent, t.pick, true,
         )
         .await
         {
@@ -704,7 +859,7 @@ async fn dispatch_planned(
             Err(refusal) => {
                 crate::decisions::forget_target(state, event_id, &t.agent.id).await;
                 if refusal.shown.is_empty() {
-                    continue;
+                    return;
                 }
                 state
                     .append(
@@ -722,7 +877,6 @@ async fn dispatch_planned(
             }
         }
     }
-    started
 }
 
 /// Whether [`crate::agent_dispatch::plan`] asks System One for this message:

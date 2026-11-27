@@ -396,11 +396,22 @@ fn event_message(e: &Event, key: &TurnKey) -> Option<Message> {
     }
 }
 
+/// A reply thread's anchor as its history's first turn: as
+/// [`event_message`] says, any other kind as a user turn. An
+/// attachment-only message gives nothing.
+fn anchor_message(anchor: &Event, key: &TurnKey) -> Option<Message> {
+    match anchor.kind.as_str() {
+        kind::MESSAGE => event_message(anchor, key),
+        _ => Some(event_message(anchor, key).unwrap_or_else(|| user_turn(anchor, key))),
+    }
+}
+
 /// A random key for one run, stated in its system prompt and carried in
 /// each of its real context parts. Providers may merge adjacent user turns
 /// (or flatten their parts into one string), so the part boundary alone
 /// cannot tell Metro's context from text that imitates it; the key can,
 /// since nobody writing a message knows it.
+#[derive(Clone)]
 struct TurnKey(String);
 
 impl TurnKey {
@@ -427,6 +438,27 @@ fn user_turn(e: &Event, key: &TurnKey) -> Message {
             UserContent::text(e.text.clone()),
         ],
     }
+}
+
+/// Of the replies written after a room run's message, before it started,
+/// only `agent`'s answers to `initiator`'s messages (runs this process
+/// knows): never the agent's work for someone else, nor another agent's.
+fn late_replies(
+    state: &AppState,
+    late: Vec<Event>,
+    agent: &SpaceAgent,
+    initiator: &Author,
+) -> Vec<Event> {
+    late.into_iter()
+        .filter(|e| {
+            let Some(a) = &e.activity else { return false };
+            a.agent.as_ref().is_some_and(|b| b.id == agent.id)
+                && state.runs.get(&a.id).is_some_and(|r| {
+                    initiator.id.as_deref() == Some(r.actor.as_str())
+                        && r.agent_id.as_deref() == Some(agent.id.as_str())
+                })
+        })
+        .collect()
 }
 
 fn history(events: &[Event], key: &TurnKey) -> Vec<Message> {
@@ -830,8 +862,13 @@ enum Scope {
 /// search or its history).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PersonalLane {
-    Chat,
-    Page { page_id: String },
+    /// The main Chat (`thread` `None`) or one of its threads.
+    Chat {
+        thread: Option<String>,
+    },
+    Page {
+        page_id: String,
+    },
 }
 
 impl PersonalLane {
@@ -846,9 +883,15 @@ impl PersonalLane {
         activity: Option<&Activity>,
     ) -> anyhow::Result<Event> {
         match self {
-            PersonalLane::Chat => {
-                db.append_personal_with(user_id, kind, author, text, &Addressed::room(), activity)
-            }
+            PersonalLane::Chat { thread } => db.append_personal_with(
+                user_id,
+                thread.as_deref(),
+                kind,
+                author,
+                text,
+                &Addressed::room(),
+                activity,
+            ),
             PersonalLane::Page { page_id } => crate::pages::store::append_page_event(
                 db, page_id, user_id, kind, author, text, activity,
             ),
@@ -863,7 +906,7 @@ impl PersonalLane {
         n: usize,
     ) -> anyhow::Result<Vec<Event>> {
         match self {
-            PersonalLane::Chat => db.personal_before(user_id, before, n),
+            PersonalLane::Chat { thread } => db.chat_before(user_id, thread.as_deref(), before, n),
             PersonalLane::Page { page_id } => {
                 crate::pages::store::page_events_before(db, page_id, user_id, before, n)
             }
@@ -937,7 +980,7 @@ impl AgentHook for ReasoningSummaries {
                             })
                             .await;
                         if let Err(e) = r {
-                            tracing::error!(error = %format!("{e:#}"), "appending reasoning summary");
+                            crate::db::log_append_error(&e, "appending reasoning summary");
                         }
                     }
                 }
@@ -945,6 +988,24 @@ impl AgentHook for ReasoningSummaries {
             rig_agent::agent::ModelTurnAction::Continue
         }
     }
+}
+
+/// The [`crate::steering::Steer`] hook of a run keyed `key`.
+fn steer_hook(
+    state: &AppState,
+    inbox: &Arc<crate::steering::Inbox>,
+    turn: &Activity,
+    key: &TurnKey,
+    provenance: Option<Arc<crate::web_tools::Provenance>>,
+) -> crate::steering::Steer {
+    let key = key.clone();
+    crate::steering::Steer::new(
+        state,
+        inbox.clone(),
+        turn,
+        Arc::new(move |e| user_turn(e, &key)),
+        provenance,
+    )
 }
 
 // ---- Space rooms ----
@@ -1194,6 +1255,23 @@ async fn execute_room_run(
 ) {
     let built_from = model.built_from.clone();
     let limits = state.config.limits.clone();
+    // A run answering a person's own message takes the messages that person
+    // then sends this agent in the same room or thread. Held until the run's
+    // reply is stored (see execute_personal_run).
+    let inbox = match &initiator.id {
+        Some(user) if trigger.kind == kind::MESSAGE && trigger.actor_id.as_ref() == Some(user) => {
+            state
+                .steering
+                .open(crate::steering::Place::Room {
+                    space: space_id.to_owned(),
+                    room: room.id.clone(),
+                    agent: agent.id.clone(),
+                    user: user.clone(),
+                })
+                .map(Arc::new)
+        }
+        _ => None,
+    };
     let loaded = {
         let (space, room_id, before, n, agent_id, user, fetch) = (
             space_id.to_owned(),
@@ -1257,6 +1335,9 @@ async fn execute_room_run(
                     parent_events,
                     anchor,
                     context,
+                    // Replies written after the message, before this run
+                    // started (it waited for a decision or a running run).
+                    Db::replies_after_in(&tx, &space, &room_id, before, n)?,
                 ))
             })
             .await
@@ -1270,7 +1351,7 @@ async fn execute_room_run(
                 Code::AgentHistoryUnavailable,
             )
         }
-        Ok((earlier, paired, parent_events, anchor, context)) => {
+        Ok((earlier, paired, parent_events, anchor, context, late)) => {
             let agent_rules = agent_preamble(agent);
             let window = crate::compaction::window(
                 state,
@@ -1341,6 +1422,8 @@ async fn execute_room_run(
             }
             // Web tools: only when the agent may use them, and only on the
             // computer of the person who started the run.
+            // Steered messages add theirs ([`crate::steering::Steer`]).
+            let mut web_provenance = None;
             let (search, fetch) = (
                 agent.allows(crate::web_tools::WEB_SEARCH),
                 agent.allows(crate::web_tools::WEB_FETCH),
@@ -1349,13 +1432,14 @@ async fn execute_room_run(
                 let user = initiator.id.clone().unwrap_or_default();
                 let paired = crate::web_devices::has_device(state, &user).await;
                 if matches!(paired, Ok(true)) {
-                    let provenance = crate::web_tools::Provenance::from_messages(
+                    let provenance = Arc::new(crate::web_tools::Provenance::from_messages(
                         parent_events
                             .iter()
                             .chain(anchor.iter())
                             .chain(earlier.iter())
                             .chain(std::iter::once(trigger)),
-                    );
+                    ));
+                    web_provenance = Some(provenance.clone());
                     let ctx = crate::web_tools::WebContext {
                         state: state.clone(),
                         scope: crate::web_tools::WebScope::Room {
@@ -1364,7 +1448,7 @@ async fn execute_room_run(
                         },
                         initiator: initiator.clone(),
                         turn: turn.clone(),
-                        provenance: Arc::new(provenance),
+                        provenance,
                         agent_id: Some(agent.id.clone()),
                     };
                     builder = builder
@@ -1418,13 +1502,17 @@ async fn execute_room_run(
                     turn: turn.clone(),
                 });
             }
+            if let Some(inbox) = &inbox {
+                builder = builder.add_hook(steer_hook(state, inbox, turn, &key, web_provenance));
+            }
             let prompt = user_turn(trigger, &key);
+            let mut window = window;
+            window
+                .events
+                .extend(late_replies(state, late, agent, initiator));
             let mut history = history(&window.events, &key);
-            if let Some(anchor) = &anchor {
-                history.insert(
-                    0,
-                    event_message(anchor, &key).unwrap_or_else(|| user_turn(anchor, &key)),
-                );
+            if let Some(anchor) = anchor.as_ref().and_then(|a| anchor_message(a, &key)) {
+                history.insert(0, anchor);
             }
             drive(
                 state,
@@ -1931,7 +2019,7 @@ pub async fn respond_personal_routed(
         trigger,
         route,
         false,
-        PersonalLane::Chat,
+        PersonalLane::Chat { thread: None },
         Activity::chat(),
         None,
     )
@@ -1954,7 +2042,7 @@ pub async fn start_personal_run(
         trigger.clone(),
         route,
         true,
-        PersonalLane::Chat,
+        PersonalLane::Chat { thread: None },
         Activity::chat(),
         None,
     )
@@ -1966,12 +2054,17 @@ pub async fn start_personal_run(
 /// and a signal sent once its `started` marker is written.
 pub struct ChatStart {
     pub turn: Activity,
+    /// The Chat thread it answers in (`None`: the main Chat).
+    pub thread: Option<String>,
     pub cancel: watch::Receiver<bool>,
     pub guard: crate::meta::TurnGuard,
     /// `true` once the `started` marker is written; `false` when it was
     /// deliberately not started (stopped, its message deleted, or another
     /// process holds it). Dropped unsent: the start failed (or panicked).
     pub started: tokio::sync::oneshot::Sender<bool>,
+    /// The turn's place in its sender's line, held until it ends: the next
+    /// message waits (it is queued) until then.
+    pub line: Option<crate::decisions::Turn>,
 }
 
 /// [`start_personal_run`] for a turn registered already. It starts only if
@@ -1984,13 +2077,14 @@ pub async fn start_chat_turn(
     start: ChatStart,
 ) -> Result<(), String> {
     let turn = start.turn.clone();
+    let thread = start.thread.clone();
     run_personal(
         state.clone(),
         user_id.to_owned(),
         trigger.clone(),
         route,
         true,
-        PersonalLane::Chat,
+        PersonalLane::Chat { thread },
         turn,
         Some(start),
     )
@@ -2051,20 +2145,26 @@ async fn run_personal(
                 .call(move |db| lane.append(db, &user_id, kind, &author, &text, activity.as_ref()))
                 .await;
             if let Err(e) = r {
-                tracing::error!(error = %format!("{e:#}"), "appending personal event");
+                crate::db::log_append_error(&e, "appending personal event");
             }
         }
     };
     // In Chat a refusal stands alone; on a page it carries the turn, so the
     // page can show that this click failed.
-    let tag = (lane != PersonalLane::Chat).then(|| turn.clone());
+    let in_chat = matches!(lane, PersonalLane::Chat { .. });
+    let tag = (!in_chat).then(|| turn.clone());
     // A Chat turn its sender knows by id (it waited to start): its refusal
     // names that id, so the sender's pending Stop clears.
     let known = chat.as_ref().map(|c| c.turn.id.clone());
+    let lane_thread = match &lane {
+        PersonalLane::Chat { thread } => thread.clone(),
+        PersonalLane::Page { .. } => None,
+    };
     let append = |kind: &'static str, text: String| {
-        let (state, user, known, author, plain) = (
+        let (state, user, thread, known, author, plain) = (
             state.clone(),
             user_id.clone(),
+            lane_thread.clone(),
             known.clone(),
             agent_author.clone(),
             append_as(kind, text.clone(), tag.clone()),
@@ -2075,11 +2175,18 @@ async fn run_personal(
                     let r = state
                         .db
                         .call(move |db| {
-                            db.append_personal_for_turn(&user, kind, &author, &text, &turn)
+                            db.append_personal_for_turn(
+                                &user,
+                                thread.as_deref(),
+                                kind,
+                                &author,
+                                &text,
+                                &turn,
+                            )
                         })
                         .await;
                     if let Err(e) = r {
-                        tracing::error!(error = %format!("{e:#}"), "appending personal event");
+                        crate::db::log_append_error(&e, "appending personal event");
                     }
                 }
                 None => plain.await,
@@ -2131,16 +2238,36 @@ async fn execute_personal_run(
     let built_from = model.built_from.clone();
     let limits = state.config.limits.clone();
     // A Chat turn can be stopped by its owner (`POST /v1/chat/turns/{id}/stop`).
-    let (cancel, _registered, started_signal) = match (lane.clone(), chat) {
-        (PersonalLane::Chat, Some(chat)) => {
-            (Some(chat.cancel), Some(chat.guard), Some(chat.started))
+    let (cancel, _registered, started_signal, _line) = match (lane.clone(), chat) {
+        (PersonalLane::Chat { .. }, Some(chat)) => (
+            Some(chat.cancel),
+            Some(chat.guard),
+            Some(chat.started),
+            Some(chat.line),
+        ),
+        (PersonalLane::Chat { thread }, None) => {
+            let (cancel, guard) = state
+                .chat_runs
+                .register(&turn.id, &user_id, thread.as_deref());
+            (Some(cancel), Some(guard), None, None)
         }
-        (PersonalLane::Chat, None) => {
-            let (cancel, guard) = state.chat_runs.register(&turn.id, &user_id);
-            (Some(cancel), Some(guard), None)
-        }
-        (PersonalLane::Page { .. }, _) => (None, None, None),
+        (PersonalLane::Page { .. }, _) => (None, None, None, None),
     };
+    // A turn from the sender's line takes the messages they steer into it.
+    // Held until the turn's reply is stored: what it never took then waits
+    // its turn, which sees that reply.
+    let inbox = _line.as_ref().and_then(|_| {
+        state
+            .steering
+            .open(crate::steering::Place::Chat {
+                user: user_id.clone(),
+                thread: match &lane {
+                    PersonalLane::Chat { thread } => thread.clone(),
+                    PersonalLane::Page { .. } => None,
+                },
+            })
+            .map(Arc::new)
+    });
     // Stopped before it started: nothing to show.
     if cancel.as_ref().is_some_and(|c| *c.borrow()) {
         if let Some(signal) = started_signal {
@@ -2162,7 +2289,7 @@ async fn execute_personal_run(
                 .call(move |db| lane.append(db, &user_id, kind, &author, &text, activity.as_ref()))
                 .await;
             if let Err(e) = r {
-                tracing::error!(error = %format!("{e:#}"), "appending personal event");
+                crate::db::log_append_error(&e, "appending personal event");
             }
         }
     };
@@ -2170,7 +2297,11 @@ async fn execute_personal_run(
     // deleted since it was sent starts nothing: the check, the marker and
     // settling its pending decision are one transaction.
     let started = turn.at(activity::STARTED).with_route(route.note.clone());
-    if lane == PersonalLane::Chat && trigger.kind == kind::MESSAGE {
+    let thread = match &lane {
+        PersonalLane::Chat { thread } => Some(thread.clone()),
+        PersonalLane::Page { .. } => None,
+    };
+    if thread.is_some() && trigger.kind == kind::MESSAGE {
         let (user, trigger_id, author, marker, epoch) = (
             user_id.clone(),
             trigger.id,
@@ -2202,7 +2333,7 @@ async fn execute_personal_run(
             }
             // The sender (if waiting) learns the start failed.
             Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "starting a Chat turn");
+                crate::db::log_append_error(&e, "starting a Chat turn");
                 return;
             }
         }
@@ -2214,6 +2345,7 @@ async fn execute_personal_run(
     }
     let end = |phase: &'static str| append_as(kind::ACTIVITY, String::new(), Some(turn.at(phase)));
     let tagged = |kind: &'static str, text: String| append_as(kind, text, Some(turn.clone()));
+    // A Chat reply thread's history begins with its anchor, unless deleted.
     let earlier = {
         let (user, before, n, lane) = (
             user_id.clone(),
@@ -2223,11 +2355,19 @@ async fn execute_personal_run(
         );
         state
             .db
-            .call(move |db| lane.before(db, &user, before, n))
+            .call(move |db| {
+                let anchor = match &lane {
+                    PersonalLane::Chat { thread: Some(t) } => {
+                        crate::chat_threads::anchor_in(&db.lock(), &user, t)?
+                    }
+                    _ => None,
+                };
+                Ok((lane.before(db, &user, before, n)?, anchor))
+            })
             .await
     };
-    let earlier = match earlier {
-        Ok(events) => events,
+    let (earlier, anchor) = match earlier {
+        Ok(loaded) => loaded,
         Err(e) => {
             tracing::error!(error = %format!("{e:#}"), "loading personal history");
             state
@@ -2245,7 +2385,7 @@ async fn execute_personal_run(
     // In Chat only: web tools for a person who turned them on, always on
     // their own computer; Space tools while "Use my Spaces in Chat" is on
     // and its notice was shown (each call checks again).
-    let (web, spaces) = if lane == PersonalLane::Chat {
+    let (web, spaces) = if thread.is_some() {
         let user = user_id.clone();
         state
             .db
@@ -2265,12 +2405,12 @@ async fn execute_personal_run(
         (false, false)
     };
     let lane_rules = match lane {
-        PersonalLane::Chat => crate::meta::chat_preamble(spaces, web),
+        PersonalLane::Chat { .. } => crate::meta::chat_preamble(spaces, web),
         PersonalLane::Page { .. } => PERSONAL_PREAMBLE.to_owned(),
     };
     // Page conversations are never compacted.
-    let window = match lane {
-        PersonalLane::Chat => {
+    let window = match &lane {
+        PersonalLane::Chat { thread } => {
             let name = match &trigger.actor_id {
                 Some(id) if *id == user_id => trigger.actor.as_str(),
                 _ => user_id.as_str(),
@@ -2278,6 +2418,7 @@ async fn execute_personal_run(
             let run = crate::compaction::Run {
                 place: crate::compaction::Place::Chat {
                     user_id: user_id.clone(),
+                    thread: thread.clone(),
                 },
                 user_id: &user_id,
                 user_name: name,
@@ -2291,6 +2432,25 @@ async fn execute_personal_run(
         }
         PersonalLane::Page { .. } => crate::compaction::Window::today(earlier.clone()),
     };
+    // A turn that waited in line also sees the replies written after its
+    // message, before it started.
+    let mut window = window;
+    if let PersonalLane::Chat { thread } = &lane {
+        let (user, thread, after, n) = (
+            user_id.clone(),
+            thread.clone(),
+            trigger.id,
+            limits.agent_history,
+        );
+        match state
+            .db
+            .call(move |db| db.personal_replies_after(&user, thread.as_deref(), after, n))
+            .await
+        {
+            Ok(late) => window.events.extend(late),
+            Err(e) => tracing::error!(error = %format!("{e:#}"), "loading later Chat replies"),
+        }
+    }
     let mut builder = model
         .builder()
         .preamble(PREAMBLE)
@@ -2299,29 +2459,46 @@ async fn execute_personal_run(
         builder = builder.append_preamble(crate::compaction::PREAMBLE);
     }
     if spaces {
-        let ctx = crate::meta::Ctx::new(&state, &user_id, &turn, &trigger, &earlier);
+        let chat_thread = thread.clone().flatten();
+        let ctx = crate::meta::Ctx::new(
+            &state,
+            &user_id,
+            chat_thread.as_deref(),
+            &turn,
+            &trigger,
+            &earlier,
+        );
         builder = builder.dynamic_tools(crate::meta::tools(&ctx));
     }
-    if lane == PersonalLane::Chat && trigger.text.is_empty() && !trigger.attachments.is_empty() {
+    if thread.is_some() && trigger.text.is_empty() && !trigger.attachments.is_empty() {
         builder = builder.append_preamble(
             "The latest message contains only attachments. You cannot access those files. \
              Ask what the user needs and invite them to paste the relevant text.",
         );
     }
+    // Steered messages add theirs ([`crate::steering::Steer`]).
+    let mut web_provenance = None;
     if web {
         let paired = crate::web_devices::has_device(&state, &user_id).await;
         if matches!(paired, Ok(true)) {
+            let provenance = Arc::new(crate::web_tools::Provenance::from_messages(
+                anchor
+                    .iter()
+                    .chain(earlier.iter())
+                    .chain(std::iter::once(&trigger)),
+            ));
+            web_provenance = Some(provenance.clone());
             let ctx = crate::web_tools::WebContext {
                 state: state.clone(),
-                scope: crate::web_tools::WebScope::PersonalChat,
+                scope: crate::web_tools::WebScope::PersonalChat {
+                    thread: thread.clone().flatten(),
+                },
                 initiator: Author {
                     id: Some(user_id.clone()),
                     name: String::new(),
                 },
                 turn: turn.clone(),
-                provenance: Arc::new(crate::web_tools::Provenance::from_messages(
-                    earlier.iter().chain(std::iter::once(&trigger)),
-                )),
+                provenance: provenance.clone(),
                 agent_id: None,
             };
             builder = builder
@@ -2334,7 +2511,7 @@ async fn execute_personal_run(
     }
     let mut reacted = Arc::new(AtomicBool::new(false));
     // Reactions are for Chat messages; a page-only conversation has none.
-    if lane == PersonalLane::Chat
+    if thread.is_some()
         && let Some((tool, flag)) = reaction_tool(
             &state,
             ReactionScope::Personal {
@@ -2357,12 +2534,19 @@ async fn execute_personal_run(
             },
             turn: turn.clone(),
         });
+    if let Some(inbox) = &inbox {
+        builder = builder.add_hook(steer_hook(&state, inbox, &turn, &key, web_provenance));
+    }
     let prompt = user_turn(&trigger, &key);
+    let mut history = history(&window.events, &key);
+    if let Some(anchor) = anchor.as_ref().and_then(|a| anchor_message(a, &key)) {
+        history.insert(0, anchor);
+    }
     let phase = match drive(
         &state,
         builder.build(),
         prompt,
-        history(&window.events, &key),
+        history,
         cancel,
         route.note.connection_id.as_deref(),
         false,
@@ -2485,6 +2669,20 @@ mod tests {
         assert_eq!(ctx["speaker_id"], "alice");
         assert_eq!(ctx["event_id"], 7);
         assert_eq!(texts(&m)[1], "hi");
+    }
+
+    #[test]
+    fn an_attachment_only_anchor_adds_no_turn() {
+        let key = TurnKey::new();
+        assert!(anchor_message(&event(kind::MESSAGE, " ", Some(1)), &key).is_none());
+        assert_eq!(
+            texts(&anchor_message(&event(kind::MESSAGE, "q", Some(1)), &key).unwrap())[1],
+            "q"
+        );
+        assert!(matches!(
+            anchor_message(&event(kind::AGENT, "a", Some(1)), &key),
+            Some(Message::Assistant { .. })
+        ));
     }
 
     #[test]

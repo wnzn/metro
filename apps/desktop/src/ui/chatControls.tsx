@@ -271,7 +271,7 @@ export function EmojiChoice(
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel}
     >
-      <Text class="text-(length:--text-lg)">{props.emoji}</Text>
+      <Text class="text-(length:--text-lg) text-popover-foreground">{props.emoji}</Text>
     </Button>
   );
 }
@@ -586,7 +586,7 @@ export function AskAgentChooser(props: Testable & { choices: readonly AskAgentCh
               <MenuSeparator class="my-[4px] h-px bg-border" />
             </If>
             <MenuItem
-              class={cx(popoverItemClass, "group flex-row items-center gap-(--space-2)")}
+              class={cx(popoverItemClass, "flex-row items-center gap-(--space-2)")}
               role="menuitemradio"
               checked={c().checked}
               onSelect={c().onSelect}

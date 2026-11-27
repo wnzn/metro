@@ -58,8 +58,10 @@ import {
   sending,
   setDraft,
   status,
+  steeredIn,
   toggleReaction,
 } from "../store";
+import { cancelQueuedTurn, queuedChatTurns } from "./meta/state";
 import type { Reactions as ReactionMap, RoomEvent } from "../store";
 import { choiceForTurn, ComposerModelControls } from "./composerModels";
 import type { AttachedFile, EventAgent } from "../api/client";
@@ -704,6 +706,9 @@ function LiveMessageRow(props: { row: () => Of<"event">; actions: TranscriptActi
           </MessageFiles>
         )}
       </If>
+      <If when={!direct() && event().kind === "message"}>
+        <DeliveryNote eventId={event().id} events={nearby()} />
+      </If>
       <If when={reactable()}>
         <Reactions eventId={event().id} roomId={roomId()} direct={direct()} />
       </If>
@@ -713,6 +718,26 @@ function LiveMessageRow(props: { row: () => Of<"event">; actions: TranscriptActi
       </If>
       <If when={!props.actions.readOnly && !direct()}><SenderNotice event={event} focusComposer={focusComposer} /></If>
     </MessageFrame>
+  );
+}
+
+/** "Steered" on a message delivered into a running agent turn; "Queued" on the user's own queued Chat message. */
+function DeliveryNote(props: { eventId: number; events: readonly RoomEvent[] }) {
+  const queued = () => (mainPlace() === "chat" ? queuedChatTurns().get(props.eventId) ?? null : null);
+  return (
+    <If when={!steeredIn(props.events).has(props.eventId)} else={
+      <HeaderNote testID={`steered:${props.eventId}`} text="Steered" accessibilityLabel="Added to the agent's running reply" />
+    }>
+      <If when={queued()}>
+        {(turn) => (
+          <Row gap={2} align="center" testID={`queued:${props.eventId}`}>
+            <HeaderNote text="Queued" accessibilityLabel="Queued: runs after the current reply" />
+            <InlineLink testID={`unqueue:${props.eventId}`} label="Cancel" accessibilityLabel="Remove from the queue"
+              onPress={() => void cancelQueuedTurn(turn())} />
+          </Row>
+        )}
+      </If>
+    </If>
   );
 }
 
@@ -916,7 +941,7 @@ export function Composer(props: {
   askPicture?: JSX.Element;
   /** The agent chooser joined to Ask agent. */
   askChooser?: JSX.Element;
-  /** Replaces Chat Send while a reply is running; saving a note remains separate. */
+  /** Beside Chat Send while a reply is running (Stop, and what Send does meanwhile). Send stays. */
   stopReply?: JSX.Element;
 }) {
   const hasFiles = () => stagedFor(composerScope()).length > 0;
@@ -955,7 +980,7 @@ export function Composer(props: {
     }, { when: "always", repeat: true });
   });
   const post = (ask: boolean) => {
-    if ((personal() && props.stopReply) || !(ask && !personal() ? canAsk() : canSend())) return;
+    if (!(ask && !personal() ? canAsk() : canSend())) return;
     if (!personal()) {
       void send(ask, choiceForTurn, ask ? props.askAgentId : undefined, props.replyAgentId);
     } else if (ask) {
@@ -1062,14 +1087,15 @@ export function Composer(props: {
                 disabled={!canSend()}
                 onPress={() => void saveChatNote()}
               />
-              {props.stopReply ?? <SendButton
+              {props.stopReply}
+              <SendButton
                 testID="send"
                 accessibilityLabel={hasFiles() ? "Send to your agent. The agent cannot read attached files." : "Send to your agent"}
                 tooltip="Send to your agent (Return)"
                 busy={sending() === "agent"}
                 disabled={!canSend()}
                 onPress={() => post(true)}
-              />}
+              />
             </If>}>
               <Action compact variant="primary" testID="run-command" label="Run command" busyLabel="Summarizing…"
                 busy={compacting()} disabled={!ready()} onPress={submit} />

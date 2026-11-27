@@ -698,8 +698,8 @@ isn't secret and never leaves the device.
     credentials ([screenshot](screenshots/route-attribution.png)).
   - Since 0.4.0, the group is named
     after the Space agent working the turn, can show how that agent was
-    chosen (for example *Picked by classifier: Coder*; in the source,
-    not released, that label and *detected by System One* are no longer
+    chosen (for example *Picked by classifier: Coder*; since 0.6.1,
+    that label and *detected by System One* are no longer
     shown), and shows the
     provider's reasoning summaries (`reasoning_summary` events) as
     plain text. Collapsed, the group is one summary line (for example

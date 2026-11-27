@@ -524,3 +524,20 @@ test("a long, uppercase extension keeps its own text and family colour", async (
   expect(app.viewStyle(`id:quick-asset:${id}:ext`)?.backgroundColor).toBe(themeColor("dark", "ext-markdown"));
   expect(app.shows(`label:/^Release NOTES\\.MARKDOWN, Your personal library\\./`)).toBe(true);
 });
+
+test("a Chat message in a Chat thread opens that thread", async () => {
+  const w = quickWorld();
+  w.f.state.chatThreads.set("alice", [{ id: "ct-9", title: "Trip plans" }]);
+  w.f.state.events.set("chat:alice:ct-9", [{ id: 7, kind: "message", actor: "alice", actor_id: "alice", text: "the ferry leaves at nine" }]);
+  w.q.answers.set("ferry", () => ({
+    assets: [],
+    messages: [{ space_id: null, room_id: "ct-9", event_id: 7, actor: "alice", text: "the ferry leaves at nine" }],
+  }));
+  const app = await signIn(w);
+  await app.type("id:top-search", "ferry");
+  await app.waitFor("id:quick-message:chat:ct-9:7");
+  await app.press("id:quick-message:chat:ct-9:7");
+  await app.waitFor("id:chat-view >> text:A thread in your Chat. Only you can open it.");
+  await app.waitFor("id:chat-view >> text:the ferry leaves at nine");
+  expect(app.shows("id:chat-view >> text:Trip plans")).toBe(true);
+});

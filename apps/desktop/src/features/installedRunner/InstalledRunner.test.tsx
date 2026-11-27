@@ -26,7 +26,6 @@ function bridgeWithRunner(f: F, runnerId: string | null, name: string, opts: Opt
   const t = { log };
   const st = { state: opts.state ?? "online", canReconnect: opts.canReconnect ?? false, runnerId, delay: 0, status: 200, available: opts.available ?? true };
   const status = () => ({
-    requested: opts.requested ?? true,
     marker: opts.requested === false ? "absent" : "accepted",
     marker_detail: null,
     available: st.available,
@@ -36,6 +35,7 @@ function bridgeWithRunner(f: F, runnerId: string | null, name: string, opts: Opt
     ...(opts.unconfirmedName && !st.runnerId ? { unconfirmed_name: opts.unconfirmedName } : {}),
     spaces_folder: !st.available ? null : ROOT,
     tools: ["workspace.list", "workspace.read"],
+    can_set_up: st.state === "not_set_up",
     can_reconnect: st.canReconnect,
   });
   const handle = (req: Req) => {
@@ -49,6 +49,17 @@ function bridgeWithRunner(f: F, runnerId: string | null, name: string, opts: Opt
       }
       const body = st.status === 200 ? status() : { error: { code: "unavailable", message: "try again" } };
       return { status: st.status, body, ...(st.delay ? { delay: st.delay } : {}) };
+    }
+    if (path === "/v1/local-tools/runner/setup" && req.method === "POST" && st.state === "not_set_up") {
+      st.runnerId = f.addRunner(name, "personal", b.state.session!.account_id).id;
+      st.state = "online";
+      return { status: 200, body: status() };
+    }
+    if (path === "/v1/local-tools/runner/forget" && req.method === "POST") {
+      if (JSON.parse(req.body ?? "{}").runner_id !== st.runnerId) return { status: 409, body: { error: { code: "runner_changed", message: "changed" } } };
+      st.runnerId = null;
+      st.state = "not_set_up";
+      return { status: 200, body: status() };
     }
     if (path === "/v1/local-tools/runner/reconnect" && req.method === "POST") {
       st.state = "online";
@@ -435,7 +446,7 @@ for (const replaced of [false, true]) {
   });
 }
 
-test("shows the installer's runner, read-only tools and how to attach; opening only reads", async () => {
+test("shows this computer's runner, read-only tools and how to attach; opening only reads", async () => {
   const f = world();
   f.addSpace("solo", "Solo", "alice");
   f.addSpace("other", "Other", "alice");
@@ -561,7 +572,33 @@ test("the healthy installed runner has exactly one scoped Rotate and Delete path
   expect(f.posts().filter((p) => p.path.startsWith("/v1/runners/")).map((p) => [p.method, p.path])).toEqual([
     ["POST", `/v1/runners/${mine.id}/token`], ["DELETE", `/v1/runners/${mine.id}`],
   ]);
+  // Deleted here: turned off on this computer too, ready to set up again.
+  await app.waitFor("id:installed-runner-setup");
+  expect(posts(t).map((l) => [l.path, l.body])).toEqual([["/v1/local-tools/runner/forget", JSON.stringify({ runner_id: mine.id })]]);
+  expect(app.shows("id:runners-error")).toBe(false);
+});
+
+test("Set up on a signed-in server posts only on the press, then offers Spaces to attach", async () => {
+  const f = world();
+  f.addSpace("solo", "Solo", "alice");
+  const t = bridgeWithRunner(f, null, "Metro desktop on this computer (abc123)", { state: "not_set_up", requested: false });
+  const app = await openWith(f, t);
+  await signInToRunners(app, "alice");
+  await app.waitFor("id:installed-runner-setup");
+  expect(text(app)).toContain("Built into Metro");
+  expect(app.shows("id:runner-attach-list")).toBe(false);
+  expect(app.shows("id:installed-runner-reconnect")).toBe(false);
+  await sleep(200);
   expect(posts(t)).toEqual([]);
+  expect(f.state.runners.size).toBe(0);
+  await app.press("id:installed-runner-setup");
+  await app.waitFor("id:installed-runner-notice");
+  expect(posts(t).map((l) => [l.path, l.body])).toEqual([["/v1/local-tools/runner/setup", "{}"]]);
+  expect(text(app)).toContain("Connected");
+  await app.waitFor("id:runner-attach-pick:solo");
+  // Metro attaches nothing on its own.
+  expect(f.state.attached.has("solo")).toBe(false);
+  expect(f.posts().filter((p) => p.path.includes("/runner"))).toEqual([]);
 });
 
 test("an interrupted setup with no known id: reconnect creates a new runner and warns of an unused one", async () => {
@@ -580,7 +617,7 @@ test("an interrupted setup with no known id: reconnect creates a new runner and 
   expect(posts(t)).toEqual([]);
 });
 
-test("hidden on a remote server, when not requested, with an older launcher, and without the launcher", async () => {
+test("hidden without a bound session, with an older launcher, and without the launcher", async () => {
   for (const opts of [{ available: false }, { requested: false, available: false }, { legacy: true }] as Opts[]) {
     const f = world();
     const t = bridgeWithRunner(f, "rn1", "This PC", opts);
@@ -632,9 +669,11 @@ test("each account binds one Sidebar read; Settings refreshes without carrying t
 
 test("parse and badge are strict and honest", () => {
   expect(parseInstalledRunner(null)).toBe(null);
-  expect(parseInstalledRunner({ requested: true, available: false, state: "unavailable" })).toBe(null);
-  expect(parseInstalledRunner({ requested: false, available: true, state: "online" })).toBe(null);
-  expect(parseInstalledRunner({ requested: true, available: true, state: "weird" })).toBe(null);
+  expect(parseInstalledRunner({ available: false, state: "unavailable" })).toBe(null);
+  expect(parseInstalledRunner({ available: true, state: "weird" })).toBe(null);
+  const fresh = parseInstalledRunner({ available: true, state: "not_set_up", can_set_up: true })!;
+  expect([fresh.canSetUp, fresh.canReconnect, fresh.runner]).toEqual([true, false, null]);
+  expect(installedRunnerBadge(fresh).label).toBe("Not set up");
   const r = parseInstalledRunner({ requested: true, available: true, state: "offline", runner: { id: "rn1", name: "PC" }, tools: ["workspace.list"], can_reconnect: false })!;
   expect(r.runner).toEqual({ id: "rn1", name: "PC" });
   expect(installedRunnerBadge(r).tone).toBe("warning");

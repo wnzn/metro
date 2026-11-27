@@ -3,6 +3,137 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Source only: Metro 0.6.2 lanes (2026-11-27, local)
+
+Local Linux builds only. This is not a release, release files, a
+native desktop check by a person or a publication record.
+
+**Integrated gate** on `release/062` at
+`6b7e4f7e9de8ebc3a325794d0475f176bf5c5530`, with every lane merged and
+review fixes in:
+
+- `cargo fmt`, `cargo clippy -D warnings` and `cargo build` passed.
+- `cargo test --workspace`: 1,294 passed, 0 failed, 3 ignored, across 78
+  suites.
+- E2e 17/17 passed: `agent_pages`, `attachments`, `compaction`,
+  `device_connector`, `intelligence`, `library`, `library_reference`,
+  `message_lifecycle`, `messaging`, `meta_agent`, `pages`, `schedules`,
+  `settings`, `smoke`, `threads`, `updates` and `web_search`.
+- Packaging: 206 passed, 63 skipped.
+- Desktop: `nsh check` passed; full `nsh test` 992/992 (12m50s).
+- Reviews: the Opus 5.5 review found no blockers, 1 major, 5 minor and
+  some nits, all fixed in `c52a569..6b7e4f7`; the Opus re-review
+  accepted them.
+
+**After the gate**, `cd75165` changed only the classification guidance:
+a question or request to the room still gets an agent when it mentions
+or is about another person. `metro-server` lib 419 passed, 1 ignored;
+`model_routing` 24 and `model_routing_http` 3 passed; e2e `messaging.py`
+and `intelligence.py` passed; `cargo fmt --check` and `cargo clippy
+--workspace --all-targets -D warnings` passed. The full gate was not
+rerun.
+
+Per-lane results below were reported on each lane branch before
+integration.
+
+- **Colours lane** (`lane/062-colors`: dropdown text in dark and light).
+  99/99 targeted desktop tests and `nsh check` passed; before and after
+  screenshots were taken.
+- **Classification lane** (`lane/062-classify`: wider Space context,
+  thread anchor, *No agent* guidance). `metro-server` lib tests 410
+  passed, 1 ignored. Integration tests: `model_routing` 24,
+  `message_lifecycle` 28, `replies` 11, `model_routing_http` 18,
+  `meta_agent` 11, `api` 21 and `message_time` 5 passed. E2e
+  `messaging.py`, `intelligence.py` and `message_lifecycle.py` passed.
+  Desktop `RoutingSettings` 13/13.
+- **Runner lane** (`lane/062-runner`: built-in desktop runner on any
+  signed-in server). `desktop_runner` 10/10, `desktop_local_runner` 3/3,
+  `desktop_tools` 11/11, `metro-connector` lib 147/147,
+  `desktop_bridge` 7/7, `desktop_local` 4 passed and 1 ignored. Desktop
+  `InstalledRunner` 52/52, `RunnerOffer` 49/49, `LocalTools` 14/14,
+  `localWorkspace` 13/13, `App` 35/35. Packaging: 269 run OK, 63
+  skipped. No Windows run.
+- **Install lane** (`lane/062-install`: runner install tabs). Desktop
+  `App` 35/35, `SpaceSettings` 28/28, `setupTemplates` 8/8; the generated
+  Docker Compose file was validated with `docker compose config`.
+- **Steering lane** (`lane/062-steer`: Chat Queue/Steer, Space
+  steering). `metro-server` 764 passed, 1 ignored; full desktop
+  `nsh test` 976/976.
+- **Threads lane** (`lane/062-threads`, after merging `release/062`
+  including steering: personal Chat threads). `metro-server` 783 passed,
+  1 ignored; e2e `message_lifecycle.py`, `compaction.py` and
+  `meta_agent.py` passed; full desktop `nsh test` 990/990.
+- **Version bump** (`a1169fd`, 0.6.2). Packaging 206 passed, 63
+  skipped; `cargo check` passed.
+
+**Not verified:** any native Windows run in this cycle (including the
+desktop by a person and the built-in runner), and any real vendor run,
+account or sign-in.
+
+## Published: Metro 0.6.1 (2026-11-27, GitHub release v0.6.1)
+
+**What was published.** The stable
+[Metro 0.6.1 release](https://github.com/wnzn/metro/releases/tag/v0.6.1)
+was published at `2026-11-27T06:52:28Z` (not a draft or prerelease,
+marked latest).
+Tag `v0.6.1` points to `5384e8a6d89ebd7ddb20c3b79623d5bd6132868f`,
+the merge of [PR #20](https://github.com/wnzn/metro/pull/20).
+The only Actions run on that commit is the push to `main`,
+[CI 45949761195](https://github.com/wnzn/metro/actions/runs/45949761195)
+(created `2026-11-27T06:06:38Z`), which succeeded, including the
+release Windows desktop and preview jobs, asset and image signing, and
+publication. Windows code signing was skipped.
+
+The [0.6.1 guide](released-0.6.1.md) describes the shipped changes.
+The [0.6.2 changes](next-source.md) are not part of this release.
+
+**Assets** (18):
+
+| File | Verification |
+| --- | --- |
+| `Metro-0.6.1-linux-x64.tar.gz` + `.sha256` | `Metro-0.6.1-linux-x64.tar.gz.sigstore.json` |
+| `Metro-0.6.1-windows-x64.zip` + `.sha256` | No Authenticode; check against the signed manifest |
+| `Metro-0.6.1-windows-x64.unsigned-preview.msi` + `.sha256` | No Authenticode; check against the signed manifest |
+| `Metro-runner-0.6.1-linux-x64.tar.gz` + `.sha256` | `Metro-runner-0.6.1-linux-x64.tar.gz.sigstore.json` |
+| `install-metro-linux.sh`, `install-metro-runner-linux.sh`, `install-metro-windows.ps1`, `metro-runner-container.sh`, `metro-runner-container.ps1` | Listed in `SHA256SUMS`; the PowerShell scripts have no Authenticode |
+| `IMAGES.txt` | Listed in `SHA256SUMS` |
+| `SHA256SUMS` | `SHA256SUMS.sigstore.json` |
+
+**Images.** Pin by digest; there is no `latest` tag. The release's
+[`IMAGES.txt`](https://github.com/wnzn/metro/releases/download/v0.6.1/IMAGES.txt)
+records these references and the workflow's keyless Sigstore verification
+of each digest against the exact source commit.
+
+| Reference | Digest | Platforms |
+| --- | --- | --- |
+| `ghcr.io/wnzn/metro-server:v0.6.1` | `sha256:dbae2cbb40eefe0914936639de7533b53184f7719868f273b2377b71a1995459` | `linux/amd64`, `linux/arm64` |
+| `ghcr.io/wnzn/metro-server` | `sha256:14f429ecba8ece79346b33fb093c9a7ccb9dcac10cb88f91bb8b3b28996eb745` | `linux/amd64` |
+| `ghcr.io/wnzn/metro-server` | `sha256:9f5ebedb5b520d08eb984cba7c53e6ff84d0db6b097618e20a1a2f32d81cd494` | `linux/arm64` |
+| `ghcr.io/wnzn/metro-runner:v0.6.1` | `sha256:d74d0b32408fe35da3aefeb17f24f2814a230466a372b0e8a6594b41fda163cc` | `linux/amd64`, `linux/arm64` |
+| `ghcr.io/wnzn/metro-runner` | `sha256:1ab95708981bf2b0c35ad3944cf0a1c05d382b9633e86583a869ec901a445972` | `linux/amd64` |
+| `ghcr.io/wnzn/metro-runner` | `sha256:b91df8bd9f4d3883cee38b8125a823164a7c9c33c2bba8032e0ebfd2a29cbfe9` | `linux/arm64` |
+| `ghcr.io/wnzn/metro-embeddinggemma2:v0.6.1` | `sha256:229b27674ad17463da7c85ea3a8eedd19b1f5318e5dc5fd69c89d034b87f106e` | `linux/amd64` (no weights) |
+| `ghcr.io/wnzn/metro-embeddinggemma2` | `sha256:347526719759e61d62df93e4c144d64c080efb2a40a18919cda50440c78d6a93` | `linux/amd64` |
+
+**How it was checked** (2026-11-27, read-only):
+
+```sh
+gh release view v0.6.1 --repo wnzn/metro --json tagName,publishedAt,isPrerelease,isDraft,url,assets
+gh api repos/wnzn/metro/releases/latest --jq .tag_name
+gh api repos/wnzn/metro/git/ref/tags/v0.6.1
+gh pr view 20 --repo wnzn/metro --json mergeCommit
+gh api "repos/wnzn/metro/actions/runs?head_sha=5384e8a6d89ebd7ddb20c3b79623d5bd6132868f"
+gh run view 45949761195 --repo wnzn/metro --json headSha,jobs
+gh release download v0.6.1 --repo wnzn/metro -p IMAGES.txt -p SHA256SUMS -D <new empty dir>
+```
+
+The 18 asset names and eight image references matched the release, and
+`IMAGES.txt` matched its checksum in `SHA256SUMS`. No release binary or
+container was run and no signature was independently verified in this
+check. The native Windows CI runs for 0.6.1 are unattended, not a
+desktop or MSI wizard run by a person on native Windows. Real vendor
+accounts and sign-ins remain unverified.
+
 ## Source only: Metro 0.6.1 lanes (2026-11-27, local)
 
 Lane runs on local builds, reported by each lane; not release files, a
@@ -88,7 +219,7 @@ Windows preview gate, asset and image signing, and publication. Windows
 code signing was skipped.
 
 The [0.6.0 guide](released-0.6.0.md) describes the shipped changes.
-The [0.6.1 changes](next-source.md) are not part of this release.
+The [0.6.1 changes](released-0.6.1.md) came in the next release.
 
 **Assets** (18):
 

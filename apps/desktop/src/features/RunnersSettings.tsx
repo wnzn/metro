@@ -194,7 +194,10 @@ function RunnerRow(props: { runner: RegisteredRunner }) {
 }
 
 function RunnerManagement(props: { runner: RegisteredRunner; installed?: boolean }) {
-  const r = () => props.runner;
+  // The last runner shown: a deletion can drop it from the list before this
+  // panel is disposed, and its pending reads mustn't fail the deletion.
+  let last = props.runner;
+  const r = () => (last = props.runner ?? last);
   const canRotate = () => !props.installed || !installedRunner()?.canReconnect;
   const busy = () => !!runnerBusy() || !!runnerUpdateBusy() || (props.installed && (!!installedBusy() || runnerAttachBusy()));
   // Moving between installed and standalone controls invalidates the old panel.

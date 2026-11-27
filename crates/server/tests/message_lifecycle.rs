@@ -1449,9 +1449,14 @@ async fn stop_before_start_works_through_the_api_and_across_a_restart() {
 
 // ---- Third review: slots, failure paths, stale work, Space deletion ----
 
-/// Each message's `started` markers after `after`.
+/// Each message's `started` markers after `after`, and the messages
+/// steered into a running run instead (one sender, one agent).
 fn starts(events: &[Value], after: i64) -> usize {
     started_for(events, after)
+        + events
+            .iter()
+            .filter(|e| e["kind"] == "steered" && id(e) > after)
+            .count()
 }
 
 async fn with_coder(h: &H, sid: &str) {

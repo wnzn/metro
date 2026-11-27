@@ -197,16 +197,14 @@ test("a Space post rechecks access before navigating and never opens a fallback 
   expect(app.shows("id:chat-view")).toBe(true);
 });
 
-test("Stop replaces Send, leaves the draft intact, and uses the running Chat turn ID", async () => {
+test("Stop sits beside Send, leaves the draft intact, and uses the running Chat turn ID", async () => {
   const f = setup({ notice_shown: true });
   f.control.stopDelay = 500;
   f.addChat({ kind: "activity", actor: "agent", text: "Started", activity: turn(liveId, "started") });
   const app = await launch(f, 1200, true);
   await app.waitFor("label:Stop Metro's reply");
-  expect(app.shows("id:send")).toBe(false);
+  expect(app.shows("id:send")).toBe(true);
   await app.type("id:composer", "Next message");
-  await app.submit("id:composer");
-  expect(f.posts().filter(p => p.path === "/v1/chat/messages")).toHaveLength(0);
   await app.press("id:chat-stop");
   await app.waitFor("text:Stopping…");
   expect(app.enabled("id:chat-stop")).toBe(false);

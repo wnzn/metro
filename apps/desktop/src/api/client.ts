@@ -24,6 +24,8 @@ import type { PostedSenderNotes } from "../features/senderNotices/response";
 
 /** `anchorEventId` distinguishes a reply thread from a delegated thread. */
 export type Room = { id: string; name: string; parentRoomId?: string; anchorEventId?: number };
+/** A thread of the personal Chat: a new one, or a reply thread under a main-Chat message. */
+export type ChatThread = { id: string; title: string; anchorEventId?: number; createdAt?: string; lastAt?: string; count: number };
 /**
  * Who a message addresses: the Space's agent, or a member by their stable
  * user id. An agent mention with `agentId` names one of the Space's agents
@@ -69,6 +71,8 @@ export type EventActivity = {
   tool?: WebToolNote;
   meta?: MetaNote;
   spacePost?: SpacePost;
+  /** Only on a `steered` event: the person's message delivered into this running turn. */
+  steered?: number;
 };
 /** A Space agent as a run's events show it: enough for its name and avatar. */
 export type EventAgent = { id: string; handle: string; name: string; avatar_version?: string; color: string };
@@ -116,6 +120,8 @@ export type RoomEvent = {
   turnId?: string;
 };
 export type ReplyAddress = { eventId: number; askAgent: boolean; agentId?: string };
+/** What a Chat message sent while Metro replies does: wait for that reply (queue) or join it (steer). */
+export type ChatDelivery = "queue" | "steer";
 /**
  * A Library file attached to a message, or a tombstone for one deleted
  * since (no name, nothing to open). Which library holds a file is the
@@ -957,9 +963,9 @@ export function createClient(options: ClientOptions) {
       await request("POST", `${room(spaceId, roomId)}/demo`, {});
     },
 
-    /** The user's personal Chat, outside every Space. */
-    async compact(scope: { kind: "chat" } | { kind: "room"; spaceId: string; roomId: string }, focus: string): Promise<RoomEvent> {
-      const path = scope.kind === "chat" ? "/v1/chat/compact" : `${room(scope.spaceId, scope.roomId)}/compact`;
+    /** The user's personal Chat (or one of its threads), outside every Space. */
+    async compact(scope: { kind: "chat"; thread?: string } | { kind: "room"; spaceId: string; roomId: string }, focus: string): Promise<RoomEvent> {
+      const path = scope.kind === "chat" ? `/v1/chat/compact${chatThreadQuery(scope.thread, "?")}` : `${room(scope.spaceId, scope.roomId)}/compact`;
       const event = decodeEvent(await request("POST", path, focus ? { focus } : {}, undefined, 610_000));
       if (!event?.compaction) throw new ApiError("protocol", "The server did not return a summary.");
       return event;
@@ -974,29 +980,41 @@ export function createClient(options: ClientOptions) {
       return { auto: data.auto, at_percent: data.at_percent };
     },
 
-    async listChatEvents(after: number): Promise<RoomEvent[]> {
-      const data = await request("GET", `/v1/chat/events?after=${encodeURIComponent(String(after))}`);
+    /** Events of the main Chat, or of the Chat thread `thread`. */
+    async listChatEvents(after: number, thread?: string): Promise<RoomEvent[]> {
+      const data = await request("GET", `/v1/chat/events?after=${encodeURIComponent(String(after))}${chatThreadQuery(thread, "&")}`);
       const events = isObject(data) ? data.events : undefined;
       if (!Array.isArray(events)) throw new ApiError("protocol", "GET /v1/chat/events did not return { events: [...] }.");
       return events.filter(isEvent).map(toEvent);
     },
 
-    async sendChatMessage(text: string, assetIds?: readonly string[], choice?: TurnModelChoice): Promise<SentChatMessage> {
+    async sendChatMessage(text: string, assetIds?: readonly string[], choice?: TurnModelChoice, delivery: ChatDelivery = "queue", thread?: string): Promise<SentChatMessage> {
       // Text sends also ask the agent on servers that require the legacy flag.
       const body: Record<string, unknown> = { text, invoke_agent: true, ...turnModelBody(choice) };
       const ids = assetIdsBody(assetIds);
       if (ids) body.asset_ids = ids;
-      const data = await request("POST", "/v1/chat/messages", body);
+      // Queue is the server's default; only Steer is sent.
+      if (delivery === "steer") body.delivery = "steer";
+      let data: unknown;
+      try {
+        data = await request("POST", `/v1/chat/messages${chatThreadQuery(thread, "?")}`, body);
+      } catch (error) {
+        // Older servers reject the unknown field while decoding the request.
+        if (delivery === "steer" && error instanceof ApiError && error.status === 422) {
+          throw new ApiError("http", "Update Metro Server to steer a running reply, or switch to Queue. Your draft was kept.", 422);
+        }
+        throw error;
+      }
       // The turn it starts, which can be stopped before it starts.
       const turn = isObject(data) && typeof data.turn_id === "string" && /^chat_[A-Za-z0-9]{1,64}$/.test(data.turn_id) &&
         isEventId(data.id) ? { id: data.turn_id, eventId: data.id } : null;
       return { notes: readPostedNotes(data, { kind: "chat", text }), turn };
     },
 
-    async saveChatNote(text: string, assetIds?: readonly string[]): Promise<void> {
+    async saveChatNote(text: string, assetIds?: readonly string[], thread?: string): Promise<void> {
       const ids = assetIdsBody(assetIds);
       try {
-        await request("POST", "/v1/chat/messages", { text, save_note: true, ...(ids ? { asset_ids: ids } : {}) });
+        await request("POST", `/v1/chat/messages${chatThreadQuery(thread, "?")}`, { text, save_note: true, ...(ids ? { asset_ids: ids } : {}) });
       } catch (error) {
         // Older servers reject the unknown field while decoding the request.
         // Never fall back to invoke_agent: false: a mention could still start work.
@@ -1005,6 +1023,37 @@ export function createClient(options: ClientOptions) {
         }
         throw error;
       }
+    },
+
+    async listChatThreads(): Promise<ChatThread[]> {
+      const data = await request("GET", "/v1/chat/threads");
+      const threads = isObject(data) ? data.threads : undefined;
+      if (!Array.isArray(threads)) throw new ApiError("protocol", "GET /v1/chat/threads did not return { threads: [...] }.");
+      return threads.map(toChatThread).filter((t): t is ChatThread => !!t);
+    },
+
+    async createChatThread(title: string): Promise<ChatThread> {
+      return confirmedThread(await request("POST", "/v1/chat/threads", { title }));
+    },
+
+    /** The reply thread of main-Chat event `eventId`, created when there is none. */
+    async chatReplyThread(eventId: number): Promise<ChatThread> {
+      const thread = confirmedThread(await request("POST", `/v1/chat/events/${encodeURIComponent(String(eventId))}/thread`, {}));
+      if (thread.anchorEventId !== eventId) throw new ApiError("protocol", "The server did not confirm the reply thread.");
+      return thread;
+    },
+
+    async renameChatThread(id: string, title: string): Promise<ChatThread> {
+      const thread = confirmedThread(await request("PATCH", `/v1/chat/threads/${encodeURIComponent(id)}`, { title }));
+      if (thread.id !== id) throw new ApiError("protocol", "The server did not confirm the thread.");
+      return thread;
+    },
+
+    /** Deletes a Chat thread and everything in it; resolves to the main-Chat `message_deleted` events it wrote. */
+    async deleteChatThread(id: string): Promise<RoomEvent[]> {
+      const data = await request("DELETE", `/v1/chat/threads/${encodeURIComponent(id)}`);
+      if (!isObject(data) || data.deleted !== true) throw new ApiError("protocol", "The server did not confirm the deletion.");
+      return Array.isArray(data.events) ? data.events.filter(isEvent).map(toEvent) : [];
     },
 
     async listRuns(): Promise<Run[]> {
@@ -1041,6 +1090,28 @@ export function createClient(options: ClientOptions) {
       await request("POST", `/v1/runs/${encodeURIComponent(runId)}/stop`, {});
     },
   };
+}
+
+/** `?thread=` (or `&thread=`) for a Chat thread; nothing for the main Chat. */
+function chatThreadQuery(thread: string | undefined, sep: "?" | "&"): string {
+  return thread ? `${sep}thread=${encodeURIComponent(thread)}` : "";
+}
+
+function toChatThread(v: unknown): ChatThread | null {
+  if (!isObject(v) || typeof v.id !== "string" || !v.id || typeof v.title !== "string") return null;
+  const count = typeof v.count === "number" && Number.isInteger(v.count) && v.count >= 0 ? v.count : 0;
+  return {
+    id: v.id, title: v.title, count,
+    ...(isEventId(v.anchor_event_id) ? { anchorEventId: v.anchor_event_id } : {}),
+    ...(typeof v.created_at === "string" ? { createdAt: v.created_at } : {}),
+    ...(typeof v.last_at === "string" ? { lastAt: v.last_at } : {}),
+  };
+}
+
+function confirmedThread(data: unknown): ChatThread {
+  const thread = toChatThread(data);
+  if (!thread) throw new ApiError("protocol", "The server did not confirm the thread.");
+  return thread;
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {
@@ -1422,6 +1493,7 @@ function toEvent(v: RoomEvent): RoomEvent {
         activity.meta = readMetaNote(raw.activity.meta);
       }
     }
+    if (event.kind === "steered" && isObject(raw.activity) && isEventId(raw.activity.steered)) activity.steered = raw.activity.steered;
     if (event.kind === "page_draft" && event.actor === "agent" && activity.source === "agent" && isObject(raw.activity)) {
       const draft = toPageDraftCard(raw.activity.page_draft);
       if (draft) activity.page_draft = draft;

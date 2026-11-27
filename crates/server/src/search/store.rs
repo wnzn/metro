@@ -134,14 +134,15 @@ pub fn events_after(
     match source {
         Source::Chat => {
             let mut stmt = conn.prepare_cached(&format!(
-                "SELECT id, actor, text FROM personal_events
+                "SELECT id, actor, text, thread_id FROM personal_events
                  WHERE user_id = ?1 AND id > ?2 AND kind IN {INDEXED_KINDS}
                  ORDER BY id ASC LIMIT ?3"
             ))?;
+            // A Chat thread's id stands where a room's would.
             let rows = stmt.query_map(params![user, cursor, limit], |r| {
                 Ok(EventRow {
                     id: r.get(0)?,
-                    room_id: None,
+                    room_id: r.get(3)?,
                     actor: r.get(1)?,
                     text: r.get(2)?,
                 })
@@ -330,7 +331,7 @@ fn unchanged(
     let row: Option<(Option<String>, String)> = match source {
         Source::Chat => conn
             .prepare_cached(&format!(
-                "SELECT NULL, text FROM personal_events
+                "SELECT thread_id, text FROM personal_events
                  WHERE user_id = ?1 AND id = ?2 AND kind IN {INDEXED_KINDS}"
             ))?
             .query_row(params![user, v.event_id], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -411,13 +412,13 @@ pub fn current_events(
         let row = match source {
             Source::Chat => conn
                 .prepare_cached(&format!(
-                    "SELECT id, actor, text FROM personal_events
+                    "SELECT id, actor, text, thread_id FROM personal_events
                      WHERE user_id = ?1 AND id = ?2 AND kind IN {INDEXED_KINDS}"
                 ))?
                 .query_row(params![user, id], |r| {
                     Ok(EventRow {
                         id: r.get(0)?,
-                        room_id: None,
+                        room_id: r.get(3)?,
                         actor: r.get(1)?,
                         text: r.get(2)?,
                     })

@@ -1,28 +1,32 @@
-//! The desktop's personal registered runner on its own hosted Metro server,
-//! requested by the installer.
+//! This computer's personal registered runner, built into the desktop app:
+//! no separate runner install, no terminal and no extra process.
 //!
 //! This is a real registered runner (`POST /v1/runners`, `visibility:
-//! personal`), owned by the local account and shown in its runner list like
-//! any other. It is **not** the per-Space dedicated local tools of the parent
-//! module and never stands in for them, or they for it.
+//! personal`), owned by the signed-in account and shown in its runner list
+//! like any other. It is **not** the per-Space dedicated local tools of the
+//! parent module and never stands in for them, or they for it.
 //!
-//! - **Requested by the installer only.** Nothing happens unless an
-//!   installer-made marker file ([`MARKER`], zero length, a regular file,
-//!   not a link) sits at the agreed place ([`marker_path`]): next to the
-//!   launcher on Windows and Linux; on macOS beside the outer `Metro.app`,
-//!   inside a private install folder dedicated to it (never inside the
-//!   signed bundle). See [`installer_marker`].
-//! - **Own hosted server only.** It runs only with a [`HostedSession`] (the
-//!   bridge's session is exactly this app's running local server).
-//! - **One runner, created once.** The first bound session creates it and
-//!   keeps its token in one private file (mode 600, written atomically)
-//!   tied to that server and account. Later starts resume it; nothing is
-//!   created on each start. If the runner is deleted or its token rotated
-//!   or revoked elsewhere, it is **not** recreated automatically: the state
-//!   says so, and only an explicit reconnect (`POST
-//!   /v1/local-tools/runner/reconnect`) issues a new token or runner. An
-//!   installer update changes nothing here: the record lives in the desktop
-//!   root, not in the install folder.
+//! - **Set up explicitly.** Nothing is created until the person presses Set
+//!   up in Settings › Runners (`POST /v1/local-tools/runner/setup`), for the
+//!   server and account they're signed in to. One exception keeps the older
+//!   installer choice working: an installer-made marker file ([`MARKER`],
+//!   zero length, a regular file, not a link; see [`installer_marker`])
+//!   sets it up without a press, and only on this app's own hosted server.
+//! - **Any signed-in server.** It runs with the bridge's bound session
+//!   ([`BoundSession`]): the desktop's own local server or a remote one the
+//!   person signed in to (whose URL, and consent for plain HTTP, the bridge
+//!   already checked). Each (server, account) has its own record and
+//!   folders.
+//! - **One runner, created once.** Setup creates it and keeps its token in
+//!   one private file (mode 600, written atomically) tied to that server
+//!   and account. Later starts resume it; nothing is created on each start.
+//!   If the runner is deleted or its token rotated or revoked elsewhere, it
+//!   is **not** recreated automatically: the state says so, and only an
+//!   explicit reconnect (`POST /v1/local-tools/runner/reconnect`) issues a
+//!   new token or runner. After the person deletes it in Settings, `forget`
+//!   turns it off here (the record becomes `off`, the Space folders stay).
+//!   An app update changes nothing here: the record lives in the desktop
+//!   root, not in the install folder, and the runner updates with the app.
 //! - **Runners are identified by id only.** A display name never identifies
 //!   a runner: names can repeat, and anyone with the runner can rename or
 //!   reuse one. Nothing is ever rotated, adopted or reported as attached
@@ -43,7 +47,9 @@
 //!   `workspace.read` from that Space's own private `spaces/<sid>/` folder,
 //!   opened handle-relative without following links ([`super::folder`]).
 //!   Check, MCP and commands are refused; no Docker, no inbound port.
-//! - **Stops** on sign-out, server or account switch, and app exit.
+//! - **Starts and stops with the app**: resumed when a session of that
+//!   server and account is bound, stopped on sign-out, server or account
+//!   switch, and app exit.
 //!
 //! ```text
 //! <local-tools root>/runner/<sha256(server, account)[..16]>/
@@ -67,10 +73,11 @@ use zeroize::Zeroize;
 use super::folder::Folder;
 use super::hosted::{CallError, Claim, CreateError, Hosted, Job, RunnerInfo};
 use super::store::{read_capped, subdir, valid_space_id, write_atomic};
-use super::{HostedSession, ToolsError, from_call};
+use super::{BoundSession, ToolsError, from_call};
 use crate::Secret;
 
-/// The installer's request, a zero-length regular file.
+/// The installer's request (on the own hosted server only), a zero-length
+/// regular file.
 pub const MARKER: &str = "enable-local-runner";
 const RUNNER_DIR: &str = "runner";
 const SPACES: &str = "spaces";
@@ -93,10 +100,10 @@ pub const NOT_OFFERED: &str = "is not available here: this Space is served by th
 /// What the installer asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Marker {
-    /// No marker: no personal runner is provisioned or run.
+    /// No marker: set up only by an explicit press.
     Absent,
     Accepted,
-    /// A marker exists but isn't trustworthy; nothing is provisioned.
+    /// A marker exists but isn't trustworthy; it is ignored.
     Rejected(String),
 }
 
@@ -295,6 +302,8 @@ pub enum RecordState {
     Deleted,
     /// A creation was interrupted and the runner wasn't found afterwards.
     Interrupted,
+    /// The person deleted it and turned it off here; set up again to use.
+    Off,
 }
 
 impl RecordState {
@@ -305,6 +314,7 @@ impl RecordState {
             RecordState::Revoked => "revoked",
             RecordState::Deleted => "deleted",
             RecordState::Interrupted => "interrupted",
+            RecordState::Off => "off",
         }
     }
     fn parse(s: &str) -> Option<Self> {
@@ -314,6 +324,7 @@ impl RecordState {
             "revoked" => RecordState::Revoked,
             "deleted" => RecordState::Deleted,
             "interrupted" => RecordState::Interrupted,
+            "off" => RecordState::Off,
             _ => return None,
         })
     }
@@ -390,10 +401,22 @@ pub fn identity_dir(server_url: &str, account_id: &str) -> String {
         .collect()
 }
 
-/// `<root>/runner/<identity>/`, created private when `create`.
-fn identity_handle(root: &File, h: &HostedSession, create: bool) -> io::Result<File> {
+/// `<root>/runner/<identity>/`, created private when `create`. A folder an
+/// earlier build made under the server's other spelling
+/// ([`BoundSession::legacy_url`]) is renamed to it first, with its Space
+/// folders: one server never gets a second runner.
+fn identity_handle(root: &File, h: &BoundSession, create: bool) -> io::Result<File> {
     let r = subdir(root, RUNNER_DIR, create)?;
-    subdir(&r, &identity_dir(&h.server_url, &h.account_id), create)
+    let name = identity_dir(&h.server_url, &h.account_id);
+    if let Some(old) = h.legacy_url() {
+        let old = identity_dir(old, &h.account_id);
+        let missing =
+            |n: &str| matches!(subdir(&r, n, false), Err(e) if e.kind() == io::ErrorKind::NotFound);
+        if missing(&name) && !missing(&old) {
+            cap_primitives::fs::rename(&r, Path::new(&old), &r, Path::new(&name))?;
+        }
+    }
+    subdir(&r, &name, create)
 }
 
 /// Where the Space folders of this (server, account) are, for showing.
@@ -406,7 +429,7 @@ pub fn spaces_path(root_path: &Path, server_url: &str, account_id: &str) -> Path
 
 /// This identity's record. One made for another server or account (copied
 /// or tampered) counts as absent.
-pub fn load(root: &File, h: &HostedSession) -> io::Result<Option<Record>> {
+pub fn load(root: &File, h: &BoundSession) -> io::Result<Option<Record>> {
     let dir = match identity_handle(root, h, false) {
         Ok(d) => d,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -420,11 +443,22 @@ pub fn load(root: &File, h: &HostedSession) -> io::Result<Option<Record>> {
     };
     let rec = Record::from_json(&bytes);
     bytes.zeroize();
-    Ok(rec.filter(|r| r.server_url == h.server_url && r.account_id == h.account_id))
+    let Some(mut rec) = rec.filter(|r| {
+        r.account_id == h.account_id
+            && (r.server_url == h.server_url || h.legacy_url() == Some(r.server_url.as_str()))
+    }) else {
+        return Ok(None);
+    };
+    // Written by an earlier build under the other spelling: now this one's.
+    if rec.server_url != h.server_url {
+        rec.server_url = h.server_url.clone();
+        save(root, h, &rec)?;
+    }
+    Ok(Some(rec))
 }
 
 /// Write this identity's record atomically, mode 600.
-pub fn save(root: &File, h: &HostedSession, rec: &Record) -> io::Result<()> {
+pub fn save(root: &File, h: &BoundSession, rec: &Record) -> io::Result<()> {
     if rec.server_url != h.server_url || rec.account_id != h.account_id {
         return Err(io::Error::other("record for another identity"));
     }
@@ -435,7 +469,7 @@ pub fn save(root: &File, h: &HostedSession, rec: &Record) -> io::Result<()> {
     r
 }
 
-fn remove_record(root: &File, h: &HostedSession) -> io::Result<()> {
+fn remove_record(root: &File, h: &BoundSession) -> io::Result<()> {
     let dir = match identity_handle(root, h, false) {
         Ok(d) => d,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -453,7 +487,7 @@ fn remove_record(root: &File, h: &HostedSession) -> io::Result<()> {
 
 /// The Space's folder (`spaces/<sid>/`), created private if needed, opened
 /// without following links.
-pub fn space_folder(root: &File, h: &HostedSession, sid: &str) -> io::Result<File> {
+pub fn space_folder(root: &File, h: &BoundSession, sid: &str) -> io::Result<File> {
     if !valid_space_id(sid) {
         return Err(io::Error::other("invalid Space id"));
     }
@@ -469,11 +503,11 @@ pub fn space_folder(root: &File, h: &HostedSession, sid: &str) -> io::Result<Fil
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunnerState {
-    /// The installer didn't ask for it.
-    NotRequested,
-    /// Asked for, but the bound session isn't this app's own server.
+    /// Not set up for this server and account (or turned off).
+    NotSetUp,
+    /// No session is bound.
     Unavailable,
-    /// Asked for and own server bound, but not started yet.
+    /// Set up, but not started yet.
     Idle,
     Starting,
     Online,
@@ -492,10 +526,10 @@ struct Note {
     detail: Option<String>,
 }
 
-const REVOKED: &str = "This computer's runner is no longer accepted by the local Metro server \
+const REVOKED: &str = "This computer's runner is no longer accepted by the Metro server \
      (its token was rotated or revoked, or the runner was deleted). Metro doesn't recreate it on \
      its own; reconnect it to continue.";
-const DELETED: &str = "This computer's runner was deleted from the local Metro server. Metro \
+const DELETED: &str = "This computer's runner was deleted from the Metro server. Metro \
      doesn't recreate it on its own; reconnect it to create a new one.";
 const INTERRUPTED: &str = "Setting up this computer's runner was interrupted, so Metro can't \
      tell which runner (if any) was created. It won't guess or try again on its own. Reconnect to \
@@ -566,7 +600,7 @@ pub struct Ctx<'a> {
     pub marker: &'a Marker,
     pub root: &'a Arc<File>,
     pub root_path: &'a Path,
-    pub hosted: &'a HostedSession,
+    pub session: &'a BoundSession,
     pub api: &'a Hosted,
     pub store_lock: &'a Arc<Mutex<()>>,
 }
@@ -574,15 +608,15 @@ pub struct Ctx<'a> {
 impl Ctx<'_> {
     fn load(&self) -> io::Result<Option<Record>> {
         let _g = self.store_lock.lock();
-        load(self.root, self.hosted)
+        load(self.root, self.session)
     }
     fn save(&self, r: &Record) -> io::Result<()> {
         let _g = self.store_lock.lock();
-        save(self.root, self.hosted, r)
+        save(self.root, self.session, r)
     }
     fn remove(&self) -> io::Result<()> {
         let _g = self.store_lock.lock();
-        remove_record(self.root, self.hosted)
+        remove_record(self.root, self.session)
     }
 }
 
@@ -590,7 +624,7 @@ impl Ctx<'_> {
 pub fn status(
     slot: &Slot,
     marker: &Marker,
-    cx: Option<(&Path, &HostedSession, Option<Record>)>,
+    cx: Option<(&Path, &BoundSession, Option<Record>)>,
 ) -> Value {
     let (marker_s, marker_detail) = match marker {
         Marker::Absent => ("absent", None),
@@ -599,7 +633,6 @@ pub fn status(
     };
     let base = |state: RunnerState, detail: Option<String>| {
         json!({
-            "requested": marker.accepted(),
             "marker": marker_s,
             "marker_detail": marker_detail,
             "available": false,
@@ -608,34 +641,33 @@ pub fn status(
             "runner": null,
             "spaces_folder": null,
             "tools": TOOLS,
+            "can_set_up": false,
             "can_reconnect": false,
         })
     };
-    if !marker.accepted() {
-        return base(RunnerState::NotRequested, marker_detail.clone());
-    }
     let Some((root_path, h, rec)) = cx else {
-        return base(
-            RunnerState::Unavailable,
-            Some(
-                "This computer's runner works only in this computer's own Metro workspace. \
-                 Open the local workspace to use it."
-                    .into(),
-            ),
-        );
+        return base(RunnerState::Unavailable, Some(NO_SESSION.into()));
     };
+    let live = slot.worker.as_ref().is_some_and(Handle::live);
+    let off = rec.as_ref().is_none_or(|r| r.state == RecordState::Off);
     let n = match &slot.worker {
         Some(w) => w.note(),
-        None => slot
-            .last
-            .clone()
-            .unwrap_or_else(|| note(RunnerState::Idle, None)),
+        None => slot.last.clone().unwrap_or_else(|| {
+            note(
+                if off {
+                    RunnerState::NotSetUp
+                } else {
+                    RunnerState::Idle
+                },
+                None,
+            )
+        }),
     };
     let mut v = base(n.state, n.detail);
     v["available"] = json!(true);
     v["spaces_folder"] =
         json!(spaces_path(root_path, &h.server_url, &h.account_id).to_string_lossy());
-    if let Some(r) = rec.as_ref() {
+    if let Some(r) = rec.as_ref().filter(|r| r.state != RecordState::Off) {
         match &r.runner_id {
             Some(id) => v["runner"] = json!({"id": id, "name": r.name}),
             // The name an unconfirmed creation asked for: only a hint for
@@ -646,9 +678,12 @@ pub fn status(
             None => {}
         }
     }
-    v["can_reconnect"] = json!(!slot.worker.as_ref().is_some_and(Handle::live));
+    v["can_set_up"] = json!(!live && off);
+    v["can_reconnect"] = json!(!live && !off);
     v
 }
+
+const NO_SESSION: &str = "Sign in to a Metro server to use this computer's runner.";
 
 fn spawn(cx: &Ctx<'_>, runner_id: String, token: Secret) -> Handle {
     let (tx, rx) = watch::channel(false);
@@ -657,7 +692,7 @@ fn spawn(cx: &Ctx<'_>, runner_id: String, token: Secret) -> Handle {
         hosted: cx.api.clone(),
         root: cx.root.clone(),
         store_lock: cx.store_lock.clone(),
-        session: cx.hosted.clone(),
+        session: cx.session.clone(),
         runner_id: runner_id.clone(),
         token,
     };
@@ -701,8 +736,8 @@ fn new_name() -> String {
 
 /// The manager couldn't get as far as starting this computer's runner
 /// (`reason` says why). Shown in its status until the next start attempt.
-pub(super) fn start_failed(slot: &mut Slot, marker: &Marker, reason: &str) {
-    if marker.accepted() && !slot.worker.as_ref().is_some_and(Handle::live) {
+pub(super) fn start_failed(slot: &mut Slot, reason: &str) {
+    if !slot.worker.as_ref().is_some_and(Handle::live) {
         slot.set(note(RunnerState::Failed, Some(reason)));
     }
 }
@@ -729,14 +764,10 @@ fn fs_failed(slot: &mut Slot, what: &str) {
     ));
 }
 
-/// After a session of this account on the own server is bound: resume the
-/// runner, or create it the first time. Never recreates one that was
-/// revoked or deleted.
+/// After a session of this account is bound: resume the runner once it is
+/// set up (on the own hosted server with the installer's marker, create it
+/// the first time). Never recreates one that was revoked or deleted.
 pub async fn ensure(slot: &mut Slot, cx: &Ctx<'_>) {
-    if !cx.marker.accepted() {
-        slot.stop().await;
-        return;
-    }
     if slot.worker.as_ref().is_some_and(Handle::live) {
         return;
     }
@@ -750,8 +781,10 @@ pub async fn ensure(slot: &mut Slot, cx: &Ctx<'_>) {
         Err(_) => return fs_failed(slot, "read its record"),
     };
     match rec {
-        None => provision(slot, cx).await,
+        None if cx.marker.accepted() && cx.session.is_hosted() => provision(slot, cx).await,
+        None => slot.set(note(RunnerState::NotSetUp, None)),
         Some(r) => match r.state {
+            RecordState::Off => slot.set(note(RunnerState::NotSetUp, None)),
             RecordState::Creating => interrupt(slot, cx, r),
             RecordState::Active => start(slot, cx, r).await,
             RecordState::Revoked => slot.set(note(RunnerState::Revoked, Some(REVOKED))),
@@ -761,8 +794,9 @@ pub async fn ensure(slot: &mut Slot, cx: &Ctx<'_>) {
     }
 }
 
-/// The person explicitly asks to reconnect. Idempotent while the runner
-/// runs. Otherwise, by id only, never by name:
+/// The person explicitly asks to reconnect a runner that is set up here
+/// (Set up creates the first one). Idempotent while the runner runs.
+/// Otherwise, by id only, never by name:
 ///
 /// - `choice`: a runner id the person picked from their own runner list;
 ///   it gets a new token and becomes this computer's runner.
@@ -774,13 +808,6 @@ pub(super) async fn reconnect(
     cx: &Ctx<'_>,
     choice: Option<String>,
 ) -> Result<(), ToolsError> {
-    if !cx.marker.accepted() {
-        return Err(ToolsError::new(
-            409,
-            "not_requested",
-            "This installation didn't ask for a runner on this computer.",
-        ));
-    }
     if slot.worker.as_ref().is_some_and(Handle::live) {
         return match (&choice, running_id(slot)) {
             (Some(c), Some(id)) if c != id => Err(ToolsError::new(
@@ -797,6 +824,13 @@ pub(super) async fn reconnect(
     let rec = cx
         .load()
         .map_err(|_| super::fs_error("read the runner's record"))?;
+    if rec.as_ref().is_none_or(|r| r.state == RecordState::Off) {
+        return Err(ToolsError::new(
+            409,
+            "not_set_up",
+            "This computer's runner isn't set up here. Use Set up.",
+        ));
+    }
     if let Some(r) = rec.as_ref().filter(|r| r.state == RecordState::Active) {
         if choice
             .as_ref()
@@ -820,15 +854,15 @@ pub(super) async fn reconnect(
     };
     let list = cx
         .api
-        .personal_runners(&cx.hosted.token)
+        .personal_runners(&cx.session.token)
         .await
         .map_err(from_call)?;
     // Ids are unique on the server; exactly one or none.
     match list.into_iter().find(|r| r.id == target) {
         Some(info) => {
             let base = rec.unwrap_or_else(|| Record {
-                server_url: cx.hosted.server_url.clone(),
-                account_id: cx.hosted.account_id.clone(),
+                server_url: cx.session.server_url.clone(),
+                account_id: cx.session.account_id.clone(),
                 name: info.name.clone(),
                 state: RecordState::Interrupted,
                 runner_id: None,
@@ -847,6 +881,70 @@ pub(super) async fn reconnect(
             failed_as_error(slot)
         }
     }
+}
+
+/// The person pressed Set up: create this computer's runner for this
+/// server and account. Only while it isn't set up (or was turned off);
+/// otherwise Reconnect is the way back.
+pub(super) async fn setup(slot: &mut Slot, cx: &Ctx<'_>) -> Result<(), ToolsError> {
+    if slot.worker.as_ref().is_some_and(Handle::live) {
+        return Ok(());
+    }
+    let rec = cx
+        .load()
+        .map_err(|_| super::fs_error("read the runner's record"))?;
+    if rec.as_ref().is_some_and(|r| r.state != RecordState::Off) {
+        return Err(ToolsError::new(
+            409,
+            "already_set_up",
+            "This computer's runner is already set up here. Use Reconnect.",
+        ));
+    }
+    if let Some(w) = slot.worker.take() {
+        w.stop().await;
+    }
+    provision(slot, cx).await;
+    failed_as_error(slot)
+}
+
+/// The person deleted this computer's runner (`runner_id`) in Settings:
+/// stop it and turn it off here. Only for the recorded runner, and only
+/// once the server no longer lists it. Its Space folders stay.
+pub(super) async fn forget(
+    slot: &mut Slot,
+    cx: &Ctx<'_>,
+    runner_id: &str,
+) -> Result<(), ToolsError> {
+    let rec = cx
+        .load()
+        .map_err(|_| super::fs_error("read the runner's record"))?;
+    let Some(mut rec) = rec.filter(|r| r.runner_id.as_deref() == Some(runner_id)) else {
+        return Err(ToolsError::new(
+            409,
+            "runner_changed",
+            "That isn't this computer's runner any more.",
+        ));
+    };
+    let list = cx
+        .api
+        .personal_runners(&cx.session.token)
+        .await
+        .map_err(from_call)?;
+    if list.iter().any(|r| r.id == runner_id) {
+        return Err(ToolsError::new(
+            409,
+            "runner_exists",
+            "Delete this computer's runner first.",
+        ));
+    }
+    slot.stop().await;
+    rec.state = RecordState::Off;
+    rec.runner_id = None;
+    rec.token = None;
+    cx.save(&rec)
+        .map_err(|_| super::fs_error("save the runner's record"))?;
+    slot.set(note(RunnerState::NotSetUp, None));
+    Ok(())
 }
 
 fn failed_as_error(slot: &Slot) -> Result<(), ToolsError> {
@@ -877,7 +975,7 @@ async fn start(slot: &mut Slot, cx: &Ctx<'_>, rec: Record) {
     };
     // Still ours on the server? If the server says it's gone, say so and
     // don't recreate. If it can't be asked now, let the worker find out.
-    match cx.api.personal_runners(&cx.hosted.token).await {
+    match cx.api.personal_runners(&cx.session.token).await {
         Ok(list) if !list.iter().any(|r| r.id == id) => {
             let mut r = rec;
             r.state = RecordState::Deleted;
@@ -889,7 +987,7 @@ async fn start(slot: &mut Slot, cx: &Ctx<'_>, rec: Record) {
         Err(CallError::Unauthorized) => {
             slot.set(note(
                 RunnerState::Failed,
-                Some("The local Metro server didn't accept this sign-in."),
+                Some("The Metro server didn't accept this sign-in."),
             ));
             return;
         }
@@ -901,8 +999,8 @@ async fn start(slot: &mut Slot, cx: &Ctx<'_>, rec: Record) {
 /// Create the runner (first time, or explicitly after it was deleted).
 async fn provision(slot: &mut Slot, cx: &Ctx<'_>) {
     let mut rec = Record {
-        server_url: cx.hosted.server_url.clone(),
-        account_id: cx.hosted.account_id.clone(),
+        server_url: cx.session.server_url.clone(),
+        account_id: cx.session.account_id.clone(),
         name: new_name(),
         state: RecordState::Creating,
         runner_id: None,
@@ -915,7 +1013,7 @@ async fn provision(slot: &mut Slot, cx: &Ctx<'_>) {
     slot.set(note(RunnerState::Starting, None));
     match cx
         .api
-        .create_personal_runner(&cx.hosted.token, &rec.name)
+        .create_personal_runner(&cx.session.token, &rec.name)
         .await
     {
         Ok((info, token)) => {
@@ -928,7 +1026,7 @@ async fn provision(slot: &mut Slot, cx: &Ctx<'_>) {
                 // reconnect to exactly that runner.
                 if cx
                     .api
-                    .delete_runner(&cx.hosted.token, &info.id)
+                    .delete_runner(&cx.session.token, &info.id)
                     .await
                     .is_ok()
                 {
@@ -951,7 +1049,7 @@ async fn provision(slot: &mut Slot, cx: &Ctx<'_>) {
             slot.set(note(
                 RunnerState::Failed,
                 Some(&format!(
-                    "The local Metro server didn't create this computer's runner: {}",
+                    "The Metro server didn't create this computer's runner: {}",
                     error.message()
                 )),
             ));
@@ -973,7 +1071,7 @@ async fn rotate_into(
     rec: &Record,
     info: &RunnerInfo,
 ) -> Result<(), ToolsError> {
-    let token = match cx.api.rotate_runner(&cx.hosted.token, &info.id).await {
+    let token = match cx.api.rotate_runner(&cx.session.token, &info.id).await {
         Ok(t) => t,
         Err(e) => {
             let err = from_call(e);
@@ -1001,13 +1099,6 @@ async fn rotate_into(
 /// this computer (created if needed) and whether this runner serves it.
 /// Members only; attaching stays in the Space's runner settings.
 pub(super) async fn folder_for(cx: &Ctx<'_>, sid: &str) -> Result<Value, ToolsError> {
-    if !cx.marker.accepted() {
-        return Err(ToolsError::new(
-            409,
-            "not_requested",
-            "This installation didn't ask for a runner on this computer.",
-        ));
-    }
     if !valid_space_id(sid) {
         return Err(ToolsError::new(404, "not_found", "no such Space"));
     }
@@ -1024,7 +1115,7 @@ pub(super) async fn folder_for(cx: &Ctx<'_>, sid: &str) -> Result<Value, ToolsEr
         })?;
     if cx
         .api
-        .role(&cx.hosted.token, sid)
+        .role(&cx.session.token, sid)
         .await
         .map_err(from_call)?
         .is_none()
@@ -1034,16 +1125,16 @@ pub(super) async fn folder_for(cx: &Ctx<'_>, sid: &str) -> Result<Value, ToolsEr
     // By the stable runner id, never by display name.
     let attached = cx
         .api
-        .space_runner_id(&cx.hosted.token, sid)
+        .space_runner_id(&cx.session.token, sid)
         .await
         .map_err(from_call)?
         .is_some_and(|id| Some(&id) == rec.runner_id.as_ref());
     {
         let _g = cx.store_lock.lock();
-        space_folder(cx.root, cx.hosted, sid)
+        space_folder(cx.root, cx.session, sid)
             .map_err(|_| super::fs_error("create the Space's folder"))?;
     }
-    let path = spaces_path(cx.root_path, &cx.hosted.server_url, &cx.hosted.account_id).join(sid);
+    let path = spaces_path(cx.root_path, &cx.session.server_url, &cx.session.account_id).join(sid);
     Ok(json!({
         "space_id": sid,
         "folder": path.to_string_lossy(),
@@ -1061,7 +1152,7 @@ struct Spec {
     hosted: Hosted,
     root: Arc<File>,
     store_lock: Arc<Mutex<()>>,
-    session: HostedSession,
+    session: BoundSession,
     runner_id: String,
     token: Secret,
 }
@@ -1338,6 +1429,67 @@ mod tests {
         assert_eq!(a.len(), 32);
         assert_ne!(a, identity_dir("http://127.0.0.1:2", "local"));
         assert_ne!(a, identity_dir("http://127.0.0.1:1", "other"));
+    }
+
+    #[test]
+    fn one_server_spelled_differently_keeps_one_runner_record() {
+        let t = tempfile::tempdir().unwrap();
+        let root = crate::desktop_tools::store::open_root(&t.path().join("tools")).unwrap();
+        let tok = Secret::new("bearer");
+        let session = |url: &str| BoundSession::signed_in(url, &tok, "alice").unwrap();
+        // An earlier build keyed it by the URL as typed.
+        let old = "https://Metro.Example:443/";
+        let earlier = BoundSession {
+            server_url: old.trim_end_matches('/').into(),
+            legacy_url: None,
+            ..session(old)
+        };
+        let rec = Record {
+            server_url: earlier.server_url.clone(),
+            account_id: "alice".into(),
+            name: "n".into(),
+            state: RecordState::Active,
+            runner_id: Some("rn-1".into()),
+            token: Some(Secret::new("metro_rt_v2_secret")),
+        };
+        save(&root, &earlier, &rec).unwrap();
+        std::fs::create_dir_all(
+            spaces_path(
+                t.path().join("tools").as_path(),
+                &earlier.server_url,
+                "alice",
+            )
+            .join("s-1"),
+        )
+        .unwrap();
+        // Now every spelling is the same server: the old record is found,
+        // moved under the one name with its folders, and rewritten.
+        for url in [old, "https://metro.example", "HTTPS://METRO.EXAMPLE/"] {
+            let h = session(url);
+            assert_eq!(h.server_url(), "https://metro.example");
+            let back = load(&root, &h).unwrap().expect("the earlier record");
+            assert_eq!(back.runner_id.as_deref(), Some("rn-1"));
+            assert_eq!(back.server_url, "https://metro.example");
+        }
+        let tools = t.path().join("tools");
+        assert!(
+            spaces_path(&tools, "https://metro.example", "alice")
+                .join("s-1")
+                .is_dir()
+        );
+        assert_eq!(
+            std::fs::read_dir(tools.join(RUNNER_DIR)).unwrap().count(),
+            1
+        );
+        // A path keeps its case; only the trailing slash goes.
+        assert_eq!(
+            session("http://10.0.0.2:8080/Metro/").server_url(),
+            "http://10.0.0.2:8080/Metro"
+        );
+        assert_ne!(
+            session("https://metro.example:8443").server_url(),
+            "https://metro.example"
+        );
     }
 
     #[test]

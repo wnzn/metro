@@ -1648,3 +1648,56 @@ async fn a_scheduled_prompt_searches_on_the_creators_computer_or_answers_without
     )
     .await;
 }
+
+#[tokio::test]
+async fn a_url_in_a_steered_message_may_be_fetched() {
+    let s = Server::start().await;
+    let sid = s.space(ALICE, &[]).await;
+    s.agent_tools(ALICE, &sid, json!(["web_fetch"])).await;
+    let (_, model) = s.chat_device(ALICE).await;
+    let (_, web) = s.web_device(ALICE, "laptop").await;
+    s.idle(&web).await;
+    let room = format!("/v1/spaces/{sid}/rooms/lobby");
+    s.post(
+        ALICE,
+        &format!("{room}/messages"),
+        json!({"text": "@agent go"}),
+    )
+    .await;
+    let job = s.model_job(&model).await;
+    // Sent while the run waits on the model: steered into it.
+    let (status, body) = s
+        .post(
+            ALICE,
+            &format!("{room}/messages"),
+            json!({"text": "@agent also read https://steer.example/page"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    s.reply_tool(&model, &job, "react_to_message", json!({"emoji": "👀"}))
+        .await;
+    let job = s.model_job(&model).await;
+    assert!(
+        job["request"].to_string().contains("steer.example"),
+        "{job}"
+    );
+    s.reply_tool(
+        &model,
+        &job,
+        "web_fetch",
+        json!({"urls": ["https://steer.example/page"]}),
+    )
+    .await;
+    let wj = s.job(&web, &json!({})).await;
+    assert_eq!(wj["request"]["urls"], json!(["https://steer.example/page"]));
+    let page = json!({"ok": true, "response": {"v": 1, "provider": "exa", "mode": "keyless",
+        "attempts": [{"provider": "exa", "mode": "keyless", "outcome": "ok"}],
+        "pages": [{"url": "https://steer.example/page", "text": "t"}]}});
+    assert_eq!(s.answer(&web, &wj, page).await, StatusCode::NO_CONTENT);
+    let job = s.model_job(&model).await;
+    s.reply_text(&model, &job, "done").await;
+    let events = s
+        .wait_for(ALICE, &format!("{room}/events"), "agent", "done")
+        .await;
+    assert_eq!(events.iter().filter(|e| e["kind"] == "steered").count(), 1);
+}

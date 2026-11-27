@@ -3,12 +3,12 @@
 This guide uses published installers. See [Updates](updates.md) for the
 update controls and Linux journal diagnostic.
 
-> **Latest release: [Metro 0.6.0](https://github.com/wnzn/metro/releases/tag/v0.6.0)**
-> (2026-11-26, from `430c835`). Releases are published automatically when a
+> **Latest release: [Metro 0.6.1](https://github.com/wnzn/metro/releases/tag/v0.6.1)**
+> (2026-11-27, from `5384e8a`). Releases are published automatically when a
 > version bump is merged into the protected `main` branch
 > ([how](#official-releases)). Its `SHA256SUMS` is signed with Sigstore; its
 > Windows files are **not** code-signed. What was checked is in
-> [acceptance](acceptance.md#published-metro-060-2026-11-26-github-release-v060).
+> [acceptance](acceptance.md#published-metro-061-2026-11-27-github-release-v061).
 >
 > This page describes the per-user installer scripts at `fb7cb06`, the
 > Windows MSI from `ff28b09` onwards, and the desktop's runner screen at
@@ -87,12 +87,12 @@ against the Sigstore-verified `SHA256SUMS` before you run it
 come back once a certificate is set up and it says `signed`
 ([deploy.md](deploy.md#windows-releases-signed-or-unsigned)).
 
-**Unattended checks on native Windows.** In 0.6.0 and earlier releases, the
+**Unattended checks on native Windows.** In 0.6.1 and earlier releases, the
 run's `windows-distribution / preview` job on a GitHub `windows-2025`
 runner installed the unsigned MSI into a chosen folder, checked its
 payload, ran the server and uninstalled it, and passed the MSI lane's
 native tests (upgrade, repair, downgrade, uninstall), all unattended
-([0.6.0 release record](acceptance.md#published-metro-060-2026-11-26-github-release-v060), [0.5.1](acceptance.md#published-metro-051-2026-11-26-github-release-v051), [0.5.0](acceptance.md#published-metro-050-2026-11-25-github-release-v050), [0.4.0](acceptance.md#published-metro-040-2026-11-25-github-release-v040), [0.3.2](acceptance.md#published-metro-032-2026-11-24-github-release-v032)).
+([0.6.1 release record](acceptance.md#published-metro-061-2026-11-27-github-release-v061), [0.6.0](acceptance.md#published-metro-060-2026-11-26-github-release-v060), [0.5.1](acceptance.md#published-metro-051-2026-11-26-github-release-v051), [0.5.0](acceptance.md#published-metro-050-2026-11-25-github-release-v050), [0.4.0](acceptance.md#published-metro-040-2026-11-25-github-release-v040), [0.3.2](acceptance.md#published-metro-032-2026-11-24-github-release-v032)).
 Earlier local desktop GUI smoke tests ran under Wine on Linux, not on
 native Windows. **No person has verified the desktop GUI or the MSI
 wizard on native Windows.** See the [MSI notes](../packaging/windows-msi/README.md).
@@ -105,8 +105,9 @@ wizard on native Windows.** See the [MSI notes](../packaging/windows-msi/README.
   type a path or use **Browse…** (Windows Installer's own folder browser).
   The default is `%LOCALAPPDATA%\Programs\Metro Desktop\`. Pick a new or
   empty folder. From a command line: `INSTALLDIR="D:\Any Path"`.
-- **Local runner support** is a checkbox, on by default (`LOCALRUNNER=1|0`).
-  See [the desktop's own runner](#the-desktops-own-runner).
+- **Local runner support** is a checkbox, on by default (`LOCALRUNNER=1|0`):
+  it sets up [the desktop's own runner](#the-desktops-own-runner) without a
+  press in the app's own local workspace.
 - Updates reuse the remembered folder and choices. Remove it from
   **Settings → Apps → Installed apps**. Removal deletes only what it
   installed, so files you added stay, and your data in
@@ -118,8 +119,8 @@ wizard on native Windows.** See the [MSI notes](../packaging/windows-msi/README.
   an unknown publisher, and to check the file against its SHA-256 checksum
   (`SHA256SUMS`) before installing. Windows SmartScreen may warn about it. Only a signed release
   has `Metro-<version>-windows-x64.msi`, signed with Authenticode ([check
-  it](#check-a-download)). The 0.6.0 release has the unsigned
-  `Metro-0.6.0-windows-x64.unsigned-preview.msi` only.
+  it](#check-a-download)). The 0.6.1 release has the unsigned
+  `Metro-0.6.1-windows-x64.unsigned-preview.msi` only.
 
 ### The portable ZIP and `install-metro-windows.ps1`
 
@@ -158,33 +159,48 @@ has never run.
 
 ## The desktop's own runner
 
-The desktop installers turn on **local runner support** for a new install.
-They do it by placing an empty `enable-local-runner` file next to the
-launcher (on macOS, beside `Metro.app` in its private install folder; the
-signed bundle is never changed).
+The desktop app has a runner built in, so you don't install one to give
+your Spaces tools on this computer. It's **in the source, not released**
+(after Metro 0.6.1); in Metro 0.6.1 and earlier it works only in the app's
+own local workspace and only when the installer asked for it.
 
-- `--no-local-runner` (Windows `-NoLocalRunner`) leaves it off;
+- **Set it up in the app.** Open **Settings → Runners → This computer's
+  runner** and press **Set up**. Metro creates **one personal registered
+  runner** for the server and account you're signed in to, local or remote,
+  and keeps its credential in one private file on this computer. Nothing is
+  created until you press it.
+- **It runs while Metro is open.** Later launches start it again for that
+  server and account, without another press. It stops when you sign out,
+  switch server or account, or quit Metro. It updates with the app.
+- **List and read only.** It lists and reads files in each attached Space's
+  own folder on this computer. It never runs commands, checks, MCP or
+  Docker, and opens no port.
+- **Installer choice.** The desktop installers still turn on **local runner
+  support** for a new install, by placing an empty `enable-local-runner`
+  file next to the launcher (on macOS, beside `Metro.app` in its private
+  install folder; the signed bundle is never changed). With it, Metro sets
+  the runner up without a press after you sign in to the app's own local
+  workspace (**Use locally** / **On this computer**). `--no-local-runner`
+  (Windows `-NoLocalRunner`, MSI `LOCALRUNNER=0`) leaves that off;
   `--local-runner` turns it on. An update keeps your previous choice unless
-  you pass one of them.
-- Only launchers that support it act on it. Their `RELEASE.json` says
-  `"local_runner": "installer-marker"`. With an older archive (including
-  builds at or before `28ba4e2`), the installer still installs it, keeps your
-  choice, and says no runner will be set up.
-- After you sign in to the app's own local workspace (**Use locally** /
-  **On this computer**), the app creates **one personal registered runner**
-  for that account. It lists and reads files only, never runs commands, MCP
-  or Docker, and opens no port. It never runs for a remote server.
+  you pass one of them. Only launchers whose `RELEASE.json` says
+  `"local_runner": "installer-marker"` act on the file.
+- **Turn it off** by deleting it: the **Delete…** control under this
+  computer's runner removes the registration from the server and turns it
+  off here. The Space folders on this computer stay. **Set up** creates a
+  new one.
 
 **Settings → Runners → This computer's runner** (`57409bb`) shows its name,
-its state and its read-only tools. It's hidden on a remote server, without
-the launcher, with an older launcher, or when the installer didn't ask.
+its state and its read-only tools. It's hidden without the launcher (for
+example in a browser) or with an older launcher.
 
 - **Choose where to attach it.** You can use the
   [local runner offer](released-0.5.0.md#this-computers-runner) when
   creating a Space or choosing existing Spaces from **Settings → Runners**.
   You can also attach it from **Space settings → Runner**. These choices
   never replace an existing assignment. Each attached Space gets its
-  own folder, with **Show folder** and **Copy path** under the local runner.
+  own folder, with **Show folder** and **Copy path** under this computer's
+  runner.
 - **Recovery is explicit.** If its token is no longer accepted, or setup was
   interrupted, the state says so and nothing is retried on its own.
   **Reconnect…** first explains what it will do, then:
@@ -197,14 +213,18 @@ the launcher, with an older launcher, or when the installer didn't ask.
     delete it there if you don't need it.
 
 This is separate from a Space's **Local tools** switch, and from a
-standalone runner below. See the
+standalone runner below, which you need only for another machine, for
+checks and MCP, or for a runner that keeps going while Metro is closed. See the
 [desktop README](../apps/desktop/README.md#three-different-ways-to-give-a-space-tools).
 
 ## A standalone runner (operators)
 
 For any Metro server, local or remote. First create the runner in
-**Settings → Runners → Add runner**; its credential is shown once. Save it
-to a file only you can read, without echoing it:
+**Settings → Runners → Add runner**; its credential is shown once. In the
+source, not released (0.6.2), the app shows the matching steps on tabs
+next to it: **Linux**, **Docker run** and **Docker Compose** (**Cloud** is
+coming soon). Save the credential to a file only you can read, without
+echoing it:
 
 ```sh
 ( umask 077; IFS= read -rs -p 'Runner credential: ' t; echo
@@ -264,7 +284,7 @@ sh metro-runner-container.sh status
 - On a Linux host, the token file must be readable by the image's runner
   user (uid 1000); otherwise use the native runner.
 - The image named by `--version` is the GHCR runner image
-  `ghcr.io/wnzn/metro-runner:v<version>`, published in 0.6.0
+  `ghcr.io/wnzn/metro-runner:v<version>`, published in 0.6.1
   (`linux/amd64`, `linux/arm64`).
 
 ### Networking
@@ -316,9 +336,9 @@ that.
 
 ## Official releases
 
-> **This process published [Metro 0.6.0](https://github.com/wnzn/metro/releases/tag/v0.6.0)**
-> on 2026-11-26, from `430c835`, in CI run
-> [45737693549](https://github.com/wnzn/metro/actions/runs/45737693549).
+> **This process published [Metro 0.6.1](https://github.com/wnzn/metro/releases/tag/v0.6.1)**
+> on 2026-11-27, from `5384e8a`, in CI run
+> [45949761195](https://github.com/wnzn/metro/actions/runs/45949761195).
 > There's no Windows code-signing setup, so releases ship Windows unsigned
 > for now ([deploy.md](deploy.md#windows-releases-signed-or-unsigned)).
 

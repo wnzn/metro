@@ -158,6 +158,8 @@ pub struct IndexBody {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SearchResult {
     pub space_id: Option<String>,
+    /// A Space's room or thread; for personal Chat (`space_id` null) its
+    /// Chat thread, or null for the main Chat.
     pub room_id: Option<String>,
     pub event_id: i64,
     pub actor: String,

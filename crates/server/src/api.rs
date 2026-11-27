@@ -250,9 +250,21 @@ pub struct AfterQuery {
     after: Option<i64>,
 }
 
+/// `?after=&thread=` of the personal Chat: `thread` names one of the
+/// caller's Chat threads ([`crate::chat_threads`]); absent is the main Chat.
+#[derive(Deserialize, Default)]
+pub struct ChatQuery {
+    pub(crate) after: Option<i64>,
+    pub(crate) thread: Option<String>,
+}
+
 fn after_cursor(query: Result<Query<AfterQuery>, QueryRejection>) -> ApiResult<i64> {
     let Query(query) = query?;
-    let after = query.after.unwrap_or(0);
+    check_after(query.after)
+}
+
+fn check_after(after: Option<i64>) -> ApiResult<i64> {
+    let after = after.unwrap_or(0);
     if after < 0 {
         return Err(ApiError::bad_request(
             "after must be a non-negative integer",
@@ -949,14 +961,20 @@ pub async fn delete_chat_reaction(
 pub async fn chat_events(
     State(state): State<AppState>,
     who: Human,
-    query: Result<Query<AfterQuery>, QueryRejection>,
+    query: Result<Query<ChatQuery>, QueryRejection>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let after = after_cursor(query)?;
+    let Query(query) = query?;
+    let after = check_after(query.after)?;
+    let thread = crate::chat_threads::checked(&state, &who, query.thread).await?;
     let page = state.config.limits.events_page;
     let events = db(&state, move |db| {
-        let mut events = db.personal_after(&who.id, after, page)?;
+        let mut events = db.chat_after(&who.id, thread.as_deref(), after, page)?;
+        if thread.is_none() {
+            crate::chat_threads::hydrate(db, &who.id, &mut events)?;
+        }
         let place = Place::Personal {
             user_id: who.id.clone(),
+            thread,
         };
         attachments::hydrate(db, &who.id, &place, &mut events)?;
         Ok(events)
@@ -985,6 +1003,22 @@ pub struct ChatMessage {
     /// The sender's own personal library files to attach.
     #[serde(default)]
     asset_ids: Vec<String>,
+    /// What happens while an earlier turn is running: `queue` (default)
+    /// waits for it to end, `steer` joins it ([`crate::steering`]).
+    #[serde(default)]
+    delivery: Delivery,
+}
+
+/// How a Chat message sent while a turn runs is handled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Delivery {
+    /// Its own turn, once every earlier one has ended.
+    #[default]
+    Queue,
+    /// Into the running turn, at its next model call; if that turn ends
+    /// first, its own turn as with `queue`.
+    Steer,
 }
 
 fn chat_invokes_agent() -> bool {
@@ -1006,9 +1040,12 @@ impl ChatMessage {
 pub async fn chat_message(
     State(state): State<AppState>,
     who: Human,
+    query: Result<Query<ChatQuery>, QueryRejection>,
     body: JsonBody<ChatMessage>,
 ) -> ApiResult<(StatusCode, Json<PostedMessage>)> {
+    let Query(query) = query?;
     let Json(body) = body?;
+    let thread = crate::chat_threads::checked(&state, &who, query.thread).await?;
     let text = check_message(&state, &who.id, None, &body.text, &body.asset_ids).await?;
     let resolved = body.recipients(&text)?;
     let addressing = Addressing::of(&resolved);
@@ -1051,25 +1088,30 @@ pub async fn chat_message(
         scope: crate::decisions::Scope::Personal,
         user_id: who.id.clone(),
         place: None,
-        payload: json!({"choice": body.provider_connection_id.as_ref().map(|id| json!({
-            "provider_connection_id": id,
-            "model_id": body.model_id,
-            "reasoning_effort": body.reasoning_effort,
-        }))}),
+        payload: json!({
+            "choice": body.provider_connection_id.as_ref().map(|id| json!({
+                "provider_connection_id": id,
+                "model_id": body.model_id,
+                "reasoning_effort": body.reasoning_effort,
+            })),
+            "delivery": body.delivery,
+        }),
         claimed_by: state.decisions.epoch().to_owned(),
         turn_id: Some(turn.clone()),
     });
     let addressed = addressed(&resolved);
     let (uid, author, stored) = (who.id.clone(), who.author(), text.clone());
-    let ids = body.asset_ids;
+    let (ids, delivery) = (body.asset_ids, body.delivery);
     let place = Place::Personal {
         user_id: uid.clone(),
+        thread: thread.clone(),
     };
     let order = state.decisions.clone();
-    // Stored and given its place in the sender's line under one lock, so
-    // turns start in the order their messages were stored.
+    // Stored and given its place in its conversation's line (the main Chat
+    // or this thread) under one lock, so turns start in storage order.
+    let line = crate::decisions::chat_line(&uid, thread.as_deref());
     let (appended, ticket) = db(&state, move |db| {
-        let (appended, ticket) = order.in_chat_order(&uid, || {
+        let (appended, ticket) = order.in_chat_order(&line, || {
             attachments::append_message(
                 db,
                 &place,
@@ -1080,6 +1122,7 @@ pub async fn chat_message(
                 &[],
                 &MessageMeta::default(),
                 pending.as_ref(),
+                None,
             )
         });
         Ok((appended?, ticket))
@@ -1087,7 +1130,9 @@ pub async fn chat_message(
     .await?;
     let event = match appended {
         Append::Posted(event) => *event,
-        Append::NoRoom | Append::NoAsset | Append::NoRecipient | Append::NoReplyTarget => {
+        // The thread was deleted meanwhile.
+        Append::NoRoom => return Err(ApiError::not_found("no such Chat thread")),
+        Append::NoAsset | Append::NoRecipient | Append::NoReplyTarget => {
             return Err(no_attachment());
         }
     };
@@ -1096,7 +1141,9 @@ pub async fn chat_message(
     if let (Some(how), Some(turn)) = (how, turn_id.clone()) {
         let (state, user, event) = (state.clone(), who.id.clone(), event.clone());
         let watch = crate::decisions::Watch::chat(&state, &user, event.id, Some(&turn));
-        tokio::spawn(chat_turn(state, user, event, how, ticket, turn, watch));
+        tokio::spawn(chat_turn(
+            state, user, thread, event, how, ticket, turn, watch, delivery,
+        ));
     }
     Ok((
         StatusCode::ACCEPTED,
@@ -1120,23 +1167,45 @@ pub(crate) enum ChatRoute {
 }
 
 /// Route and start the Chat turn answering `event` once `ticket` is served,
-/// so a person's turns start in send order. The turn is registered first,
-/// while it waits and routes, so Stop and the busy check see it; one
-/// stopped meanwhile never starts. Its pending decision is settled with its
-/// `started` marker, or here when nothing starts.
+/// that is once every earlier turn of the same conversation (the main Chat
+/// or this thread) has ended: each runs one turn at a time, in send order.
+/// The turn is registered first, while it waits and routes, so Stop and the
+/// busy check see it; one stopped meanwhile never starts. Its pending
+/// decision is settled with its `started` marker (or its `steered` marker),
+/// or here when nothing starts. With [`Delivery::Steer`] it's first offered
+/// to the turn running in the same conversation ([`crate::steering`]);
+/// handed back, it waits its turn like any other.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn chat_turn(
     state: AppState,
     user: String,
+    thread: Option<String>,
     event: Event,
     how: ChatRoute,
     ticket: crate::decisions::Ticket,
     turn_id: String,
     watch: crate::decisions::Watch,
+    delivery: Delivery,
 ) {
     use crate::decisions::{Scope, forget};
     let turn = crate::db::Activity::agent(turn_id, crate::db::Activity::AGENT_NAME);
-    let (cancel, guard) = state.chat_runs.register(&turn.id, &user);
-    let _in_line = ticket.wait().await;
+    let (cancel, guard) = state.chat_runs.register(&turn.id, &user, thread.as_deref());
+    if delivery == Delivery::Steer {
+        let place = crate::steering::Place::Chat {
+            user: user.clone(),
+            thread: thread.clone(),
+        };
+        if let Some(taken) = state
+            .steering
+            .offer(&place, event.id, false, Some(cancel.clone()))
+            && taken.await.is_ok()
+        {
+            // In the running turn now; its marker settled the pending turn.
+            watch.done();
+            return;
+        }
+    }
+    let in_line = ticket.wait().await;
     let route = match how {
         ChatRoute::Chosen(route) => *route,
         ChatRoute::Routing(settings) => {
@@ -1173,9 +1242,11 @@ pub(crate) async fn chat_turn(
     let (started, written) = tokio::sync::oneshot::channel();
     let start = crate::agent::ChatStart {
         turn,
+        thread,
         cancel,
         guard,
         started,
+        line: Some(in_line),
     };
     // A turn that cannot start says why in the Chat.
     if crate::agent::start_chat_turn(&state, &user, &event, route, start)
@@ -1188,8 +1259,23 @@ pub(crate) async fn chat_turn(
     // Hold the line until this turn's `started` marker is written (or it
     // found its message deleted, or the turn stopped first). Anything else
     // (the start failed or panicked before its marker) is said in the Chat.
-    if written.await.is_ok() {
-        watch.done();
+    match written.await {
+        Ok(true) => watch.done(),
+        // Not started. Stopped just before its marker: its pending turn is
+        // dropped too (another process's is left alone).
+        Ok(false) => {
+            watch.done();
+            let id = event.id;
+            let stopped = state
+                .db
+                .call(move |db| crate::decisions::cancelled(db, id))
+                .await
+                .unwrap_or(false);
+            if stopped {
+                forget(&state, Scope::Personal, event.id).await;
+            }
+        }
+        Err(_) => {}
     }
 }
 
@@ -1230,10 +1316,12 @@ async fn live_chat_message(state: &AppState, user: &str, id: i64) -> Option<Even
         })
 }
 
-/// Start a Chat turn left pending at shutdown ([`crate::decisions::resume`]).
+/// Start a Chat turn left pending at shutdown ([`crate::decisions::resume`]),
+/// in its conversation `thread` (`None`: the main Chat).
 pub(crate) async fn resume_chat_turn(
     state: AppState,
     row: crate::decisions::Stored,
+    thread: Option<String>,
     ticket: crate::decisions::Ticket,
 ) {
     use crate::decisions::{Scope, forget};
@@ -1272,8 +1360,9 @@ pub(crate) async fn resume_chat_turn(
                          used now: {} No agent ran.",
                         e.message()
                     );
-                    let (user, author, turn) = (
+                    let (user, thread, author, turn) = (
                         row.user_id.clone(),
+                        thread.clone(),
                         Author::server(actor::SYSTEM),
                         turn_id.clone(),
                     );
@@ -1282,6 +1371,7 @@ pub(crate) async fn resume_chat_turn(
                         .call(move |db| {
                             db.append_personal_for_turn(
                                 &user,
+                                thread.as_deref(),
                                 kind::ERROR,
                                 &author,
                                 &message,
@@ -1302,7 +1392,19 @@ pub(crate) async fn resume_chat_turn(
             }
         },
     };
-    chat_turn(state, row.user_id, event, how, ticket, turn_id, watch).await;
+    let delivery = serde_json::from_value(row.payload["delivery"].clone()).unwrap_or_default();
+    chat_turn(
+        state,
+        row.user_id,
+        thread,
+        event,
+        how,
+        ticket,
+        turn_id,
+        watch,
+        delivery,
+    )
+    .await;
 }
 
 #[cfg(test)]

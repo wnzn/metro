@@ -1,7 +1,7 @@
 // Settings › Runners: "This computer's runner", the personal registered
-// runner the installer asked for, on this computer's own Metro workspace.
+// runner built into Metro, for the server this session is signed in to.
 // Shown only when the launcher's bridge says so (see installedRunner.ts).
-// Opening reads; Reconnect and Show folder act only when pressed.
+// Opening reads; Set up, Reconnect and Show folder act only when pressed.
 
 import { Clipboard, effect, signal, untracked } from "nsh";
 import type { JSX } from "nsh";
@@ -20,6 +20,7 @@ import {
   ownedInstalledRunner,
   reconnectInstalledRunner,
   runnerSpaces,
+  setupInstalledRunner,
   showRunnerFolder,
 } from "./installedRunner";
 import type { InstalledRunner } from "./installedRunner";
@@ -42,14 +43,16 @@ export function installedRunnerBadge(r: InstalledRunner): { tone: Tone; label: s
       return { tone: "danger", label: "Failed" };
     case "idle":
       return { tone: "neutral", label: "Not started" };
+    case "not_set_up":
+      return { tone: "neutral", label: "Not set up" };
     default:
       return { tone: "neutral", label: "Stopped" };
   }
 }
 
-/** What a "Disconnected" badge doesn't say: the local server isn't answering. */
+/** What a "Disconnected" badge doesn't say: the server isn't answering. */
 export function installedRunnerNote(r: InstalledRunner): string {
-  return r.state === "offline" ? "Can't reach the local server. " : "";
+  return r.state === "offline" ? "Can't reach the server. " : "";
 }
 
 export function reconnectImpact(r: InstalledRunner): string {
@@ -67,7 +70,9 @@ export function InstalledRunnerSection(props: { management?: JSX.Element; picks:
   return (
     <>
       <If when={installedRunner()}>
-        {(r) => <Section r={r()} management={props.management} picks={props.picks} />}
+        {(r) => <If when={r().state !== "not_set_up"} else={<SetUp r={r()} />}>
+          <Section r={r()} management={props.management} picks={props.picks} />
+        </If>}
       </If>
       <If when={installedFolderRefreshExhausted()}>
         <Banner variant="inline" tone="warning" testID="installed-runner-folders-unavailable"
@@ -79,6 +84,49 @@ export function InstalledRunnerSection(props: { management?: JSX.Element; picks:
   );
 }
 
+const DESCRIPTION = "Built into Metro and runs while Metro is open. Agents in Spaces you attach it to can list and read files in each Space's own folder here.";
+
+function Notes() {
+  return (
+    <>
+      <If when={installedError()}>
+        {(m) => (
+          <Column padX={4} padY={2}>
+            <Banner variant="inline" tone="danger" testID="installed-runner-error" message={m()} />
+          </Column>
+        )}
+      </If>
+      <If when={installedNotice()}>
+        {(m) => (
+          <Column padX={4} padY={2}>
+            <Banner variant="inline" tone="success" testID="installed-runner-notice" message={m()} />
+          </Column>
+        )}
+      </If>
+    </>
+  );
+}
+
+function SetUp(props: { r: InstalledRunner }) {
+  return (
+    <SettingsGroup title="This computer's runner" description={DESCRIPTION} testID="installed-runner">
+      <If when={props.r.detail}>
+        {(d) => (
+          <Column padX={4} padY={2}>
+            <Label variant="caption" color="muted" testID="installed-runner-detail">{d()}</Label>
+          </Column>
+        )}
+      </If>
+      <Notes />
+      <Row padX={4} padY={3} justify="end">
+        <Action testID="installed-runner-setup" label="Set up" busyLabel="Setting up…" variant="primary"
+          busy={installedBusy() === "setup"} disabled={!props.r.canSetUp || !!installedBusy() || runnerAttachBusy() || !!runnerBusy()}
+          onPress={() => void setupInstalledRunner()} />
+      </Row>
+    </SettingsGroup>
+  );
+}
+
 function Section(props: { r: InstalledRunner; management?: JSX.Element; picks: AttachSelection }) {
   const copied = signal<string | null>(null);
   const r = () => props.r;
@@ -87,7 +135,7 @@ function Section(props: { r: InstalledRunner; management?: JSX.Element; picks: A
   return (
     <SettingsGroup
       title="This computer's runner"
-      description="A personal runner the Metro installer set up on this computer, for this local workspace. It's separate from a Space's Local tools switch."
+      description={DESCRIPTION}
       testID="installed-runner"
     >
       <SettingRow
@@ -161,20 +209,7 @@ function Section(props: { r: InstalledRunner; management?: JSX.Element; picks: A
           </Column>
         </If>
       </SettingRow>
-      <If when={installedError()}>
-        {(m) => (
-          <Column padX={4} padY={2}>
-            <Banner variant="inline" tone="danger" testID="installed-runner-error" message={m()} />
-          </Column>
-        )}
-      </If>
-      <If when={installedNotice()}>
-        {(m) => (
-          <Column padX={4} padY={2}>
-            <Banner variant="inline" tone="success" testID="installed-runner-notice" message={m()} />
-          </Column>
-        )}
-      </If>
+      <Notes />
       <If when={r().canReconnect}>
         <Column padX={4} padY={3} gap={2}>
           <ConfirmInline testID="installed-runner-reconnect" triggerLabel="Reconnect…" confirmLabel="Reconnect"

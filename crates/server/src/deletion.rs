@@ -235,7 +235,9 @@ pub fn delete_in_space(
     Ok(Ok(written))
 }
 
-/// Delete event `eid` of `who`'s personal Chat; as [`delete_in_space`].
+/// Delete event `eid` of `who`'s personal Chat or one of its threads; as
+/// [`delete_in_space`]. A main-Chat message that anchors a Chat thread
+/// stays as a [`kind::DELETED`] row while the thread exists.
 pub fn delete_in_chat(
     db: &Db,
     eid: i64,
@@ -243,19 +245,30 @@ pub fn delete_in_chat(
 ) -> anyhow::Result<Result<Vec<Event>, Refused>> {
     let mut conn = db.lock();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let target: Option<String> = tx
+    let target: Option<(String, Option<String>)> = tx
         .query_row(
-            "SELECT kind FROM personal_events WHERE id = ?1 AND user_id = ?2",
+            "SELECT kind, thread_id FROM personal_events WHERE id = ?1 AND user_id = ?2",
             params![eid, who.id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let Some(target_kind) = target else {
+    let Some((target_kind, home)) = target else {
         return Ok(Err(Refused::NotFound));
     };
+    if target_kind == kind::DELETED {
+        return Ok(Err(Refused::NotFound));
+    }
     if !deletable(&target_kind) {
         return Ok(Err(Refused::Kind));
     }
+    let anchored: Option<String> = tx
+        .query_row(
+            "SELECT id FROM chat_threads WHERE user_id = ?1 AND anchor_event_id = ?2",
+            params![who.id, eid],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let tombstone = anchored.is_some();
     tx.execute(
         "DELETE FROM personal_reactions WHERE user_id = ?1 AND target_event_id = ?2",
         params![who.id, eid],
@@ -275,45 +288,69 @@ pub fn delete_in_chat(
         "DELETE FROM search_vectors WHERE user_id = ?1 AND source = 'chat' AND event_id = ?2",
         params![who.id, eid],
     )?;
-    tx.execute("DELETE FROM personal_events WHERE id = ?1", [eid])?;
+    if tombstone {
+        tx.execute(
+            "UPDATE personal_events SET kind = ?2, text = '', mentions = '[]', audience = 'room',
+                 activity = NULL
+             WHERE id = ?1",
+            params![eid, kind::DELETED],
+        )?;
+    } else {
+        tx.execute("DELETE FROM personal_events WHERE id = ?1", [eid])?;
+    }
     crate::decisions::forget_in(&tx, crate::decisions::Scope::Personal, eid)?;
-    let covering: Vec<i64> = {
+    // Summaries that cover it: of its own thread (or the main Chat), and of
+    // the thread anchored on it (whose history begins with it).
+    let covering: Vec<(i64, Option<String>)> = {
         let mut stmt = tx.prepare(&format!(
-            "SELECT id FROM personal_events WHERE user_id = ?1 AND kind = 'compaction' AND {}",
+            "SELECT id, thread_id FROM personal_events
+             WHERE user_id = ?1 AND kind = 'compaction'
+               AND (thread_id IS ?3 OR thread_id = ?4) AND {}",
             covers(2)
         ))?;
-        stmt.query_map(params![who.id, eid], |r| r.get(0))?
-            .collect::<Result<_, _>>()?
+        stmt.query_map(params![who.id, eid, home, anchored], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<Result<_, _>>()?
     };
-    let at = now_ms();
     let mut written = Vec::with_capacity(1 + covering.len());
-    for (target, gone) in
-        std::iter::once((eid, false)).chain(covering.into_iter().map(|c| (c, true)))
-    {
-        if gone {
-            tx.execute("DELETE FROM personal_events WHERE id = ?1", [target])?;
-        }
-        let payload = DeletionPayload {
-            target_event_id: target,
-            tombstone: false,
-        };
-        tx.execute(
-            "INSERT INTO personal_events
-                 (user_id, kind, actor, actor_id, text, mentions, audience, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, '[]', 'room', ?6)",
-            params![
-                who.id,
-                kind::MESSAGE_DELETED,
-                who.name,
-                who.id,
-                serde_json::to_string(&payload)?,
-                at
-            ],
-        )?;
-        written.push(marker(who, tx.last_insert_rowid(), &payload, at)?);
+    written.push(note_chat_in(&tx, who, home.as_deref(), eid, tombstone)?);
+    for (target, thread) in covering {
+        tx.execute("DELETE FROM personal_events WHERE id = ?1", [target])?;
+        written.push(note_chat_in(&tx, who, thread.as_deref(), target, false)?);
     }
     tx.commit()?;
     Ok(Ok(written))
+}
+
+/// Write the `message_deleted` event for `target` in `who`'s Chat `thread`.
+pub(crate) fn note_chat_in(
+    tx: &Connection,
+    who: &Human,
+    thread: Option<&str>,
+    target: i64,
+    tombstone: bool,
+) -> anyhow::Result<Event> {
+    let payload = DeletionPayload {
+        target_event_id: target,
+        tombstone,
+    };
+    let at = now_ms();
+    tx.execute(
+        "INSERT INTO personal_events
+             (user_id, thread_id, kind, actor, actor_id, text, mentions, audience, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '[]', 'room', ?7)",
+        params![
+            who.id,
+            thread,
+            kind::MESSAGE_DELETED,
+            who.name,
+            who.id,
+            serde_json::to_string(&payload)?,
+            at
+        ],
+    )?;
+    marker(who, tx.last_insert_rowid(), &payload, at)
 }
 
 fn answer(events: Vec<Event>) -> Json<Value> {

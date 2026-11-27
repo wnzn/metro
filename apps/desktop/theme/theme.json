@@ -48,6 +48,9 @@
       "brand-error": "#EF4444",
       "brand-ai": "#8B5CF6",
       "brand-info": "#06B6D4",
+      "agent-avatar-ink-light": "#ffffff",
+      "agent-avatar-ink-dark": "#0b0f19",
+      "scrim": "#000000",
       "font-sans": "Inter, system-ui, sans-serif"
     },
     "light": {

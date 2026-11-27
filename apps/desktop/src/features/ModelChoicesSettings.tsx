@@ -499,7 +499,7 @@ function DataFlow(props: { draft: RoutingDraft }) {
       />
       <SettingRow
         label="Space classification"
-        description="Where enabled, System One gets your unaddressed message, the Space name and description, the room name, and up to three recent messages or agent replies from that room. It also receives your requests to the generic agent, without the recent messages. This never applies to personal Chat."
+        description="Where enabled, System One gets your unaddressed message, the Space name and description, the room name, members' names, and up to eight recent messages or agent replies from the room or thread, including the message that started a reply thread unless deleted. It also gets who wrote those messages and whom they addressed. It receives your requests to the generic agent without this message history. This never applies to personal Chat."
         testID="dataflow-addressing"
       />
       <FlowRow

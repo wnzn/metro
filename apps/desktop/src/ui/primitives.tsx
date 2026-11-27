@@ -22,8 +22,11 @@ import {
   padXClass,
   padYClass,
   popoverClass,
+  popoverDangerLabelClass,
   popoverItemClass,
+  popoverLabelClass,
   popoverMotion,
+  selectSearchClass,
   textClass,
   toneBorderClass,
   toneSolidClass,
@@ -514,7 +517,7 @@ export function NavItem(
     <Each of={[...(props.menu?.items ?? [])]} key={(item) => item.id}>
       {(item) => (
         <MenuItem class={popoverItemClass} disabled={item().disabled} onSelect={() => onSelect(item())} testID={item().id}>
-          <Text class={cx(textClass.sm, item().destructive ? "text-destructive" : "text-popover-foreground")}>{item().label}</Text>
+          <Text class={cx(textClass.sm, item().destructive ? popoverDangerLabelClass : popoverLabelClass)}>{item().label}</Text>
         </MenuItem>
       )}
     </Each>
@@ -1186,13 +1189,13 @@ export function ActionsMenu(
             controlHeightClass.compact,
             focusRing,
             transitionClass,
-            disabledClass,
+            "disabled:bg-muted",
           )}
           disabled={props.disabled}
           accessibilityLabel={props.accessibilityLabel ?? props.label}
           testID={props.testID}
         >
-          <Text class={cx(textClass.xs, "font-medium text-foreground")}>{props.label}</Text>
+          <Text class={cx(textClass.xs, "font-medium text-foreground", disabledTextClass)}>{props.label}</Text>
           <Icon name="chevron-down" color="muted" size={14} />
         </Button>
       }
@@ -1209,7 +1212,7 @@ export function ActionsMenu(
               onSelect={() => row().item.onPress()}
               testID={row().item.id}
             >
-              <Text class={cx(textClass.sm, row().item.destructive ? "text-destructive" : "text-popover-foreground")}>{row().item.label}</Text>
+              <Text class={cx(textClass.sm, row().item.destructive ? popoverDangerLabelClass : popoverLabelClass)}>{row().item.label}</Text>
             </MenuItem>
           </>
         )}
@@ -1306,12 +1309,15 @@ export function SegmentedControl<T extends string>(
     value: T;
     onChange: (value: T) => void;
     disabled?: boolean;
+    wrap?: boolean;
     testID?: string;
+    /** Smaller, for a composer bar. */
+    compact?: boolean;
   },
 ) {
   return (
     <RadioGroup
-      class="flex-row self-start gap-[2px] rounded-(--radius-sm) border border-border bg-muted p-[3px]"
+      class={cx("flex-row self-start gap-[2px] rounded-(--radius-sm) border border-border bg-muted p-[3px]", props.wrap && "flex-wrap max-w-full")}
       accessibilityLabel={props.accessibilityLabel}
       testID={props.testID}
     >
@@ -1319,7 +1325,8 @@ export function SegmentedControl<T extends string>(
         {(option) => (
           <Radio
             class={cx(
-              "group flex-row items-center justify-center min-w-[84px] min-h-[28px] rounded-[5px] px-(--space-3) checked:bg-primary",
+              "group flex-row items-center justify-center rounded-[5px] checked:bg-primary",
+              props.compact ? "min-w-[52px] min-h-[22px] px-(--space-2)" : "min-w-[84px] min-h-[28px] px-(--space-3)",
               // Hover only on unchecked options: a hover background would
               // otherwise cover the checked one under the pointer.
               props.value !== option().value && "hover:bg-background/60",
@@ -1335,7 +1342,7 @@ export function SegmentedControl<T extends string>(
           >
             <Text
               class={cx(
-                textClass.sm,
+                props.compact ? textClass.xs : textClass.sm,
                 "font-medium text-muted-foreground group-checked:text-primary-foreground",
                 // As with the background: hover ink only on unchecked options.
                 props.value !== option().value && "group-hover:text-foreground",
@@ -1441,12 +1448,11 @@ export function Picker(
   return (
     <Select
       class={cx(
-        "flex-row items-center justify-between gap-(--space-2) min-w-[200px] self-start rounded-(--radius-sm) border bg-background px-(--space-3) hover:bg-muted",
+        "flex-row items-center justify-between gap-(--space-2) min-w-[200px] self-start rounded-(--radius-sm) border bg-background px-(--space-3) hover:bg-muted disabled:bg-muted",
         controlEdgeClass,
         controlHeightClass.default,
         focusRing,
         transitionClass,
-        disabledClass,
       )}
       items={props.items.map((item) => ({
         value: item.value,
@@ -1467,7 +1473,8 @@ export function Picker(
       popupEndingClass={popoverMotion.ending}
       itemClass={cx(popoverItemClass, "selected:font-semibold")}
       groupClass="px-(--space-2) pt-(--space-2) pb-(--space-1)"
-      searchClass={cx("mb-[4px] rounded-(--radius-sm) border border-input bg-background px-(--space-2) py-(--space-1) text-foreground", textClass.sm)}
+      renderGroup={(group) => <Text class={cx(textClass.xs, "font-semibold text-muted-foreground")}>{group.title}</Text>}
+      searchClass={selectSearchClass}
       testID={props.testID}
       renderItem={
         anyDetail()
@@ -1475,7 +1482,7 @@ export function Picker(
               const item = byValue().get(entry.value);
               return (
                 <View class="flex-col gap-px" testID={props.testID ? `${props.testID}:${entry.value}` : undefined}>
-                  <Text class={cx(textClass.sm, "text-popover-foreground")} style={{ numberOfLines: 1 }}>
+                  <Text class={cx(textClass.sm, popoverLabelClass)} style={{ numberOfLines: 1 }}>
                     {item?.label ?? entry.title}
                   </Text>
                   <If when={item?.detail}>
@@ -1488,7 +1495,7 @@ export function Picker(
       }
       trigger={
         <View class="flex-1 flex-row items-center justify-between gap-(--space-2)">
-          <Text class={cx(textClass.sm, current() ? "text-foreground" : "text-muted-foreground")} style={{ numberOfLines: 1 }}>
+          <Text class={cx(textClass.sm, current() && !props.disabled ? "text-foreground" : "text-muted-foreground")} style={{ numberOfLines: 1 }}>
             {current() ?? props.placeholder ?? ""}
           </Text>
           <Icon name="chevron-down" color="muted" size={14} />

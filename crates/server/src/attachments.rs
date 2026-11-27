@@ -56,8 +56,15 @@ pub struct AttachedFile {
 /// Where a message goes: a person's own Chat, or a room (or thread) of a Space.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Place {
-    Personal { user_id: String },
-    Space { space_id: String, room_id: String },
+    /// The main Chat (`thread` `None`) or one of its threads.
+    Personal {
+        user_id: String,
+        thread: Option<String>,
+    },
+    Space {
+        space_id: String,
+        room_id: String,
+    },
 }
 
 impl Place {
@@ -140,6 +147,7 @@ pub fn append_message(
     recipients: &[crate::mentions::Mention],
     meta: &MessageMeta,
     pending: Option<&crate::decisions::NewPending>,
+    planned: Option<&crate::decisions::NewTargets>,
 ) -> anyhow::Result<Append> {
     let Some(sender) = author.id.as_deref() else {
         return Ok(Append::NoRoom);
@@ -162,6 +170,14 @@ pub fn append_message(
         }
         // Personal Chat has no Reply.
         Place::Personal { .. } if meta.reply_to.is_some() => return Ok(Append::NoReplyTarget),
+        Place::Personal {
+            user_id,
+            thread: Some(thread),
+        } => {
+            if !crate::chat_threads::exists_in(&tx, user_id, thread)? {
+                return Ok(Append::NoRoom);
+            }
+        }
         Place::Personal { .. } => {}
     }
     let mut attachments = Vec::with_capacity(asset_ids.len());
@@ -189,23 +205,18 @@ pub fn append_message(
         }
     }
     let mut event = match place {
-        Place::Personal { user_id } => {
+        Place::Personal { user_id, thread } => {
             let at = crate::db::now_ms();
-            tx.execute(
-                "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, \
-                 mentions, audience, created_at, activity) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    user_id,
-                    kind::MESSAGE,
-                    author.name,
-                    author.id,
-                    text,
-                    addressed.mentions.to_string(),
-                    addressed.audience,
-                    at,
-                    crate::db::event_metadata_json(None, None, meta)?,
-                ],
+            crate::db::insert_personal_in(
+                &tx,
+                user_id,
+                thread.as_deref(),
+                kind::MESSAGE,
+                author,
+                text,
+                addressed,
+                at,
+                crate::db::event_metadata_json(None, None, meta)?,
             )?;
             let mut event = crate::db::new_event(
                 tx.last_insert_rowid(),
@@ -232,6 +243,10 @@ pub fn append_message(
     // A decision to make after the response is durable with its message.
     if let Some(p) = pending {
         crate::decisions::insert_in(&tx, p, event.id)?;
+    }
+    // So are the runs offered to running turns ([`crate::steering`]).
+    if let Some(p) = planned {
+        crate::decisions::insert_targets_in(&tx, p, event.id)?;
     }
     tx.commit()?;
     event.attachments = attachments.into_iter().map(Attachment::File).collect();

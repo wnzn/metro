@@ -150,7 +150,7 @@ usable in that Space. It is off by default. The rules below are for
   one agent: the same `choice`, without *No agent*. A pick at or above
   `min_route_probability` runs that agent; a weaker one runs the default
   agent. A failed decision posts an error in the room and runs nothing for
-  `@agent`. In the source, not released, the room's marker for a weak pick
+  `@agent`. Since 0.6.1, the room's marker for a weak pick
   says only *Default agent*, without the guessed agent or its score.
 
 For these decisions:
@@ -163,7 +163,7 @@ For these decisions:
 - An unaddressed message that started a run this way is stored with
   `addressed_by: "classifier"`, which no client can send. The run's activity
   shows how its agent was chosen, for example *Picked by classifier: Coder*.
-  In the source, not released, the classifier's output is never stored in
+  Since 0.6.1, the classifier's output is never stored in
   a message's recipients, whether the decision is
   [deferred](#decisions-after-posting) or not: the POST says
   `classified: true`, and the run shows only as the picked agent's run,
@@ -206,9 +206,45 @@ doesn't turn classification on. [Replying to a specific agent](messages.md#reply
 addresses it directly and bypasses the unaddressed classifier, as does
 a named agent mention.
 
+### Classification in 0.6.2
+
+**In the source, not released.** The classifier now gets more of the
+conversation and a narrower reason to stay quiet. For unaddressed text,
+the sender's System One connection receives, along with the agent
+options and the new message:
+
+- the Space name, up to 300 characters of its description, and the room
+  or thread name;
+- the sender's display name and the display names of the Space's other
+  current members (at most 32; a member with no name is left out, never
+  replaced by an id);
+- up to eight earlier messages or agent replies in that room or thread,
+  oldest first: each excerpt is at most 400 characters, and all of them
+  together at most 2,400 (the newest are kept). Each one says who wrote
+  it, whether a person or an agent, and, when it named recipients, their
+  display names (`to`: people, agents, or `agent` for the generic
+  `@agent`). In a reply thread, the message the thread started from
+  comes first, marked `anchor`, unless it was deleted. It counts as one
+  of the eight and within the 2,400 characters, and is always kept: the
+  thread's older messages are dropped first.
+
+Only events before the message are included, and deleted messages never
+are. There are still no stable participant IDs or agent instructions.
+
+The prompt leans strongly toward an agent: a question, request, task or
+remark to the room, or a follow-up to an agent, gets the agent that fits
+it best, even when it mentions or is about another person ("can someone
+summarize what Bob said?"). *No agent* is only for a message that talks
+to another person (addresses them by name, or continues a conversation
+with them), one that is only conversation about someone with no question
+or request for the room, or one where the sender says an agent shouldn't
+respond (for example "just noting" or "not for the bot"). The threshold and its handling
+above are unchanged. Messages that mention only people (`@bob`) still
+never reach System One.
+
 ### Decisions after posting
 
-**In the source, not released (0.6.1).** A Space message POST with
+**Since 0.6.1.** A Space message POST with
 `"defer_decisions": true` (the desktop always sends it) stores and
 returns the message at once. If it would otherwise wait on System One
 (the sender's opt-in classification, the classifier's pick for `@agent`,

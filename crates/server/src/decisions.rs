@@ -306,27 +306,15 @@ pub fn plan_in(
     if !held || !present {
         return Ok(false);
     }
-    let now = crate::db::now_ms();
-    for (position, t) in targets.iter().enumerate() {
-        tx.execute(
-            "INSERT OR IGNORE INTO pending_targets (event_id, agent_id, position, space_id, room_id,
-                 user_id, pick, addressed_by, choice, claimed_by, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                event_id,
-                t.agent_id,
-                position as i64,
-                space,
-                room,
-                user,
-                t.pick,
-                serde_json::to_value(t.addressed_by)?.as_str(),
-                choice.map(|c| c.to_string()),
-                epoch,
-                now
-            ],
-        )?;
-    }
+    let planned = NewTargets {
+        epoch: epoch.to_owned(),
+        space: space.to_owned(),
+        room: room.to_owned(),
+        user: user.to_owned(),
+        targets: targets.to_vec(),
+        choice: choice.cloned(),
+    };
+    insert_targets_in(&tx, &planned, event_id)?;
     for reason in errors {
         crate::db::Db::append_event_in(
             &tx,
@@ -341,6 +329,43 @@ pub fn plan_in(
     }
     tx.commit()?;
     Ok(true)
+}
+
+/// Planned runs of a Space message, claimed by the process `epoch` that
+/// writes them.
+pub struct NewTargets {
+    pub epoch: String,
+    pub space: String,
+    pub room: String,
+    pub user: String,
+    pub targets: Vec<PlannedTarget>,
+    pub choice: Option<serde_json::Value>,
+}
+
+/// Write `p` for message `event_id`, inside the caller's transaction.
+pub fn insert_targets_in(conn: &Connection, p: &NewTargets, event_id: i64) -> anyhow::Result<()> {
+    let now = crate::db::now_ms();
+    for (position, t) in p.targets.iter().enumerate() {
+        conn.execute(
+            "INSERT OR IGNORE INTO pending_targets (event_id, agent_id, position, space_id, room_id,
+                 user_id, pick, addressed_by, choice, claimed_by, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                event_id,
+                t.agent_id,
+                position as i64,
+                p.space,
+                p.room,
+                p.user,
+                t.pick,
+                serde_json::to_value(t.addressed_by)?.as_str(),
+                p.choice.as_ref().map(|c| c.to_string()),
+                p.epoch,
+                now
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 /// Claim one planned run inside the transaction that registers it and
@@ -465,9 +490,9 @@ pub fn fail_in(
                 .as_ref()
                 .map(|t| serde_json::json!({ "turn_id": t }).to_string());
             conn.execute(
-                "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
-                 SELECT ?1, 'error', ?2, NULL, ?3, '[]', 'room', ?4, ?6
-                 WHERE EXISTS (SELECT 1 FROM personal_events WHERE id = ?5 AND user_id = ?1)",
+                "INSERT INTO personal_events (user_id, thread_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
+                 SELECT ?1, thread_id, 'error', ?2, NULL, ?3, '[]', 'room', ?4, ?6
+                 FROM personal_events WHERE id = ?5 AND user_id = ?1",
                 params![user, crate::db::actor::AGENT, text, crate::db::now_ms(), event_id, meta],
             )?;
         }
@@ -768,8 +793,31 @@ pub async fn resume(state: AppState) -> anyhow::Result<usize> {
             }
             // Taken in order now, so the Chat's turns keep their send order.
             Scope::Personal => {
-                let ticket = state.decisions.chat_ticket(&row.user_id);
-                tokio::spawn(async move { crate::api::resume_chat_turn(state, row, ticket).await });
+                // Its own conversation's line: the main Chat or its thread.
+                let (user, eid) = (row.user_id.clone(), row.event_id);
+                let thread = match state
+                    .db
+                    .call(move |db| Ok(crate::chat_threads::thread_of_in(&db.lock(), &user, eid)?))
+                    .await
+                {
+                    Ok(Some(thread)) => thread,
+                    // Its message is gone: nothing to start.
+                    Ok(None) => {
+                        forget(&state, Scope::Personal, eid).await;
+                        continue;
+                    }
+                    // Never guessed: it waits, stored, for the next start.
+                    Err(e) => {
+                        tracing::error!(error = %format!("{e:#}"), "finding a pending Chat turn's conversation");
+                        continue;
+                    }
+                };
+                let ticket = state
+                    .decisions
+                    .chat_ticket(&chat_line(&row.user_id, thread.as_deref()));
+                tokio::spawn(async move {
+                    crate::api::resume_chat_turn(state, row, thread, ticket).await
+                });
             }
         }
     }
@@ -777,6 +825,16 @@ pub async fn resume(state: AppState) -> anyhow::Result<usize> {
 }
 
 // ---- Concurrency and order ----
+
+/// The key of one Chat conversation's turn line: each Chat thread, and the
+/// main Chat, runs its own turns one at a time. A user id never contains
+/// `\0`, so a thread's key never equals anyone's main-Chat key.
+pub fn chat_line(user: &str, thread: Option<&str>) -> String {
+    match thread {
+        Some(t) => format!("{user}\0{t}"),
+        None => user.to_owned(),
+    }
+}
 
 /// Both permits a deferred decision holds while it calls System One.
 pub struct Slot {
@@ -1074,14 +1132,16 @@ impl Pending {
     }
 
     /// Store a Chat message with `store` and give it the next place in
-    /// `user`'s line, both under one lock: line order is storage order.
-    pub fn in_chat_order<T>(&self, user: &str, store: impl FnOnce() -> T) -> (T, Ticket) {
+    /// line `line` ([`chat_line`]), both under one lock: line order is
+    /// storage order.
+    pub fn in_chat_order<T>(&self, line: &str, store: impl FnOnce() -> T) -> (T, Ticket) {
         let _held = self.chat_insert.lock().unwrap_or_else(|e| e.into_inner());
-        let ticket = self.chat_ticket(user);
+        let ticket = self.chat_ticket(line);
         (store(), ticket)
     }
 
-    /// The next place in `user`'s line of Chat turns.
+    /// The next place in line `user` of Chat turns: a person's id for
+    /// their main Chat, or a [`chat_line`] key for one of its threads.
     pub fn chat_ticket(&self, user: &str) -> Ticket {
         let mut lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
         let line = lines.entry(user.to_owned()).or_insert_with(|| Line {
