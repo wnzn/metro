@@ -3,7 +3,8 @@
 > Update checks and managed Linux desktop updates were released in Metro 0.5.0.
 > Windows in-app updates and Windows journal diagnostics described below are
 > **in the source, not released** (Metro 0.6.5). Windows updates in the
-> published 0.6.4 release are manual.
+> published 0.6.4 release are manual. No native Windows run of these
+> Windows update paths is recorded yet, by CI or by a person.
 > Do not use repository installer scripts to update an installed release.
 > Use the verified prebuilt files and installers from the corresponding
 > published release; see [Install](install.md#check-a-download).
@@ -63,7 +64,9 @@ new app never reaches that point, the backup stays.
 If Windows Installer fails and Metro confirms the old version is intact,
 **About & updates** shows the failure. Check again to retry. If Metro
 asks you to restart Windows, restart Windows, then open Metro again.
-If Windows Installer is still working, Metro doesn't open the workspace.
+If Windows Installer is still working when you start Metro, Metro closes
+without opening the workspace. Start it again when the installer has
+finished.
 After an interruption Metro checks Windows Installer and the installed
 version before reopening the workspace. If the checks disagree, Metro
 stops and keeps the journal, staged MSI and backup.

@@ -177,7 +177,7 @@ test("portable, unmigrated and older launcher installs stay manual", async () =>
     { platform: "windows", install: "portable", words: "This is a portable copy", reason: "portable" },
     { platform: "linux", install: "linux-installer", words: "Run the current Metro Linux installer once", reason: "manual_migration_required" },
     { platform: "windows", install: "windows-script", words: "Run the Windows installer script once with -Action Update to turn on in-app updates.", reason: "manual_migration_required" },
-    { platform: "windows", install: "windows-msi", words: "The Windows preview MSI is unsigned", reason: "manual_update_required" },
+    { platform: "windows", install: "windows-msi", words: "The Windows MSI is unsigned", reason: "manual_update_required" },
   ] as const) {
     // Even a bridge with an incorrect "ready" and can_update_in_app is manual.
     const f = scenario({ ...available(), current: { version: CURRENT, channel: "release", install: example.install }, phase: "ready", reason: example.reason });
@@ -557,6 +557,8 @@ test("Windows journal recovery doesn't suggest the wrong installer diagnostic", 
     await app.waitFor("id:update-recovery-support");
     expect(text(app)).not.toContain("Linux installer");
     expect(text(app).includes("-Action Status")).toBe(install === "windows-script");
+    expect(text(app).includes("Keep the staged MSI.")).toBe(install === "windows-msi");
+    expect(text(app).includes("Share the diagnostic")).toBe(install === "windows-script");
     expect(app.shows("id:update-recovery-release")).toBe(false);
     expect(app.shows("id:update-start")).toBe(false);
   }

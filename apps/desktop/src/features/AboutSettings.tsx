@@ -25,10 +25,10 @@ function notInApp(s: UpdateState) {
     case "linux-installer": return platform.name === "linux" && s.reason === "manual_migration_required"
       ? "This Linux install uses an older layout. Run the current Metro Linux installer once to enable in-app updates."
       : "This install can check for updates, but can't apply them in Metro.";
-    case "windows-msi": return "Windows updates are manual. Get the installer from Metro Releases and run it yourself. The Windows preview MSI is unsigned and Windows may warn you.";
+    case "windows-msi": return "This copy can't install updates in Metro. Get the MSI from Metro Releases and run it yourself. The Windows MSI is unsigned and Windows may warn you.";
     case "windows-script": return s.reason === "manual_migration_required"
       ? "Run the Windows installer script once with -Action Update to turn on in-app updates."
-      : "Windows updates are manual. Use the Windows install script from Metro Releases. Metro won't run an installer for you.";
+      : "This copy can't install updates in Metro. Use the Windows installer script from Metro Releases with -Action Update.";
     case "portable": return "This is a portable copy. Get the package for your platform from Metro Releases and extract it yourself. Metro won't replace this folder.";
     default: return "In-app updates aren't supported on this platform.";
   }
@@ -256,9 +256,9 @@ function PublishedUpdates(props: { updates: DesktopUpdates }) {
   const s = () => updates.state()!;
   const install = () => s().current.install;
   const diagnostic = () => {
-    if (install() === "windows-msi") return "";
-    return install() === "windows-script" ? " Use the verified Windows installer script with -Action Status for read-only diagnosis."
-      : " Use the verified Linux installer's status command for read-only diagnosis.";
+    if (install() === "windows-msi") return " Keep the staged MSI. Share Metro's recovery message, not private files.";
+    return (install() === "windows-script" ? " Use the verified Windows installer script with -Action Status for read-only diagnosis."
+      : " Use the verified Linux installer's status command for read-only diagnosis.") + " Share the diagnostic, not private files.";
   };
   const recoveryInstaller = () => install() === "windows-msi" ? "the Windows MSI"
     : install() === "windows-script" ? "the Windows installer script" : "the Linux installer";
@@ -334,7 +334,7 @@ function PublishedUpdates(props: { updates: DesktopUpdates }) {
     </If>
     <If when={journalBlocked()}>
       <SettingRow label="Update recovery" testID="update-journal-recovery" stacked
-        description={`Stop Metro, its bundled server and any installer. Keep the installation, update records and both database copies. Do not remove locks or records, change the current version, or run install, update or uninstall.${diagnostic()} Share the diagnostic, not private files.`}>
+        description={`Stop Metro, its bundled server and any installer. Keep the installation, update records and both database copies. Do not remove locks or records, change the current version, or run install, update or uninstall.${diagnostic()}`}>
         <OfficialLink label="Contact Metro maintainers" url={`${METRO_SOURCE}/issues`} testID="update-recovery-support" />
       </SettingRow>
     </If>

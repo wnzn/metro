@@ -634,7 +634,8 @@ see [New in Metro 0.6.4](docs/released-0.6.4.md); for later changes, see
   Portable copies stay manual; servers and Docker runners get notices only.
   Standalone runner self-update verifies independently; the server sends a
   version, never a URL or code. If recovery is uncertain, keep journals,
-  locks and database copies intact, and stop before opening the workspace.
+  locks, database copies and any staged MSI intact, and stop before
+  opening the workspace.
   Document the verified installer's read-only diagnostic where available,
   never an improvised repair. The MSI helper re-verifies the exact MSI,
   doesn't infer success from a dead PID, and never automatically downgrades

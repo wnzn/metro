@@ -5,3 +5,4 @@
   **Restart now**. Older script installs need one manual update to turn
   this on. Portable ZIP copies still update manually. See
   [Updates](updates.md) for migration, backups and recovery.
+  No native Windows run of these update paths is recorded yet.
