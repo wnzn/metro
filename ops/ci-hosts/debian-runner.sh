@@ -29,6 +29,9 @@ cat > "$HOME/.config/docker/daemon.json" <<'EOF'
 { "log-driver": "local", "log-opts": { "max-size": "20m", "max-file": "2" } }
 EOF
 systemctl --user restart docker
+# Desktop audio services the user manager would otherwise start for this account.
+systemctl --user mask --now pipewire.service pipewire.socket pipewire-pulse.service \
+  pipewire-pulse.socket wireplumber.service filter-chain.service >/dev/null 2>&1 || true
 DOCKER_HOST="unix://$XDG_RUNTIME_DIR/docker.sock" docker info --format '{{.SecurityOptions}}' | grep -q rootless
 
 # Rust: rustup with the repo's pinned toolchain.

@@ -34,7 +34,8 @@ and let the script delete it after use.
    ```
 
    `debian-runner.sh` does the following:
-   - sets up rootless Docker as a systemd `--user` unit
+   - sets up rootless Docker as a systemd `--user` unit, and masks the
+     pipewire and wireplumber user services
    - installs rustup 1.29.3 and Rust 1.98.1, checked by sha256
    - installs actions/runner 2.338.2, checked by the release asset's sha256
    - installs the hooks
@@ -100,7 +101,8 @@ What persists between jobs:
 - `~/.ssh`.
 - Linux only:
   - rootless Docker config and data (`~/.config/docker`,
-    `~/.config/systemd`, `~/.local/share/docker`)
+    `~/.config/systemd`, `~/.local/share/docker`), and the runner's own
+    `~/.config/GitHub` cache
   - pulled images, deleted when unused for 7 days
   - build cache, capped at 20 GB
 - Mac only:
