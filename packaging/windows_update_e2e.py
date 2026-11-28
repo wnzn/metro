@@ -156,7 +156,10 @@ class Run:
         self.hold = tmp / "hold"
         self.server = ReleaseServer()
         threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith("METRO_")}
+        # PSModulePath from a pwsh 7 parent makes Windows PowerShell 5.1 load
+        # 7's modules (no Get-FileHash); without it 5.1 uses its defaults.
+        self.env = {k: v for k, v in os.environ.items()
+                    if not k.startswith("METRO_") and k.upper() != "PSMODULEPATH"}
         self.env.update({
             "METRO_INSTALL_DIR": str(self.root),
             "METRO_DESKTOP_HOME": str(self.home),
@@ -245,7 +248,7 @@ class Run:
         if not lnk.exists():
             return None
         q = f"(New-Object -ComObject WScript.Shell).CreateShortcut('{lnk}').TargetPath"
-        r = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", q],
+        r = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", q], env=self.env,
                            capture_output=True, text=True, timeout=60)
         return r.stdout.strip()
 

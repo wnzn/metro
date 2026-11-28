@@ -175,7 +175,7 @@ function Start-Metro([string] $Dir, [string] $DesktopHome, [string] $UiOut, [str
 }
 
 function Assert-On([string] $Version, [string] $Dir, [string] $What) {
-    $installed = Get-Installed
+    $installed = @(Get-Installed)
     Record "$What`: product $Version" ($installed.Count -eq 1 -and $installed[0] -eq (Get-ProductVersion $Version)) ($installed -join ', ')
     $reg = Get-ItemProperty -LiteralPath $RegKey -ErrorAction SilentlyContinue
     Record "$What`: remembered version and folder" ($reg -and [string] $reg.Version -eq $Version -and ([string] $reg.InstallDir).TrimEnd('\') -eq $Dir) `
@@ -203,7 +203,7 @@ function Invoke-Scenario([string] $Scenario) {
     $entry = [ordered] @{ scenario = $Scenario; outcome = '' }
     $result.scenarios.Add($entry)
     try {
-        Record "$tag`: no Metro product before" ((Get-Installed).Count -eq 0)
+        Record "$tag`: no Metro product before" (@(Get-Installed).Count -eq 0)
         $code = Invoke-Msiexec "/i `"$(Join-Path $Root $spec.msi_a)`" INSTALLDIR=`"$dir`"" "$tag-install-a.log"
         Record "$tag`: MSI A installed" ($code -eq 0) "exit $code"
         Assert-On $spec.version_a $dir "$tag (before)"
@@ -262,7 +262,7 @@ function Invoke-Scenario([string] $Scenario) {
                 }
                 $null = Wait-Until 600 'Windows Installer to finish' { -not (Test-InstallerBusy) }
                 $before = Get-Content -LiteralPath (Join-Path $desktopHome 'update\msi-update.json') -Raw
-                $installed = Get-Installed
+                $installed = @(Get-Installed)
                 $files = Get-FilesVersion $dir
                 $p = Start-Metro $dir $desktopHome $uiOut '' 1
                 $starts = @(Read-Ui $uiOut | Where-Object { $_.event -eq 'start' }).Count
