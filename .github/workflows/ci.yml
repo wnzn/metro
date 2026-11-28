@@ -30,16 +30,47 @@ concurrency:
 # runs whatever the classifier said, and `release` requires each to succeed.
 # If `workflows` fails, `rust`, `containers` and `packaging` still run
 # (`desktop` and `package-smoke`, as before, do not).
+#
+# Runners: `workflows` decides (its first step) whether this event may use
+# Metro's self-hosted runners: a protected push to main, or a pull request
+# into main from a branch of this repository by a verified writer. Then every
+# Linux job runs on `metro-ci-linux-docker` and the macOS build on
+# `metro-ci-macos-arm64`; anything else, including forks, any doubt and a
+# failed `workflows`, gets GitHub-hosted runners. A chosen self-hosted label
+# is a queue, never a fallback: if the runner is offline the job waits.
+# Native Windows jobs, `workflows` and `release-policy` stay GitHub-hosted, as
+# does everything that signs or publishes (release-publish.yml).
 jobs:
   rust:
     needs: [workflows, release-policy]
     if: >-
       ${{ !cancelled() && (needs.workflows.outputs.rust != 'false'
       || needs.release-policy.outputs.release == 'true') }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.workflows.outputs.self_hosted == 'true' && 'metro-ci-linux-docker' || 'ubuntu-24.04' }}
     env:
       RUSTUP_TOOLCHAIN: 1.98.1
     steps:
+      # Recheck the repository, event and ref on the self-hosted runner before
+      # any checkout. Hosted runners skip this step.
+      - name: Self-hosted runner only for this repository's main push or same-repository PR to main
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        env:
+          WANT_OS: Linux
+          WANT_ARCH: X64
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = wnzn/metro
+          test "$GITHUB_REPOSITORY_ID" = 1467654868
+          case "$GITHUB_EVENT_NAME" in
+            push) test "$GITHUB_REF" = refs/heads/main ;;
+            pull_request)
+              test "$GITHUB_BASE_REF" = main
+              python3 -I -c 'import json, sys; pr = json.load(open(sys.argv[1]))["pull_request"]; sys.exit(not (pr["head"]["repo"]["id"] == pr["base"]["repo"]["id"] == 1467654868))' "$GITHUB_EVENT_PATH" ;;
+            *) exit 1 ;;
+          esac
+          test "$RUNNER_OS" = "$WANT_OS"
+          test "$RUNNER_ARCH" = "$WANT_ARCH"
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
@@ -112,50 +143,44 @@ jobs:
           python3 tests/e2e/updates.py --bin-dir "$target/debug" --timeout 120
 
   desktop:
-    # Release runs stay on GitHub-hosted runners: the self-hosted queue is used
-    # only when the selector chose it and release-policy did not choose a
-    # release (it is skipped for pull requests, and CI only for main pushes
-    # without a version bump). Still runs when release-policy is skipped.
+    # Release runs use the same queue as every other trusted run. Still runs
+    # when release-policy is skipped.
     needs: [workflows, release-policy]
     if: >-
       ${{ !cancelled() && needs.workflows.result == 'success' && needs.release-policy.result != 'failure'
       && (needs.workflows.outputs.desktop != 'false' || needs.release-policy.outputs.release == 'true') }}
-    # Choose a queue, not a fallback if the selected runner is offline.
-    runs-on: ${{ needs.workflows.outputs.desktop_runner == 'metro-ci-linux-x64' && needs.release-policy.outputs.release != 'true' && 'metro-ci-linux-x64' || 'ubuntu-24.04' }}
+    runs-on: ${{ needs.workflows.outputs.self_hosted == 'true' && 'metro-ci-linux-docker' || 'ubuntu-24.04' }}
     timeout-minutes: 45
     env:
       NSH_VERSION: v0.6.1
       NSH_ARCHIVE_SHA256: 9a7ac692f1c229df476be8ff83a3c5912d271453b644e313f02cb19d18696070
     steps:
-      - name: Verify preinstalled Native Shell and offline TypeScript
+      # Recheck the repository, event and ref on the self-hosted runner before
+      # any checkout. Hosted runners skip this step.
+      - name: Self-hosted runner only for this repository's main push or same-repository PR to main
         if: runner.environment == 'self-hosted'
         shell: bash
         env:
-          NSH_CLI_SHA256: 8eb4cedc71aaaeeda729d4dba7d0fb2040db29cce98cd6ff3dad6df7d5d5bafd
+          WANT_OS: Linux
+          WANT_ARCH: X64
         run: |
           set -euo pipefail
-          # Recheck the repository and ref before checking out on this runner.
           test "$GITHUB_REPOSITORY" = wnzn/metro
           test "$GITHUB_REPOSITORY_ID" = 1467654868
           case "$GITHUB_EVENT_NAME" in
             push) test "$GITHUB_REF" = refs/heads/main ;;
-            pull_request) test "$GITHUB_BASE_REF" = main ;;
+            pull_request)
+              test "$GITHUB_BASE_REF" = main
+              python3 -I -c 'import json, sys; pr = json.load(open(sys.argv[1]))["pull_request"]; sys.exit(not (pr["head"]["repo"]["id"] == pr["base"]["repo"]["id"] == 1467654868))' "$GITHUB_EVENT_PATH" ;;
             *) exit 1 ;;
           esac
-          test "$RUNNER_OS" = Linux
-          test "$RUNNER_ARCH" = X64
-          test "$(type -P nsh)" = /opt/nsh/bin/nsh
-          test "${NSH_TSC:-}" = /opt/typescript/lib/tsc
-          test -x "$NSH_TSC"
-          printf '%s  %s\n' "$NSH_CLI_SHA256" /opt/nsh/bin/nsh | sha256sum --check -
-          /opt/nsh/bin/nsh --version
-          "$NSH_TSC" --version | grep -Fx 'Version 7.0.2'
+          test "$RUNNER_OS" = "$WANT_OS"
+          test "$RUNNER_ARCH" = "$WANT_ARCH"
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Install pinned Longbridge Native Shell
-        if: runner.environment == 'github-hosted'
         run: |
           set -eu
           install_dir="$RUNNER_TEMP/nsh-$NSH_VERSION"
@@ -180,8 +205,29 @@ jobs:
     if: >-
       ${{ !cancelled() && (needs.workflows.outputs.containers != 'false'
       || needs.release-policy.outputs.release == 'true') }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.workflows.outputs.self_hosted == 'true' && 'metro-ci-linux-docker' || 'ubuntu-24.04' }}
     steps:
+      # Recheck the repository, event and ref on the self-hosted runner before
+      # any checkout. Hosted runners skip this step.
+      - name: Self-hosted runner only for this repository's main push or same-repository PR to main
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        env:
+          WANT_OS: Linux
+          WANT_ARCH: X64
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = wnzn/metro
+          test "$GITHUB_REPOSITORY_ID" = 1467654868
+          case "$GITHUB_EVENT_NAME" in
+            push) test "$GITHUB_REF" = refs/heads/main ;;
+            pull_request)
+              test "$GITHUB_BASE_REF" = main
+              python3 -I -c 'import json, sys; pr = json.load(open(sys.argv[1]))["pull_request"]; sys.exit(not (pr["head"]["repo"]["id"] == pr["base"]["repo"]["id"] == 1467654868))' "$GITHUB_EVENT_PATH" ;;
+            *) exit 1 ;;
+          esac
+          test "$RUNNER_OS" = "$WANT_OS"
+          test "$RUNNER_ARCH" = "$WANT_ARCH"
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
@@ -294,9 +340,15 @@ jobs:
           unset XDG_CONFIG_HOME
           s="$GITHUB_WORKSPACE/packaging/metro-runner-container.sh"
           # On Linux the bind-mounted mode-600 token file must belong to the image's runner
-          # user (uid 1000 in the published image); build a variant for this CI user's uid.
-          docker build -q --target runner --build-arg "RUNNER_UID=$(id -u)" --build-arg "RUNNER_GID=$(id -g)" \
-            -t metro-runner:ci-uid "$GITHUB_WORKSPACE" >/dev/null
+          # user (uid 1000 in the published image); build a variant that runs as this CI
+          # user. Rootless Docker maps this user to uid 0 in the container, so there the
+          # variant runs as that (unprivileged, --cap-drop ALL) uid 0.
+          if docker info --format '{{json .SecurityOptions}}' | grep -q 'name=rootless'; then
+            printf 'FROM metro-runner:ci\nUSER 0:0\n' | docker build -q -t metro-runner:ci-uid - >/dev/null
+          else
+            docker build -q --target runner --build-arg "RUNNER_UID=$(id -u)" --build-arg "RUNNER_GID=$(id -g)" \
+              -t metro-runner:ci-uid "$GITHUB_WORKSPACE" >/dev/null
+          fi
           head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$home/runner token"
           chmod 600 "$home/runner token"
           sh "$s" setup --server-url https://metro.invalid --token-file "$home/runner token" \
@@ -370,13 +422,15 @@ jobs:
       containers: ${{ steps.changes.outputs.containers }}
       packaging: ${{ steps.changes.outputs.packaging }}
       previews: ${{ steps.changes.outputs.previews }}
-      desktop_runner: ${{ steps.desktop-route.outputs.desktop_runner }}
+      self_hosted: ${{ steps.runner-route.outputs.self_hosted }}
     env:
       ACTIONLINT_VERSION: 1.7.12
       ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
     steps:
-      - name: Select the desktop runner from the GitHub event
-        id: desktop-route
+      # GitHub-hosted on purpose: it reads the event before anything may reach a
+      # self-hosted runner.
+      - name: Select GitHub-hosted or Metro self-hosted runners from the GitHub event
+        id: runner-route
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -450,10 +504,9 @@ jobs:
                   use_metro, reason = select(os.environ, json.load(stream), token)
           except (OSError, ValueError, KeyError, TypeError, AttributeError):
               use_metro, reason = False, "event payload is missing or incomplete"
-          runner = "metro-ci-linux-x64" if use_metro else "ubuntu-24.04"
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              print(f"desktop_runner={runner}", file=output)
-          print(f"Desktop runner: {runner} ({reason}).")
+              print(f"self_hosted={'true' if use_metro else 'false'}", file=output)
+          print(f"Runners: {'Metro self-hosted' if use_metro else 'GitHub-hosted'} ({reason}).")
           PY
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -494,18 +547,61 @@ jobs:
     if: >-
       ${{ !cancelled() && (needs.workflows.outputs.packaging != 'false'
       || needs.release-policy.outputs.release == 'true') }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.workflows.outputs.self_hosted == 'true' && 'metro-ci-linux-docker' || 'ubuntu-24.04' }}
     steps:
+      # Recheck the repository, event and ref on the self-hosted runner before
+      # any checkout. Hosted runners skip this step.
+      - name: Self-hosted runner only for this repository's main push or same-repository PR to main
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        env:
+          WANT_OS: Linux
+          WANT_ARCH: X64
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = wnzn/metro
+          test "$GITHUB_REPOSITORY_ID" = 1467654868
+          case "$GITHUB_EVENT_NAME" in
+            push) test "$GITHUB_REF" = refs/heads/main ;;
+            pull_request)
+              test "$GITHUB_BASE_REF" = main
+              python3 -I -c 'import json, sys; pr = json.load(open(sys.argv[1]))["pull_request"]; sys.exit(not (pr["head"]["repo"]["id"] == pr["base"]["repo"]["id"] == 1467654868))' "$GITHUB_EVENT_PATH" ;;
+            *) exit 1 ;;
+          esac
+          test "$RUNNER_OS" = "$WANT_OS"
+          test "$RUNNER_ARCH" = "$WANT_ARCH"
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
-      - name: Packaging and installer tests (PE resources, app-menu integration, isolated installers)
+      # The self-hosted runner has the apt packages preinstalled (no sudo there).
+      - name: Packaging test tools (GitHub-hosted, from apt)
+        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends desktop-file-utils libglib2.0-bin shellcheck python3-yaml
+      # GitHub's ubuntu-24.04 image ships pwsh; Debian has no package for it.
+      - name: Pinned PowerShell 7 for this job (self-hosted, no sudo)
+        if: runner.environment == 'self-hosted'
+        env:
+          PWSH_VERSION: 7.7.0
+          PWSH_SHA256: c89d9c682d2c403dfe726f3df948e359675235a5bd6fab535776de69729ca0cb
+        run: |
+          set -eu
+          archive="$RUNNER_TEMP/powershell-$PWSH_VERSION-linux-x64.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 --output "$archive" \
+            "https://github.com/PowerShell/PowerShell/releases/download/v$PWSH_VERSION/powershell-$PWSH_VERSION-linux-x64.tar.gz"
+          printf '%s  %s\n' "$PWSH_SHA256" "$archive" | sha256sum --check -
+          mkdir "$RUNNER_TEMP/pwsh"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/pwsh"
+          chmod 755 "$RUNNER_TEMP/pwsh/pwsh"
+          printf '%s\n' "$RUNNER_TEMP/pwsh" >> "$GITHUB_PATH"
+      - name: Packaging and installer tests (PE resources, app-menu integration, isolated installers)
+        run: |
+          set -eu
+          # The PowerShell tests would skip without pwsh, so require it.
+          for tool in shellcheck desktop-file-validate gio pwsh; do command -v "$tool"; done
+          python3 -I -c 'import yaml'
           shellcheck -s sh packaging/*.sh
-          # pwsh ships with the ubuntu-24.04 image; the PowerShell tests skip without it.
-          command -v pwsh
           python3 -B -m unittest discover -s packaging -v
           # Their own folders: discover -s packaging does not descend into them.
           # The public-Sigstore fixture test skips without METRO_TEST_COSIGN.
@@ -613,7 +709,7 @@ jobs:
   # Build and package everything a release would ship, but publish nothing:
   # pull requests and main pushes that change a build input (the `previews`
   # segment), and every PR to another branch, but never a release run.
-  # Unknown or unreadable diffs still build. No macOS builds for now (see release.yml).
+  # Unknown or unreadable diffs still build.
   # No secrets and contents: read only (release.yml's whole tree stays read-only).
   # It waits for windows-update-builds (windows-distribution.yml's `updates`
   # job runs those builds); a failed build fails that job, it skips nothing.
@@ -627,6 +723,7 @@ jobs:
     uses: ./.github/workflows/release.yml
     with:
       release: false
+      self_hosted: ${{ needs.workflows.outputs.self_hosted == 'true' }}
     permissions:
       contents: read
 
@@ -644,6 +741,7 @@ jobs:
     with:
       release: true
       version: ${{ needs.release-policy.outputs.version }}
+      self_hosted: ${{ needs.workflows.outputs.self_hosted == 'true' }}
     permissions:
       contents: read
 

@@ -92,7 +92,8 @@ before sending a token over ordinary plain HTTP; see
 > listed by digest in the release's [`IMAGES.txt`](https://github.com/wnzn/metro/releases/download/v0.6.4/IMAGES.txt):
 > `ghcr.io/wnzn/metro-server:v0.6.4` and `ghcr.io/wnzn/metro-runner:v0.6.4`
 > (`linux/amd64`, `linux/arm64`), and `ghcr.io/wnzn/metro-embeddinggemma2:v0.6.4`
-> (`linux/amd64`, no weights). There's no macOS build for now. Windows
+> (`linux/amd64`, no weights). 0.6.4 has no macOS build; the source, not
+> released, adds an ad hoc signed Apple-silicon one ([macOS](docs/install.md#desktop-on-macos)). Windows
 > files are **unsigned** (no Authenticode signature), so expect SmartScreen
 > warnings and check them against the Sigstore-signed `SHA256SUMS`
 > ([docs/install.md](docs/install.md#check-a-download)). The desktop app

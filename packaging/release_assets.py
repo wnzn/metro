@@ -4,20 +4,21 @@
 `assemble` takes the per-platform CI outputs (the `dist-*` artifacts) and writes
 the release folder with SHA256SUMS:
 
-  - desktop archives: Linux x64 and Windows x64 (plus the macOS archives in
-    `release` mode, none for now: see MACOS); the Linux runner archive; each
-    with its .sha256
+  - desktop archives: Linux x64, Windows x64 and macOS arm64 (MACOS); the
+    Linux runner archive; each with its .sha256
   - the Windows MSI and its .sha256, and the two PowerShell scripts, exactly as
     the Windows lane produced them (never replaced by checkout copies)
-  - the shell installers from this checkout (install-metro-macos.sh only in
-    release mode, next to notarized macOS archives, so not for now)
+  - the shell installers from this checkout, install-metro-macos.sh included
 
 Every archive is opened and checked against its sidecar and RELEASE.json.
+Every macOS archive is package.py's ad hoc signed build (RELEASE.json
+"signing": "adhoc", status "preview-not-verified": no Developer ID, not
+notarized), as release.yml ships it in both modes; the native macOS job
+already checked its signature and launched it. macos_release.py's notarized,
+stapled Developer ID build is also accepted, though no workflow makes one now.
 Release mode also requires: the metro-tui terminal client in every desktop
-archive (named by RELEASE.json "tui"), every macOS archive (if any) notarized, stapled Developer ID
-builds per RELEASE.json (the native macOS gate already verified the real
-signature and ticket), and Windows as packaging/windows-release-signing.txt
-says:
+archive (named by RELEASE.json "tui"), and Windows as
+packaging/windows-release-signing.txt says:
 
   signed    an Authenticode signature present on every Windows executable, the
             MSI and both .ps1 scripts (validity is checked natively by
@@ -29,8 +30,8 @@ says:
             scripts exactly this checkout's, and the MSI named
             Metro-<v>-windows-x64.unsigned-preview.msi.
 
-Anything else in the input, such as an ad hoc preview, or a Windows build that
-doesn't match the checked-in mode, is refused.
+Anything else in the input, such as a macOS archive for another target, or a
+Windows build that doesn't match the checked-in mode, is refused.
 
 The output is the `release-assets` artifact that sign-release-assets.yml
 (release_signatures.py prepare) takes as is: SHA256SUMS lists every file except
@@ -51,12 +52,10 @@ import zipfile
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "release-signatures"))
 import release_signatures  # noqa: E402  (the checked-in Windows signing mode and the signer's names)
-# The Macs a release ships: none for now. macOS builds are off in CI (GitHub's
-# macOS runners queued for 15+ minutes and jobs were cancelled; see
-# release.yml). The macOS checks below stay for when they return
-# ("macos-arm64", "macos-x64"), together with release_signatures.MACOS_TARGETS.
-MACOS = ()
-DESKTOP = ("linux-x64", "windows-x64")  # every mode; release mode adds MACOS
+# The Macs every preview and release ships (release_signatures.MACOS_TARGETS):
+# Apple silicon only, ad hoc signed.
+MACOS = release_signatures.MACOS_TARGETS
+DESKTOP = ("linux-x64", "windows-x64") + MACOS
 SH_SCRIPTS = ("install-metro-linux.sh", "install-metro-runner-linux.sh", "metro-runner-container.sh")
 PS1_SCRIPTS = ("install-metro-windows.ps1", "metro-runner-container.ps1")
 MACOS_SCRIPT = "install-metro-macos.sh"
@@ -101,15 +100,14 @@ class Layout:
             windows = release_signatures.windows_signing()
         require(windows in release_signatures.WINDOWS_SIGNING_MODES, f"bad Windows signing mode {windows!r}")
         self.windows_signed = windows == "signed"
-        desktop = DESKTOP + (MACOS if mode == "release" else ())
         self.archives = {f"Metro-{version}-{t}{'.zip' if t == 'windows-x64' else '.tar.gz'}": ("desktop", t)
-                         for t in desktop}
+                         for t in DESKTOP}
         self.archives[f"Metro-runner-{version}-linux-x64.tar.gz"] = ("runner", "linux-x64")
         # windows-distribution.yml names its unsigned MSI distinctly (previews and
         # unsigned releases); only windows-sign.yml produces the signed name.
         self.msi = release_signatures.windows_msi(version, windows)
         self.ps1 = PS1_SCRIPTS
-        self.sh = SH_SCRIPTS + ((MACOS_SCRIPT,) if mode == "release" and MACOS else ())
+        self.sh = SH_SCRIPTS + ((MACOS_SCRIPT,) if MACOS else ())
 
     def collected(self):
         """What the dist-* artifacts must hold, exactly."""
@@ -192,13 +190,19 @@ def check_archive(path, version, kind, target, release, windows_signed=None):
         require(sha256_bytes(files[f"{top}/{name}"]) == digest, f"{path.name}: {name} does not match RELEASE.json")
     if kind == "desktop":
         require(TUI[target] in listed or not release, f"{path.name}: a release desktop archive must include {TUI[target]}")
-    if target.startswith("macos-"):
+    if target.startswith("macos-") and manifest.get("signing") == "adhoc":
+        # package.py's ad hoc build, exactly as labelled: never presented as Developer ID or notarized.
+        require(manifest.get("status") == "preview-not-verified"
+                and not any(k in manifest for k in ("notarization", "signing_team")),
+                f"{path.name}: an ad hoc macOS build must be labelled preview-not-verified, without notarization")
+    elif target.startswith("macos-"):
+        # macos_release.py's Developer ID build (no workflow makes one now): notarized and stapled.
         n = manifest.get("notarization") or {}
         require(manifest.get("signing") == "developer-id" and manifest.get("status") == "notarized"
                 and n.get("status") == "Accepted" and n.get("stapled") is True
                 and re.fullmatch(r"[0-9a-fA-F-]{36}", str(n.get("submission_id", "")))
                 and re.fullmatch(r"[A-Z0-9]{10}", str(manifest.get("signing_team", ""))),
-                f"{path.name}: not a notarized, stapled Developer ID build; ad hoc previews are never released")
+                f"{path.name}: neither package.py's ad hoc build nor a notarized, stapled Developer ID build")
         for ticket in n.get("ticket_files") or [None]:
             require(ticket and f"{top}/{ticket}" in files, f"{path.name}: the stapled ticket is missing")
     elif target == "windows-x64":

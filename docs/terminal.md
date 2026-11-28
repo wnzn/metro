@@ -26,7 +26,7 @@ It's inside each desktop download, including the 0.6.0 release archives.
 | --- | --- |
 | `Metro-<version>-linux-x64.tar.gz` | `metro-tui`, next to the `Metro` launcher |
 | `Metro-<version>-windows-x64.zip`, or the MSI's install folder | `metro-tui.exe`, next to `Metro.exe` |
-| macOS: no download for now ([install.md](install.md#desktop-on-macos)); the packaging puts it | inside the app: `Metro.app/Contents/MacOS/metro-tui` |
+| `Metro-<version>-macos-arm64.tar.gz` (in the source, not released; [install.md](install.md#desktop-on-macos)) | inside the app: `Metro.app/Contents/MacOS/metro-tui` |
 
 Run it from a terminal in that folder, for example `./metro-tui --server …`
 on Linux or `.\metro-tui.exe --server …` in Windows Terminal or PowerShell.

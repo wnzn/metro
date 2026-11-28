@@ -585,7 +585,9 @@ see [New in Metro 0.6.4](docs/released-0.6.4.md); for later changes, see
     native audio and video playback, seeking or the native file picker for
     library uploads, until a run is recorded.
 - **User and operator docs use prebuilt files only:** the desktop app
-  (Windows, Linux), the server and runner images, and the Linux runner
+  (Windows, Linux; in the source, not released, also an ad hoc signed,
+  not notarized macOS arm64 archive, updated manually), the server and
+  runner images, and the Linux runner
   binary from https://github.com/wnzn/metro. They never ask anyone to
   compile, `cargo install`, build an image locally, or run a terminal
   sidecar next to the desktop app. Source builds live only in

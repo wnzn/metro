@@ -30,7 +30,7 @@ class SelfHostedWorkflowTests(unittest.TestCase):
         self.assertNotIn("secrets.", yaml.safe_dump(workflow))
         self.assertTrue(all("uses" not in job and "environment" not in job for job in workflow["jobs"].values()))
         self.assertTrue(authorize["runs-on"].startswith("ubuntu-"))
-        self.assertEqual(desktop["runs-on"], "metro-ci-linux-x64")
+        self.assertEqual(desktop["runs-on"], "metro-ci-linux-docker")
         self.assertEqual(desktop["needs"], "authorize")
         self.assertNotIn("if", desktop)  # implicit success() avoids scheduling after a skip or failure
 
@@ -63,7 +63,12 @@ class SelfHostedWorkflowTests(unittest.TestCase):
         self.assertEqual(checkout["with"], {"ref": "${{ github.sha }}", "persist-credentials": False})
         self.assertIn('test "$(git rev-parse HEAD)" = "$GITHUB_SHA"', steps[2]["run"])
         self.assertRegex(steps[0]["env"]["NSH_CLI_SHA256"], r"^[0-9a-f]{64}$")
-        self.assertLess(steps[0]["run"].index("sha256sum"), steps[0]["run"].index('--version'))
+        self.assertRegex(steps[0]["env"]["NSH_ARCHIVE_SHA256"], r"^[0-9a-f]{64}$")
+        # The pinned archive is checked before extraction, the CLI inside it before it runs.
+        run = steps[0]["run"]
+        self.assertLess(run.index('"$NSH_ARCHIVE_SHA256"'), run.index("tar -xzf"))
+        self.assertLess(run.index("tar -xzf"), run.index('"$NSH_CLI_SHA256"'))
+        self.assertLess(run.index('"$NSH_CLI_SHA256"'), run.index('--version'))
         self.assertEqual([step["run"] for step in steps[3:]], [
             '"$METRO_NSH" check', '"$METRO_NSH" build --release',
             '"$METRO_NSH" test', '"$METRO_NSH" test src/features/Shell.test.tsx',

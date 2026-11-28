@@ -66,15 +66,19 @@ class ReleaseInputs(unittest.TestCase):
             sidecar = name + ".sha256"
             self.assertEqual((self.assets / sidecar).read_bytes(), (self.out / sidecar).read_bytes())
 
-    def test_release_ships_windows_and_linux_only_while_macos_is_off(self):
-        self.assertEqual(release.MACOS_TARGETS, ())
+    def test_release_ships_linux_windows_and_apple_silicon(self):
+        self.assertEqual(release.MACOS_TARGETS, ("macos-arm64",))
+        mac = f"Metro-{self.version}-macos-arm64.tar.gz"
         base = {f"Metro-{self.version}-linux-x64.tar.gz", f"Metro-runner-{self.version}-linux-x64.tar.gz",
-                f"Metro-{self.version}-windows-x64.zip"}
+                f"Metro-{self.version}-windows-x64.zip", mac}
         self.assertEqual(release.binaries(self.version, "signed"), base | {f"Metro-{self.version}-windows-x64.msi"})
         self.assertEqual(release.binaries(self.version, "unsigned"),
                          base | {f"Metro-{self.version}-windows-x64.unsigned-preview.msi"})
         self.assertEqual(release.binaries(self.version), release.binaries(self.version, release.windows_signing()))
-        self.assertFalse(any("macos" in name for name in release.INSTALLERS))
+        self.assertIn("install-metro-macos.sh", release.INSTALLERS)
+        # The macOS archive gets its own Sigstore bundle, like the Linux archives.
+        self.assertEqual(release.direct_archives(self.version),
+                         (f"Metro-{self.version}-linux-x64.tar.gz", f"Metro-runner-{self.version}-linux-x64.tar.gz", mac))
         (self.assets / f"Metro-{self.version}-macos-x64.tar.gz").touch()
         with self.assertRaisesRegex(release.ReleaseError, "unexpected.*macos-x64"):
             self.prepare()

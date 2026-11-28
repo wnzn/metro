@@ -39,17 +39,18 @@ jobs:
   desktop:
     needs: authorize
     # This is a routing label, not an authorization mechanism. Runner access is
-    # configured separately. Registration may omit all default labels.
-    runs-on: metro-ci-linux-x64
-    timeout-minutes: 10
+    # configured separately. Registration omits all default labels.
+    runs-on: metro-ci-linux-docker
+    timeout-minutes: 15
     defaults:
       run:
         shell: bash
     steps:
-      - name: Verify the Linux x64 runner and preinstalled Native Shell
+      - name: Verify the Linux x64 runner and install the pinned Native Shell
         env:
-          NSH_VERSION: 0.6.1
-          # nsh/bin/nsh from the checksum-verified official v0.6.1 Linux x64 archive.
+          NSH_VERSION: v0.6.1
+          # The official v0.6.1 Linux x64 archive, and nsh/bin/nsh inside it.
+          NSH_ARCHIVE_SHA256: 9a7ac692f1c229df476be8ff83a3c5912d271453b644e313f02cb19d18696070
           NSH_CLI_SHA256: 8eb4cedc71aaaeeda729d4dba7d0fb2040db29cce98cd6ff3dad6df7d5d5bafd
         run: |
           set -euo pipefail
@@ -59,15 +60,14 @@ jobs:
             exit 1
           fi
           printf 'Runner: %q (OS=%s, ARCH=%s)\n' "$RUNNER_NAME" "$RUNNER_OS" "$RUNNER_ARCH"
-          if ! nsh_path="$(type -P nsh)" || ! nsh_path="$(realpath -- "$nsh_path")"; then
-            echo "::error::Install the pinned Linux x64 NSH $NSH_VERSION on the runner PATH."
-            exit 1
-          fi
-          hash="$(sha256sum < "$nsh_path")"
-          if [[ "${hash%% *}" != "$NSH_CLI_SHA256" || "$nsh_path" == *$'\n'* || "$nsh_path" == *$'\r'* ]]; then
-            echo "::error::The runner PATH must point to the official Linux x64 NSH $NSH_VERSION binary."
-            exit 1
-          fi
+          dir="$RUNNER_TEMP/nsh-$NSH_VERSION"
+          mkdir -p "$dir"
+          curl --fail --silent --show-error --location --retry 3 --output "$dir/nsh.tar.gz" \
+            "https://github.com/longbridge/nsh/releases/download/$NSH_VERSION/nsh-linux-x86_64.tar.gz"
+          printf '%s  %s\n' "$NSH_ARCHIVE_SHA256" "$dir/nsh.tar.gz" | sha256sum --check -
+          tar -xzf "$dir/nsh.tar.gz" -C "$dir"
+          nsh_path="$dir/nsh/bin/nsh"
+          printf '%s  %s\n' "$NSH_CLI_SHA256" "$nsh_path" | sha256sum --check -
           "$nsh_path" --version
           printf 'METRO_NSH=%s\n' "$nsh_path" >> "$GITHUB_ENV"
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0

@@ -41,9 +41,10 @@ described in [docs/install.md](../../docs/install.md). The Linux installer
 passed in a local test cut on Debian 13 and CachyOS
 ([acceptance](../../docs/acceptance.md#staged-installers-and-setup-at-57409bb-2026-11-23-project-manager-local)). They're published
 with each release since 0.3.2 and listed in its signed `SHA256SUMS`; the scripts themselves
-aren't code-signed, and the Windows one hasn't been run in a recorded test. There's no
-Mac build or download for now: CI doesn't build macOS. The macOS installer
-script stays in the repository, untested, for when Mac builds return.
+aren't code-signed, and the Windows one hasn't been run in a recorded test. 0.6.4 has no
+Mac download. In the source, not released, CI builds an ad hoc signed Apple-silicon
+`Metro-<version>-macos-arm64.tar.gz` for `install-metro-macos.sh`
+([install.md](../../docs/install.md#desktop-on-macos)); no person has tried it on a Mac.
 
 In 0.2.0, the first screen, **Connect to Metro**, offers two choices:
 

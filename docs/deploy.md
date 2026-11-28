@@ -211,14 +211,9 @@ It runs:
 - the desktop checks and tests (the test builds below package the app);
 - both container targets;
 - the packaging and workflow tests;
-- unsigned test builds for Linux and Windows
+- unsigned test builds for Linux and Windows and, in the source but not
+  released, an ad hoc signed Apple-silicon Mac
   ([install.md](install.md#test-builds-from-github-actions)).
-
-There are no macOS builds for now, in test builds or releases. GitHub's
-macOS runners queued for 15 minutes or more and the jobs were cancelled, so
-the Mac jobs are switched off. The macOS packaging code stays in the source;
-the jobs can be restored from git history (see the comment at the top of
-`release.yml`).
 
 Each pull request into `main` and each push to `main` runs only the jobs its
 changes need. The `workflows` job (workflow lint, action pins) always runs
@@ -257,6 +252,64 @@ they always compile from scratch.
 
 A tag push starts nothing, and there's no manual trigger. What has been
 verified so far is in [acceptance.md](acceptance.md).
+
+### Which machines run CI
+
+**In the source, not released.** Metro 0.6.4 ran everything on GitHub's
+machines except the `desktop` job. The 0.6.5 source moves the Linux and
+macOS jobs, including release builds, to two self-hosted runners. Setting
+them up is in [ops/ci-hosts](../ops/ci-hosts/README.md).
+
+The first step of the `workflows` job decides, on a GitHub machine, whether
+a run may use them. It allows only these two:
+
+- a protected push to `main` by a person, not deleted or forced;
+- a pull request into `main` from a branch of `wnzn/metro` itself, whose
+  author has write access. CI checks the access with GitHub's API on each run.
+
+Everything else runs only on GitHub's machines: pull requests from forks,
+bots, other branches and any case CI can't decide.
+
+| Jobs | Allowed run | Any other run |
+| --- | --- | --- |
+| `rust`, `desktop`, `containers`, `packaging`; the Linux builds and checks in `release.yml` | `metro-ci-linux-docker` (Debian 13, rootless Docker) | `ubuntu-24.04` |
+| The macOS build (`desktop-macos`) | `metro-ci-macos-arm64` | `macos-15` |
+| Native Windows builds and tests | `windows-2025` | `windows-2025` |
+| `workflows`, `release-policy`, and everything after the release build: tag, images, Sigstore signing, publication | GitHub's machines | GitHub's machines |
+
+- Every job on a self-hosted runner checks the repository, the event, the
+  branch and the pull request's source repository again before it checks
+  out any code.
+- **These checks live in the workflow files, which a pull request can
+  change.** A fork's pull request could edit them to name a self-hosted
+  label. The real safeguard is the repository setting **Require approval
+  for all external contributors** (Settings → Actions → General). Keep it
+  on, and never approve a fork's run that changes `.github/` unless you've
+  read the change.
+- If a self-hosted runner is offline, its jobs wait for it. They never move
+  to a GitHub machine.
+- Jobs that hold a write token or a GitHub OIDC token (the tag, images,
+  `SHA256SUMS` signing, publication) always run on GitHub's fresh,
+  single-use machines, so the Sigstore certificates still name a
+  GitHub-hosted runner. Windows signing does too, except with the `kms`
+  backend's own restricted runner ([below](#windows-releases-signed-or-unsigned)).
+- The Linux binaries that ship (desktop, server, terminal client, runner)
+  are compiled inside the pinned Debian 12 Rust image
+  (`packaging/Dockerfile.build`, `Dockerfile`), never against the
+  runner's own Debian 13 libraries. So they need glibc 2.36 at most, and
+  packaging refuses any that needs more than 2.39 (2.36 for the runner).
+- The Mac runner has no GUI session, so there the macOS build runs a
+  headless check instead of opening the app's window: the signatures,
+  `Info.plist` files, architecture and the bundled server's `/healthz`.
+  The run log says so, and a failed check fails the job. GitHub's
+  `macos-15` still opens the window.
+- **Consequence:** the Linux and macOS release files are built on those two
+  persistent machines, which also run code from trusted pull requests.
+  Anyone who controls one of them could change a release build. The
+  container images are still built on GitHub's machines.
+- The manual `self-hosted-ci.yml` workflow also uses
+  `metro-ci-linux-docker`. No workflow uses the older `metro-ci-linux-x64`
+  runner from `ops/github-runner` any more.
 
 ### Releases from `main` on a version bump
 
@@ -325,7 +378,8 @@ Re-run that run; it still releases. The order, in `release.yml` and then
    release as they are.
 4. Create the immutable `v<version>` tag on exactly that commit, with the
    workflow's own token.
-5. The exact release set: Windows and Linux only, no macOS for now.
+5. The exact release set: Windows and Linux, and in the source (not
+   released) the ad hoc signed Apple-silicon Mac.
 6. GHCR images, pushed, read back and signed.
 7. The Sigstore-signed `SHA256SUMS`.
 8. Publication: the files are uploaded to a staging draft, every digest
@@ -341,9 +395,10 @@ A release needs this setup, which was in place for 0.6.4:
 - **The `main` branch,** the repository's default branch, protected against
   deletion and force pushes. Changes, including version bumps, arrive
   through pull requests.
-- **macOS:** nothing for now. Releases don't build or sign a Mac, and no
-  workflow reads the Apple signing secrets. If they're already set, they're
-  unused.
+- **macOS:** nothing. In the source (not released), releases include an
+  ad hoc signed Apple-silicon Mac that isn't notarized. No workflow reads
+  the Apple signing secrets; if they're set, nothing uses them. There's no
+  Intel Mac build.
 - **Windows:** nothing while releases ship Windows unsigned
   ([below](#windows-releases-signed-or-unsigned)). Before switching to
   signed: the `windows-release-signing` environment, with deployment

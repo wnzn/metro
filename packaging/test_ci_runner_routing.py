@@ -1,4 +1,9 @@
-"""Regular desktop CI routes the real job without granting forks runner access."""
+"""CI routes trusted events to Metro's self-hosted runners and everything else to GitHub's.
+
+The `workflows` job's selector decides once per run (self_hosted=true|false);
+every Linux job and the macOS build follow it, and nothing that signs or
+publishes ever runs on a self-hosted label.
+"""
 
 from copy import deepcopy
 import json
@@ -8,12 +13,16 @@ import subprocess
 import tempfile
 import unittest
 
-from test_release_workflow import load, yaml
+from test_release_workflow import WF, load, yaml
 
 
 METRO = 1467654868
-HOSTED = "ubuntu-24.04"
-LOCAL = "metro-ci-linux-x64"
+HOSTED = "false"
+LOCAL = "true"
+LINUX = "${{ needs.workflows.outputs.self_hosted == 'true' && 'metro-ci-linux-docker' || 'ubuntu-24.04' }}"
+RELEASE_LINUX = "${{ inputs.self_hosted && 'metro-ci-linux-docker' || 'ubuntu-24.04' }}"
+RELEASE_MAC = "${{ inputs.self_hosted && 'metro-ci-macos-arm64' || 'macos-15' }}"
+SELF_HOSTED = {"metro-ci-linux-docker", "metro-ci-macos-arm64"}
 AUTHOR = {"type": "User", "login": "alice", "id": 176448921}
 FAKE_TOKEN = "synthetic-test-only"
 
@@ -36,7 +45,7 @@ class DesktopRoutingTests(unittest.TestCase):
         cls.ci = load("ci.yml")
         cls.desktop = cls.ci["jobs"]["desktop"]
         cls.workflow_gate = cls.ci["jobs"]["workflows"]
-        cls.selector, = [step for step in cls.workflow_gate["steps"] if step.get("id") == "desktop-route"]
+        cls.selector, = [step for step in cls.workflow_gate["steps"] if step.get("id") == "runner-route"]
 
     def route(self, kind, payload, *, answer=None, status=0, lookup=False, **overrides):
         with tempfile.TemporaryDirectory() as d:
@@ -74,7 +83,9 @@ sys.exit({status!r})
             self.assertNotIn("synthetic debug response", r.stdout + r.stderr)
             self.assertNotIn("alice", r.stdout)
             self.assertNotIn("maintainer", r.stdout)
-            return output.read_text().strip().removeprefix("desktop_runner="), r.stdout
+            text = output.read_text().strip()
+            self.assertRegex(text, r"^self_hosted=(true|false)$")
+            return text.removeprefix("self_hosted="), r.stdout
 
     def test_pr_routing_uses_verified_permission_not_association(self):
         for role in ("write", "maintain", "admin"):
@@ -146,30 +157,28 @@ sys.exit({status!r})
             self.assertEqual(self.route("push", PUSH | {flag: True})[0], HOSTED)
         self.assertEqual(self.route("workflow_dispatch", {})[0], HOSTED)
 
-    def test_release_runs_keep_the_desktop_job_on_github_hosted_runners(self):
+    def test_release_runs_use_the_same_queue_as_other_trusted_runs(self):
         """Evaluate the real runs-on and if expressions over every release-policy outcome."""
         def evaluate(expression, ctx):
             # Exactly the two shapes used by the desktop job; anything else fails this test.
             body = expression.removeprefix("${{ ").removesuffix(" }}")
-            runner = ("needs.workflows.outputs.desktop_runner == 'metro-ci-linux-x64' "
-                      "&& needs.release-policy.outputs.release != 'true' && 'metro-ci-linux-x64' || 'ubuntu-24.04'")
             gate = ("!cancelled() && needs.workflows.result == 'success' && needs.release-policy.result != 'failure' "
                     "&& (needs.workflows.outputs.desktop != 'false' || needs.release-policy.outputs.release == 'true')")
-            if body == runner:
-                local = ctx["selected"] == LOCAL and ctx["release"] != "true"
-                return LOCAL if local else HOSTED
+            if expression == LINUX:
+                return "metro-ci-linux-docker" if ctx["selected"] == "true" else "ubuntu-24.04"
             self.assertEqual(" ".join(body.split()), gate)
             return (not ctx["cancelled"] and ctx["workflows"] == "success" and ctx["policy"] != "failure"
                     and (ctx.get("desktop", "") != "false" or ctx.get("release") == "true"))
 
         cases = (
-            # (release-policy result, release output, selector choice) -> (desktop runs, runner)
-            ("skipped", "", LOCAL, True, LOCAL),          # pull request
-            ("success", "false", LOCAL, True, LOCAL),     # main push without a version bump
-            ("success", "true", LOCAL, True, HOSTED),     # release run: always GitHub-hosted
-            ("success", "true", HOSTED, True, HOSTED),
-            ("skipped", "", HOSTED, True, HOSTED),        # fork or untrusted PR
-            ("failure", "", LOCAL, False, None),          # no release, and nothing to route
+            # (release-policy result, release output, selector output) -> (desktop runs, runner)
+            ("skipped", "", LOCAL, True, "metro-ci-linux-docker"),     # trusted pull request
+            ("success", "false", LOCAL, True, "metro-ci-linux-docker"),  # main push without a version bump
+            ("success", "true", LOCAL, True, "metro-ci-linux-docker"),   # release run
+            ("success", "true", HOSTED, True, "ubuntu-24.04"),
+            ("skipped", "", HOSTED, True, "ubuntu-24.04"),             # fork or untrusted PR
+            ("skipped", "", "", True, "ubuntu-24.04"),                 # no answer: hosted
+            ("failure", "", LOCAL, False, None),                       # no release, and nothing to route
         )
         for policy, release, selected, runs, runner in cases:
             ctx = {"policy": policy, "release": release, "selected": selected, "workflows": "success",
@@ -189,7 +198,7 @@ sys.exit({status!r})
                                                         "workflows": "success", "cancelled": False,
                                                         "desktop": desktop, "release": release}), runs)
 
-    def test_single_read_only_desktop_job_and_one_toolchain_per_runner(self):
+    def test_single_read_only_desktop_job_with_pinned_nsh(self):
         self.assertEqual(self.ci["permissions"], {"contents": "read"})
         self.assertNotIn("permissions", self.desktop)
         self.assertNotIn("secrets", self.desktop)
@@ -197,35 +206,33 @@ sys.exit({status!r})
         self.assertEqual(self.desktop["needs"], ["workflows", "release-policy"])
         self.assertIs(self.selector, self.workflow_gate["steps"][0])
         self.assertEqual(self.selector["env"], {"GH_TOKEN": "${{ github.token }}"})
-        self.assertEqual(self.workflow_gate["outputs"]["desktop_runner"], "${{ steps.desktop-route.outputs.desktop_runner }}")
-        self.assertEqual(self.desktop["runs-on"],
-                         "${{ needs.workflows.outputs.desktop_runner == 'metro-ci-linux-x64' "
-                         "&& needs.release-policy.outputs.release != 'true' "
-                         "&& 'metro-ci-linux-x64' || 'ubuntu-24.04' }}")
+        self.assertEqual(self.workflow_gate["outputs"]["self_hosted"], "${{ steps.runner-route.outputs.self_hosted }}")
+        self.assertEqual(self.desktop["runs-on"], LINUX)
         self.assertEqual(" ".join(self.desktop["if"].split()),
                          "${{ !cancelled() && needs.workflows.result == 'success' "
                          "&& needs.release-policy.result != 'failure' && (needs.workflows.outputs.desktop != 'false' "
                          "|| needs.release-policy.outputs.release == 'true') }}")
         self.assertIn("desktop", self.ci["jobs"]["release"]["needs"])
-        for job in ("rust", "containers", "workflows", "packaging", "release-policy"):
-            self.assertEqual(self.ci["jobs"][job]["runs-on"], HOSTED)
         # The slow packaging tests run in their own job, so they do not hold up the desktop job.
         packaging = self.ci["jobs"]["packaging"]
         self.assertEqual(packaging["needs"], ["workflows", "release-policy"])
-        self.assertEqual(packaging["steps"][0]["with"], {"persist-credentials": False})
+        tests, = [s for s in packaging["steps"] if "unittest discover" in str(s.get("run", ""))]
         for suite in ("packaging", "packaging/release-signatures", "packaging/windows-signing"):
-            self.assertIn(f"python3 -B -m unittest discover -s {suite} -v\n", packaging["steps"][1]["run"])
+            self.assertIn(f"python3 -B -m unittest discover -s {suite} -v\n", tests["run"])
+        self.assertIn("for tool in shellcheck desktop-file-validate gio pwsh; do command -v", tests["run"])
+        apt, = [s for s in packaging["steps"] if "apt-get" in str(s.get("run", ""))]
+        self.assertEqual(apt["if"], "runner.environment == 'github-hosted'")  # no sudo on the self-hosted runner
+        pwsh, = [s for s in packaging["steps"] if "PWSH_SHA256" in str(s.get("env", ""))]
+        self.assertEqual(pwsh["if"], "runner.environment == 'self-hosted'")
+        self.assertRegex(pwsh["env"]["PWSH_SHA256"], r"^[0-9a-f]{64}$")
+        self.assertLess(pwsh["run"].index("sha256sum --check"), pwsh["run"].index("tar -xzf"))
         self.assertNotIn("unittest discover", yaml.safe_dump(self.workflow_gate))
         steps = self.desktop["steps"]
-        verify, checkout, install, *commands = steps
-        self.assertEqual(verify["if"], "runner.environment == 'self-hosted'")
-        self.assertIn("sha256sum --check", verify["run"])
-        self.assertIn("test \"${NSH_TSC:-}\" = /opt/typescript/lib/tsc", verify["run"])
-        self.assertIn("Version 7.0.2", verify["run"])
-        self.assertNotIn("curl", verify["run"])
+        guard, checkout, install, *commands = steps
+        self.assertEqual(guard["if"], "runner.environment == 'self-hosted'")
         self.assertEqual(checkout["with"], {"ref": "${{ github.sha }}", "persist-credentials": False})
-        self.assertEqual(install["if"], "runner.environment == 'github-hosted'")
-        self.assertIn("curl", install["run"])
+        self.assertNotIn("if", install)  # the pinned NSH is downloaded on every runner
+        self.assertIn('"$NSH_ARCHIVE_SHA256" "$archive" | sha256sum --check -', install["run"])
         self.assertEqual(commands, [
             {"run": "nsh check", "working-directory": "apps/desktop"},
             {"name": "NSH headless tests (all files, isolated workers)",
@@ -235,3 +242,100 @@ sys.exit({status!r})
         ])
         # The release build is package-smoke's `ui` job, not this one.
         self.assertNotIn("nsh build", yaml.safe_dump(self.desktop))
+
+
+class RunnerMapTests(unittest.TestCase):
+    """Every job in every workflow: GitHub-hosted, or self-hosted only through the selector."""
+
+    @classmethod
+    def setUpClass(cls):
+        if yaml is None:
+            raise unittest.SkipTest("PyYAML is not installed")
+        cls.workflows = {path.name: load(path.name) for path in sorted(WF.glob("*.yml"))}
+
+    def test_the_runner_map(self):
+        got = {(file, name): job.get("runs-on", job.get("uses"))
+               for file, wf in self.workflows.items() for name, job in wf["jobs"].items()}
+        want_ci = {"rust": LINUX, "desktop": LINUX, "containers": LINUX, "packaging": LINUX,
+                   "workflows": "ubuntu-24.04", "release-policy": "ubuntu-24.04",
+                   "windows-update-builds": "windows-2025", "package-smoke": "./.github/workflows/release.yml",
+                   "release": "./.github/workflows/release.yml", "publish": "./.github/workflows/release-publish.yml"}
+        want_release = {"meta": RELEASE_LINUX, "runner-linux": RELEASE_LINUX, "ui": RELEASE_LINUX,
+                        "desktop-linux": RELEASE_LINUX, "assets": RELEASE_LINUX, "desktop-macos": RELEASE_MAC,
+                        "desktop-windows": "windows-2025",
+                        "windows-distribution": "./.github/workflows/windows-distribution.yml"}
+        self.assertEqual({n: r for (f, n), r in got.items() if f == "ci.yml"}, want_ci)
+        self.assertEqual({n: r for (f, n), r in got.items() if f == "release.yml"}, want_release)
+        self.assertEqual(got[("self-hosted-ci.yml", "desktop")], "metro-ci-linux-docker")
+        self.assertEqual(got[("self-hosted-ci.yml", "authorize")], "ubuntu-24.04")
+        # Nothing that signs, publishes or holds an OIDC token reaches a self-hosted label, and no
+        # workflow still names the retired metro-ci-linux-x64 runner.
+        for (file, name), runner in got.items():
+            text = json.dumps(self.workflows[file]["jobs"][name])
+            self.assertNotIn("metro-ci-linux-x64", text, (file, name))
+            if file in ("ci.yml", "release.yml", "self-hosted-ci.yml"):
+                continue
+            with self.subTest(file=file, job=name):
+                self.assertFalse(any(label in str(runner) for label in SELF_HOSTED))
+        for file in ("release-publish.yml", "sign-release-assets.yml", "release-images.yml", "windows-sign.yml",
+                     "windows-distribution.yml", "check-runner-stack.yml"):
+            self.assertNotIn("metro-ci-", (WF / file).read_text(), file)
+
+    def test_only_trusted_runs_choose_self_hosted_and_release_yml_gets_a_boolean(self):
+        ci = self.workflows["ci.yml"]["jobs"]
+        for name in ("package-smoke", "release"):
+            self.assertEqual(ci[name]["with"]["self_hosted"], "${{ needs.workflows.outputs.self_hosted == 'true' }}")
+            self.assertIn("workflows", ci[name]["needs"])
+        spec = self.workflows["release.yml"]["on"]["workflow_call"]["inputs"]["self_hosted"]
+        self.assertEqual((spec["type"], spec["default"]), ("boolean", False))
+        # Labels only ever come from fixed strings in these expressions, never from an input value.
+        for file in ("ci.yml", "release.yml"):
+            for name, job in self.workflows[file]["jobs"].items():
+                runner = str(job.get("runs-on", ""))
+                if "${{" in runner:
+                    self.assertIn(runner, (LINUX, RELEASE_LINUX, RELEASE_MAC), (file, name))
+
+    def test_every_self_hosted_job_rechecks_the_event_before_checkout(self):
+        guards = []
+        for file in ("ci.yml", "release.yml"):
+            for name, job in self.workflows[file]["jobs"].items():
+                if not any(label in str(job.get("runs-on", "")) for label in SELF_HOSTED):
+                    continue
+                with self.subTest(file=file, job=name):
+                    first = job["steps"][0]
+                    self.assertEqual(first["if"], "runner.environment == 'self-hosted'")
+                    self.assertNotIn("uses", first)
+                    checkout = next(i for i, s in enumerate(job["steps"]) if "actions/checkout" in str(s.get("uses")))
+                    self.assertGreater(checkout, 0)
+                    mac = "macos" in job["runs-on"]
+                    self.assertEqual(first["env"], {"WANT_OS": "macOS" if mac else "Linux",
+                                                    "WANT_ARCH": "ARM64" if mac else "X64"})
+                    guards.append(first["run"])
+        self.assertEqual(len(guards), 10)
+        self.assertEqual(len(set(guards)), 1)  # one script, everywhere
+        self.check_guard(guards[0])
+
+    def check_guard(self, script):
+        with tempfile.TemporaryDirectory() as d:
+            def run(kind, payload, **env):
+                event = Path(d) / "event.json"
+                event.write_text(json.dumps(payload))
+                base = {"PATH": os.environ["PATH"], "GITHUB_REPOSITORY": "wnzn/metro",
+                        "GITHUB_REPOSITORY_ID": str(METRO), "GITHUB_EVENT_NAME": kind, "GITHUB_REF": "refs/heads/main",
+                        "GITHUB_BASE_REF": "main" if kind == "pull_request" else "", "GITHUB_EVENT_PATH": str(event),
+                        "RUNNER_OS": "Linux", "RUNNER_ARCH": "X64", "WANT_OS": "Linux", "WANT_ARCH": "X64"}
+                return subprocess.run(["bash", "-c", script], env=base | env, capture_output=True).returncode
+
+            fork = deepcopy(PR)
+            fork["pull_request"]["head"]["repo"]["id"] = 123
+            self.assertEqual(run("push", PUSH), 0)
+            self.assertEqual(run("pull_request", PR), 0)
+            for kind, payload, env in (
+                ("pull_request", fork, {}), ("pull_request", PR, {"GITHUB_BASE_REF": "release"}),
+                ("pull_request", {}, {}), ("push", PUSH, {"GITHUB_REF": "refs/heads/feature"}),
+                ("push", PUSH, {"GITHUB_REPOSITORY": "someone/metro"}), ("push", PUSH, {"GITHUB_REPOSITORY_ID": "1"}),
+                ("workflow_dispatch", {}, {}), ("pull_request_target", PR, {}),
+                ("push", PUSH, {"RUNNER_OS": "macOS"}), ("push", PUSH, {"RUNNER_ARCH": "ARM64"}),
+            ):
+                with self.subTest(kind=kind, env=env):
+                    self.assertNotEqual(run(kind, payload, **env), 0)

@@ -612,9 +612,12 @@ async fn check_once_records_verified_latest_and_images() {
         "https://github.com/wnzn/metro/releases/tag/v9.1.0"
     );
     // A failing check keeps the last verified release and reports the error.
-    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    // Bound but never listening, and kept until the end: connections are
+    // refused, and no fixture another test starts meanwhile can take the
+    // port (as it could if a listener were bound and dropped).
+    let dead = tokio::net::TcpSocket::new_v4().unwrap();
+    dead.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let dead_base = format!("http://{}", dead.local_addr().unwrap());
-    drop(dead);
     let fetcher = AsyncFetcher::new(
         Source::loopback_fixture(&dead_base).unwrap(),
         Duration::from_secs(5),

@@ -595,7 +595,7 @@ def macos(args, stage):
     copy(brand_notice(RENDERER_SOURCE, resources), stage / "licenses/BRAND-MARKS.txt")
     write_inter_notice(stage)
     write(stage / "START.txt",
-          "Metro for macOS — CI PREVIEW, NOT YET VERIFIED.\n"
+          "Metro for macOS.\n"
           "This build is ad hoc signed. It is not Developer ID signed or notarized,\n"
           "so macOS may refuse to open it. Do not change Gatekeeper settings for it.\n\n"
           f"Requires macOS {MACOS_MIN} or newer on {'Apple silicon' if args.target == 'macos-arm64' else 'an Intel Mac'}.\n"

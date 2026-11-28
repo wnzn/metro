@@ -191,7 +191,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
     def test_pull_requests_get_a_read_only_secretless_tree(self):
         smoke = self.ci["jobs"]["package-smoke"]
         self.assertEqual(smoke["uses"], "./.github/workflows/release.yml")
-        self.assertEqual(smoke["with"], {"release": False})
+        self.assertEqual(smoke["with"], {"release": False,
+                                         "self_hosted": "${{ needs.workflows.outputs.self_hosted == 'true' }}"})
         self.assertEqual(smoke["permissions"], {"contents": "read"})
         self.assertNotIn("secrets", smoke)
         for name, job in self.release["jobs"].items():
@@ -211,7 +212,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(" ".join(publish["if"].split()),
                          "needs.release-policy.outputs.release == 'true' && " + " ".join(MAIN_IF.split()))
         self.assertEqual(" ".join(release["if"].split()), RELEASE_IF)
-        self.assertEqual(release["with"], {"release": True, "version": "${{ needs.release-policy.outputs.version }}"})
+        self.assertEqual(release["with"], {"release": True, "version": "${{ needs.release-policy.outputs.version }}",
+                                           "self_hosted": "${{ needs.workflows.outputs.self_hosted == 'true' }}"})
         self.assertEqual(release["permissions"], {"contents": "read"})
         self.assertEqual(set(release["needs"]), {"rust", "desktop", "containers", "workflows", "packaging",
                                                  "release-policy"})
@@ -319,23 +321,37 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 self.assertIs(matches_conjunction(jobs["publish"]["if"], context),
                               policy and name != "no version bump or already public")
 
-    def test_no_job_runs_on_a_macos_runner(self):
-        """macOS builds are off for now (GitHub's macOS runners queued 15+ minutes and jobs were cancelled)."""
-        self.assertNotIn("desktop-macos", self.release["jobs"])
+    def test_one_ad_hoc_apple_silicon_build_and_no_apple_signing(self):
+        """Restored from 106e5da without the Intel Mac, the matrix or Developer ID signing."""
+        jobs = self.release["jobs"]
+        mac = jobs["desktop-macos"]
+        self.assertEqual(mac["needs"], "meta")
+        self.assertNotIn("if", mac)  # every preview and every release builds and smokes the Mac
+        self.assertNotIn("strategy", mac)
+        self.assertEqual(mac["runs-on"], "${{ inputs.self_hosted && 'metro-ci-macos-arm64' || 'macos-15' }}")
+        self.assertEqual(mac["timeout-minutes"], 90)
+        self.assertEqual({k: mac["env"][k] for k in ("TARGET", "RUST_TARGET", "NSH_ASSET")},
+                         {"TARGET": "macos-arm64", "RUST_TARGET": "aarch64-apple-darwin",
+                          "NSH_ASSET": "nsh-macos-arm64.tar.gz"})
+        self.assertRegex(mac["env"]["NSH_ASSET_SHA256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(uploads(mac), ["smoke-macos-arm64-screenshot", "dist-desktop-macos-arm64"])
         self.assertNotIn("macos-sign", self.publish["jobs"])
-        self.assertNotIn("macos_matrix", self.release["jobs"]["meta"].get("outputs", {}))
+        self.assertNotIn("macos_matrix", jobs["meta"].get("outputs", {}))
+        text = steps_text(mac)
+        for needle in ('test "$(uname -m)" = arm64', "shasum -a 256 -c -", 'package.py desktop --target "$TARGET"',
+                       'cargo test --locked --release --target "$RUST_TARGET" -p metro-desktop',
+                       "install-metro-macos.sh", "codesign --verify --deep --strict", "smoke-macos-launch.sh"):
+            self.assertIn(needle, text)
+        for forbidden in ("macos_release.py", "notarytool", "stapler", "Developer ID", "--options runtime"):
+            self.assertNotIn(forbidden, text)
+        # No Intel Mac and no macOS runner anywhere else.
         for path in sorted(WF.glob("*.yml")):
-            wf = load(path.name)
-            for name, job in wf["jobs"].items():
-                runners = [job.get("runs-on")]
-                matrix = (job.get("strategy") or {}).get("matrix")
-                if isinstance(matrix, dict):
-                    for key, value in matrix.items():
-                        runners += value if isinstance(value, list) else [value]
-                with self.subTest(workflow=path.name, job=name):
-                    self.assertNotIn("macos", json.dumps(runners).lower())
-            # No macOS step, matrix or runner label anywhere, even in an expression.
-            self.assertIsNone(re.search(r"runs-on:\s*\S*macos|macos-\d+|MACOS_BUILDS", path.read_text()), path.name)
+            text = path.read_text()
+            self.assertNotIn("macos-15-intel", text, path.name)
+            self.assertNotIn("x86_64-apple-darwin", text, path.name)
+            self.assertNotIn("MACOS_BUILDS", text, path.name)
+            if path.name != "release.yml":
+                self.assertIsNone(re.search(r"runs-on:.*macos", text), path.name)
 
     def test_no_workflow_references_the_apple_secrets(self):
         names = set(macos_release.SECRET_ENV)
@@ -364,7 +380,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         builds = {
             "runner-linux": "Build metro-runner in the bookworm toolchain image",
             "desktop-windows": "Build metro-desktop, metro-server and metro-tui (native, locked)",
-            "desktop-linux": "Build metro-desktop, metro-server and metro-tui (locked)",
+            "desktop-linux": "Build metro-desktop, metro-server and metro-tui (locked, in the pinned bookworm build image)",
+            "desktop-macos": "Build metro-desktop, metro-server and metro-tui (native, locked)",
         }
         for job, step_name in builds.items():
             steps = self.release["jobs"][job]["steps"]
@@ -392,6 +409,53 @@ class ReleaseWorkflowTests(unittest.TestCase):
         # The Dockerfile defaults to a source build.
         self.assertIn("ARG METRO_RELEASE_CHANNEL=\n", (ROOT / "Dockerfile").read_text())
 
+    def test_shipped_linux_binaries_are_built_in_pinned_bookworm_images(self):
+        """Never against a self-hosted runner's newer glibc; package.py's limits stay the safety net."""
+        build = (ROOT / "packaging/Dockerfile.build").read_text()
+        linux_from = re.search(r"(?m)^FROM (\S+) AS linux$", build).group(1)
+        self.assertRegex(linux_from, r"^rust:1\.98\.1-bookworm@sha256:[0-9a-f]{64}$")
+        root = (ROOT / "Dockerfile").read_text()
+        self.assertRegex(root, r"(?m)^FROM rust:1\.98\.1-bookworm@sha256:[0-9a-f]{64} AS rust-base$")
+        job = self.release["jobs"]["desktop-linux"]
+        step, = [s for s in job["steps"] if "cargo build" in str(s.get("run", ""))]
+        run = step["run"]
+        self.assertIn("docker build --quiet --target linux -t metro-linux-build:ci - < packaging/Dockerfile.build", run)
+        self.assertIn("docker run --rm --network none --user \"$user\"", run)
+        self.assertIn("--env METRO_RELEASE_CHANNEL", run)
+        cargo = [line.strip() for line in run.splitlines() if "cargo build" in line]
+        self.assertEqual(cargo, ["cargo build --locked --release --target x86_64-unknown-linux-gnu --bin metro-desktop "
+                                 "--bin metro-server --bin metro-tui --offline"])
+        self.assertLess(run.index("metro-linux-build:ci \\\n"), run.index("cargo build"))
+        # The runner binary comes from the root Dockerfile's bookworm `build` stage.
+        runner = steps_text(self.release["jobs"]["runner-linux"])
+        self.assertIn("docker build --target build", runner)
+        self.assertNotIn("cargo build", runner)
+        # No other Linux job in release.yml compiles shipped binaries on the host.
+        for name in ("meta", "ui", "assets", "runner-linux"):
+            self.assertNotIn("cargo build", steps_text(self.release["jobs"][name]), name)
+        package = (ROOT / "packaging/package.py").read_text()
+        self.assertEqual(package.count("(2, 39)"), 4)  # launcher, renderer, server, tui
+        self.assertIn("elf(args.binary, (2, 36))", package)  # runner
+
+    def test_macos_smoke_runs_the_window_launch_only_with_a_gui_session(self):
+        step, = [s for s in self.release["jobs"]["desktop-macos"]["steps"]
+                 if s.get("name") == "Install into a path with spaces, then a clean start and shutdown"]
+        self.assertEqual(step["env"]["RUNNER_KIND"], "${{ runner.environment }}")
+        run = step["run"]
+        self.assertTrue(run.startswith("set -Eeuo pipefail\n"))
+        self.assertIn('session="$(launchctl managername 2>/dev/null || true)"', run)
+        branch = run[run.index('if [ "$session" = Aqua ]; then'):run.index("\nfi\n")]
+        aqua, headless = branch.split("\nelse\n")
+        self.assertIn("sh packaging/smoke-macos-launch.sh", aqua)
+        self.assertNotIn("headless", aqua)
+        # Without Aqua: only on a self-hosted runner, announced, and its failure fails the step.
+        lines = [line.strip() for line in headless.splitlines()]
+        self.assertEqual(lines[0], 'test "$RUNNER_KIND" = self-hosted')
+        self.assertIn("::notice title=macOS launch smoke::No Aqua (GUI) session", headless)
+        self.assertIn('sh packaging/smoke-macos-headless.sh "$app" "$manifest" "$RUNNER_TEMP/headless"', lines)
+        self.assertNotIn("|| true", headless)
+        self.assertNotIn("continue-on-error", step)
+
     def test_linux_desktop_job_has_only_blocking_steps(self):
         # The best-effort Xvfb launch could never fail CI, so it and its screenshot are gone.
         job = self.release["jobs"]["desktop-linux"]
@@ -417,13 +481,15 @@ class ReleaseWorkflowTests(unittest.TestCase):
 
     def test_platform_build_jobs_have_timeouts(self):
         jobs = self.release["jobs"]
-        self.assertEqual({name: jobs[name].get("timeout-minutes") for name in ("desktop-linux", "desktop-windows", "runner-linux")},
-                         {"desktop-linux": 30, "desktop-windows": 40, "runner-linux": 20})
+        self.assertEqual({name: jobs[name].get("timeout-minutes")
+                          for name in ("desktop-linux", "desktop-windows", "desktop-macos", "runner-linux")},
+                         {"desktop-linux": 30, "desktop-windows": 40, "desktop-macos": 90, "runner-linux": 20})
 
     def test_only_final_outputs_are_named_dist(self):
         names = {(job, u) for job, j in self.release["jobs"].items() for u in uploads(j) if u.startswith("dist-")}
         self.assertEqual(names, {("runner-linux", "dist-runner-linux-x64"),
-                                 ("desktop-linux", "dist-desktop-linux-x64")})
+                                 ("desktop-linux", "dist-desktop-linux-x64"),
+                                 ("desktop-macos", "dist-desktop-macos-arm64")})
         self.assertEqual(uploads(self.release["jobs"]["desktop-windows"])[-1], "seed-desktop-windows-x64")
         win = self.release["jobs"]["windows-distribution"]
         self.assertEqual(win["uses"], "./.github/workflows/windows-distribution.yml")
@@ -433,7 +499,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
 
     def test_preview_aggregate_runs_only_in_read_only_mode(self):
         assets = self.release["jobs"]["assets"]
-        self.assertEqual(set(assets["needs"]), {"meta", "runner-linux", "windows-distribution", "desktop-linux"})
+        self.assertEqual(set(assets["needs"]), {"meta", "runner-linux", "windows-distribution", "desktop-linux",
+                                                "desktop-macos"})
         self.assertEqual(assets["if"], "${{ !inputs.release }}")
         self.assertIn("--mode smoke", steps_text(assets))
         self.assertEqual(uploads(assets), ["preview-assets"])
@@ -564,7 +631,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
 
     def test_every_desktop_build_ships_and_runs_the_terminal_client(self):
         jobs = self.release["jobs"]
-        for name in ("desktop-windows", "desktop-linux"):
+        for name in ("desktop-windows", "desktop-linux", "desktop-macos"):
             text = steps_text(jobs[name])
             self.assertNotIn("steps.tui", yaml.safe_dump(jobs[name]), name)  # no optional discovery
             self.assertRegex(text, r"cargo build --locked --release --target \S+ --bin metro-desktop --bin metro-server "
@@ -593,16 +660,17 @@ class ReleaseWorkflowTests(unittest.TestCase):
                     if file != "ci.yml":
                         self.assertEqual(step["if"], "${{ !inputs.release }}", name)
         self.assertEqual(found, {"ci.yml": {"rust", "windows-update-builds"},
-                                 "release.yml": {"desktop-linux", "desktop-windows"}})
+                                 "release.yml": {"desktop-linux", "desktop-windows", "desktop-macos"}})
         e2e, = [s for s in self.ci["jobs"]["windows-update-builds"]["steps"] if "rust-cache" in str(s.get("uses", ""))]
         self.assertEqual(e2e["with"], {"key": "windows-update-e2e", "workspaces": ". -> target-e2e",
                                        "save-if": main_only})
         keys = {name: self.release["jobs"][name]["steps"] for name in found["release.yml"]}
         self.assertEqual({name: next(s["with"]["key"] for s in steps if "rust-cache" in str(s.get("uses", "")))
                           for name, steps in keys.items()},
-                         {"desktop-linux": "x86_64-unknown-linux-gnu", "desktop-windows": "x86_64-pc-windows-msvc"})
+                         {"desktop-linux": "x86_64-unknown-linux-gnu", "desktop-windows": "x86_64-pc-windows-msvc",
+                          "desktop-macos": "aarch64-apple-darwin"})
         # release.yml never runs an official build with a cache: every use is in a guarded step.
-        self.assertEqual((WF / "release.yml").read_text().count("rust-cache@"), 2)
+        self.assertEqual((WF / "release.yml").read_text().count("rust-cache@"), 3)
 
     def test_ci_compiles_each_profile_once(self):
         rust = [s.get("run", "") for s in self.ci["jobs"]["rust"]["steps"]]
@@ -614,8 +682,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("cargo test", linux)
         self.assertIn("cargo fetch --locked --target x86_64-unknown-linux-gnu", linux)
         self.assertIn("sys.version_info >= (3, 11)", linux)
-        self.assertRegex(steps_text(self.release["jobs"]["desktop-windows"]),
-                         r"cargo test --locked --release --target \S+ -p metro-desktop")
+        for name in ("desktop-windows", "desktop-macos"):
+            self.assertRegex(steps_text(self.release["jobs"][name]),
+                             r"cargo test --locked --release --target \S+ -p metro-desktop", name)
 
     def test_ci_runs_the_terminal_client_in_a_real_pty(self):
         rust = self.ci["jobs"]["rust"]

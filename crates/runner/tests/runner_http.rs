@@ -275,12 +275,11 @@ fn invalid_job_shape_is_reported() {
 #[test]
 fn unreachable_server_is_claim_error() {
     let ws = tempfile::tempdir().unwrap();
-    // Bind then drop to get a closed port.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let mut r = runner_for(&format!("http://127.0.0.1:{port}"), ws.path(), &[]);
+    // Reserve the port without listening so another fixture cannot take it.
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    socket.bind(&addr.into()).unwrap();
+    let addr = socket.local_addr().unwrap().as_socket().unwrap();
+    let mut r = runner_for(&format!("http://{addr}"), ws.path(), &[]);
     assert_eq!(r.step(), Step::ClaimError);
 }

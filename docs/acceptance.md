@@ -3,6 +3,105 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Source only: Metro 0.6.5 (2026-11-28, GitHub CI and local)
+
+In the source, not released. See [what changed](next-source.md).
+`release/065` at `43023f7` (version 0.6.5). Neither CI run below
+contains the self-hosted CI lane (`lane/065-ci`: self-hosted runner
+selection, the macOS arm64 archive, bookworm-built Linux binaries) or
+the port fixes (`ac7a975`, `43f3d01`); no CI run of `release/065` is
+recorded.
+
+- **Native Windows CI:** all required checks passed on
+  [PR #26](https://github.com/wnzn/metro/pull/26) at `cd78e6d` in
+  [run 46134350031](https://github.com/wnzn/metro/actions/runs/46134350031),
+  on GitHub-hosted `windows-2025`. All seven script-install update
+  end-to-end scenarios passed (`windows_update_e2e.py`: a 0.4.0 script
+  install migrated, the installer lock, 1.0.0 → 1.0.1, stale-start
+  forwarding, rollback from a broken 1.0.2, Status and Uninstall). The MSI
+  update harness passed 79 checks with 0 failures: `update`,
+  `failure-retry`, `helper-killed` and `helper-msiexec-killed` for the
+  current user; `update` and `failure-retry` for a standard user. Native
+  unit tests also passed, including the update-state and MSI-journal
+  sharing tests and the POSIX-semantics replace (`win_rename`).
+- **Main push:** [run 46148980109](https://github.com/wnzn/metro/actions/runs/46148980109)
+  (merge `72f59be`) failed in the Rust job only:
+  `ask_agent_runs_the_rig_tool_loop_through_the_space_runner`. Another
+  test released an ephemeral port to simulate an offline model; the
+  tool-loop test's mock model got that port and recorded the offline
+  test's request first. That request had no workspace tools, so the
+  tool-loop assertion failed. `ac7a975` fixes the two server tests (in
+  `api.rs` and `updates.rs`) by holding bound sockets that never listen,
+  for the whole test; `43f3d01` does the same for the release-fetcher and
+  runner HTTP fixtures.
+- **Self-hosted CI:** `metro-ci-linux-docker` and `metro-ci-macos-arm64`
+  are registered and online. Neither run above contains the workflows
+  that select them, so no job on either is recorded. (The `desktop` job in
+  both runs used the older `metro-ci-linux-x64` runner.)
+- **Local Linux, at `43023f7`:** `cargo fmt --all --check` and
+  `cargo clippy --locked --workspace --all-targets -- -D warnings`
+  passed. `cargo test --locked --workspace` with
+  `METRO_SERVER_BIN=$CARGO_TARGET_DIR/debug/metro-server`: 1,382 passed,
+  0 failed, 3 ignored (`metro-server` alone: 809 passed, 1 ignored).
+  `python3 -m unittest discover -s packaging`: 298 run, 275 passed,
+  23 skipped. Stress loops: `metro-server` `--test api --test updates`
+  100 times with 0 failures; `metro-release --test fetch` with
+  `metro-runner --test runner_http` 30 times with 0 failures.
+- Review: Opus 5.5. It corrected this entry: it now names the commits
+  each CI run tested, and it replaces stress-loop counts that weren't
+  recorded with its own reruns. It found no code issues in `43f3d01` or
+  the version bump. No second review has been recorded.
+
+**Not verified:** native Windows by a person, an update from a real
+Sigstore-signed release, the MSI kill scenarios' stay-on-old and
+stop-safely recovery paths in native end-to-end runs (covered by unit
+tests only), any CI run of the macOS arm64 archive or on either
+self-hosted runner, or a macOS app launch on the Mac runner.
+
+## Source only: self-hosted CI runners and an ad hoc Apple-silicon build (2026-11-28, CI lane, local)
+
+`lane/065-ci` at `9aef369`, merged with `feat/windows-updates` at `af0dac6`
+(in the source, not released; [deploy.md](deploy.md#which-machines-run-ci),
+[install.md](install.md#desktop-on-macos)):
+
+- trusted runs put every Linux job on `metro-ci-linux-docker` and
+  `desktop-macos` on `metro-ci-macos-arm64`; forks and anything uncertain
+  stay on GitHub's machines; tagging, images, signing and publication stay
+  GitHub-hosted;
+- `desktop-macos` is restored for Apple silicon only, ad hoc signed, and its
+  archive is part of every preview and release, with a Sigstore bundle.
+
+**Not yet shown:** any GitHub run of these workflows, either self-hosted
+runner taking a job, the macOS build or launch smoke on the Mac runner, the
+rootless-Docker `containers` job, or a release with the macOS archive.
+
+Checked locally, with `TMPDIR` off `/tmp`:
+
+```sh
+~/.cache/actionlint-1.7.12/actionlint -color -shellcheck <docker shellcheck wrapper>  # clean
+# ci.yml's "Every action is pinned" grep                                    # no unpinned actions
+python -B -m unittest discover -s packaging                  # 294 tests, OK (8 skipped), pwsh 7.7.0 on PATH
+python -B -m unittest discover -s packaging/release-signatures  # 18 tests, OK (1 skipped)
+python -B -m unittest discover -s packaging/windows-signing     # 41 tests, OK
+python -B -m unittest discover -s ops/github-runner             # 34 tests, OK
+```
+
+The pinned PowerShell `powershell-7.7.0-linux-x64.tar.gz` matched GitHub's
+asset digest `c89d9c68…` and ran (`7.7.0`) on Debian 13.
+
+Follow-up on the same branch (Linux build container, macOS headless check):
+
+- `desktop-linux`'s build step, run by hand on Debian 13 with rootful Docker
+  (the `--user` path, not the rootless one): `cargo build --release` of
+  `metro-desktop`, `metro-server` and `metro-tui` in `Dockerfile.build`'s
+  `linux` stage, offline, finished in 114 s. The binaries belong to the
+  invoking user, and `package.py`'s check reports glibc 2.34 for all three.
+- `smoke-macos-headless.sh`: shellcheck clean, and its preflight failures
+  were checked on Linux. It hasn't run on a Mac.
+- Rerun: packaging 298 tests OK (8 skipped), release-signatures 18 OK
+  (1 skipped), windows-signing 41 OK, ops/github-runner 34 OK, actionlint
+  clean.
+
 ## Published: Metro 0.6.4 (2026-11-28, GitHub release v0.6.4)
 
 **What was published.** The stable

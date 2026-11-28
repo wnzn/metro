@@ -4,7 +4,12 @@ One Linux x64 runner for the public repository `wnzn/metro`, run with Docker
 Compose. It's for Metro's own CI only. It has nothing to do with Metro's
 personal or Space runners (`metro-runner`), and it never signs anything:
 the Windows signer and every release job stay on their own workflows.
-GitHub-hosted Windows jobs aren't affected. (There are no macOS jobs for now.)
+GitHub-hosted Windows jobs aren't affected.
+
+> **Retired in the 0.6.5 source (not released):** no workflow sends jobs to
+> this runner any more; they use `metro-ci-linux-docker`
+> ([ops/ci-hosts](../ci-hosts/README.md)). The rest of this page describes
+> the stack as it was.
 
 > **Status: registered; the manual smoke run passed.**
 >
@@ -23,22 +28,14 @@ GitHub-hosted Windows jobs aren't affected. (There are no macOS jobs for now.)
   single label `metro-ci-linux-x64` and none of GitHub's default labels
   (`self-hosted`, `Linux`, `X64`). A workflow reaches it only with
   `runs-on: metro-ci-linux-x64`.
-- **What runs on it.** It checks, builds and tests the desktop app, and
-  publishes nothing. Two workflows use this label:
-  - **`ci.yml`'s `desktop` job,** automatically. That covers pull requests
-    from branches of `wnzn/metro` itself into `main` by trusted authors (not
-    forks, not Dependabot) and pushes to the protected `main` branch that
-    don't release. It runs `nsh check` and `nsh test`, only when the change
-    touches the desktop app's source
-    ([CI and publishing](../../docs/deploy.md#ci-and-publishing)).
-  - **`.github/workflows/self-hosted-ci.yml`,** a manual run on the literal
-    `main` branch ([below](#run-the-workflow)).
-- **What stays on GitHub's runners:** everything else, including:
-  - official release runs: a push to `main` that bumps the version keeps its
-    `desktop` job on GitHub's runners too;
-  - pull requests from forks;
-  - the Rust jobs and anything that needs Docker;
-  - the native Windows jobs (there are no macOS jobs for now).
+- **What runs on it: nothing, since the 0.6.5 source (not released).**
+  `ci.yml`'s `desktop` job and the manual `self-hosted-ci.yml` workflow now
+  use `metro-ci-linux-docker` from [ops/ci-hosts](../ci-hosts/README.md),
+  and no workflow names `metro-ci-linux-x64`. Up to 0.6.4, `ci.yml`'s
+  `desktop` job ran here for pull requests into `main` from branches of
+  `wnzn/metro` by trusted authors and for pushes to `main` that don't
+  release, and the manual workflow ran here too. A runner that's still
+  registered with this label gets no jobs; remove it ([below](#remove-it)).
 - **The label only routes jobs; it doesn't authorize them.** A workflow
   change that targets it still needs review like any other.
 - **No Docker access, no host files.** There's no Docker socket, no host
@@ -174,7 +171,9 @@ ops/github-runner/runner.sh status
 
 ## Run the workflow
 
-Only a manual dispatch on `main` starts it. That needs write access to
+Up to 0.6.4 this workflow ran here; in the 0.6.5 source it runs on
+`metro-ci-linux-docker` and downloads the pinned NSH itself. Only a manual
+dispatch on `main` starts it. That needs write access to
 `wnzn/metro`. A hosted job
 first checks the exact repository, branch and workflow. Then the
 self-hosted job checks the runner and the pinned NSH, checks out exactly
@@ -190,10 +189,9 @@ gh run list --repo wnzn/metro --workflow self-hosted-ci.yml --limit 5
 If the runner is down, the job waits in the queue until it's back. GitHub
 fails it after 24 hours in the queue.
 
-This applies to `ci.yml`'s automatic `desktop` job too. While every runner
-with this label is offline, that job waits; it isn't moved to a
-GitHub-hosted runner. `down` doesn't hand a queued job to anything else
-either.
+Up to 0.6.4 this applied to `ci.yml`'s automatic `desktop` job too: while
+every runner with this label was offline, that job waited; it wasn't moved
+to a GitHub-hosted runner.
 
 ## Remove it
 
