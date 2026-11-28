@@ -147,6 +147,87 @@ fn atomic_temp_name(name: &str) -> String {
 #[cfg(unix)]
 mod unix_fs;
 
+#[cfg(windows)]
+mod win_rename {
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::path::Path;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_RENAME_INFO, FileRenameInfoEx, FlushFileBuffers, SetFileInformationByHandle,
+    };
+
+    const DELETE: u32 = 0x0001_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const REPLACE_IF_EXISTS: u32 = 1;
+    const POSIX_SEMANTICS: u32 = 2;
+
+    /// Rename the file `from` over the file `to` by handle with POSIX
+    /// semantics (Windows 10 1607+ on NTFS), then flush the moved file.
+    pub fn replace_posix(from: &Path, to: &Path) -> io::Result<()> {
+        let file = std::fs::OpenOptions::new()
+            .access_mode(DELETE | GENERIC_WRITE)
+            .share_mode(0)
+            .custom_flags(OPEN_REPARSE_POINT)
+            .open(from)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let target: Vec<u16> = std::path::absolute(to)?.as_os_str().encode_wide().collect();
+        if target.contains(&0) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let header = std::mem::size_of::<FILE_RENAME_INFO>();
+        let size = header + target.len() * 2;
+        // u64 words: FILE_RENAME_INFO's alignment (it holds a HANDLE).
+        let mut buf = vec![0u64; size.div_ceil(8)];
+        let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        // SAFETY: `buf` is zeroed, aligned and large enough for the header
+        // and the name (FileName is its last field); the handle is open.
+        unsafe {
+            (*info).Anonymous.Flags = REPLACE_IF_EXISTS | POSIX_SEMANTICS;
+            (*info).FileNameLength = (target.len() * 2) as u32;
+            std::ptr::copy_nonoverlapping(
+                target.as_ptr(),
+                std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+                target.len(),
+            );
+            let h = file.as_raw_handle();
+            if SetFileInformationByHandle(h, FileRenameInfoEx, info.cast(), size as u32) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if FlushFileBuffers(h) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        #[test]
+        fn replaces_a_file_its_reader_shares_delete_on() {
+            let dir = tempfile::tempdir().unwrap();
+            let (from, to) = (dir.path().join("new"), dir.path().join("journal"));
+            std::fs::write(&to, b"old").unwrap();
+            std::fs::write(&from, b"new").unwrap();
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(7)
+                .open(&to)
+                .unwrap();
+            super::replace_posix(&from, &to).unwrap();
+            drop(held);
+            assert_eq!(std::fs::read(&to).unwrap(), b"new");
+            assert!(!from.exists());
+        }
+    }
+}
+
 /// Same-filesystem rename, with metadata made durable before returning.
 pub fn rename_durable(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
     #[cfg(windows)]
@@ -164,19 +245,41 @@ pub fn rename_durable(from: &std::path::Path, to: &std::path::Path) -> std::io::
             encoded.push(0);
             Ok(encoded)
         };
-        let (from, to) = (wide(from)?, wide(to)?);
-        // SAFETY: both paths are NUL-terminated UTF-16; no cross-volume copy.
-        if unsafe {
-            MoveFileExW(
-                from.as_ptr(),
-                to.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
+        // Replacing a file that another process has open is denied by
+        // MoveFileExW even when that reader shares delete (classic rename
+        // semantics). Then, for a file target only: rename by handle with
+        // POSIX semantics (replaces a target its readers share delete on;
+        // they keep reading the old file), flushed like WRITE_THROUGH; and
+        // retry for a bounded time, for readers that don't share delete.
+        // Anything else fails at once.
+        let replaces_file = std::fs::symlink_metadata(to).is_ok_and(|m| m.is_file());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let (wfrom, wto) = (wide(from)?, wide(to)?);
+        loop {
+            // SAFETY: both paths are NUL-terminated UTF-16; no cross-volume copy.
+            if unsafe {
+                MoveFileExW(
+                    wfrom.as_ptr(),
+                    wto.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            } != 0
+            {
+                return Ok(());
+            }
+            let e = io::Error::last_os_error();
+            // ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION
+            if !(replaces_file && matches!(e.raw_os_error(), Some(5 | 32))) {
+                return Err(e);
+            }
+            if win_rename::replace_posix(from, to).is_ok() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(e);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        Ok(())
     }
     #[cfg(not(windows))]
     {

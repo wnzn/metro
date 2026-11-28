@@ -170,7 +170,7 @@ pub fn read_pointer(root: &Path) -> Option<String> {
 
 /// The Windows pointer, `current.txt`: one version, optional whitespace.
 pub fn read_text_pointer(root: &Path) -> Option<String> {
-    let raw = read_evidence_file(&root.join(TEXT_POINTER), 128).ok()?;
+    let raw = read_state_file(&root.join(TEXT_POINTER), 128).ok()?;
     let raw = std::str::from_utf8(&raw).ok()?;
     let v = raw.trim().to_string();
     Version::parse(&v).map(|_| v)
@@ -206,8 +206,45 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// Open the regular file itself, never a symlink, junction, pipe or device.
-/// Windows also denies new conflicting writes and renames while held.
+/// Windows also denies new conflicting writes and renames while held: for
+/// content that is verified (staged packages, downloads, snapshots).
 pub fn open_input(path: &Path) -> io::Result<fs::File> {
+    open_regular(path, 1) // FILE_SHARE_READ
+}
+
+/// Update state Metro replaces with [`write_atomic`] or deletes while another
+/// start may read it (journals, status, gates, the pointer, trial markers):
+/// like [`open_input`], but on Windows shared for read, write and delete, so
+/// holding it never blocks that rename or delete. A replacement while held
+/// leaves this handle on the whole previous file (every reader validates
+/// what it parses). A sharing violation or a file pending deletion, from a
+/// rename in progress, is retried briefly, never taken as absent.
+pub fn open_state(path: &Path) -> io::Result<fs::File> {
+    #[cfg(windows)]
+    {
+        let deadline = std::time::Instant::now() + STATE_RETRY;
+        loop {
+            match open_regular(path, 7) {
+                // ERROR_ACCESS_DENIED (delete pending), ERROR_SHARING_VIOLATION, ERROR_DELETE_PENDING
+                Err(e)
+                    if matches!(e.raw_os_error(), Some(5 | 32 | 303))
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                other => return other,
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    open_regular(path, 0)
+}
+
+/// How long [`open_state`] retries a transient denial.
+#[cfg(windows)]
+const STATE_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn open_regular(path: &Path, _share: u32) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -218,7 +255,7 @@ pub fn open_input(path: &Path) -> io::Result<fs::File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        options.share_mode(1).custom_flags(0x0020_0000); // FILE_SHARE_READ, OPEN_REPARSE_POINT
+        options.share_mode(_share).custom_flags(0x0020_0000); // OPEN_REPARSE_POINT
     }
     let file = options.open(path)?;
     let meta = file.metadata()?;
@@ -353,7 +390,7 @@ impl Journal {
 }
 
 pub fn load_journal(path: &Path) -> io::Result<Option<Journal>> {
-    let f = match open_input(path) {
+    let f = match open_state(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
@@ -519,7 +556,7 @@ pub fn staged(kind: &InstallKind, update_dir: &Path) -> Option<(Version, String)
             script_state(root, &j.from) && version_present(root, &j.to)
         }
         InstallKind::WindowsMsi { .. } => {
-            open_input(&stage_assets(update_dir, &j.id).join("package.msi")).is_ok()
+            open_state(&stage_assets(update_dir, &j.id).join("package.msi")).is_ok()
         }
         _ => false,
     };
@@ -570,10 +607,17 @@ fn archive_err(e: metro_release::Error) -> StageError {
 }
 
 fn read_evidence_file(path: &Path, cap: usize) -> io::Result<Vec<u8>> {
+    read_capped(open_input(path)?, cap)
+}
+
+/// A small state file another start may replace or delete ([`open_state`]).
+fn read_state_file(path: &Path, cap: usize) -> io::Result<Vec<u8>> {
+    read_capped(open_state(path)?, cap)
+}
+
+fn read_capped(file: fs::File, cap: usize) -> io::Result<Vec<u8>> {
     let mut data = Vec::new();
-    open_input(path)?
-        .take((cap + 1) as u64)
-        .read_to_end(&mut data)?;
+    file.take((cap + 1) as u64).read_to_end(&mut data)?;
     if data.len() > cap {
         return Err(io::ErrorKind::InvalidData.into());
     }
@@ -1092,7 +1136,7 @@ pub fn mark_trial_ok(update_dir: &Path, id: &str) -> io::Result<()> {
 
 pub fn trial_ok(update_dir: &Path, id: &str) -> bool {
     valid_id(id)
-        && read_evidence_file(&update_dir.join(format!("trial-{id}.ok")), 2)
+        && read_state_file(&update_dir.join(format!("trial-{id}.ok")), 2)
             .is_ok_and(|raw| raw == b"ok")
 }
 
@@ -1642,7 +1686,7 @@ pub mod entry {
     }
 
     pub fn present(root: &Path) -> bool {
-        open_input(&path(root)).is_ok()
+        open_state(&path(root)).is_ok()
     }
 
     /// The root this program is the entry point of: it sits directly in a
@@ -1918,5 +1962,136 @@ pub mod msi {
         }
         let n = (len as usize / 2).saturating_sub(1).min(buf.len());
         Some(String::from_utf16_lossy(&buf[..n]))
+    }
+}
+
+/// Windows sharing of update state: another start may hold the journal while
+/// this one replaces it (desktop-windows CI job).
+#[cfg(all(test, windows))]
+mod state_share_tests {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::time::{Duration, Instant};
+
+    fn journal(started_at: i64) -> Journal {
+        Journal {
+            version: 1,
+            id: "abcdef0123456789".into(),
+            from: "1.0.0".into(),
+            to: "1.0.1".into(),
+            phase: JournalPhase::Trial,
+            outcome: None,
+            detail: None,
+            local_db_snapshot: false,
+            backup_manifest: None,
+            watchdog_pid: None,
+            source_pid: None,
+            reported: false,
+            started_at,
+        }
+    }
+
+    #[test]
+    fn replacing_the_journal_while_a_reader_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(JOURNAL);
+        write_journal(&path, &journal(1)).unwrap();
+        // A reader (another start) holds the journal through the replacement.
+        let mut held = open_state(&path).unwrap();
+        let t = Instant::now();
+        write_journal(&path, &journal(2)).unwrap();
+        let mut old = Vec::new();
+        held.read_to_end(&mut old).unwrap();
+        // The held handle still reads one whole journal (the old one).
+        let old: Journal = serde_json::from_slice(&old).unwrap();
+        assert_eq!(old.started_at, 1);
+        drop(held);
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        assert_eq!(load_journal(&path).unwrap().unwrap().started_at, 2);
+        // Deleting it while held works too.
+        let held = open_state(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        drop(held);
+        assert!(load_journal(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_reader_that_does_not_share_delete_delays_but_never_fails_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(JOURNAL);
+        write_journal(&path, &journal(1)).unwrap();
+        // FILE_SHARE_READ only, as older Metro versions and some tools open it.
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        write_journal(&path, &journal(2)).unwrap();
+        release.join().unwrap();
+        assert_eq!(load_journal(&path).unwrap().unwrap().started_at, 2);
+    }
+
+    #[test]
+    fn a_reader_waits_out_an_exclusive_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(JOURNAL);
+        write_journal(&path, &journal(1)).unwrap();
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        // A sharing violation is retried, never read as "no journal".
+        assert_eq!(load_journal(&path).unwrap().unwrap().started_at, 1);
+        release.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_replacements_and_reads_never_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(JOURNAL);
+        write_journal(&path, &journal(0)).unwrap();
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                for n in 1..=300 {
+                    write_journal(&path, &journal(n)).unwrap();
+                }
+            })
+        };
+        let mut last = 0;
+        while !writer.is_finished() {
+            let j = load_journal(&path)
+                .unwrap()
+                .expect("the journal is always there");
+            assert!(
+                j.started_at >= last,
+                "went back from {last} to {}",
+                j.started_at
+            );
+            last = j.started_at;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        writer.join().unwrap();
+        assert_eq!(load_journal(&path).unwrap().unwrap().started_at, 300);
+    }
+
+    #[test]
+    fn the_msi_journal_is_shared_the_same_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(super::super::msi::JOURNAL);
+        fs::write(&path, b"{}").unwrap();
+        let held = open_state(&path).unwrap();
+        write_atomic(&path, b"{\"replaced\":true}").unwrap();
+        drop(held);
+        assert_eq!(fs::read(&path).unwrap(), b"{\"replaced\":true}");
     }
 }

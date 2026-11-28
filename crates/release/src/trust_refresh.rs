@@ -410,7 +410,9 @@ impl CacheDir {
                 use std::os::windows::fs::OpenOptionsExt;
                 options
                     .custom_flags(0x0020_0000)
-                    .share_mode(if lock { 3 } else { 1 });
+                    // Unlocked reads share delete too: another start's
+                    // refresh replaces these files while they are read.
+                    .share_mode(if lock { 3 } else { 7 });
             }
             options.open(self.path.join(name))?
         };
