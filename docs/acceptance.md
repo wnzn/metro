@@ -3,6 +3,37 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Source only: self-hosted CI runners and an ad hoc Apple-silicon build (2026-11-28, CI lane, local)
+
+`lane/065-ci` at `9aef369`, merged with `feat/windows-updates` at `af0dac6`
+(in the source, not released; [deploy.md](deploy.md#which-machines-run-ci),
+[install.md](install.md#desktop-on-macos)):
+
+- trusted runs put every Linux job on `metro-ci-linux-docker` and
+  `desktop-macos` on `metro-ci-macos-arm64`; forks and anything uncertain
+  stay on GitHub's machines; tagging, images, signing and publication stay
+  GitHub-hosted;
+- `desktop-macos` is restored for Apple silicon only, ad hoc signed, and its
+  archive is part of every preview and release, with a Sigstore bundle.
+
+**Not yet shown:** any GitHub run of these workflows, either self-hosted
+runner taking a job, the macOS build or launch smoke on the Mac runner, the
+rootless-Docker `containers` job, or a release with the macOS archive.
+
+Checked locally, with `TMPDIR` off `/tmp`:
+
+```sh
+~/.cache/actionlint-1.7.12/actionlint -color -shellcheck <docker shellcheck wrapper>  # clean
+# ci.yml's "Every action is pinned" grep                                    # no unpinned actions
+python -B -m unittest discover -s packaging                  # 294 tests, OK (8 skipped), pwsh 7.7.0 on PATH
+python -B -m unittest discover -s packaging/release-signatures  # 18 tests, OK (1 skipped)
+python -B -m unittest discover -s packaging/windows-signing     # 41 tests, OK
+python -B -m unittest discover -s ops/github-runner             # 34 tests, OK
+```
+
+The pinned PowerShell `powershell-7.7.0-linux-x64.tar.gz` matched GitHub's
+asset digest `c89d9c68…` and ran (`7.7.0`) on Debian 13.
+
 ## Published: Metro 0.6.4 (2026-11-28, GitHub release v0.6.4)
 
 **What was published.** The stable
