@@ -136,16 +136,22 @@ function Read-Ui([string] $Dir) {
     return @(Get-Content -LiteralPath $f | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json })
 }
 
+# The app replaces or removes these files while the test reads them: a file
+# that is gone between the check and the read counts as absent.
+function Read-JsonFile([string] $Path) {
+    try { $raw = [IO.File]::ReadAllText($Path) }
+    catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] { return $null }
+    return $raw | ConvertFrom-Json
+}
+
 function Get-Journal([string] $DesktopHome) {
-    $f = Join-Path $DesktopHome 'update\msi-update.json'
-    if (Test-Path -LiteralPath $f) { return Get-Content -LiteralPath $f -Raw | ConvertFrom-Json }
-    return $null
+    return Read-JsonFile (Join-Path $DesktopHome 'update\msi-update.json')
 }
 
 function Get-LastUpdate([string] $DesktopHome) {
-    $f = Join-Path $DesktopHome 'update\status.json'
-    if (-not (Test-Path -LiteralPath $f)) { return $null }
-    return (Get-Content -LiteralPath $f -Raw | ConvertFrom-Json).last_update
+    $s = Read-JsonFile (Join-Path $DesktopHome 'update\status.json')
+    if ($s) { return $s.last_update }
+    return $null
 }
 
 function Get-FilesVersion([string] $Dir) {

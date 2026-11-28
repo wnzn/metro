@@ -9,7 +9,7 @@
 //!   its first render when it can update in-app);
 //! - with `$METRO_MSI_TEST_UPDATE_TO=<version>`, while the reported
 //!   version isn't that one and the log holds fewer than
-//!   `$METRO_MSI_TEST_ATTEMPTS` (default 1) presses: check, download, wait
+//!   `$METRO_MSI_TEST_ATTEMPTS` (default 1) downloads: check, download, wait
 //!   until ready, and `POST /v1/update/apply` (Restart now), then wait to
 //!   be closed;
 //! - otherwise exits 0.
@@ -90,8 +90,9 @@ fn main() {
         }
     ));
     let target = std::env::var("METRO_MSI_TEST_UPDATE_TO").unwrap_or_default();
-    // At most this many Restart now presses per log (a relaunched old
-    // version doesn't try again on its own).
+    // At most this many attempts per log (a relaunched old version doesn't
+    // try again on its own). Counted by downloads: the launcher closes this
+    // window during Restart now, often before the apply answer is logged.
     let attempts: usize = std::env::var("METRO_MSI_TEST_ATTEMPTS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -99,7 +100,7 @@ fn main() {
     let pressed = std::env::var("METRO_MSI_TEST_OUT")
         .ok()
         .and_then(|d| std::fs::read_to_string(std::path::Path::new(&d).join("ui.jsonl")).ok())
-        .map_or(0, |log| log.matches("\"event\":\"apply\"").count());
+        .map_or(0, |log| log.matches("\"event\":\"download\"").count());
     if target.is_empty() || target == current || pressed >= attempts {
         return;
     }
