@@ -5,7 +5,9 @@
   **Restart now**. Older script installs need one manual update to turn
   this on. Portable ZIP copies still update manually. See
   [Updates](updates.md) for migration, backups and recovery.
-  No native Windows run of these update paths is recorded yet.
+  [Unattended native Windows CI](acceptance.md#source-only-metro-065-2026-11-28-github-ci-and-local)
+  exercised both managed update paths with fixtures, not with a
+  published update or a person at the desktop.
 - An Apple-silicon Mac download, `Metro-X.Y.Z-macos-arm64.tar.gz`, in every
   test build and release, installed with `install-metro-macos.sh`. It's ad
   hoc signed and not notarized, so macOS may refuse to open it, and it
@@ -14,5 +16,6 @@
 - CI runs its Linux and macOS jobs, release builds included, on two
   self-hosted runners for trusted pushes and pull requests, and on GitHub's
   machines for everything else. Tagging, images, signing and publishing
-  stay on GitHub's machines. See
+  stay on GitHub's machines. Both runners are registered; no workflow job
+  on either runner has been recorded yet. See
   [Which machines run CI](deploy.md#which-machines-run-ci).

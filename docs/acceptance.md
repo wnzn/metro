@@ -3,6 +3,41 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Source only: Metro 0.6.5 (2026-11-28, GitHub CI and local)
+
+In the source, not released. See [what changed](next-source.md).
+
+- **Native Windows CI:** all required checks passed on
+  [PR #26](https://github.com/wnzn/metro/pull/26) in
+  [run 46134350031](https://github.com/wnzn/metro/actions/runs/46134350031).
+  All script/ZIP update end-to-end scenarios passed. The MSI update harness
+  passed 79 checks: `update`, `failure-retry`, `helper-killed` and
+  `helper-msiexec-killed` for the current user; `update` and
+  `failure-retry` for a standard user. Native unit tests also passed,
+  including journal sharing and the POSIX rename fallback.
+- **Main push:** [run 46148980109](https://github.com/wnzn/metro/actions/runs/46148980109)
+  failed in the Rust job. One test released an ephemeral port to simulate
+  an offline model, and another test's mock model acquired the port and
+  recorded the offline test's request before its own. The first request
+  had no workspace tools, so the tool-loop test's assertion failed.
+  `ac7a975` fixes the two server tests by holding bound sockets that never
+  listen. The two follow-up stress loops had 0 failures in 200 and 240
+  iterations respectively; `metro-server` passed 809 tests. The equivalent
+  release-fetcher and runner HTTP fixtures now also hold their ports.
+- **Self-hosted CI:** `metro-ci-linux-docker` and `metro-ci-macos-arm64`
+  were registered; neither had taken a real workflow job at this gate.
+- **Local Linux:** `cargo fmt --check` and
+  `cargo clippy --workspace --all-targets -- -D warnings` passed.
+  `cargo test --locked --workspace` with
+  `METRO_SERVER_BIN=$CARGO_TARGET_DIR/debug/metro-server`:
+  1,382 passed, 0 failed, 3 ignored.
+  `python3 -m unittest discover -s packaging`: 275 passed, 23 skipped.
+
+**Not verified:** native Windows by a person, an update from a real
+Sigstore-signed release, the MSI kill scenarios' stay-on-old and
+stop-safely recovery paths in native end-to-end runs (covered by unit
+tests only), or a macOS app launch on the Mac runner.
+
 ## Source only: self-hosted CI runners and an ad hoc Apple-silicon build (2026-11-28, CI lane, local)
 
 `lane/065-ci` at `9aef369`, merged with `feat/windows-updates` at `af0dac6`
