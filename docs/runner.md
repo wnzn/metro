@@ -57,9 +57,18 @@ are refused. It creates missing parent folders (mode 755), replaces the file
 atomically, and never writes through a hard link. It never needs approval.
 
 Both new tools are in the agents' default tool list: new agents, and agents
-created without an explicit list, get them. Agents created before 0.6.3
-keep their saved list and don't gain them; a Space owner adds
-`workspace.write` and `workspace.shell` to their tool list. Shell commands
+created without an explicit list, get them. In 0.6.3, agents created
+before it keep their saved list and don't gain them; a Space owner adds
+`workspace.write` and `workspace.shell` to their tool list.
+
+In the source, not released (0.6.4): a one-time migration when the
+server starts adds whichever of `workspace.write` and `workspace.shell`
+is missing to every saved agent list that holds all five earlier
+default runner tools (`workspace.list`, `workspace.read`,
+`workspace.check`, `workspace.mcp_list` and `workspace.mcp`). A list
+missing any of the five is left as it is, and its owner adds the tools.
+The migration changes only the lists: the runner, sandbox and shell
+gating are unchanged. Shell commands
 still follow the [shell policy](#shell-policy), which asks every time by
 default.
 

@@ -138,9 +138,16 @@ A Space has one or more **agents**, at most 16. Each has:
   thread never gets thread tools. Since 0.6.3, the list
   can also hold `workspace.write` and `workspace.shell`, and both are in
   `default_tools`: a new Space's default agent and agents created without
-  `tools` get them. Every agent stores its list, so agents created before
-  0.6.3 keep their saved list and don't gain them; the owner adds them.
-  Shell commands also follow the runner's
+  `tools` get them. Every agent stores its list, so in 0.6.3 agents
+  created before it keep their saved list and don't gain them.
+  In the source, not released (0.6.4): once, when the server first
+  starts on that version, it adds `workspace.write` and
+  `workspace.shell` (whichever is missing) to every saved list that
+  holds all five earlier default runner tools, `workspace.list`,
+  `workspace.read`, `workspace.check`, `workspace.mcp_list` and
+  `workspace.mcp`. Existing entries stay. A list missing any of the
+  five was narrowed on purpose and is left untouched; the owner adds the
+  tools to it. Shell commands also follow the runner's
   [shell policy](runner.md#shell-commands).
 
 Exactly one agent is the Space's **default**. Every Space starts with one

@@ -177,6 +177,63 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Once per database (0.6.4): give agents with the full 0.6.2 runner tool
+/// set the two new defaults, in catalogue order like every saved list.
+/// Narrower and unreadable allowlists stay as saved.
+pub(crate) fn migrate_runner_tools(conn: &Connection) -> anyhow::Result<()> {
+    const OLD_DEFAULTS: [&str; 5] = [
+        "workspace.list",
+        "workspace.read",
+        "workspace.check",
+        "workspace.mcp_list",
+        "workspace.mcp",
+    ];
+    let tx = conn.unchecked_transaction()?;
+    if tx.execute(
+        "INSERT INTO metro_meta (key, value) VALUES ('agent_runner_tools_v064', '1')
+         ON CONFLICT (key) DO NOTHING",
+        [],
+    )? == 1
+    {
+        // A non-text cell reads as None instead of failing startup.
+        let agents: Vec<(i64, Option<String>)> = {
+            let mut stmt = tx.prepare("SELECT rowid, tools FROM space_agents")?;
+            stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get::<_, Option<String>>(1).ok().flatten()))
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+        let added = [RunnerTool::Write, RunnerTool::Shell].map(RunnerTool::runner_name);
+        let catalogue = all_tools();
+        let mut update = tx.prepare("UPDATE space_agents SET tools = ?1 WHERE rowid = ?2")?;
+        for (rowid, raw) in agents {
+            // Like normal reads, never grant tools from an invalid allowlist.
+            let Some(tools) = raw.and_then(|r| serde_json::from_str::<Vec<String>>(&r).ok()) else {
+                continue;
+            };
+            let has = |tool: &str| tools.iter().any(|t| t == tool);
+            if !OLD_DEFAULTS.iter().all(|tool| has(tool)) || added.iter().all(|tool| has(tool)) {
+                continue;
+            }
+            // Known entries in catalogue order (as the API saves them), then
+            // anything unrecognised as it was; duplicates collapse.
+            let mut next: Vec<String> = catalogue
+                .iter()
+                .filter(|t| has(t) || added.contains(&t.as_str()))
+                .cloned()
+                .collect();
+            for t in &tools {
+                if !next.contains(t) {
+                    next.push(t.clone());
+                }
+            }
+            update.execute(params![serde_json::to_string(&next)?, rowid])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// The default agent of a new Space, in its creating transaction.
 pub fn seed_default(tx: &Transaction<'_>, space_id: &str) -> rusqlite::Result<()> {
     insert_default(

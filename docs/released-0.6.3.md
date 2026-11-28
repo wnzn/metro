@@ -23,6 +23,9 @@ for earlier features.
   Space's default agent, get them unless their owner picks a list.
   Agents created before 0.6.3 keep their saved list; a Space owner adds the
   tools to them.
+  In the source, not released (0.6.4): a one-time startup migration
+  adds them to saved lists that still hold all five earlier default
+  runner tools ([details](next-source.md)).
 - **Shell policy.** Each runner has a shell mode: **Off**, **Ask every
   time** (the default), **Ask when System One flags it** or **Always
   allow**, and who approves: the runner's owner (the default; **Org
