@@ -84,7 +84,8 @@ fn log(entry: Value) {
         .append(true)
         .open(path)
     {
-        let _ = writeln!(f, "{entry}");
+        // One append write per line: two instances may log at once.
+        let _ = f.write_all(format!("{entry}\n").as_bytes());
     }
 }
 

@@ -58,7 +58,8 @@ fn log(line: &str) {
         .append(true)
         .open(std::path::Path::new(&dir).join("ui.jsonl"))
     {
-        let _ = writeln!(f, "{line}");
+        // One append write per line: two instances may log at once.
+        let _ = f.write_all(format!("{line}\n").as_bytes());
     }
 }
 
