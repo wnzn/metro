@@ -70,6 +70,57 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def _open_shared(path):
+    """Open for reading with read, write and delete sharing (Windows), so a
+    test read never blocks the app's rename or delete of the file."""
+    if sys.platform != "win32":
+        return open(path, "rb")
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    # GENERIC_READ; FILE_SHARE_READ | WRITE | DELETE; OPEN_EXISTING; FILE_ATTRIBUTE_NORMAL
+    h = k32.CreateFileW(str(path), 0x80000000, 7, None, 3, 0x80, None)
+    if h == wintypes.HANDLE(-1).value:
+        err = ctypes.get_last_error()
+        raise OSError(None, ctypes.FormatError(err), str(path), err)
+    return os.fdopen(msvcrt.open_osfhandle(h, os.O_RDONLY | os.O_BINARY), "rb")
+
+
+def read_shared(path, seconds=10):
+    """A file the app may replace, delete or hold open: its bytes, or None
+    when it doesn't exist. A sharing violation or a file pending deletion
+    (access denied) is read again until `seconds` pass, never taken as
+    absent."""
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            with _open_shared(path) as f:
+                return f.read()
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            # ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND: absent.
+            if getattr(e, "winerror", None) in (2, 3):
+                return None
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
+def read_json_lines(path):
+    """Complete lines of a JSON-lines log other processes append to (a line
+    being written has no newline yet)."""
+    data = read_shared(path)
+    if not data or b"\n" not in data:
+        return []
+    complete = data[:data.rindex(b"\n")].decode("utf-8")
+    return [json.loads(line) for line in complete.splitlines() if line.strip()]
+
+
 def test_bundle(data):
     """The dev TestVerifier's bundle format (metro_release::testing)."""
     return json.dumps({"metroTestBundle": 1, "sha256": sha(data), "commit": COMMIT,
@@ -186,9 +237,7 @@ class Run:
         return r.returncode, out
 
     def events(self):
-        if not self.stub_log.exists():
-            return []
-        return [json.loads(line) for line in self.stub_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+        return read_json_lines(self.stub_log)
 
     def wait_event(self, what, pred, since=0):
         deadline = time.monotonic() + self.timeout
@@ -229,11 +278,12 @@ class Run:
         self.stop.unlink()
 
     def pointer(self):
-        return (self.root / "current.txt").read_text().strip()
+        data = read_shared(self.root / "current.txt")
+        return data.decode("utf-8").strip() if data is not None else None
 
     def journal(self):
-        path = self.root / ".update.json"
-        return json.loads(path.read_text()) if path.exists() else None
+        data = read_shared(self.root / ".update.json")
+        return json.loads(data) if data is not None else None
 
     def registry(self):
         import winreg
@@ -287,7 +337,7 @@ class Run:
         self.say("the current script migrates it")
         _, out = self.ps(INSTALLER, "-Action", "Update", "-Archive", zips[A][0])
         require("In-app updates are on for this install" in out, out)
-        require((self.root / ".metro-desktop-install").read_bytes() == b"metro-update-lock-v2\n", "marker")
+        require(read_shared(self.root / ".metro-desktop-install") == b"metro-update-lock-v2\n", "marker")
         entry = self.root / "Metro.exe"
         require(entry.is_file(), "no entry point")
         require(self.shortcut() == str(entry), f"shortcut after migration: {self.shortcut()}")
@@ -382,7 +432,7 @@ class Run:
         require(e["version"] == B and last["outcome"] == "rolled_back" and "exited with 3" in last.get("detail", ""),
                 f"after rollback: {e}")
         require(self.pointer() == B, "pointer moved")
-        require(db.read_bytes() == b"the database before 1.0.2", "database not restored")
+        require(read_shared(db) == b"the database before 1.0.2", "database not restored")
         self.wait_for("1.0.2's files to go", lambda: not (self.root / "versions" / BAD).exists())
         require(self.registry()["DisplayVersion"] == B, "registry changed by the rollback")
         self.stop_all()
@@ -392,7 +442,7 @@ class Run:
         require(f"Installed: Metro {B}" in out and "In-app updates: on" in out, out)
         self.ps(INSTALLER, "-Action", "Uninstall")
         require(not self.root.exists() and self.registry() is None and self.shortcut() is None, "uninstall left things")
-        require(db.read_bytes() == b"the database before 1.0.2", "uninstall touched Metro data")
+        require(read_shared(db) == b"the database before 1.0.2", "uninstall touched Metro data")
 
 
 # Holds the installer's own lock (its functions, unmodified) until stdin closes.
