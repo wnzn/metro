@@ -85,6 +85,12 @@ def run_shell(server, runner, timeout):
         # Exercise the existing agent, not the freshly created one.
         space = f"{SPACES}/s-0000000000000001"
         room = f"{space}/rooms/lobby"
+        upgraded = call(alice, "GET", f"{space}/agents", read_json=True)
+        by_handle = {a["handle"]: a["tools"] for a in upgraded["agents"]}
+        require(by_handle.get("agent") == agents["default_tools"],
+                f"the upgraded default agent has {by_handle.get('agent')}")
+        require(not {"workspace.write", "workspace.shell"} & set(by_handle["narrowed"]),
+                "the narrowed agent gained tools")
         call(alice, "POST", f"{space}/members", body={"user_id": "bob"})
         token = issue_token(call, alice, f"{space}/runner-token", "issue the runner token")
         children.append(start_child(stack, "runner", runner, state, env | {

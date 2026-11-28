@@ -2564,20 +2564,63 @@ mod tests {
     fn v062_agent_runner_tools_migrate_once() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v062.sqlite3");
-        Connection::open(&path)
-            .unwrap()
-            .execute_batch(include_str!("../tests/fixtures/agent_tools_v062.sql"))
-            .unwrap();
-
-        let read_tools = |conn: &Connection, handle: &str| -> Vec<String> {
-            let raw: String = conn
-                .query_row(
-                    "SELECT tools FROM space_agents WHERE handle = ?1",
-                    [handle],
-                    |row| row.get(0),
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(include_str!("../tests/fixtures/agent_tools_v062.sql"))
+                .unwrap();
+            // Rows the API never writes must not stop startup or gain tools.
+            let odd = |id: &str, handle: &str, tools: rusqlite::types::Value| {
+                conn.execute(
+                    "INSERT INTO space_agents (id, space_id, name, handle, description, tools,
+                                               color, created_at, updated_at)
+                     VALUES (?1, 's-0000000000000001', ?2, ?2, 'Odd.', ?3, '#4f46e5', 9, 9)",
+                    rusqlite::params![id, handle, tools],
                 )
                 .unwrap();
-            serde_json::from_str(&raw).unwrap()
+            };
+            use rusqlite::types::Value;
+            odd("ag-00000000000000a1", "int", Value::Integer(7));
+            odd("ag-00000000000000a2", "blob", Value::Blob(vec![0xff, 0x00]));
+            odd(
+                "ag-00000000000000a3",
+                "garbage",
+                Value::Text("not json".into()),
+            );
+            odd(
+                "ag-00000000000000a4",
+                "object",
+                Value::Text(r#"{"workspace.list":1}"#.into()),
+            );
+            odd(
+                "ag-00000000000000a5",
+                "mixed",
+                Value::Text(r#"["workspace.list",1]"#.into()),
+            );
+            // Full old defaults with duplicates, the opt-in tools and an
+            // entry this build doesn't know.
+            odd(
+                "ag-00000000000000a6",
+                "dupes",
+                Value::Text(
+                    r#"["workspace.list","workspace.list","workspace.read","workspace.check","workspace.mcp_list","workspace.mcp","threads","pages_list","page_read","page_propose","web_search","web_fetch","future.tool"]"#
+                        .into(),
+                ),
+            );
+        }
+
+        let read_raw = |conn: &Connection, handle: &str| -> rusqlite::types::Value {
+            conn.query_row(
+                "SELECT tools FROM space_agents WHERE handle = ?1",
+                [handle],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let read_tools = |conn: &Connection, handle: &str| -> Vec<String> {
+            match read_raw(conn, handle) {
+                rusqlite::types::Value::Text(raw) => serde_json::from_str(&raw).unwrap(),
+                other => panic!("{handle}: {other:?}"),
+            }
         };
         let old_default = [
             "workspace.list",
@@ -2587,10 +2630,21 @@ mod tests {
             "workspace.mcp",
             "threads",
         ];
-        let migrated: Vec<_> = old_default
-            .into_iter()
-            .chain(["workspace.write", "workspace.shell"])
-            .collect();
+        // Exactly what a new agent gets, in the same order.
+        let migrated = crate::space_agents::default_tools();
+        assert_eq!(
+            migrated,
+            [
+                "workspace.list",
+                "workspace.read",
+                "workspace.write",
+                "workspace.shell",
+                "workspace.check",
+                "workspace.mcp_list",
+                "workspace.mcp",
+                "threads",
+            ]
+        );
         {
             let db = Db::open(&path).unwrap();
             let conn = db.lock();
@@ -2605,19 +2659,37 @@ mod tests {
                     "threads",
                 ]
             );
+            assert_eq!(read_tools(&conn, "writer"), migrated);
             assert_eq!(
-                read_tools(&conn, "writer"),
+                read_tools(&conn, "dupes"),
                 [
                     "workspace.list",
-                    "workspace.write",
                     "workspace.read",
+                    "workspace.write",
+                    "workspace.shell",
                     "workspace.check",
                     "workspace.mcp_list",
                     "workspace.mcp",
                     "threads",
-                    "workspace.shell",
+                    "pages_list",
+                    "page_read",
+                    "page_propose",
+                    "web_search",
+                    "web_fetch",
+                    "future.tool",
                 ]
             );
+            use rusqlite::types::Value;
+            // TEXT affinity stores it as "7": valid JSON, not a list.
+            assert_eq!(read_raw(&conn, "int"), Value::Text("7".into()));
+            assert_eq!(read_raw(&conn, "blob"), Value::Blob(vec![0xff, 0x00]));
+            for (handle, raw) in [
+                ("garbage", "not json"),
+                ("object", r#"{"workspace.list":1}"#),
+                ("mixed", r#"["workspace.list",1]"#),
+            ] {
+                assert_eq!(read_raw(&conn, handle), Value::Text(raw.into()));
+            }
 
             // An owner can turn both new tools back off without a restart undoing it.
             conn.execute(
@@ -2628,6 +2700,22 @@ mod tests {
         }
         let db = Db::open(&path).unwrap();
         assert_eq!(read_tools(&db.lock(), "agent"), old_default);
+    }
+
+    #[test]
+    fn new_databases_mark_the_agent_tool_migration_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.sqlite3");
+        let db = Db::open(&path).unwrap();
+        let done: String = db
+            .lock()
+            .query_row(
+                "SELECT value FROM metro_meta WHERE key = 'agent_runner_tools_v064'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(done, "1");
     }
 
     #[test]

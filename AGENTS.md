@@ -143,12 +143,13 @@ see [New in Metro 0.6.3](docs/released-0.6.3.md); for later changes, see
   path, `..`, symlink anywhere in the path or hard link. It never needs
   approval. Write and shell are in `default_tools`: new agents and agents
   created without a list get them. Every agent stores its list. A
-  one-time startup migration (0.6.4, in the source, not released)
-  appends whichever of write and shell is missing to every saved list
-  that holds all five pre-0.6.3 defaults (`workspace.list`, `.read`,
-  `.check`, `.mcp_list`, `.mcp`), keeping existing entries and their
-  order; a list missing any of the five is left untouched, and the
-  owner adds the tools to it. Shell stays gated by the policy below.
+  one-time startup migration (0.6.4, in the source, not released) adds
+  whichever of write and shell is missing to every saved list that
+  holds all five pre-0.6.3 defaults (`workspace.list`, `.read`,
+  `.check`, `.mcp_list`, `.mcp`), keeping every existing entry and
+  storing the list in catalogue order as the API does. A list missing
+  any of the five, or unreadable, is left untouched. Shell stays gated
+  by the policy below.
 - **Shell policy**: `shell_mode` `off` / `approve` (default) / `classify`
   / `allow`, `approver` `owner` (default) / `members`. A registered
   runner has one default plus per-Space overrides (null inherits), read

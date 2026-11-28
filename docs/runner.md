@@ -63,12 +63,12 @@ before it keep their saved list and don't gain them; a Space owner adds
 
 In the source, not released (0.6.4): a one-time migration when the
 server starts adds whichever of `workspace.write` and `workspace.shell`
-is missing to the end of every saved agent list that holds all five
-earlier default runner tools (`workspace.list`, `workspace.read`,
-`workspace.check`, `workspace.mcp_list` and `workspace.mcp`), keeping
-existing entries and their order. A list missing any of the five is left
-as it is, and its owner adds the tools. The migration changes only the
-lists: the runner, sandbox and shell gating are unchanged. Shell commands
+is missing to every saved agent list that holds all five earlier
+default runner tools (`workspace.list`, `workspace.read`,
+`workspace.check`, `workspace.mcp_list` and `workspace.mcp`). A list
+missing any of the five is left as it is, and its owner adds the tools.
+The migration changes only the lists: the runner, sandbox and shell
+gating are unchanged. Shell commands
 still follow the [shell policy](#shell-policy), which asks every time by
 default.
 

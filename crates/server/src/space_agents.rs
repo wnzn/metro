@@ -177,8 +177,9 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Give agents with the full 0.6.2 runner tool set the two new defaults.
-/// Keep the original order and leave narrower allowlists as saved.
+/// Once per database (0.6.4): give agents with the full 0.6.2 runner tool
+/// set the two new defaults, in catalogue order like every saved list.
+/// Narrower and unreadable allowlists stay as saved.
 pub(crate) fn migrate_runner_tools(conn: &Connection) -> anyhow::Result<()> {
     const OLD_DEFAULTS: [&str; 5] = [
         "workspace.list",
@@ -194,32 +195,39 @@ pub(crate) fn migrate_runner_tools(conn: &Connection) -> anyhow::Result<()> {
         [],
     )? == 1
     {
-        let agents: Vec<(String, String)> = {
-            let mut stmt = tx.prepare("SELECT id, tools FROM space_agents")?;
-            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<rusqlite::Result<_>>()?
+        // A non-text cell reads as None instead of failing startup.
+        let agents: Vec<(i64, Option<String>)> = {
+            let mut stmt = tx.prepare("SELECT rowid, tools FROM space_agents")?;
+            stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get::<_, Option<String>>(1).ok().flatten()))
+            })?
+            .collect::<rusqlite::Result<_>>()?
         };
-        let mut update = tx.prepare("UPDATE space_agents SET tools = ?1 WHERE id = ?2")?;
-        for (id, raw) in agents {
+        let added = [RunnerTool::Write, RunnerTool::Shell].map(RunnerTool::runner_name);
+        let catalogue = all_tools();
+        let mut update = tx.prepare("UPDATE space_agents SET tools = ?1 WHERE rowid = ?2")?;
+        for (rowid, raw) in agents {
             // Like normal reads, never grant tools from an invalid allowlist.
-            let Ok(mut tools) = serde_json::from_str::<Vec<String>>(&raw) else {
+            let Some(tools) = raw.and_then(|r| serde_json::from_str::<Vec<String>>(&r).ok()) else {
                 continue;
             };
-            if !OLD_DEFAULTS
-                .iter()
-                .all(|tool| tools.iter().any(|t| t == tool))
-            {
+            let has = |tool: &str| tools.iter().any(|t| t == tool);
+            if !OLD_DEFAULTS.iter().all(|tool| has(tool)) || added.iter().all(|tool| has(tool)) {
                 continue;
             }
-            let before = tools.len();
-            for tool in [RunnerTool::Write, RunnerTool::Shell].map(RunnerTool::runner_name) {
-                if !tools.iter().any(|t| t == tool) {
-                    tools.push(tool.to_owned());
+            // Known entries in catalogue order (as the API saves them), then
+            // anything unrecognised as it was; duplicates collapse.
+            let mut next: Vec<String> = catalogue
+                .iter()
+                .filter(|t| has(t) || added.contains(&t.as_str()))
+                .cloned()
+                .collect();
+            for t in &tools {
+                if !next.contains(t) {
+                    next.push(t.clone());
                 }
             }
-            if tools.len() != before {
-                update.execute(params![serde_json::to_string(&tools)?, id])?;
-            }
+            update.execute(params![serde_json::to_string(&next)?, rowid])?;
         }
     }
     tx.commit()?;
