@@ -172,16 +172,16 @@ test("secondary and older launcher responses do not claim support or send health
   expect(f.calls).toHaveLength(0);
 });
 
-test("portable, legacy Linux, Windows ZIP-installed and Windows MSI copies are manual only", async () => {
+test("portable, unmigrated and older launcher installs stay manual", async () => {
   for (const example of [
-    { install: "portable", words: "This is a portable copy", reason: "portable" },
-    { install: "linux-installer", words: "Run the current Metro Linux installer once", reason: "manual_migration_required" },
-    { install: "windows-script", words: "Use the Windows install script", reason: "manual_update_required" },
-    { install: "windows-msi", words: "The Windows preview MSI is unsigned", reason: "manual_update_required" },
-  ]) {
+    { platform: "windows", install: "portable", words: "This is a portable copy", reason: "portable" },
+    { platform: "linux", install: "linux-installer", words: "Run the current Metro Linux installer once", reason: "manual_migration_required" },
+    { platform: "windows", install: "windows-script", words: "Run the Windows installer script once with -Action Update to turn on in-app updates.", reason: "manual_migration_required" },
+    { platform: "windows", install: "windows-msi", words: "The Windows MSI is unsigned", reason: "manual_update_required" },
+  ] as const) {
     // Even a bridge with an incorrect "ready" and can_update_in_app is manual.
     const f = scenario({ ...available(), current: { version: CURRENT, channel: "release", install: example.install }, phase: "ready", reason: example.reason });
-    const app = await harness(f);
+    const app = await harness(f, true, bridgeEnv(), example.platform);
     await app.press("id:h-render");
     await app.waitFor("id:update-download-page");
     expect(text(app)).toContain(example.words);
@@ -195,6 +195,69 @@ test("portable, legacy Linux, Windows ZIP-installed and Windows MSI copies are m
   await windows.waitFor("id:update-download-page");
   expect(windows.shows("id:update-restart")).toBe(false);
   expect(inconsistent.steps()).toEqual([]);
+});
+
+test("managed Windows script installs use the in-app update flow", async () => {
+  const f = scenario({ ...available(), current: { version: CURRENT, channel: "release", install: "windows-script" } });
+  const app = await harness(f, true, bridgeEnv(), "windows");
+  await app.press("id:h-render");
+  await app.waitFor("id:update-start");
+  await download(app);
+  f.update({ phase: "ready" });
+  await app.waitFor("id:update-restart");
+  await app.press("id:update-restart");
+  await app.waitFor("text:/Metro is restarting/");
+  expect(f.steps()).toEqual(["started", "download", "apply"]);
+});
+
+test("Windows MSI uses the in-app flow and confirms the handoff before asking to interrupt work", async () => {
+  const f = scenario({ ...available(), current: { version: CURRENT, channel: "release", install: "windows-msi" } });
+  const app = await harness(f, true, bridgeEnv(), "windows");
+  await app.press("id:h-render");
+  await app.waitFor("id:update-start");
+  expect(app.shows("id:update-manual")).toBe(false);
+  await app.press("id:update-start");
+  expect(f.count("download")).toBe(0);
+  await app.press("id:update-start:confirm");
+  await app.waitFor("label:/Downloading Metro/");
+  expect(app.shows("id:update-restart")).toBe(false);
+  f.update({ phase: "ready", busy: { serving_connections: 0, local_workspace: true } });
+  await app.waitFor("id:update-restart");
+  await app.press("id:update-restart");
+  await app.waitFor("text:Metro closes, Windows Installer updates it, then Metro starts again.");
+  expect(f.count("apply")).toBe(0);
+  await app.press("id:update-msi-restart:cancel");
+  expect(f.count("apply")).toBe(0);
+  await app.press("id:update-restart");
+  await app.press("id:update-msi-restart:confirm");
+  await app.waitFor("text:/Restarting now stops work in the local workspace/");
+  await app.press("id:update-interrupt:confirm");
+  await app.waitFor("text:/Metro is restarting/");
+  expect(f.count("started")).toBe(1);
+  expect(f.calls.filter(c => c.step === "apply").map(c => c.body)).toEqual([
+    { version: NEXT, confirm_interrupt: false }, { version: NEXT, confirm_interrupt: true },
+  ]);
+});
+
+test("Windows Installer outcomes show safe messages and allow retry after a fresh check", async () => {
+  for (const [failure_code, message] of [
+    ["installer_cancelled", "The update was cancelled. Metro wasn't changed."],
+    ["installer_busy", "Another installation was running. Try again when it has finished."],
+    ["installer_failed", "Windows Installer couldn't update Metro. Metro wasn't changed."],
+  ]) {
+    const f = scenario({ ...available(), current: { version: CURRENT, channel: "release", install: "windows-msi" },
+      last_update: { from: CURRENT, to: NEXT, at: lastAt, outcome: "install_failed", failure_code, detail: "private detail" } });
+    const app = await harness(f, true, bridgeEnv(), "windows");
+    await app.waitFor("id:update-outcome");
+    expect(text(app)).toContain(message);
+    expect(text(app)).not.toContain("private detail");
+    expect(app.shows("id:update-start")).toBe(false);
+    expect(app.shows("id:update-manual-recovery")).toBe(false);
+    f.check = () => { f.update({ last_checked_at: lastAt + 1 }); return undefined; };
+    await app.press("id:update-check");
+    await app.waitFor("id:update-start");
+    expect(f.steps()).toEqual(["check"]);
+  }
 });
 
 test("check preferences save on the device; a manual check shows offline without a cached offer", async () => {
@@ -484,6 +547,21 @@ test("an uncertain install journal gives read-only support guidance instead of t
   await app.waitFor("id:update-recovery-support");
   expect(app.shows("id:h-update-available")).toBe(false);
   expect(app.shows("id:update-start")).toBe(false);
+});
+
+test("Windows journal recovery doesn't suggest the wrong installer diagnostic", async () => {
+  for (const install of ["windows-script", "windows-msi"]) {
+    const f = scenario({ ...available(), current: { version: CURRENT, channel: "release", install },
+      phase: "failed", failure: { code: "update_journal_unknown" } });
+    const app = await harness(f, true, bridgeEnv(), "windows");
+    await app.waitFor("id:update-recovery-support");
+    expect(text(app)).not.toContain("Linux installer");
+    expect(text(app).includes("-Action Status")).toBe(install === "windows-script");
+    expect(text(app).includes("Keep the staged MSI.")).toBe(install === "windows-msi");
+    expect(text(app).includes("Share the diagnostic")).toBe(install === "windows-script");
+    expect(app.shows("id:update-recovery-release")).toBe(false);
+    expect(app.shows("id:update-start")).toBe(false);
+  }
 });
 
 test("a dismissed outcome stays dismissed on relaunch, but a new attempt with the same version and result appears", async () => {

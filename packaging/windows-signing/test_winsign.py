@@ -680,6 +680,7 @@ class LegacyScriptCoexistence(unittest.TestCase):
             "$root = Join-Path ([IO.Path]::GetTempPath()) 'Metro Root';"
             "@((Test-OwnShortcut (Join-Path $root 'versions/0.3.0/Metro.exe') $root),"
             "(Test-OwnShortcut (Join-Path $root 'versions/../../Metro Desktop/Metro.exe') $root),"
+            # The stable entry point <root>\Metro.exe is its own shortcut target.
             "(Test-OwnShortcut (Join-Path $root 'Metro.exe') $root),"
             "(Test-OwnShortcut (Join-Path ([IO.Path]::GetTempPath()) 'Metro Rootx/versions/1/Metro.exe') $root),"
             "(Test-OwnShortcut (Join-Path ([IO.Path]::GetTempPath()) 'Metro Desktop/Metro.exe') $root),"
@@ -688,7 +689,7 @@ class LegacyScriptCoexistence(unittest.TestCase):
         r = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
                            text=True, capture_output=True, timeout=120, env={**os.environ, "METRO_SCRIPT": str(self.SCRIPT)})
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(r.stdout.strip(), "True,False,False,False,False,False")
+        self.assertEqual(r.stdout.strip(), "True,False,True,False,False,False")
 
 
 @unittest.skipUnless(shutil.which("git") and (HERE.parents[1] / ".git").exists(), "needs a git checkout")
@@ -771,7 +772,7 @@ class Workflows(unittest.TestCase):
         for forbidden in ("environment:", "id-token", "self-hosted", "METRO_WINDOWS_SIGNING", "Invoke-MetroReleaseSigning",
                           "vars."):
             self.assertNotIn(forbidden, text)
-        self.assertEqual(set(jobs(text)), {"seed", "preview"})
+        self.assertEqual(set(jobs(text)), {"seed", "preview", "updates"})
         self.assertIn("if: needs.seed.outputs.mode == 'preview' || needs.seed.outputs.mode == 'unsigned-release'",
                       jobs(text)["preview"])
         self.assertIn("name: unsigned-desktop-windows-x64", jobs(text)["seed"])

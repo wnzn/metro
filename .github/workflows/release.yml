@@ -297,6 +297,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked --release --target x86_64-pc-windows-msvc -p metro-desktop
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # In-app updates: the script install's instance-lock handoff, the MSI update's Windows facts,
+          # and update state replaced or deleted while another start holds it.
+          cargo test --locked --release --target x86_64-pc-windows-msvc -p metro-connector --lib -- desktop::store::handoff_tests desktop::update::msi desktop::update::install::state_share_tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --release --target x86_64-pc-windows-msvc -p metro-release --lib -- win_rename
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test OpenAI sign-in and credential storage on native Windows (deterministic fixtures)
         run: |
           cargo test --locked --release --target x86_64-pc-windows-msvc -p metro-connector --test desktop_sign_in --test openai_oauth
@@ -615,10 +621,14 @@ jobs:
           foreach ($f in 'Metro.exe', 'metro-server.exe', 'ui\Metro.exe', 'enable-local-runner') {
             if (-not (Test-Path -LiteralPath (Join-Path $dir $f) -PathType Leaf)) { throw "missing $f after install" }
           }
+          # The shortcut and Installed-apps entry use the stable entry point, which starts the current version.
+          $entry = Join-Path $env:METRO_INSTALL_DIR 'Metro.exe'
+          if (-not (Test-Path -LiteralPath $entry -PathType Leaf)) { throw 'missing the <root>\Metro.exe entry point' }
           $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Metro.lnk'
-          if ((New-Object -ComObject WScript.Shell).CreateShortcut($lnk).TargetPath -ne (Join-Path $dir 'Metro.exe')) { throw 'Start menu shortcut is wrong' }
+          if ((New-Object -ComObject WScript.Shell).CreateShortcut($lnk).TargetPath -ne $entry) { throw 'Start menu shortcut is wrong' }
           $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\dev.metro.desktop'
-          if ((Get-ItemProperty $key).DisplayVersion -ne $env:VERSION) { throw 'uninstall entry is wrong' }
+          $entryKey = Get-ItemProperty $key
+          if ($entryKey.DisplayVersion -ne $env:VERSION -or $entryKey.DisplayIcon -ne $entry) { throw 'uninstall entry is wrong' }
           Run-Installer -Action Update -Archive $a -NoLocalRunner
           if (Test-Path -LiteralPath (Join-Path $dir 'enable-local-runner')) { throw '-NoLocalRunner left the marker' }
           Run-Installer -Action Update -Archive $a

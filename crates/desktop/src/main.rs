@@ -26,6 +26,7 @@
 
 #[cfg(unix)]
 mod macos;
+mod msi;
 mod update;
 
 use std::path::{Path, PathBuf};
@@ -308,6 +309,11 @@ async fn launch(
     update::gate_msi_at_start(root).map_err(start_failed)?;
     if trial.is_none() {
         update::recover_at_start(dir, root, lock.as_deref()).map_err(start_failed)?;
+        // [msi lane] an unfinished in-app MSI update
+        msi::recover_at_start(root, lock.as_deref()).map_err(start_failed)?;
+        if primary {
+            update::after_start(dir);
+        }
     }
 
     // Updates: primary instance only. Startup above reconciles safe
@@ -511,7 +517,17 @@ fn main() -> ExitCode {
         fatal("Metro can't start: this copy of Metro is damaged. Download Metro again.");
         return ExitCode::from(2);
     }
+    // A Windows script install's stable entry point only starts the current
+    // version.
+    #[cfg(windows)]
+    if let Some(code) = update::entry_main() {
+        return code;
+    }
     let mode = update::mode();
+    // [msi lane] the MSI update helper does none of the launcher's setup.
+    if let update::Mode::Helper(id) = &mode {
+        return ExitCode::from(msi::run_helper(id));
+    }
     if mode == update::Mode::LegacyHelper {
         fatal(
             "In-app MSI updates are no longer supported. Use a verified manual installer; any existing backup was kept.",
@@ -526,6 +542,13 @@ fn main() -> ExitCode {
     // SAFETY: first thing in main, before the runtime starts any thread.
     unsafe {
         metro_connector::http::exempt_loopback_from_proxy();
+    }
+    #[cfg(windows)]
+    if mode == update::Mode::Normal
+        && let Ok(dir) = install_dir()
+        && let Some(code) = update::forward_stale(&dir)
+    {
+        return code;
     }
     let paths = || -> Result<_, String> {
         let dir = install_dir()?;
@@ -542,6 +565,15 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // [msi lane] an in-app MSI update may still be installing.
+    match msi::preflight(&root) {
+        msi::Gate::Continue => {}
+        msi::Gate::QuietExit => return ExitCode::SUCCESS,
+        msi::Gate::Fatal(msg) => {
+            fatal(&format!("Metro can't start: {msg}"));
+            return ExitCode::from(1);
+        }
+    }
     let events = Events::new(&root);
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

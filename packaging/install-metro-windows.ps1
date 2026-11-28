@@ -4,11 +4,18 @@
   prebuilt Metro-<version>-windows-x64.zip. No administrator rights are needed.
 
 .DESCRIPTION
-  Installs into %LOCALAPPDATA%\Programs\Metro\<version>, adds a Start menu
-  shortcut and a per-user "Installed apps" entry. Your Metro data in
+  Installs into %LOCALAPPDATA%\Programs\Metro\versions\<version>, with
+  %LOCALAPPDATA%\Programs\Metro\Metro.exe as the stable entry point that
+  starts the current version. Adds a Start menu shortcut and a per-user
+  "Installed apps" entry that use it. Your Metro data in
   %LOCALAPPDATA%\Metro\Desktop is never touched. Local runner support (an
   empty "enable-local-runner" file next to Metro.exe) is on for a new install
   unless -NoLocalRunner is given; updates keep the previous choice.
+
+  Install and Update turn on Metro's in-app updates for this install
+  (Settings > About & updates), including for installs made by older copies
+  of this script. Don't use this script from Metro 0.4.0 or older on it:
+  those copies don't check Metro's update records.
 
 .EXAMPLE
   .\install-metro-windows.ps1 -Action Install -Archive .\Metro-0.2.0-windows-x64.zip
@@ -45,6 +52,10 @@ $LocalAppData = [Environment]::GetFolderPath('LocalApplicationData')
 if ($env:METRO_INSTALL_DIR) { $Root = $env:METRO_INSTALL_DIR } else { $Root = Join-Path $LocalAppData 'Programs\Metro' }
 if (-not [System.IO.Path]::IsPathRooted($Root)) { Fail 'METRO_INSTALL_DIR must be an absolute path' }
 $UserData = Join-Path $LocalAppData 'Metro\Desktop'
+if ($env:METRO_DESKTOP_HOME -and [System.IO.Path]::IsPathRooted($env:METRO_DESKTOP_HOME)) { $WorkspaceData = $env:METRO_DESKTOP_HOME } else { $WorkspaceData = $UserData }
+# The marker's content once in-app updates may change this install (the
+# same bytes as the Linux installer's lock migration).
+$Migrated = "metro-update-lock-v2`n"
 
 function Get-Sha256([string] $Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
 
@@ -132,7 +143,7 @@ function Test-Prerequisites {
 }
 
 function Test-Running {
-    $prefix = (Join-Path $Root 'versions') + [System.IO.Path]::DirectorySeparatorChar
+    $prefix = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
     $procs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
         Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) }
     return [bool] $procs
@@ -170,11 +181,39 @@ function Get-MsiManagedMetro {
     } catch { Fail 'cannot ask Windows Installer whether the Metro MSI is installed' }
 }
 
-# True only for a shortcut target inside this script's own versions folder.
+# True only for this script's own entry point or a target inside its own
+# versions folder.
 function Test-OwnShortcut([string] $Target, [string] $InstallRoot) {
     if (-not $Target) { return $false }
+    $full = [System.IO.Path]::GetFullPath($Target)
+    $entry = [System.IO.Path]::GetFullPath((Join-Path $InstallRoot 'Metro.exe'))
+    if ($full -ieq $entry) { return $true }
     $own = [System.IO.Path]::GetFullPath((Join-Path $InstallRoot 'versions')).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
-    return [System.IO.Path]::GetFullPath($Target).StartsWith($own, [StringComparison]::OrdinalIgnoreCase)
+    return $full.StartsWith($own, [StringComparison]::OrdinalIgnoreCase)
+}
+
+# Replace $Dest with $Source's bytes: a temp copy, then one rename.
+function Set-FileAtomic([string] $Source, [byte[]] $Bytes, [string] $Dest) {
+    $tmp = Join-Path (Split-Path -Parent $Dest) ('.' + (Split-Path -Leaf $Dest) + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        if ($Source) { Copy-Item -LiteralPath $Source -Destination $tmp }
+        else {
+            $f = [IO.File]::Open($tmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try { $f.Write($Bytes, 0, $Bytes.Length); $f.Flush($true) } finally { $f.Dispose() }
+        }
+        # File.Replace needs a null backup path; PowerShell binds $null to an empty string here.
+        if (Test-Path -LiteralPath $Dest) { [IO.File]::Replace($tmp, $Dest, [NullString]::Value) }
+        else { [IO.File]::Move($tmp, $Dest) }
+    } finally {
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
+    }
+}
+
+function Test-Migrated {
+    $marker = Join-Path $Root $Mark
+    $item = Get-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+    if (-not $item -or $item.PSIsContainer -or $item.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint) -or $item.Length -gt 128) { return $false }
+    return [IO.File]::ReadAllText($marker) -ceq $Migrated
 }
 
 function Get-ShortcutTarget([string] $Path) {
@@ -183,16 +222,35 @@ function Get-ShortcutTarget([string] $Path) {
 }
 
 # The Metro app updates itself too: it journals each step in
-# $Root\.update.json and takes the same kernel lock as this installer.
-function Assert-NoInAppUpdate {
+# $Root\.update.json, takes the same kernel lock as this installer, and
+# keeps a workspace update gate (desktop-update.json) while a trial may
+# have changed the workspace.
+function Get-UpdateJournalUnknown([string] $Reason) {
+    if (-not $Reason) { $Reason = "$(Join-Path $Root '.update.json') has an unknown in-app update state." }
+    return ("[update_journal_unknown] $Reason`n" +
+        'Stop Metro, its bundled server and any installer. Keep the installation and workspace data, including the update records, live database and backup. ' +
+        'Do not remove locks or records, change the current version pointer, or overwrite either database copy.' + "`n" +
+        "Use the verified official installer with '-Action Status' for read-only diagnosis, not Install, Update or Uninstall. " +
+        'Contact https://github.com/wnzn/metro/issues with this diagnostic, not private databases or credentials.')
+}
+
+function Test-WorkspaceUpdateGate {
+    return [bool] (Get-Item -LiteralPath (Join-Path $WorkspaceData 'desktop-update.json') -Force -ErrorAction SilentlyContinue)
+}
+
+# Reads $Root\.update.json without changing anything. Returns nothing when
+# there is no journal, else @{ Phase; To }, where a version 2 journal that
+# ended reports Phase 'cleanup' (the app still owns its backup). Throws when
+# the journal is not one this installation could have written.
+function Read-UpdateJournal {
     $journal = Join-Path $Root '.update.json'
     $item = Get-Item -LiteralPath $journal -Force -ErrorAction SilentlyContinue
     if (-not $item) { return }
     try {
         if ($item.PSIsContainer -or $item.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint) -or $item.Length -gt 65536) { throw 'unsafe journal' }
-        $raw = Get-Content -LiteralPath $journal -Raw
+        $raw = [IO.File]::ReadAllText($journal)
         $tokens = @([regex]::Matches($raw, '"(?:\\.|[^"\\])*"|[{},:\[\]]') | ForEach-Object { $_.Value })
-        $known = @('version', 'id', 'from', 'to', 'phase', 'outcome', 'detail', 'local_db_snapshot', 'watchdog_pid', 'reported', 'started_at')
+        $known = @('version', 'id', 'from', 'to', 'phase', 'outcome', 'detail', 'local_db_snapshot', 'backup_manifest', 'watchdog_pid', 'reported', 'started_at')
         $found = @()
         for ($i = 0; $i -lt ($tokens.Count - 1); $i++) {
             if ($tokens[$i + 1] -eq ':') {
@@ -202,7 +260,7 @@ function Assert-NoInAppUpdate {
             }
         }
         $j = $raw | ConvertFrom-Json
-        if (($j.version -isnot [long] -and $j.version -isnot [int]) -or $j.version -ne 1 -or
+        if (($j.version -isnot [long] -and $j.version -isnot [int]) -or $j.version -notin @(1, 2) -or
             $j.id -cnotmatch '^[0-9a-f]{16}$' -or
             ($j.started_at -isnot [long] -and $j.started_at -isnot [int])) { throw 'bad journal header' }
         function Get-JournalVersion([string] $Value) {
@@ -212,15 +270,20 @@ function Assert-NoInAppUpdate {
         if ((Get-JournalVersion $j.from) -cge (Get-JournalVersion $j.to)) { throw 'downwards transition' }
         $outcome = if ('outcome' -cin $found) { $j.outcome }
         $pidValue = if ('watchdog_pid' -cin $found) { $j.watchdog_pid }
+        $manifest = if ('backup_manifest' -cin $found) { $j.backup_manifest }
         foreach ($field in @('reported', 'local_db_snapshot')) {
             if ($field -cin $found -and $j.$field -isnot [bool]) { throw 'bad flag' }
         }
+        if ('detail' -cin $found -and $null -ne $j.detail -and $j.detail -isnot [string]) { throw 'bad detail' }
         if ($null -ne $pidValue -and (($pidValue -isnot [long] -and $pidValue -isnot [int]) -or $pidValue -le 0 -or $pidValue -ge 4294967296)) { throw 'bad pid' }
-        if ($j.phase -ceq 'staged' -and ($null -ne $pidValue -or ('local_db_snapshot' -cin $found -and $j.local_db_snapshot))) { throw 'staged trial' }
+        if ($j.phase -ceq 'backing_up' -and $j.version -ne 2) { throw 'backup without version 2' }
+        if ($j.version -eq 2 -and $j.phase -cnotin @('staged', 'backing_up')) {
+            if ($manifest -isnot [string] -or $manifest -cnotmatch '^[0-9a-f]{64}$') { throw 'bad backup manifest' }
+        } elseif ($null -ne $manifest) { throw 'unexpected backup manifest' }
+        if ($j.phase -cin @('staged', 'backing_up') -and ($null -ne $pidValue -or ('local_db_snapshot' -cin $found -and $j.local_db_snapshot))) { throw 'staged trial' }
         $current = Get-Current
         $valid = switch -CaseSensitive ($j.phase) {
-            'staged' { $null -eq $outcome -and $current -ceq $j.from }
-            'trial' { $null -eq $outcome -and $current -ceq $j.from }
+            { $_ -cin @('staged', 'backing_up', 'trial') } { $null -eq $outcome -and $current -ceq $j.from }
             { $_ -cin @('committing', 'rolling_back') } { $null -eq $outcome -and $current -cin @($j.from, $j.to) }
             'committed' { $outcome -ceq 'updated' -and $current -ceq $j.to }
             'failed' { $outcome -cin @('rolled_back', 'not_confirmed', 'install_failed') -and $current -ceq $j.from }
@@ -228,12 +291,36 @@ function Assert-NoInAppUpdate {
         }
         if (-not $valid) { throw 'foreign journal' }
     } catch {
-        Fail "$journal has an unknown in-app update state; start Metro once, then run this again"
+        throw (Get-UpdateJournalUnknown)
     }
-    if ($j.phase -cin @('trial', 'committing', 'rolling_back')) {
-        Fail "Metro is in the middle of updating itself to $($j.to). Let it finish, or close Metro and start it once to complete or undo the update, then run this again"
+    $phase = $j.phase
+    if ($j.version -eq 2 -and $phase -cin @('committed', 'failed')) { $phase = 'cleanup' }
+    return @{ Phase = $phase; To = $j.to }
+}
+
+# Under the installer lock, before any change: refuse while the app's update
+# is unfinished. Returns the version of a staged (not yet tried) update.
+function Assert-NoInAppUpdate {
+    try { $j = Read-UpdateJournal } catch { Fail $_.Exception.Message }
+    if (-not $j) {
+        if (Test-WorkspaceUpdateGate) { Fail (Get-UpdateJournalUnknown "A workspace update gate exists but this installation's update journal is missing.") }
+        return
     }
-    if ($j.phase -ceq 'staged') { return $j.to }
+    if ($j.Phase -cin @('backing_up', 'cleanup')) {
+        Fail "Metro is in the middle of updating itself to $($j.To). Let it finish, or close Metro and start it once to complete or undo the update, then run this again"
+    }
+    if ($j.Phase -cin @('trial', 'committing', 'rolling_back')) {
+        Fail ("[update_recovery_required] Metro is in the middle of updating itself to $($j.To). Let the active Metro finish. " +
+              'If it stopped, keep the install, update records and both database copies unchanged. ' +
+              "Run this script with '-Action Status' for read-only diagnosis and contact https://github.com/wnzn/metro/issues; do not run Install, Update or Uninstall to recover.")
+    }
+    # A valid staged or finished journal doesn't prove the workspace gate
+    # was retired by its owner.
+    if (Test-WorkspaceUpdateGate) {
+        Fail ("[update_recovery_required] A workspace update gate is still present. Leave the records, current pointer and both database copies unchanged. " +
+              "Use '-Action Status' for read-only diagnosis and contact https://github.com/wnzn/metro/issues if Metro cannot verify recovery.")
+    }
+    if ($j.Phase -ceq 'staged') { return $j.To }
 }
 
 function Get-LockBusyMessage([string] $Lock) {
@@ -411,7 +498,9 @@ function Install-Metro {
         if ($PSCommandPath -and ((Resolve-Path -LiteralPath $PSCommandPath).ProviderPath -ne $self)) {
             Copy-Item -LiteralPath $PSCommandPath -Destination $self -Force
         }
-        $exe = Join-Path $target 'Metro.exe'
+        # The stable entry point: starts the version current.txt names.
+        $exe = Join-Path $Root 'Metro.exe'
+        Set-FileAtomic (Join-Path $target 'Metro.exe') $null $exe
         $existing = if (-not $NoShortcut) { Get-ShortcutTarget (Get-ShortcutPath) }
         if (-not $NoShortcut -and $existing -and -not (Test-OwnShortcut $existing $Root)) {
             Say "Kept the existing Start menu shortcut: it belongs to another Metro installation ($existing)."
@@ -419,7 +508,7 @@ function Install-Metro {
             $shell = New-Object -ComObject WScript.Shell
             $lnk = $shell.CreateShortcut((Get-ShortcutPath))
             $lnk.TargetPath = $exe
-            $lnk.WorkingDirectory = $target
+            $lnk.WorkingDirectory = $Root
             $lnk.IconLocation = "$exe,0"
             $lnk.Description = 'Metro'
             $lnk.Save()
@@ -436,8 +525,12 @@ function Install-Metro {
         foreach ($k in $values.Keys) { Set-ItemProperty -Path $UninstallKey -Name $k -Value $values[$k] }
         Set-ItemProperty -Path $UninstallKey -Name NoModify -Value 1 -Type DWord
         Set-ItemProperty -Path $UninstallKey -Name NoRepair -Value 1 -Type DWord
+        # Last: from here on the app may update this install itself.
+        $wasMigrated = Test-Migrated
+        if (-not $wasMigrated) { Set-FileAtomic $null ([Text.Encoding]::ASCII.GetBytes($Migrated)) (Join-Path $Root $Mark) }
 
         Say "Metro $version is installed in $target"
+        if (-not $wasMigrated) { Say 'In-app updates are on for this install (Settings > About & updates). Don''t use installer scripts from Metro 0.4.0 or older with it.' }
         $supported = ($m.PSObject.Properties.Name -contains 'local_runner') -and $m.local_runner -eq 'installer-marker'
         if (-not $enable) { Say 'Local runner support is off: Metro won''t set up its built-in runner on its own. Set it up in Metro under Settings > Runners, or install again with -LocalRunner.' }
         elseif ($supported) {
@@ -485,6 +578,20 @@ try {
         'Verify' { Install-Metro }
         'Uninstall' { Uninstall-Metro }
         'Status' {
+            # Read-only: no lock, no change.
+            Say "Install directory: $Root"
+            Say "Workspace data: $WorkspaceData"
+            if (Test-WorkspaceUpdateGate) {
+                Say 'Workspace update gate present. Leave it and the workspace data intact.'
+                if (-not (Test-Path -LiteralPath (Join-Path $Root '.update.json'))) { Fail (Get-UpdateJournalUnknown "A workspace update gate exists but this installation's update journal is missing.") }
+            }
+            if (Test-Path -LiteralPath (Join-Path $Root '.update.json')) {
+                try { $j = Read-UpdateJournal } catch { Fail $_.Exception.Message }
+                Say "Update journal phase: $($j.Phase) (read-only diagnosis; does not authorize recovery)"
+            }
+            if (Test-Path -LiteralPath (Join-Path $Root $Mark)) {
+                if (Test-Migrated) { Say 'In-app updates: on' } else { Say 'In-app updates: off (run this script with -Action Update to turn them on)' }
+            }
             $v = Get-Current
             if ($v) {
                 Say "Installed: Metro $v in $(Join-Path $Root "versions\$v")"

@@ -7,6 +7,11 @@
 //! rename). The journal `<root>/.update.json` is written before every step,
 //! so a crash at any point ends consistent at the next start.
 //!
+//! A Windows script install also has a stable entry point, `<root>\Metro.exe`
+//! (a copy of the launcher), which the Start menu shortcut and the
+//! Installed-apps entry name. It only starts `versions\<current>\Metro.exe`
+//! and exits, so no running program blocks replacing a version.
+//!
 //! MSI installs keep their journal in `<desktop_root>/update/journal.json`;
 //! the MSI's own transaction replaces the files.
 
@@ -81,6 +86,18 @@ impl InstallKind {
     }
 }
 
+/// A script install whose installer locks were migrated (the marker holds
+/// [`metro_release::installer_lock::MIGRATION`]): the app may stage, try,
+/// commit and roll back updates in it.
+pub fn managed(kind: &InstallKind) -> bool {
+    match kind {
+        InstallKind::LinuxInstaller { root } | InstallKind::WindowsScript { root } => {
+            metro_release::installer_lock::migrated(root, MARKER)
+        }
+        _ => false,
+    }
+}
+
 /// Classify the running launcher's folder. In a trial start (`trial` is the
 /// journal id), the pointer still names the previous version; the journal
 /// vouches for this one.
@@ -142,10 +159,7 @@ pub fn detect(
 /// `current.txt`).
 pub fn read_pointer(root: &Path) -> Option<String> {
     if cfg!(windows) {
-        let raw = read_evidence_file(&root.join("current.txt"), 128).ok()?;
-        let raw = std::str::from_utf8(&raw).ok()?;
-        let v = raw.trim().to_string();
-        Version::parse(&v).map(|_| v)
+        read_text_pointer(root)
     } else {
         let link = fs::read_link(root.join("current")).ok()?;
         let rest = link.strip_prefix("versions").ok()?;
@@ -154,13 +168,23 @@ pub fn read_pointer(root: &Path) -> Option<String> {
     }
 }
 
+/// The Windows pointer, `current.txt`: one version, optional whitespace.
+pub fn read_text_pointer(root: &Path) -> Option<String> {
+    let raw = read_state_file(&root.join(TEXT_POINTER), 128).ok()?;
+    let raw = std::str::from_utf8(&raw).ok()?;
+    let v = raw.trim().to_string();
+    Version::parse(&v).map(|_| v)
+}
+
+pub const TEXT_POINTER: &str = "current.txt";
+
 /// Point the install at `version` with one atomic rename.
 pub fn set_pointer(root: &Path, version: &str) -> io::Result<()> {
     if Version::parse(version).is_none() {
         return Err(io::ErrorKind::InvalidInput.into());
     }
     if cfg!(windows) {
-        write_atomic(&root.join("current.txt"), version.as_bytes())
+        write_atomic(&root.join(TEXT_POINTER), version.as_bytes())
     } else {
         #[cfg(unix)]
         {
@@ -182,8 +206,45 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// Open the regular file itself, never a symlink, junction, pipe or device.
-/// Windows also denies new conflicting writes and renames while held.
+/// Windows also denies new conflicting writes and renames while held: for
+/// content that is verified (staged packages, downloads, snapshots).
 pub fn open_input(path: &Path) -> io::Result<fs::File> {
+    open_regular(path, 1) // FILE_SHARE_READ
+}
+
+/// Update state Metro replaces with [`write_atomic`] or deletes while another
+/// start may read it (journals, status, gates, the pointer, trial markers):
+/// like [`open_input`], but on Windows shared for read, write and delete, so
+/// holding it never blocks that rename or delete. A replacement while held
+/// leaves this handle on the whole previous file (every reader validates
+/// what it parses). A sharing violation or a file pending deletion, from a
+/// rename in progress, is retried briefly, never taken as absent.
+pub fn open_state(path: &Path) -> io::Result<fs::File> {
+    #[cfg(windows)]
+    {
+        let deadline = std::time::Instant::now() + STATE_RETRY;
+        loop {
+            match open_regular(path, 7) {
+                // ERROR_ACCESS_DENIED (delete pending), ERROR_SHARING_VIOLATION, ERROR_DELETE_PENDING
+                Err(e)
+                    if matches!(e.raw_os_error(), Some(5 | 32 | 303))
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                other => return other,
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    open_regular(path, 0)
+}
+
+/// How long [`open_state`] retries a transient denial.
+#[cfg(windows)]
+const STATE_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn open_regular(path: &Path, _share: u32) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -194,7 +255,7 @@ pub fn open_input(path: &Path) -> io::Result<fs::File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        options.share_mode(1).custom_flags(0x0020_0000); // FILE_SHARE_READ, OPEN_REPARSE_POINT
+        options.share_mode(_share).custom_flags(0x0020_0000); // OPEN_REPARSE_POINT
     }
     let file = options.open(path)?;
     let meta = file.metadata()?;
@@ -329,7 +390,7 @@ impl Journal {
 }
 
 pub fn load_journal(path: &Path) -> io::Result<Option<Journal>> {
-    let f = match open_input(path) {
+    let f = match open_state(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
@@ -379,6 +440,10 @@ fn getrandom_fill(b: &mut [u8]) -> Result<(), ()> {
 /// A journal that ended (committed/failed) since the last start, as
 /// `last_update`; it is removed. Cleans leftovers of finished updates.
 pub fn take_finished(kind: &InstallKind, update_dir: &Path, own: &Version) -> Option<LastUpdate> {
+    // [msi lane] dispatch hook
+    if matches!(kind, InstallKind::WindowsMsi { .. }) {
+        return super::msi::take_finished(update_dir, own);
+    }
     let own_s = own.to_string();
     let last = |j: &Journal, detail: Option<String>| LastUpdate {
         from: j.from.clone(),
@@ -426,6 +491,10 @@ fn finished_for(j: &Journal, own: &str) -> bool {
 /// Drop a staged update that is no longer offered (design 3.5: "otherwise
 /// it is deleted"): its version folder (never the current one) and journal.
 pub fn discard_staged(kind: &InstallKind, update_dir: &Path) {
+    // [msi lane] dispatch hook
+    if matches!(kind, InstallKind::WindowsMsi { .. }) {
+        return super::msi::discard_staged(update_dir);
+    }
     let Some(path) = journal_path(kind, update_dir) else {
         return;
     };
@@ -473,6 +542,10 @@ pub fn gate_legacy_msi(update_dir: &Path) -> io::Result<()> {
 
 /// A staged update waiting for its restart.
 pub fn staged(kind: &InstallKind, update_dir: &Path) -> Option<(Version, String)> {
+    // [msi lane] dispatch hook
+    if matches!(kind, InstallKind::WindowsMsi { .. }) {
+        return super::msi::staged(update_dir);
+    }
     let j = read_journal(&journal_path(kind, update_dir)?)?;
     if j.phase != "staged" {
         return None;
@@ -483,7 +556,7 @@ pub fn staged(kind: &InstallKind, update_dir: &Path) -> Option<(Version, String)
             script_state(root, &j.from) && version_present(root, &j.to)
         }
         InstallKind::WindowsMsi { .. } => {
-            open_input(&stage_assets(update_dir, &j.id).join("package.msi")).is_ok()
+            open_state(&stage_assets(update_dir, &j.id).join("package.msi")).is_ok()
         }
         _ => false,
     };
@@ -534,10 +607,17 @@ fn archive_err(e: metro_release::Error) -> StageError {
 }
 
 fn read_evidence_file(path: &Path, cap: usize) -> io::Result<Vec<u8>> {
+    read_capped(open_input(path)?, cap)
+}
+
+/// A small state file another start may replace or delete ([`open_state`]).
+fn read_state_file(path: &Path, cap: usize) -> io::Result<Vec<u8>> {
+    read_capped(open_state(path)?, cap)
+}
+
+fn read_capped(file: fs::File, cap: usize) -> io::Result<Vec<u8>> {
     let mut data = Vec::new();
-    open_input(path)?
-        .take((cap + 1) as u64)
-        .read_to_end(&mut data)?;
+    file.take((cap + 1) as u64).read_to_end(&mut data)?;
     if data.len() > cap {
         return Err(io::ErrorKind::InvalidData.into());
     }
@@ -803,7 +883,7 @@ impl Drop for Lock {
     }
 }
 
-fn plain_dir(path: &Path) -> bool {
+pub(super) fn plain_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| {
         #[cfg(windows)]
         {
@@ -882,12 +962,14 @@ pub fn stage(
     if target <= own {
         return Err(stage_err("not_latest"));
     }
+    // [msi lane] dispatch hook
+    if let InstallKind::WindowsMsi { dir } = kind {
+        return super::msi::stage(dir, update_dir, own, release, download);
+    }
     let path = journal_path(kind, update_dir).ok_or_else(|| stage_err("not_in_app"))?;
     let locked_root = lock_root(kind, update_dir);
     let lock = Lock::take(locked_root)?;
-    if !matches!(kind, InstallKind::LinuxInstaller { root }
-        if metro_release::installer_lock::migrated(root, MARKER))
-    {
+    if !managed(kind) {
         return Err(stage_err("not_in_app"));
     }
     let from = own.to_string();
@@ -1054,7 +1136,7 @@ pub fn mark_trial_ok(update_dir: &Path, id: &str) -> io::Result<()> {
 
 pub fn trial_ok(update_dir: &Path, id: &str) -> bool {
     valid_id(id)
-        && read_evidence_file(&update_dir.join(format!("trial-{id}.ok")), 2)
+        && read_state_file(&update_dir.join(format!("trial-{id}.ok")), 2)
             .is_ok_and(|raw| raw == b"ok")
 }
 
@@ -1194,7 +1276,7 @@ fn read_snapshot(snap: &Path, j: &Journal, expected: &str) -> io::Result<Snapsho
     Ok(record)
 }
 
-fn remove_owned_dir(path: &Path) -> io::Result<()> {
+pub(super) fn remove_owned_dir(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(_) if plain_dir(path) => fs::remove_dir_all(path)?,
         Ok(_) => return Err(io::ErrorKind::InvalidData.into()),
@@ -1204,7 +1286,7 @@ fn remove_owned_dir(path: &Path) -> io::Result<()> {
     metro_release::sync_parent(path)
 }
 
-fn clean_backup(update_dir: &Path, j: &Journal) -> io::Result<()> {
+pub(super) fn clean_backup(update_dir: &Path, j: &Journal) -> io::Result<()> {
     if j.version == 2 {
         let (tmp, published) = backup_paths(update_dir, j)?;
         remove_owned_dir(&tmp)?;
@@ -1328,7 +1410,7 @@ pub fn commit(root: &Path, j: &mut Journal, lock: &Lock) -> io::Result<()> {
     j.phase = JournalPhase::Committing;
     write_journal(&path, j)?;
     set_pointer(root, &j.to)?;
-    move_launch_entry(root, &j.from);
+    move_launch_entry(root, &j.from, &j.to);
     j.phase = JournalPhase::Committed;
     j.outcome = Some("updated".into());
     write_journal(&path, j)
@@ -1356,7 +1438,7 @@ pub fn rollback(
     // The watchdog continuously holds the instance lock. An orphaned
     // bundled server may outlive the launcher in its own process group;
     // the inherited workspace lease, not the launcher's PID, excludes it.
-    let _writer = crate::desktop_local::update_writer_exclusion(desktop_root)?;
+    let _writer = writer_exclusion_after_trial(desktop_root)?;
     j.phase = JournalPhase::RollingBack;
     j.detail = detail;
     write_journal(&path, j)?;
@@ -1373,8 +1455,38 @@ pub fn rollback(
     j.phase = JournalPhase::Failed;
     j.outcome = Some(outcome.into());
     write_journal(&path, j)?;
-    let _ = fs::remove_dir_all(root.join("versions").join(&j.to));
+    remove_tried_version(&root.join("versions").join(&j.to));
     Ok(())
+}
+
+/// The local workspace lease, after the trial was stopped. On Windows the
+/// trial's bundled server ends with the trial's job object, which closes
+/// when the trial ends; give it a moment to let go of the lease. Linux
+/// servers inherit the lease and are never waited for.
+fn writer_exclusion_after_trial(desktop_root: &Path) -> io::Result<fs::File> {
+    #[cfg(windows)]
+    {
+        let started = std::time::Instant::now();
+        loop {
+            match crate::desktop_local::update_writer_exclusion(desktop_root) {
+                Ok(f) => return Ok(f),
+                Err(e) if started.elapsed() > std::time::Duration::from_secs(15) => return Err(e),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(200)),
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    crate::desktop_local::update_writer_exclusion(desktop_root)
+}
+
+/// Windows keeps a just-ended program's files open briefly.
+fn remove_tried_version(dir: &Path) {
+    for _ in 0..if cfg!(windows) { 25 } else { 1 } {
+        if fs::remove_dir_all(dir).is_ok() || !dir.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 }
 
 pub fn ensure_script_transition(root: &Path, j: &Journal, phases: &[&str]) -> io::Result<()> {
@@ -1530,10 +1642,12 @@ fn recover_inner(
 }
 
 /// Linux: rewrite the menu entry when it names the old version's launcher.
-/// Windows: rewrite our own Start-menu shortcut and the uninstall entry.
-fn move_launch_entry(root: &Path, from: &str) {
+/// Windows: refresh the stable entry point and the Installed-apps version.
+/// Neither runs code from either version.
+fn move_launch_entry(root: &Path, from: &str, to: &str) {
     #[cfg(not(windows))]
     {
+        let _ = to;
         let data = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
@@ -1549,9 +1663,213 @@ fn move_launch_entry(root: &Path, from: &str) {
     }
     #[cfg(windows)]
     {
-        // Windows updates are manual. A legacy recovery only moves the
-        // pointer, never runs code from either version to rewrite shortcuts.
-        let _ = (root, from);
+        let _ = from;
+        if entry::present(root)
+            && let Err(e) = entry::refresh(root, to)
+        {
+            // The previous entry still starts the current version.
+            eprintln!("metro-desktop: the Metro.exe entry point was not refreshed: {e}");
+        }
+        if let Err(e) = installed_apps::sync(root, to) {
+            eprintln!("metro-desktop: the Installed apps entry was not changed: {e}");
+        }
+    }
+}
+
+/// The stable entry point of a Windows script install (`<root>\Metro.exe`).
+/// Platform-neutral so its checks run in tests everywhere.
+pub mod entry {
+    use super::*;
+
+    pub fn path(root: &Path) -> PathBuf {
+        root.join(LAUNCHER)
+    }
+
+    pub fn present(root: &Path) -> bool {
+        open_state(&path(root)).is_ok()
+    }
+
+    /// The root this program is the entry point of: it sits directly in a
+    /// marked install folder that has `versions` and `current.txt`.
+    pub fn root_of(exe: &Path) -> Option<PathBuf> {
+        let root = exe.parent()?;
+        (exe.file_name()? == LAUNCHER
+            && fs::symlink_metadata(root.join(MARKER)).is_ok_and(|m| m.is_file())
+            && plain_dir(&root.join("versions"))
+            && fs::symlink_metadata(root.join(TEXT_POINTER)).is_ok_and(|m| m.is_file()))
+        .then(|| root.to_path_buf())
+    }
+
+    /// The launcher of the version `current.txt` names, after the same
+    /// checks a start of that version makes: plain folders, a regular file.
+    pub fn target(root: &Path) -> io::Result<PathBuf> {
+        let bad = || io::Error::new(io::ErrorKind::InvalidData, "the install pointer is invalid");
+        if !plain_dir(root) || !fs::symlink_metadata(root.join(MARKER)).is_ok_and(|m| m.is_file()) {
+            return Err(bad());
+        }
+        let v = read_text_pointer(root).ok_or_else(bad)?;
+        if !version_present(root, &v) {
+            return Err(bad());
+        }
+        Ok(root.join("versions").join(v).join(LAUNCHER))
+    }
+
+    /// A normal start of a version that is not the current one in a managed
+    /// install (an old shortcut or a pin): start the current version
+    /// instead of opening the workspace with old or unconfirmed files.
+    pub fn forward_target(install_dir: &Path, own: &Version) -> Option<PathBuf> {
+        let versions = install_dir.parent()?;
+        let root = versions.parent()?;
+        if versions.file_name()? != "versions"
+            || install_dir.file_name()? != own.to_string().as_str()
+            || !metro_release::installer_lock::migrated(root, MARKER)
+        {
+            return None;
+        }
+        let current = read_text_pointer(root)?;
+        if current == own.to_string() {
+            return None;
+        }
+        target(root).ok()
+    }
+
+    /// Replace the entry point with `versions/<version>`'s launcher (temp
+    /// copy, then one rename). Fails while the entry point runs.
+    pub fn refresh(root: &Path, version: &str) -> io::Result<()> {
+        if Version::parse(version).is_none() || !version_present(root, version) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let source = open_input(&root.join("versions").join(version).join(LAUNCHER))?;
+        let tmp = root.join(format!(".entry-{}.tmp", new_id()));
+        let result = copy_synced(source, &tmp).and_then(|_| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))?;
+            }
+            metro_release::rename_durable(&tmp, &path(root))
+        });
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        result
+    }
+}
+
+/// The per-user Installed-apps entry the Windows installer script writes
+/// (`HKCU\...\Uninstall\dev.metro.desktop`). Changed only when its
+/// `InstallLocation` is this install.
+#[cfg(windows)]
+pub mod installed_apps {
+    use std::io;
+    use std::path::Path;
+
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ, RRF_RT_REG_SZ,
+        RegCloseKey, RegGetValueW, RegOpenKeyExW, RegSetValueExW,
+    };
+
+    const KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\dev.metro.desktop";
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    struct Key(HKEY);
+
+    impl Drop for Key {
+        fn drop(&mut self) {
+            // SAFETY: an open key we own.
+            unsafe {
+                RegCloseKey(self.0);
+            }
+        }
+    }
+
+    fn get(key: &Key, name: &str) -> Option<String> {
+        let name = wide(name);
+        let mut buf = vec![0u16; 2048];
+        let mut len = (buf.len() * 2) as u32;
+        // SAFETY: valid key, NUL-terminated name, sized buffer.
+        let rc = unsafe {
+            RegGetValueW(
+                key.0,
+                std::ptr::null(),
+                name.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        (rc == 0).then(|| {
+            let n = (len as usize / 2).saturating_sub(1).min(buf.len());
+            String::from_utf16_lossy(&buf[..n])
+        })
+    }
+
+    fn set(key: &Key, name: &str, value: &str) -> io::Result<()> {
+        let (name, value) = (wide(name), wide(value));
+        // SAFETY: valid key, NUL-terminated name and data of the given size.
+        let rc = unsafe {
+            RegSetValueExW(
+                key.0,
+                name.as_ptr(),
+                0,
+                REG_SZ,
+                value.as_ptr().cast(),
+                (value.len() * 2) as u32,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+        Ok(())
+    }
+
+    /// The same folder, also when one is spelled with short (8.3) names.
+    fn same_dir(a: &str, b: &Path) -> bool {
+        let norm = |s: &str| s.trim_end_matches(['\\', '/']).to_lowercase();
+        norm(a) == norm(&b.to_string_lossy())
+            || matches!(
+                (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+                (Ok(x), Ok(y)) if x == y
+            )
+    }
+
+    /// Set `DisplayVersion` to `version` (and `DisplayIcon` to the entry
+    /// point when present). `Ok` without a change for another install's
+    /// or no entry.
+    pub fn sync(root: &Path, version: &str) -> io::Result<()> {
+        let path = wide(KEY);
+        let mut raw: HKEY = std::ptr::null_mut();
+        // SAFETY: NUL-terminated subkey and an out pointer.
+        let rc = unsafe {
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                path.as_ptr(),
+                0,
+                KEY_QUERY_VALUE | KEY_SET_VALUE,
+                &mut raw,
+            )
+        };
+        if rc != 0 {
+            return Ok(());
+        }
+        let key = Key(raw);
+        if !get(&key, "InstallLocation").is_some_and(|l| same_dir(&l, root)) {
+            return Ok(());
+        }
+        if get(&key, "DisplayVersion").as_deref() != Some(version) {
+            set(&key, "DisplayVersion", version)?;
+        }
+        if super::entry::present(root) {
+            let icon = super::entry::path(root).to_string_lossy().into_owned();
+            if get(&key, "DisplayIcon").as_deref() != Some(icon.as_str()) {
+                set(&key, "DisplayIcon", &icon)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1644,5 +1962,136 @@ pub mod msi {
         }
         let n = (len as usize / 2).saturating_sub(1).min(buf.len());
         Some(String::from_utf16_lossy(&buf[..n]))
+    }
+}
+
+/// Windows sharing of update state: another start may hold the journal while
+/// this one replaces it (desktop-windows CI job).
+#[cfg(all(test, windows))]
+mod state_share_tests {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::time::{Duration, Instant};
+
+    fn journal(started_at: i64) -> Journal {
+        Journal {
+            version: 1,
+            id: "abcdef0123456789".into(),
+            from: "1.0.0".into(),
+            to: "1.0.1".into(),
+            phase: JournalPhase::Trial,
+            outcome: None,
+            detail: None,
+            local_db_snapshot: false,
+            backup_manifest: None,
+            watchdog_pid: None,
+            source_pid: None,
+            reported: false,
+            started_at,
+        }
+    }
+
+    #[test]
+    fn replacing_the_journal_while_a_reader_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(JOURNAL);
+        write_journal(&path, &journal(1)).unwrap();
+        // A reader (another start) holds the journal through the replacement.
+        let mut held = open_state(&path).unwrap();
+        let t = Instant::now();
+        write_journal(&path, &journal(2)).unwrap();
+        let mut old = Vec::new();
+        held.read_to_end(&mut old).unwrap();
+        // The held handle still reads one whole journal (the old one).
+        let old: Journal = serde_json::from_slice(&old).unwrap();
+        assert_eq!(old.started_at, 1);
+        drop(held);
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        assert_eq!(load_journal(&path).unwrap().unwrap().started_at, 2);
+        // Deleting it while held works too.
+        let held = open_state(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        drop(held);
+        assert!(load_journal(&path).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_reader_that_does_not_share_delete_delays_but_never_fails_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(JOURNAL);
+        write_journal(&path, &journal(1)).unwrap();
+        // FILE_SHARE_READ only, as older Metro versions and some tools open it.
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        write_journal(&path, &journal(2)).unwrap();
+        release.join().unwrap();
+        assert_eq!(load_journal(&path).unwrap().unwrap().started_at, 2);
+    }
+
+    #[test]
+    fn a_reader_waits_out_an_exclusive_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(JOURNAL);
+        write_journal(&path, &journal(1)).unwrap();
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        // A sharing violation is retried, never read as "no journal".
+        assert_eq!(load_journal(&path).unwrap().unwrap().started_at, 1);
+        release.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_replacements_and_reads_never_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(JOURNAL);
+        write_journal(&path, &journal(0)).unwrap();
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                for n in 1..=300 {
+                    write_journal(&path, &journal(n)).unwrap();
+                }
+            })
+        };
+        let mut last = 0;
+        while !writer.is_finished() {
+            let j = load_journal(&path)
+                .unwrap()
+                .expect("the journal is always there");
+            assert!(
+                j.started_at >= last,
+                "went back from {last} to {}",
+                j.started_at
+            );
+            last = j.started_at;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        writer.join().unwrap();
+        assert_eq!(load_journal(&path).unwrap().unwrap().started_at, 300);
+    }
+
+    #[test]
+    fn the_msi_journal_is_shared_the_same_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(super::super::msi::JOURNAL);
+        fs::write(&path, b"{}").unwrap();
+        let held = open_state(&path).unwrap();
+        write_atomic(&path, b"{\"replaced\":true}").unwrap();
+        drop(held);
+        assert_eq!(fs::read(&path).unwrap(), b"{\"replaced\":true}");
     }
 }

@@ -11,6 +11,21 @@ publish = false
 name = "metro-desktop"
 path = "src/main.rs"
 
+# Native update tests only (never shipped): stand-ins for the packaged UI
+# that drive the bridge's update endpoints (packaging/windows_update_e2e.py,
+# packaging/windows-msi/test-msi-update.ps1).
+[[bin]]
+name = "metro-ui-stub"
+path = "src/bin/ui_stub.rs"
+required-features = ["e2e-test-release"]
+
+[[example]]
+name = "msi_update_ui"
+path = "examples/msi_update_ui.rs"
+
+[features]
+e2e-test-release = ["metro-connector/e2e-test-release", "metro-release/e2e", "dep:serde_json"]
+
 # Every version below is one Cargo.lock already resolves.
 [dependencies]
 metro-connector = { path = "../connector" }
@@ -18,12 +33,15 @@ metro-release = { path = "../release" }
 # The UI's NO_PROXY: loopback and Tailscale reached directly.
 metro-url-policy = { path = "../url-policy" }
 tokio = { version = "1.53.1", features = ["macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+# The e2e UI stand-in only.
+serde_json = { version = "1.0.150", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.180"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 serde_json = "1.0.150"
+tempfile = "3.27.0"

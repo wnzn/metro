@@ -173,8 +173,131 @@ pub(crate) fn inherit_lock(file: &File, cmd: &mut std::process::Command) -> std:
     }
     Ok(())
 }
+/// Windows can't pass a held lock to another process: a process's byte-range
+/// locks end with it. A launcher that starts an update trial therefore holds
+/// a second lock, the handoff gate, from before the trial starts until the
+/// trial holds the instance lock. Every start takes the gate before it tries
+/// the instance lock, so nobody else can take the instance lock in between.
+/// (Launchers from Metro 0.6.4 and older don't know the gate.)
+#[cfg(windows)]
+mod handoff {
+    use std::fs::File;
+    use std::io;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    pub const GATE: &str = "instance.handoff.lock";
+
+    pub fn open(path: &Path) -> io::Result<File> {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        if let Ok(m) = std::fs::symlink_metadata(path)
+            && (!m.is_file() || m.file_attributes() & 0x400 != 0)
+        {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(0x0020_0000) // FILE_FLAG_OPEN_REPARSE_POINT
+            .open(path)
+    }
+
+    /// Whether another handle holds the lock on `path` right now.
+    pub fn held(path: &Path) -> io::Result<bool> {
+        let f = open(path)?;
+        match f.try_lock() {
+            Ok(()) => {
+                let _ = f.unlock();
+                Ok(false)
+            }
+            Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+        }
+    }
+
+    /// Take the gate, waiting up to `wait` for a handoff to finish.
+    pub fn take(root: &Path, wait: Duration) -> io::Result<Option<File>> {
+        let gate = open(&root.join(GATE))?;
+        let started = Instant::now();
+        loop {
+            match gate.try_lock() {
+                Ok(()) => return Ok(Some(gate)),
+                Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < wait => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+                Err(std::fs::TryLockError::Error(e)) => return Err(e),
+            }
+        }
+    }
+}
+
+/// The handoff gate, held by the launcher of an update trial (Windows).
+#[cfg(windows)]
+pub struct Handoff {
+    _gate: File,
+}
+
+#[cfg(windows)]
+impl InstanceLock {
+    /// Take the handoff gate before starting a trial.
+    pub fn begin_handoff(&self, root: &Path) -> std::io::Result<Handoff> {
+        handoff::take(root, std::time::Duration::from_secs(5))?
+            .map(|gate| Handoff { _gate: gate })
+            .ok_or_else(|| std::io::ErrorKind::WouldBlock.into())
+    }
+
+    /// After a committed trial: let go of the instance lock and keep the
+    /// gate until another process (the trial, waiting for it) holds it, or
+    /// `timeout` passes. This instance is no longer primary; exit next.
+    pub fn hand_over(&self, root: &Path, gate: Handoff, timeout: std::time::Duration) -> bool {
+        let _ = self._file.unlock();
+        let started = std::time::Instant::now();
+        let path = root.join("instance.lock");
+        let taken = loop {
+            match handoff::held(&path) {
+                Ok(true) => break true,
+                _ if started.elapsed() > timeout => break false,
+                _ => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        };
+        drop(gate);
+        taken
+    }
+
+    /// The trial's side. Its launcher holds the instance lock and the gate;
+    /// the trial waits for the instance lock, which it gets the moment the
+    /// launcher lets go after a commit. Until then the launcher holds it on
+    /// the trial's behalf. The caller has checked the journal and that its
+    /// parent is the journal's watchdog.
+    pub fn adopt_trial(root: &Path) -> Result<Self> {
+        let path = root.join("instance.lock");
+        if !handoff::held(&root.join(handoff::GATE))? || !handoff::held(&path)? {
+            bail!("trial did not find its launcher's handoff");
+        }
+        let file = handoff::open(&path)?;
+        let waiter = file.try_clone()?;
+        std::thread::Builder::new()
+            .name("metro-instance-handoff".into())
+            .spawn(move || {
+                // Same file object: the lock stays with `file` after this
+                // handle closes.
+                let _ = waiter.lock();
+            })?;
+        Ok(Self { _file: file })
+    }
+}
+
 /// Try to become the primary instance. `Ok(None)`: another instance holds it.
 pub fn try_lock_instance(root: &Path) -> Result<Option<InstanceLock>> {
+    #[cfg(windows)]
+    let Some(_gate) = handoff::take(root, std::time::Duration::from_secs(4))
+        .with_context(|| format!("opening {}", root.join(handoff::GATE).display()))?
+    else {
+        return Ok(None);
+    };
     let path = root.join("instance.lock");
     if let Ok(m) = std::fs::symlink_metadata(&path)
         && !m.is_file()
@@ -380,6 +503,38 @@ mod win {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, windows))]
+mod handoff_tests {
+    use super::*;
+
+    /// The trial's lock comes from the launcher without a gap in which a
+    /// third start could become primary (native Windows only).
+    #[test]
+    fn instance_lock_passes_to_the_trial_through_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let watchdog = try_lock_instance(root).unwrap().unwrap();
+        assert!(try_lock_instance(root).unwrap().is_none());
+        let gate = watchdog.begin_handoff(root).unwrap();
+        let trial = InstanceLock::adopt_trial(root).unwrap();
+        let started = std::time::Instant::now();
+        assert!(try_lock_instance(root).unwrap().is_none(), "gate held");
+        assert!(started.elapsed() >= std::time::Duration::from_secs(3));
+        assert!(watchdog.hand_over(root, gate, std::time::Duration::from_secs(10)));
+        drop(watchdog);
+        assert!(
+            try_lock_instance(root).unwrap().is_none(),
+            "the trial has it"
+        );
+        drop(trial);
+        assert!(try_lock_instance(root).unwrap().is_some());
+        // No handoff in progress: the trial side refuses.
+        let lock = try_lock_instance(root).unwrap().unwrap();
+        assert!(InstanceLock::adopt_trial(root).is_err());
+        drop(lock);
     }
 }
 

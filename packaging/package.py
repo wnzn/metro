@@ -47,7 +47,7 @@ INTER_FONT_SHA = "29160a80ff49ddcab2c97711247e08b1fab27a484a329ce8b813d820dc5590
 INTER_OFL_SHA = "5b9321a4298cfeb6b34354164a1c3afc3db114569984c502b9b35d988fd58c57"
 WINDOWS_SYSTEM = set("""
 advapi32 bcrypt bcryptprimitives cfgmgr32 combase comctl32 coremessaging crypt32 d2d1 d3d11
-dcomp dwmapi dwrite dxgi gdi32 imm32 iphlpapi kernel32 ktmw32 mfplat mfreadwrite msvcrt ncrypt
+dcomp dwmapi dwrite dxgi gdi32 imm32 iphlpapi kernel32 ktmw32 mfplat mfreadwrite msi msvcrt ncrypt
 ntdll ole32 oleaut32 opengl32 powrprof psapi rpcrt4 secur32 setupapi shell32 shlwapi
 synchronization ucrtbase uiautomationcore user32 userenv version windowscodecs winhttp
 winmm ws2_32 wtsapi32 xaudio2_8

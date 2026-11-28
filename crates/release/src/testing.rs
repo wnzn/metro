@@ -150,6 +150,51 @@ pub fn tar_gz(top: &str, files: &[(&str, &[u8], u32)]) -> Vec<u8> {
     gzip(&tar)
 }
 
+/// Build a stored (uncompressed) zip like the Windows release archives:
+/// regular files under `top/`, made on DOS (no Unix modes).
+pub fn zip(top: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
+    let crc = |data: &[u8]| {
+        let mut c = flate2::Crc::new();
+        c.update(data);
+        c.sum()
+    };
+    let (mut out, mut central) = (Vec::new(), Vec::new());
+    for (name, data) in files {
+        let name = format!("{top}/{name}");
+        let offset = out.len() as u32;
+        let (sum, size) = (crc(data), data.len() as u32);
+        out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        out.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        out.extend_from_slice(&sum.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(data);
+        central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        central.extend_from_slice(&[20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        central.extend_from_slice(&sum.to_le_bytes());
+        central.extend_from_slice(&size.to_le_bytes());
+        central.extend_from_slice(&size.to_le_bytes());
+        central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        central.extend_from_slice(&[0; 8]);
+        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&offset.to_le_bytes());
+        central.extend_from_slice(name.as_bytes());
+    }
+    let (cd_offset, cd_size) = (out.len() as u32, central.len() as u32);
+    out.extend_from_slice(&central);
+    out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+    out.extend_from_slice(&cd_size.to_le_bytes());
+    out.extend_from_slice(&cd_offset.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
+
 pub fn gzip(data: &[u8]) -> Vec<u8> {
     use std::io::Write;
     let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());

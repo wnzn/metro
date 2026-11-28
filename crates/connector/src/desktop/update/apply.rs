@@ -6,6 +6,10 @@
 //! 1. Snapshot the local database (the bundled server is stopped).
 //! 2. Journal `trial`, start `versions/<V>/Metro --update-trial <id>` in its
 //!    own process group (Windows: detached, its own group, out of any job).
+//!    Linux hands the trial the locked instance-lock descriptor; Windows
+//!    locks can't change process, so the launcher holds the handoff gate
+//!    and the instance lock until the trial takes it after the commit
+//!    (`store::Handoff`).
 //! 3. Watch: the new UI's first render writes `trial-<id>.ok` through the
 //!    bridge (`POST /v1/update/started`) → **commit** (pointer, menu entry);
 //!    the watchdog exits and the new version keeps running.
@@ -139,7 +143,17 @@ pub fn spawn_checked_trial(
     };
     #[cfg(target_os = "linux")]
     return spawn(&path, &exe.path, id, instance.trial_input()?);
-    #[cfg(not(target_os = "linux"))]
+    // The verified handle (read only, shared for reading) and the pinned
+    // folders are held until the process exists; the trial takes over the
+    // instance lock through the handoff gate (`store::Handoff`).
+    #[cfg(windows)]
+    {
+        let _ = instance;
+        let child = spawn(&exe.path, &exe.path, id, std::process::Stdio::null());
+        drop(exe);
+        child
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = (exe, id, instance);
         Err(std::io::ErrorKind::Unsupported.into())

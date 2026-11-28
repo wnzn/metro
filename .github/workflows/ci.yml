@@ -546,13 +546,79 @@ jobs:
           EVENT_AFTER: ${{ github.event.after }}
         run: python3 -I packaging/release_policy.py decide
 
+  # Test builds for the native in-app update tests (windows-distribution.yml,
+  # job `updates`): e2e launchers that play versions 1.0.0 and 1.0.1 and the
+  # stand-in UIs. Runs exactly when package-smoke does, never on a release
+  # run. Own target dir, never release-stamped (the e2e feature refuses to
+  # compile then), never packaged: the artifact isn't dist-*.
+  windows-update-builds:
+    needs: [workflows, release-policy]
+    if: >-
+      ${{ !cancelled() && needs.workflows.result == 'success'
+      && needs.workflows.outputs.previews != 'false'
+      && (needs.release-policy.result == 'skipped'
+          || (needs.release-policy.result == 'success' && needs.release-policy.outputs.release != 'true')) }}
+    runs-on: windows-2025
+    timeout-minutes: 50
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.1
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: windows-update-e2e
+          workspaces: '. -> target-e2e'
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build the e2e update test launchers and stand-in UIs
+        timeout-minutes: 45
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo fetch --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $out = Join-Path $env:RUNNER_TEMP 'windows-update-e2e-builds'
+          New-Item -ItemType Directory $out | Out-Null
+          $rel = 'target-e2e\x86_64-pc-windows-msvc\release'
+          foreach ($v in '1.0.0', '1.0.1') {
+            # Test-only workspace version in this throwaway checkout; Cargo.lock follows offline.
+            $toml = [IO.File]::ReadAllText('Cargo.toml')
+            $set = $toml -replace '(?m)^(\[workspace\.package\]\r?\nversion = )"[^"]+"', "`${1}`"$v`""
+            if ($set -eq $toml) { throw "cannot set the workspace version to $v" }
+            [IO.File]::WriteAllText('Cargo.toml', $set, [Text.UTF8Encoding]::new($false))
+            cargo build --offline --release --target x86_64-pc-windows-msvc --target-dir target-e2e -p metro-desktop `
+              --features e2e-test-release --bin metro-desktop --bin metro-ui-stub --example msi_update_ui
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Copy-Item "$rel\metro-desktop.exe" (Join-Path $out "launcher-$v.exe")
+          }
+          Copy-Item "$rel\metro-ui-stub.exe" (Join-Path $out 'metro-ui-stub.exe')
+          Copy-Item "$rel\examples\msi_update_ui.exe" (Join-Path $out 'msi_update_ui.exe')
+          git checkout -- Cargo.toml Cargo.lock
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem $out | Format-Table Name, Length
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-update-e2e-builds
+          path: ${{ runner.temp }}/windows-update-e2e-builds/
+          if-no-files-found: error
+          retention-days: 3
+
   # Build and package everything a release would ship, but publish nothing:
   # pull requests and main pushes that change a build input (the `previews`
   # segment), and every PR to another branch, but never a release run.
   # Unknown or unreadable diffs still build. No macOS builds for now (see release.yml).
   # No secrets and contents: read only (release.yml's whole tree stays read-only).
+  # It waits for windows-update-builds (windows-distribution.yml's `updates`
+  # job runs those builds); a failed build fails that job, it skips nothing.
   package-smoke:
-    needs: [workflows, release-policy]
+    needs: [workflows, release-policy, windows-update-builds]
     if: >-
       ${{ !cancelled() && needs.workflows.result == 'success'
       && needs.workflows.outputs.previews != 'false'
