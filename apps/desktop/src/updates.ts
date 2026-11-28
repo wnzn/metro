@@ -34,7 +34,7 @@ const channels = ["release", "preview", "source"] as const;
 const installs = ["linux-installer", "windows-script", "windows-msi", "portable", "unsupported"] as const;
 const results = ["never", "up_to_date", "available", "error"] as const;
 const outcomes = ["updated", "rolled_back", "install_failed", "not_confirmed"] as const;
-const installFailures = ["installer_busy", "stage_verification_failed", "backup_failed"] as const;
+const installFailures = ["installer_busy", "stage_verification_failed", "backup_failed", "installer_cancelled", "installer_failed"] as const;
 export const JOURNAL_UNCERTAIN = "update_journal_unknown";
 const DISMISSED_OUTCOME = "metro.update.dismissedOutcome";
 
@@ -86,9 +86,10 @@ function parseState(value: unknown): UpdateState {
     throw new UpdateBridgeError("protocol");
   }
   const canCheck = channel === "release" && install !== "unsupported" && v.can_check;
-  // Belt and braces: Windows always stays manual, independent of flags.
-  const canUpdateInApp = platform.name === "linux" && canCheck && install === "linux-installer"
-    && v.can_update_in_app && v.reason !== "manual_migration_required";
+  const managedInstall = (platform.name === "linux" && install === "linux-installer")
+    || (platform.name === "windows" && (install === "windows-script" || install === "windows-msi"));
+  const canUpdateInApp = managedInstall && canCheck && v.can_update_in_app
+    && v.reason !== "manual_migration_required" && v.reason !== "manual_update_required";
   const latest = record(v.latest);
   const busy = record(v.busy);
   const progress = record(v.progress);
@@ -251,8 +252,8 @@ export function createDesktopUpdates(endpoint: BridgeEndpoint | null, storage: P
       if (s.phase === "idle") notice.set("Download cancelled. No update was installed.");
       if (s.phase === "ready") notice.set("The update was already prepared. You can leave it for later.");
     }
-    // The bridge has no trial flag in GET. Only this install kind can be
-    // launched in trial mode. POST is a no-op on its normal launches.
+    // GET doesn't report trial or MSI commit state. The launcher decides
+    // whether this rendered-start signal completes an update.
     if (started && !healthSent && s.canUpdateInApp) {
       healthSent = true;
       void bridge?.started().catch(() => {}); // A failed signal is not startup success; the watchdog decides.
