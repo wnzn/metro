@@ -26,6 +26,7 @@
 
 #[cfg(unix)]
 mod macos;
+mod msi;
 mod update;
 
 use std::path::{Path, PathBuf};
@@ -308,6 +309,8 @@ async fn launch(
     update::gate_msi_at_start(root).map_err(start_failed)?;
     if trial.is_none() {
         update::recover_at_start(dir, root, lock.as_deref()).map_err(start_failed)?;
+        // [msi lane] an unfinished in-app MSI update
+        msi::recover_at_start(root, lock.as_deref()).map_err(start_failed)?;
     }
 
     // Updates: primary instance only. Startup above reconciles safe
@@ -512,6 +515,10 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     let mode = update::mode();
+    // [msi lane] the MSI update helper does none of the launcher's setup.
+    if let update::Mode::Helper(id) = &mode {
+        return ExitCode::from(msi::run_helper(id));
+    }
     if mode == update::Mode::LegacyHelper {
         fatal(
             "In-app MSI updates are no longer supported. Use a verified manual installer; any existing backup was kept.",
@@ -542,6 +549,15 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // [msi lane] an in-app MSI update may still be installing.
+    match msi::preflight(&root) {
+        msi::Gate::Continue => {}
+        msi::Gate::QuietExit => return ExitCode::SUCCESS,
+        msi::Gate::Fatal(msg) => {
+            fatal(&format!("Metro can't start: {msg}"));
+            return ExitCode::from(1);
+        }
+    }
     let events = Events::new(&root);
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

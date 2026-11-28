@@ -11,6 +11,15 @@ publish = false
 name = "metro-desktop"
 path = "src/main.rs"
 
+# The stand-in UI for the native MSI update tests (never shipped).
+[[example]]
+name = "msi_update_ui"
+path = "examples/msi_update_ui.rs"
+
+[features]
+# End-to-end test builds only (packaging/windows-msi/test-msi-update.ps1).
+e2e-test-release = ["metro-connector/e2e-test-release"]
+
 # Every version below is one Cargo.lock already resolves.
 [dependencies]
 metro-connector = { path = "../connector" }
@@ -27,3 +36,4 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [dev-dependencies]
 serde_json = "1.0.150"
+tempfile = "3.27.0"

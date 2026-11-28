@@ -32,6 +32,7 @@ use serde_json::{Value, json};
 
 pub mod apply;
 pub mod install;
+pub mod msi;
 
 pub use install::{InstallKind, Journal};
 
@@ -92,6 +93,9 @@ pub enum InstallFailure {
     InstallerBusy,
     StageVerificationFailed,
     BackupFailed,
+    // [msi lane] Windows Installer outcomes (never block a retry).
+    InstallerCancelled,
+    InstallerFailed,
 }
 
 impl LastUpdate {
@@ -276,10 +280,24 @@ impl UpdaterConfig {
         trial: Option<String>,
     ) -> Option<UpdaterConfig> {
         let own = Version::parse(env!("CARGO_PKG_VERSION"))?;
-        let channel = Channel::current();
+        let (channel, test) = test_release();
         let kind = install::detect(install_dir, &own, channel, trial.as_deref());
         let dir = desktop_root.join("update");
         crate::desktop::store::prepare_private_dir(&dir).ok()?;
+        if let Some((source, verifier)) = test {
+            return Some(UpdaterConfig {
+                dir,
+                install_dir: install_dir.to_path_buf(),
+                own,
+                channel,
+                kind,
+                source,
+                verifier,
+                trial,
+                ldd: PathBuf::from("ldd"),
+                trust: None,
+            });
+        }
         let trust = Arc::new(
             metro_release::trust_refresh::TrustRefresh::new(&dir.join("trust-cache")).ok()?,
         );
@@ -297,6 +315,20 @@ impl UpdaterConfig {
             trust: Some(trust),
         })
     }
+}
+
+pub type TestRelease = (Source, Arc<dyn ReleaseVerifier>);
+
+/// This build's channel, and in an e2e test build (feature
+/// `e2e-test-release`, never in a release build) with
+/// `METRO_TEST_RELEASE_BASE` set, the loopback fixture source and test
+/// verifier (it then counts as a release build, like the server's).
+pub fn test_release() -> (Channel, Option<TestRelease>) {
+    #[cfg(feature = "e2e-test-release")]
+    if let Some((source, verifier)) = metro_release::e2e::release_source() {
+        return (Channel::Release, Some((source, Arc::from(verifier))));
+    }
+    (Channel::current(), None)
 }
 
 pub struct Updater {
@@ -355,6 +387,8 @@ fn blocked_stage(status: &Status, own: Version, target: Version) -> bool {
 
 fn supports_managed_update(kind: &InstallKind) -> bool {
     matches!(kind, InstallKind::LinuxInstaller { root } if metro_release::installer_lock::migrated(root, install::MARKER))
+        // [msi lane] a registered per-user MSI install
+        || matches!(kind, InstallKind::WindowsMsi { .. })
 }
 
 fn latest_info(
@@ -601,9 +635,7 @@ impl Updater {
             (_, InstallKind::LinuxInstaller { .. }) if !self.can_update_in_app() => {
                 Some("manual_migration_required")
             }
-            (_, InstallKind::WindowsMsi { .. } | InstallKind::WindowsScript { .. }) => {
-                Some("manual_update_required")
-            }
+            (_, InstallKind::WindowsScript { .. }) => Some("manual_update_required"),
             _ => None,
         };
         let mut v = json!({
@@ -654,9 +686,6 @@ impl Updater {
         }
         if let Some(u) = &inner.status.last_update {
             v["last_update"] = serde_json::to_value(u).unwrap_or(Value::Null);
-        }
-        if matches!(self.cfg.kind, InstallKind::WindowsMsi { .. }) {
-            v["msi_note"] = "manual_update_required".into();
         }
         v
     }
@@ -1253,6 +1282,10 @@ impl Updater {
 
     /// `POST /v1/update/started`: the UI rendered (trial health signal).
     pub fn started(&self) -> bool {
+        // [msi lane] dispatch hook
+        if matches!(self.cfg.kind, InstallKind::WindowsMsi { .. }) {
+            return self.msi_started();
+        }
         let Some(id) = &self.cfg.trial else {
             return false;
         };

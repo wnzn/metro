@@ -13,12 +13,17 @@ use metro_connector::desktop::update::{ApplyRequest, InstallFailure, Updater};
 pub enum Mode {
     Normal,
     Trial(String),
+    /// [msi lane] `--update-helper <id>`: see `crate::msi`.
+    Helper(String),
     LegacyHelper,
 }
 
 pub fn mode() -> Mode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
+        [flag, id] if flag == "--update-helper" && install::valid_id(id) => {
+            Mode::Helper(id.clone())
+        }
         [flag, ..] if flag == "--update-helper" => Mode::LegacyHelper,
         [flag, id] if flag == "--update-trial" && install::valid_id(id) => Mode::Trial(id.clone()),
         [flag, ..] if flag == "--update-trial" => Mode::Trial(String::new()),
@@ -31,7 +36,7 @@ pub enum After {
     Relaunch,
 }
 
-fn recovery_message(code: &str, reason: &str) -> String {
+pub(crate) fn recovery_message(code: &str, reason: &str) -> String {
     let mut message = format!(
         "[{code}] {reason}\n\
          Stop Metro, its bundled server and any Metro installer. Keep the installation and workspace data, \
@@ -72,6 +77,10 @@ pub async fn apply(
     desktop_root: &Path,
     instance_lock: Arc<InstanceLock>,
 ) -> After {
+    // [msi lane] dispatch hook
+    if crate::msi::is_msi(updater) {
+        return crate::msi::apply(updater, req, desktop_root, instance_lock).await;
+    }
     let InstallKind::LinuxInstaller { root } = updater.kind().clone() else {
         return After::Relaunch;
     };
