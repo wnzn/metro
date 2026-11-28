@@ -1789,6 +1789,7 @@ dependencies = [
  "metro-url-policy",
  "serde",
  "serde_json",
+ "socket2",
  "tempfile",
  "ureq",
 ]

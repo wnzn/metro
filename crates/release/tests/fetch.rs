@@ -202,9 +202,10 @@ fn rate_limit_is_reported_with_its_wait() {
 
 #[test]
 fn offline_is_offline() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
+    // Reserve the port without listening so another fixture cannot take it.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let base = format!("http://{}", socket.local_addr().unwrap());
     let fetcher = AsyncFetcher::new(
         Source::loopback_fixture(&base).unwrap(),
         Duration::from_secs(5),
