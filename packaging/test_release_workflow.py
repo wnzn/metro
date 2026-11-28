@@ -40,6 +40,7 @@ E2E_RELEASE_MARKERS = ("e2e-test-release", "metro-release/e2e", "--all-features"
                        "METRO_TEST_RELEASE_", "METRO_TEST_CRASH_VERSION",
                        "metro-update-e2e-target")
 E2E_RELEASE_WORKFLOW_MARKERS = E2E_RELEASE_MARKERS + ("tests/e2e/updates.py",)
+NATIVE_UPDATE_E2E = ROOT / "packaging/windows_update_e2e.py"
 
 
 def load(name):
@@ -113,6 +114,13 @@ class E2eTestHooksNeverShipTests(unittest.TestCase):
                 continue
             text = path.read_text(encoding="utf-8")
             markers = E2E_RELEASE_WORKFLOW_MARKERS if path.parent == WF else E2E_RELEASE_MARKERS
+            if path == NATIVE_UPDATE_E2E:
+                # It runs e2e builds made elsewhere (its docstring says how),
+                # pointing them at its fixture; it never builds anything.
+                text = text.split('"""', 2)[2]
+                self.assertNotIn("cargo", text)
+                self.assertIn('"METRO_TEST_RELEASE_BASE": f"http://127.0.0.1:', text)
+                markers = tuple(m for m in markers if m != "METRO_TEST_RELEASE_")
             for needle in markers:
                 self.assertNotIn(needle, text, f"{path.name} mentions {needle}")
 
