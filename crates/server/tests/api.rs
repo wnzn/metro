@@ -355,6 +355,17 @@ impl MockModel {
     }
 }
 
+/// A loopback address where connections are refused: a socket bound but
+/// never listening. Keep the socket for the whole test. Binding and dropping
+/// a listener instead frees the port, and a mock model that another test
+/// starts at the same moment can get it and answer this test's requests.
+fn refused_port() -> (tokio::net::TcpSocket, std::net::SocketAddr) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = socket.local_addr().unwrap();
+    (socket, addr)
+}
+
 fn tool_names(request: &Value) -> Vec<String> {
     request["tools"]
         .as_array()
@@ -1426,13 +1437,10 @@ async fn interleaved_turns_in_one_room_keep_their_own_activity() {
 #[tokio::test]
 async fn a_failed_turn_ends_failed_and_a_refused_one_never_starts() {
     // A model that is not there: the run starts, then fails.
-    let dead = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        format!("http://{}/v1", l.local_addr().unwrap())
-    };
+    let (_dead, dead) = refused_port();
     let s = Server::start(
         config(Some(ModelConfig {
-            base_url: dead,
+            base_url: format!("http://{dead}/v1"),
             model: "mock".into(),
             api_key: "test-key".into(),
         })),
