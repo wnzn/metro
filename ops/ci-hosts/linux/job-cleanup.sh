@@ -3,13 +3,14 @@
 # Persists only: actions-runner, ~/.rustup (toolchains), ~/.cargo registry/git download
 # caches and rustup proxies, ~/.ssh, the rootless Docker daemon's config and data
 # (~/.config/{docker,systemd}, ~/.local/share/docker: pulled images and build cache,
-# capped below). Containers, volumes, networks and CLI config (~/.docker, registry
-# logins) go. /tmp and /var/tmp are the unit's private ones. Hygiene only: jobs run as
+# capped below) and the runner's ~/.config/GitHub cache. Containers, volumes,
+# networks and CLI config (~/.docker, registry logins) go. /tmp and /var/tmp are the unit's private ones. Hygiene only: jobs run as
 # the same user and could edit this file.
 set -u
 phase="${1:-completed}"
 home="${METRO_CI_TEST_HOME:-/home/metro-ci}"
 runner="$home/actions-runner"
+export DOCKER_HOST="${DOCKER_HOST:-unix:///run/user/$(id -u)/docker.sock}"
 
 wipe() { [ -d "$1" ] && find "$1" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null; return 0; }
 prune_dir() {  # prune_dir DIR "names to keep"
@@ -32,7 +33,7 @@ if [ -z "${METRO_CI_TEST_HOME:-}" ] && command -v docker >/dev/null; then
 fi
 
 prune_dir "$home" "actions-runner .rustup .cargo .ssh .config .local"
-prune_dir "$home/.config" "docker systemd"
+prune_dir "$home/.config" "docker systemd GitHub"   # GitHub: the runner's service-location cache
 prune_dir "$home/.local" "share"
 prune_dir "$home/.local/share" "docker"
 if [ -d "$home/.cargo" ]; then
