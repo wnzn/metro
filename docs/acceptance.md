@@ -6,37 +6,57 @@ hasn't been demonstrated.
 ## Source only: Metro 0.6.5 (2026-11-28, GitHub CI and local)
 
 In the source, not released. See [what changed](next-source.md).
+`release/065` at `43023f7` (version 0.6.5). Neither CI run below
+contains the self-hosted CI lane (`lane/065-ci`: self-hosted runner
+selection, the macOS arm64 archive, bookworm-built Linux binaries) or
+the port fixes (`ac7a975`, `43f3d01`); no CI run of `release/065` is
+recorded.
 
 - **Native Windows CI:** all required checks passed on
-  [PR #26](https://github.com/wnzn/metro/pull/26) in
-  [run 46134350031](https://github.com/wnzn/metro/actions/runs/46134350031).
-  All script/ZIP update end-to-end scenarios passed. The MSI update harness
-  passed 79 checks: `update`, `failure-retry`, `helper-killed` and
-  `helper-msiexec-killed` for the current user; `update` and
-  `failure-retry` for a standard user. Native unit tests also passed,
-  including journal sharing and the POSIX rename fallback.
+  [PR #26](https://github.com/wnzn/metro/pull/26) at `cd78e6d` in
+  [run 46134350031](https://github.com/wnzn/metro/actions/runs/46134350031),
+  on GitHub-hosted `windows-2025`. All seven script-install update
+  end-to-end scenarios passed (`windows_update_e2e.py`: a 0.4.0 script
+  install migrated, the installer lock, 1.0.0 → 1.0.1, stale-start
+  forwarding, rollback from a broken 1.0.2, Status and Uninstall). The MSI
+  update harness passed 79 checks with 0 failures: `update`,
+  `failure-retry`, `helper-killed` and `helper-msiexec-killed` for the
+  current user; `update` and `failure-retry` for a standard user. Native
+  unit tests also passed, including the update-state and MSI-journal
+  sharing tests and the POSIX-semantics replace (`win_rename`).
 - **Main push:** [run 46148980109](https://github.com/wnzn/metro/actions/runs/46148980109)
-  failed in the Rust job. One test released an ephemeral port to simulate
-  an offline model, and another test's mock model acquired the port and
-  recorded the offline test's request before its own. The first request
-  had no workspace tools, so the tool-loop test's assertion failed.
-  `ac7a975` fixes the two server tests by holding bound sockets that never
-  listen. The two follow-up stress loops had 0 failures in 200 and 240
-  iterations respectively; `metro-server` passed 809 tests. The equivalent
-  release-fetcher and runner HTTP fixtures now also hold their ports.
+  (merge `72f59be`) failed in the Rust job only:
+  `ask_agent_runs_the_rig_tool_loop_through_the_space_runner`. Another
+  test released an ephemeral port to simulate an offline model; the
+  tool-loop test's mock model got that port and recorded the offline
+  test's request first. That request had no workspace tools, so the
+  tool-loop assertion failed. `ac7a975` fixes the two server tests (in
+  `api.rs` and `updates.rs`) by holding bound sockets that never listen,
+  for the whole test; `43f3d01` does the same for the release-fetcher and
+  runner HTTP fixtures.
 - **Self-hosted CI:** `metro-ci-linux-docker` and `metro-ci-macos-arm64`
-  were registered; neither had taken a real workflow job at this gate.
-- **Local Linux:** `cargo fmt --check` and
-  `cargo clippy --workspace --all-targets -- -D warnings` passed.
-  `cargo test --locked --workspace` with
-  `METRO_SERVER_BIN=$CARGO_TARGET_DIR/debug/metro-server`:
-  1,382 passed, 0 failed, 3 ignored.
-  `python3 -m unittest discover -s packaging`: 275 passed, 23 skipped.
+  are registered and online. Neither run above contains the workflows
+  that select them, so no job on either is recorded. (The `desktop` job in
+  both runs used the older `metro-ci-linux-x64` runner.)
+- **Local Linux, at `43023f7`:** `cargo fmt --all --check` and
+  `cargo clippy --locked --workspace --all-targets -- -D warnings`
+  passed. `cargo test --locked --workspace` with
+  `METRO_SERVER_BIN=$CARGO_TARGET_DIR/debug/metro-server`: 1,382 passed,
+  0 failed, 3 ignored (`metro-server` alone: 809 passed, 1 ignored).
+  `python3 -m unittest discover -s packaging`: 298 run, 275 passed,
+  23 skipped. Stress loops: `metro-server` `--test api --test updates`
+  100 times with 0 failures; `metro-release --test fetch` with
+  `metro-runner --test runner_http` 30 times with 0 failures.
+- Review: Opus 5.5. It corrected this entry: it now names the commits
+  each CI run tested, and it replaces stress-loop counts that weren't
+  recorded with its own reruns. It found no code issues in `43f3d01` or
+  the version bump. No second review has been recorded.
 
 **Not verified:** native Windows by a person, an update from a real
 Sigstore-signed release, the MSI kill scenarios' stay-on-old and
 stop-safely recovery paths in native end-to-end runs (covered by unit
-tests only), or a macOS app launch on the Mac runner.
+tests only), any CI run of the macOS arm64 archive or on either
+self-hosted runner, or a macOS app launch on the Mac runner.
 
 ## Source only: self-hosted CI runners and an ad hoc Apple-silicon build (2026-11-28, CI lane, local)
 
