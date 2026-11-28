@@ -137,11 +137,17 @@ function Read-Ui([string] $Dir) {
 }
 
 # The app replaces or removes these files while the test reads them: a file
-# that is gone between the check and the read counts as absent.
+# that is gone counts as absent; one the app holds open is read again (a
+# sharing violation is never taken as absent).
 function Read-JsonFile([string] $Path) {
-    try { $raw = [IO.File]::ReadAllText($Path) }
-    catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] { return $null }
-    return $raw | ConvertFrom-Json
+    for ($i = 0; ; $i++) {
+        try { return [IO.File]::ReadAllText($Path) | ConvertFrom-Json }
+        catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] { return $null }
+        catch [IO.IOException] {
+            if ($i -ge 100) { throw }
+            Start-Sleep -Milliseconds 50
+        }
+    }
 }
 
 function Get-Journal([string] $DesktopHome) {
