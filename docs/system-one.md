@@ -343,6 +343,8 @@ was visible to another member 1–2 ms after the POST, against about
 When a runner's shell mode is **Ask when System One flags it**
 (`classify`), each `workspace.shell` command gets one System One Choice
 before it runs. See [Shell policy](runner.md#shell-policy).
+The [0.6.4 agent tool migration](released-0.6.4.md) doesn't change
+this policy.
 
 - The question is `shell_risk`, with the keyed options `safe` and
   `unsafe`. *Safe* means a low risk of damage or data exposure, not only

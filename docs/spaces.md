@@ -140,8 +140,7 @@ A Space has one or more **agents**, at most 16. Each has:
   `default_tools`: a new Space's default agent and agents created without
   `tools` get them. Every agent stores its list, so in 0.6.3 agents
   created before it keep their saved list and don't gain them.
-  In the source, not released (0.6.4): once, when the server first
-  starts on that version, it adds `workspace.write` and
+  On the first startup in 0.6.4, the server adds `workspace.write` and
   `workspace.shell` (whichever is missing) to every saved list that
   holds all five earlier default runner tools, `workspace.list`,
   `workspace.read`, `workspace.check`, `workspace.mcp_list` and

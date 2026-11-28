@@ -1,6 +1,6 @@
 # Metro desktop
 
-See [New in Metro 0.6.3](../../docs/released-0.6.3.md) for the published
+See [New in Metro 0.6.4](../../docs/released-0.6.4.md) for the latest published
 features or [In the source, not released](../../docs/next-source.md) for later work.
 
 The Metro desktop client, written in TSX on [Native Shell (NSH)](https://nsh.dev).
@@ -11,8 +11,8 @@ and Win32 on Windows. No npm or Node is needed to build or run it.
 
 Download the build for your system from
 [Releases](https://github.com/wnzn/metro/releases). The latest is
-[Metro 0.6.3](https://github.com/wnzn/metro/releases/tag/v0.6.3)
-([what was checked](../../docs/acceptance.md#published-metro-063-2026-11-27-github-release-v063)).
+[Metro 0.6.4](https://github.com/wnzn/metro/releases/tag/v0.6.4)
+([what was checked](../../docs/acceptance.md#published-metro-064-2026-11-28-github-release-v064)).
 Local checks cited here ran on local builds, not on the release files.
 You never need NSH, a
 checkout or a terminal to use the app; the build commands further down are
@@ -652,7 +652,7 @@ contributors only, in
 
 ## Windows portable package
 
-The release file is `Metro-0.6.3-windows-x64.zip`, a portable build with
+The release file is `Metro-0.6.4-windows-x64.zip`, a portable build with
 no installer.
 Release ZIPs ship without an Authenticode signature for now
 ([install.md](../../docs/install.md#desktop-on-windows)). No native Windows

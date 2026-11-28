@@ -23,9 +23,9 @@ for earlier features.
   Space's default agent, get them unless their owner picks a list.
   Agents created before 0.6.3 keep their saved list; a Space owner adds the
   tools to them.
-  In the source, not released (0.6.4): a one-time startup migration
-  adds them to saved lists that still hold all five earlier default
-  runner tools ([details](next-source.md)).
+  In 0.6.4, a one-time startup migration adds either tool if missing
+  from a saved list that holds all five earlier default runner tools
+  ([details](released-0.6.4.md)).
 - **Shell policy.** Each runner has a shell mode: **Off**, **Ask every
   time** (the default), **Ask when System One flags it** or **Always
   allow**, and who approves: the runner's owner (the default; **Org
@@ -72,4 +72,4 @@ chosen folder hasn't been checked on a real Windows machine.
 
 For the API, see [Shell policy API](runners.md#shell-policy-api).
 
-Later changes are [in the source, not released](next-source.md).
+The [0.6.4 changes](released-0.6.4.md) came in the next release.

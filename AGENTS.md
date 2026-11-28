@@ -37,7 +37,7 @@ don't affect which model Metro calls at runtime.
 ## Rules
 
 The rules below describe the current source. For the published changes,
-see [New in Metro 0.6.3](docs/released-0.6.3.md); for later changes, see
+see [New in Metro 0.6.4](docs/released-0.6.4.md); for later changes, see
 [In the source, not released](docs/next-source.md).
 
 - Stay inside the files you were assigned. Don't edit another lane's files;
@@ -143,7 +143,7 @@ see [New in Metro 0.6.3](docs/released-0.6.3.md); for later changes, see
   path, `..`, symlink anywhere in the path or hard link. It never needs
   approval. Write and shell are in `default_tools`: new agents and agents
   created without a list get them. Every agent stores its list. A
-  one-time startup migration (0.6.4, in the source, not released) adds
+  one-time startup migration in 0.6.4 adds
   whichever of write and shell is missing to every saved list that
   holds all five pre-0.6.3 defaults (`workspace.list`, `.read`,
   `.check`, `.mcp_list`, `.mcp`), keeping every existing entry and
@@ -550,14 +550,16 @@ see [New in Metro 0.6.3](docs/released-0.6.3.md); for later changes, see
     Documents & media gate (497 Rust tests, the 83 hardened media-service
     tests, `nsh test` 106/106) and the earlier 403-test gate are historical
     milestones.
-  - **Metro 0.6.3 is published**: stable GitHub release `v0.6.3`
-    (2026-11-27T21:39:56Z), tag on `f5c0cf2` (PR #22), made by CI run
-    46065803816, with 18 assets, Sigstore-signed `SHA256SUMS`, unsigned
-    Windows files and signed GHCR images (see [release record](docs/acceptance.md#published-metro-063-2026-11-27-github-release-v063)).
+  - **Metro 0.6.4 is published**: stable GitHub release `v0.6.4`
+    (2026-11-28T01:51:42Z), tag on `ddbfe42` (PR #24), made by CI run
+    46090688619, with 18 assets, Sigstore-signed `SHA256SUMS`, unsigned
+    Windows files and signed GHCR images (see [release record](docs/acceptance.md#published-metro-064-2026-11-28-github-release-v064)).
     Native Windows by a person, real vendor accounts and real sign-ins
-    remain unverified. [0.6.3 work](docs/released-0.6.3.md) is
-    released; [0.6.4 work](docs/next-source.md) is not.
-  - The previous release was [Metro 0.6.2](docs/acceptance.md#published-metro-062-2026-11-27-github-release-v062)
+    remain unverified. [0.6.4 work](docs/released-0.6.4.md) is
+    released; [0.6.5 work](docs/next-source.md) is not.
+  - The previous release was [Metro 0.6.3](docs/acceptance.md#published-metro-063-2026-11-27-github-release-v063)
+    (`v0.6.3` on `f5c0cf2`, CI run 46065803816), and before it
+    [Metro 0.6.2](docs/acceptance.md#published-metro-062-2026-11-27-github-release-v062)
     (`v0.6.2` on `3c0e4d1`, CI run 45980066265), and before it
     [Metro 0.6.1](docs/acceptance.md#published-metro-061-2026-11-27-github-release-v061)
     (`v0.6.1` on `5384e8a`, CI run 45949761195), and before it
@@ -589,23 +591,23 @@ see [New in Metro 0.6.3](docs/released-0.6.3.md); for later changes, see
   sidecar next to the desktop app. Source builds live only in
   [docs/development.md](docs/development.md). Docs point to the published
   release by the names and URLs recorded in `docs/acceptance.md`: the
-  current one is **Metro 0.6.3**
-  (https://github.com/wnzn/metro/releases/tag/v0.6.3, tag `v0.6.3` on
-  `f5c0cf2`), with `Metro-0.6.3-linux-x64.tar.gz`,
-  `Metro-0.6.3-windows-x64.zip`,
-  `Metro-0.6.3-windows-x64.unsigned-preview.msi`,
-  `Metro-runner-0.6.3-linux-x64.tar.gz` (each with `.sha256`), the
+  current one is **Metro 0.6.4**
+  (https://github.com/wnzn/metro/releases/tag/v0.6.4, tag `v0.6.4` on
+  `ddbfe42`), with `Metro-0.6.4-linux-x64.tar.gz`,
+  `Metro-0.6.4-windows-x64.zip`,
+  `Metro-0.6.4-windows-x64.unsigned-preview.msi`,
+  `Metro-runner-0.6.4-linux-x64.tar.gz` (each with `.sha256`), the
   installer scripts, `SHA256SUMS` with its Sigstore bundle, `IMAGES.txt`,
-  and the images `ghcr.io/wnzn/metro-server:v0.6.3`,
-  `ghcr.io/wnzn/metro-runner:v0.6.3` and
-  `ghcr.io/wnzn/metro-embeddinggemma2:v0.6.3` (pinned by digest). Windows
+  and the images `ghcr.io/wnzn/metro-server:v0.6.4`,
+  `ghcr.io/wnzn/metro-runner:v0.6.4` and
+  `ghcr.io/wnzn/metro-embeddinggemma2:v0.6.4` (pinned by digest). Windows
   files are **unsigned** (no Authenticode). Docs never present source
   that came after a release's commit as part of that release; label it
   "in the source, not released". A newer release is named in docs only
   once its publication is recorded in `docs/acceptance.md`. The desktop app's **Use locally**
   runs a bundled local server with no token, and its owner-only, per-Space,
   read-only local tools (`workspace.list`/`workspace.read`, still list
-  and read only in 0.6.3) never stand in
+  and read only in 0.6.4) never stand in
   for an operator's separately installed runner or for the app's built-in
   runner. It and the other features
   checked in the 0.2.0 Linux candidate are described as verified in that
