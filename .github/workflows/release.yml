@@ -297,8 +297,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked --release --target x86_64-pc-windows-msvc -p metro-desktop
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          # In-app updates: the script install's instance-lock handoff and the MSI update's Windows facts.
-          cargo test --locked --release --target x86_64-pc-windows-msvc -p metro-connector --lib -- desktop::store::handoff_tests desktop::update::msi
+          # In-app updates: the script install's instance-lock handoff, the MSI update's Windows facts,
+          # and update state replaced or deleted while another start holds it.
+          cargo test --locked --release --target x86_64-pc-windows-msvc -p metro-connector --lib -- desktop::store::handoff_tests desktop::update::msi desktop::update::install::state_share_tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --release --target x86_64-pc-windows-msvc -p metro-release --lib -- win_rename
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test OpenAI sign-in and credential storage on native Windows (deterministic fixtures)
         run: |

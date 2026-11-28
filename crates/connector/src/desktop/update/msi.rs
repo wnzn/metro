@@ -181,7 +181,7 @@ pub fn journal_path(update_dir: &Path) -> PathBuf {
 }
 
 pub fn load(update_dir: &Path) -> io::Result<Option<MsiJournal>> {
-    let f = match install::open_input(&journal_path(update_dir)) {
+    let f = match install::open_state(&journal_path(update_dir)) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
@@ -668,7 +668,7 @@ pub(super) fn stage(
 pub(super) fn staged(update_dir: &Path) -> Option<(Version, String)> {
     let j = load(update_dir).ok().flatten()?;
     (j.phase == Phase::Staged
-        && install::open_input(&stage_dir(update_dir, &j.id).join(PACKAGE)).is_ok())
+        && install::open_state(&stage_dir(update_dir, &j.id).join(PACKAGE)).is_ok())
     .then(|| Version::parse(&j.to).map(|v| (v, j.id)))
     .flatten()
 }

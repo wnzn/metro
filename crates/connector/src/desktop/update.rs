@@ -343,7 +343,7 @@ fn read_json<T: for<'de> Deserialize<'de>>(
     limit: usize,
 ) -> std::io::Result<Option<T>> {
     use std::io::{ErrorKind, Read};
-    let f = match install::open_input(path) {
+    let f = match install::open_state(path) {
         Ok(f) => f,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
