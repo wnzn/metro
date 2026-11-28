@@ -7,6 +7,11 @@
 //! rename). The journal `<root>/.update.json` is written before every step,
 //! so a crash at any point ends consistent at the next start.
 //!
+//! A Windows script install also has a stable entry point, `<root>\Metro.exe`
+//! (a copy of the launcher), which the Start menu shortcut and the
+//! Installed-apps entry name. It only starts `versions\<current>\Metro.exe`
+//! and exits, so no running program blocks replacing a version.
+//!
 //! MSI installs keep their journal in `<desktop_root>/update/journal.json`;
 //! the MSI's own transaction replaces the files.
 
@@ -81,6 +86,18 @@ impl InstallKind {
     }
 }
 
+/// A script install whose installer locks were migrated (the marker holds
+/// [`metro_release::installer_lock::MIGRATION`]): the app may stage, try,
+/// commit and roll back updates in it.
+pub fn managed(kind: &InstallKind) -> bool {
+    match kind {
+        InstallKind::LinuxInstaller { root } | InstallKind::WindowsScript { root } => {
+            metro_release::installer_lock::migrated(root, MARKER)
+        }
+        _ => false,
+    }
+}
+
 /// Classify the running launcher's folder. In a trial start (`trial` is the
 /// journal id), the pointer still names the previous version; the journal
 /// vouches for this one.
@@ -142,10 +159,7 @@ pub fn detect(
 /// `current.txt`).
 pub fn read_pointer(root: &Path) -> Option<String> {
     if cfg!(windows) {
-        let raw = read_evidence_file(&root.join("current.txt"), 128).ok()?;
-        let raw = std::str::from_utf8(&raw).ok()?;
-        let v = raw.trim().to_string();
-        Version::parse(&v).map(|_| v)
+        read_text_pointer(root)
     } else {
         let link = fs::read_link(root.join("current")).ok()?;
         let rest = link.strip_prefix("versions").ok()?;
@@ -154,13 +168,23 @@ pub fn read_pointer(root: &Path) -> Option<String> {
     }
 }
 
+/// The Windows pointer, `current.txt`: one version, optional whitespace.
+pub fn read_text_pointer(root: &Path) -> Option<String> {
+    let raw = read_evidence_file(&root.join(TEXT_POINTER), 128).ok()?;
+    let raw = std::str::from_utf8(&raw).ok()?;
+    let v = raw.trim().to_string();
+    Version::parse(&v).map(|_| v)
+}
+
+pub const TEXT_POINTER: &str = "current.txt";
+
 /// Point the install at `version` with one atomic rename.
 pub fn set_pointer(root: &Path, version: &str) -> io::Result<()> {
     if Version::parse(version).is_none() {
         return Err(io::ErrorKind::InvalidInput.into());
     }
     if cfg!(windows) {
-        write_atomic(&root.join("current.txt"), version.as_bytes())
+        write_atomic(&root.join(TEXT_POINTER), version.as_bytes())
     } else {
         #[cfg(unix)]
         {
@@ -885,9 +909,7 @@ pub fn stage(
     let path = journal_path(kind, update_dir).ok_or_else(|| stage_err("not_in_app"))?;
     let locked_root = lock_root(kind, update_dir);
     let lock = Lock::take(locked_root)?;
-    if !matches!(kind, InstallKind::LinuxInstaller { root }
-        if metro_release::installer_lock::migrated(root, MARKER))
-    {
+    if !managed(kind) {
         return Err(stage_err("not_in_app"));
     }
     let from = own.to_string();
@@ -1328,7 +1350,7 @@ pub fn commit(root: &Path, j: &mut Journal, lock: &Lock) -> io::Result<()> {
     j.phase = JournalPhase::Committing;
     write_journal(&path, j)?;
     set_pointer(root, &j.to)?;
-    move_launch_entry(root, &j.from);
+    move_launch_entry(root, &j.from, &j.to);
     j.phase = JournalPhase::Committed;
     j.outcome = Some("updated".into());
     write_journal(&path, j)
@@ -1356,7 +1378,7 @@ pub fn rollback(
     // The watchdog continuously holds the instance lock. An orphaned
     // bundled server may outlive the launcher in its own process group;
     // the inherited workspace lease, not the launcher's PID, excludes it.
-    let _writer = crate::desktop_local::update_writer_exclusion(desktop_root)?;
+    let _writer = writer_exclusion_after_trial(desktop_root)?;
     j.phase = JournalPhase::RollingBack;
     j.detail = detail;
     write_journal(&path, j)?;
@@ -1373,8 +1395,38 @@ pub fn rollback(
     j.phase = JournalPhase::Failed;
     j.outcome = Some(outcome.into());
     write_journal(&path, j)?;
-    let _ = fs::remove_dir_all(root.join("versions").join(&j.to));
+    remove_tried_version(&root.join("versions").join(&j.to));
     Ok(())
+}
+
+/// The local workspace lease, after the trial was stopped. On Windows the
+/// trial's bundled server ends with the trial's job object, which closes
+/// when the trial ends; give it a moment to let go of the lease. Linux
+/// servers inherit the lease and are never waited for.
+fn writer_exclusion_after_trial(desktop_root: &Path) -> io::Result<fs::File> {
+    #[cfg(windows)]
+    {
+        let started = std::time::Instant::now();
+        loop {
+            match crate::desktop_local::update_writer_exclusion(desktop_root) {
+                Ok(f) => return Ok(f),
+                Err(e) if started.elapsed() > std::time::Duration::from_secs(15) => return Err(e),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(200)),
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    crate::desktop_local::update_writer_exclusion(desktop_root)
+}
+
+/// Windows keeps a just-ended program's files open briefly.
+fn remove_tried_version(dir: &Path) {
+    for _ in 0..if cfg!(windows) { 25 } else { 1 } {
+        if fs::remove_dir_all(dir).is_ok() || !dir.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 }
 
 pub fn ensure_script_transition(root: &Path, j: &Journal, phases: &[&str]) -> io::Result<()> {
@@ -1530,10 +1582,12 @@ fn recover_inner(
 }
 
 /// Linux: rewrite the menu entry when it names the old version's launcher.
-/// Windows: rewrite our own Start-menu shortcut and the uninstall entry.
-fn move_launch_entry(root: &Path, from: &str) {
+/// Windows: refresh the stable entry point and the Installed-apps version.
+/// Neither runs code from either version.
+fn move_launch_entry(root: &Path, from: &str, to: &str) {
     #[cfg(not(windows))]
     {
+        let _ = to;
         let data = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
@@ -1549,9 +1603,213 @@ fn move_launch_entry(root: &Path, from: &str) {
     }
     #[cfg(windows)]
     {
-        // Windows updates are manual. A legacy recovery only moves the
-        // pointer, never runs code from either version to rewrite shortcuts.
-        let _ = (root, from);
+        let _ = from;
+        if entry::present(root)
+            && let Err(e) = entry::refresh(root, to)
+        {
+            // The previous entry still starts the current version.
+            eprintln!("metro-desktop: the Metro.exe entry point was not refreshed: {e}");
+        }
+        if let Err(e) = installed_apps::sync(root, to) {
+            eprintln!("metro-desktop: the Installed apps entry was not changed: {e}");
+        }
+    }
+}
+
+/// The stable entry point of a Windows script install (`<root>\Metro.exe`).
+/// Platform-neutral so its checks run in tests everywhere.
+pub mod entry {
+    use super::*;
+
+    pub fn path(root: &Path) -> PathBuf {
+        root.join(LAUNCHER)
+    }
+
+    pub fn present(root: &Path) -> bool {
+        open_input(&path(root)).is_ok()
+    }
+
+    /// The root this program is the entry point of: it sits directly in a
+    /// marked install folder that has `versions` and `current.txt`.
+    pub fn root_of(exe: &Path) -> Option<PathBuf> {
+        let root = exe.parent()?;
+        (exe.file_name()? == LAUNCHER
+            && fs::symlink_metadata(root.join(MARKER)).is_ok_and(|m| m.is_file())
+            && plain_dir(&root.join("versions"))
+            && fs::symlink_metadata(root.join(TEXT_POINTER)).is_ok_and(|m| m.is_file()))
+        .then(|| root.to_path_buf())
+    }
+
+    /// The launcher of the version `current.txt` names, after the same
+    /// checks a start of that version makes: plain folders, a regular file.
+    pub fn target(root: &Path) -> io::Result<PathBuf> {
+        let bad = || io::Error::new(io::ErrorKind::InvalidData, "the install pointer is invalid");
+        if !plain_dir(root) || !fs::symlink_metadata(root.join(MARKER)).is_ok_and(|m| m.is_file()) {
+            return Err(bad());
+        }
+        let v = read_text_pointer(root).ok_or_else(bad)?;
+        if !version_present(root, &v) {
+            return Err(bad());
+        }
+        Ok(root.join("versions").join(v).join(LAUNCHER))
+    }
+
+    /// A normal start of a version that is not the current one in a managed
+    /// install (an old shortcut or a pin): start the current version
+    /// instead of opening the workspace with old or unconfirmed files.
+    pub fn forward_target(install_dir: &Path, own: &Version) -> Option<PathBuf> {
+        let versions = install_dir.parent()?;
+        let root = versions.parent()?;
+        if versions.file_name()? != "versions"
+            || install_dir.file_name()? != own.to_string().as_str()
+            || !metro_release::installer_lock::migrated(root, MARKER)
+        {
+            return None;
+        }
+        let current = read_text_pointer(root)?;
+        if current == own.to_string() {
+            return None;
+        }
+        target(root).ok()
+    }
+
+    /// Replace the entry point with `versions/<version>`'s launcher (temp
+    /// copy, then one rename). Fails while the entry point runs.
+    pub fn refresh(root: &Path, version: &str) -> io::Result<()> {
+        if Version::parse(version).is_none() || !version_present(root, version) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let source = open_input(&root.join("versions").join(version).join(LAUNCHER))?;
+        let tmp = root.join(format!(".entry-{}.tmp", new_id()));
+        let result = copy_synced(source, &tmp).and_then(|_| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))?;
+            }
+            metro_release::rename_durable(&tmp, &path(root))
+        });
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        result
+    }
+}
+
+/// The per-user Installed-apps entry the Windows installer script writes
+/// (`HKCU\...\Uninstall\dev.metro.desktop`). Changed only when its
+/// `InstallLocation` is this install.
+#[cfg(windows)]
+pub mod installed_apps {
+    use std::io;
+    use std::path::Path;
+
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ, RRF_RT_REG_SZ,
+        RegCloseKey, RegGetValueW, RegOpenKeyExW, RegSetValueExW,
+    };
+
+    const KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\dev.metro.desktop";
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    struct Key(HKEY);
+
+    impl Drop for Key {
+        fn drop(&mut self) {
+            // SAFETY: an open key we own.
+            unsafe {
+                RegCloseKey(self.0);
+            }
+        }
+    }
+
+    fn get(key: &Key, name: &str) -> Option<String> {
+        let name = wide(name);
+        let mut buf = vec![0u16; 2048];
+        let mut len = (buf.len() * 2) as u32;
+        // SAFETY: valid key, NUL-terminated name, sized buffer.
+        let rc = unsafe {
+            RegGetValueW(
+                key.0,
+                std::ptr::null(),
+                name.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        (rc == 0).then(|| {
+            let n = (len as usize / 2).saturating_sub(1).min(buf.len());
+            String::from_utf16_lossy(&buf[..n])
+        })
+    }
+
+    fn set(key: &Key, name: &str, value: &str) -> io::Result<()> {
+        let (name, value) = (wide(name), wide(value));
+        // SAFETY: valid key, NUL-terminated name and data of the given size.
+        let rc = unsafe {
+            RegSetValueExW(
+                key.0,
+                name.as_ptr(),
+                0,
+                REG_SZ,
+                value.as_ptr().cast(),
+                (value.len() * 2) as u32,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+        Ok(())
+    }
+
+    /// The same folder, also when one is spelled with short (8.3) names.
+    fn same_dir(a: &str, b: &Path) -> bool {
+        let norm = |s: &str| s.trim_end_matches(['\\', '/']).to_lowercase();
+        norm(a) == norm(&b.to_string_lossy())
+            || matches!(
+                (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+                (Ok(x), Ok(y)) if x == y
+            )
+    }
+
+    /// Set `DisplayVersion` to `version` (and `DisplayIcon` to the entry
+    /// point when present). `Ok` without a change for another install's
+    /// or no entry.
+    pub fn sync(root: &Path, version: &str) -> io::Result<()> {
+        let path = wide(KEY);
+        let mut raw: HKEY = std::ptr::null_mut();
+        // SAFETY: NUL-terminated subkey and an out pointer.
+        let rc = unsafe {
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                path.as_ptr(),
+                0,
+                KEY_QUERY_VALUE | KEY_SET_VALUE,
+                &mut raw,
+            )
+        };
+        if rc != 0 {
+            return Ok(());
+        }
+        let key = Key(raw);
+        if !get(&key, "InstallLocation").is_some_and(|l| same_dir(&l, root)) {
+            return Ok(());
+        }
+        if get(&key, "DisplayVersion").as_deref() != Some(version) {
+            set(&key, "DisplayVersion", version)?;
+        }
+        if super::entry::present(root) {
+            let icon = super::entry::path(root).to_string_lossy().into_owned();
+            if get(&key, "DisplayIcon").as_deref() != Some(icon.as_str()) {
+                set(&key, "DisplayIcon", &icon)?;
+            }
+        }
+        Ok(())
     }
 }
 

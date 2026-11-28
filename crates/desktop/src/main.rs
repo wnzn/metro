@@ -308,6 +308,9 @@ async fn launch(
     update::gate_msi_at_start(root).map_err(start_failed)?;
     if trial.is_none() {
         update::recover_at_start(dir, root, lock.as_deref()).map_err(start_failed)?;
+        if primary {
+            update::after_start(dir);
+        }
     }
 
     // Updates: primary instance only. Startup above reconciles safe
@@ -511,6 +514,12 @@ fn main() -> ExitCode {
         fatal("Metro can't start: this copy of Metro is damaged. Download Metro again.");
         return ExitCode::from(2);
     }
+    // A Windows script install's stable entry point only starts the current
+    // version.
+    #[cfg(windows)]
+    if let Some(code) = update::entry_main() {
+        return code;
+    }
     let mode = update::mode();
     if mode == update::Mode::LegacyHelper {
         fatal(
@@ -526,6 +535,13 @@ fn main() -> ExitCode {
     // SAFETY: first thing in main, before the runtime starts any thread.
     unsafe {
         metro_connector::http::exempt_loopback_from_proxy();
+    }
+    #[cfg(windows)]
+    if mode == update::Mode::Normal
+        && let Ok(dir) = install_dir()
+        && let Some(code) = update::forward_stale(&dir)
+    {
+        return code;
     }
     let paths = || -> Result<_, String> {
         let dir = install_dir()?;
