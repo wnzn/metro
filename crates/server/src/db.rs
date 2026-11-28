@@ -743,6 +743,7 @@ impl Db {
                 "database schema version {v} is not supported by this server (expects {SCHEMA_VERSION})"
             ),
         }
+        crate::space_agents::migrate_runner_tools(&conn)?;
         interrupt_orphaned_activity(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -2557,6 +2558,76 @@ mod tests {
                 .is_none()
         );
         assert_eq!(db.personal_after("alice", 0, 10).unwrap()[0].activity, None);
+    }
+
+    #[test]
+    fn v062_agent_runner_tools_migrate_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v062.sqlite3");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(include_str!("../tests/fixtures/agent_tools_v062.sql"))
+            .unwrap();
+
+        let read_tools = |conn: &Connection, handle: &str| -> Vec<String> {
+            let raw: String = conn
+                .query_row(
+                    "SELECT tools FROM space_agents WHERE handle = ?1",
+                    [handle],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            serde_json::from_str(&raw).unwrap()
+        };
+        let old_default = [
+            "workspace.list",
+            "workspace.read",
+            "workspace.check",
+            "workspace.mcp_list",
+            "workspace.mcp",
+            "threads",
+        ];
+        let migrated: Vec<_> = old_default
+            .into_iter()
+            .chain(["workspace.write", "workspace.shell"])
+            .collect();
+        {
+            let db = Db::open(&path).unwrap();
+            let conn = db.lock();
+            assert_eq!(read_tools(&conn, "agent"), migrated);
+            assert_eq!(
+                read_tools(&conn, "narrowed"),
+                [
+                    "workspace.list",
+                    "workspace.read",
+                    "workspace.check",
+                    "workspace.mcp_list",
+                    "threads",
+                ]
+            );
+            assert_eq!(
+                read_tools(&conn, "writer"),
+                [
+                    "workspace.list",
+                    "workspace.write",
+                    "workspace.read",
+                    "workspace.check",
+                    "workspace.mcp_list",
+                    "workspace.mcp",
+                    "threads",
+                    "workspace.shell",
+                ]
+            );
+
+            // An owner can turn both new tools back off without a restart undoing it.
+            conn.execute(
+                "UPDATE space_agents SET tools = ?1 WHERE handle = 'agent'",
+                [serde_json::to_string(&old_default).unwrap()],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(read_tools(&db.lock(), "agent"), old_default);
     }
 
     #[test]

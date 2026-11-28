@@ -3,12 +3,13 @@
 server and the real runner. The shell command waits for the Space owner's
 approval, runs in the runner's workspace, and a stopped run kills its command."""
 
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from functools import partial
 import json
 from pathlib import Path
 import secrets
 import signal
+import sqlite3
 import time
 from urllib.parse import quote
 
@@ -30,16 +31,16 @@ class ShellModel(OpenAIModel):
             text = " ".join(content_parts(last.get("content")))
             return text_reply(f"tool said: {text}")
         names = {t["function"]["name"] for t in request.get("tools", [])}
+        for name in ("workspace_write", "workspace_shell"):
+            require(name in names, f"{name} was not offered to the upgraded agent")
         prompt = " ".join(content_parts(last.get("content")))
         if "write the note" in prompt:
-            require("workspace_write" in names, "workspace_write was not offered")
             call = {"name": "workspace_write",
                     "arguments": json.dumps({"path": "notes/hello.txt", "content": "hello from metro\n"})}
         elif "sleep" in prompt:
             call = {"name": "workspace_shell",
                     "arguments": json.dumps({"command": "touch started; sleep 30; touch finished"})}
         else:
-            require("workspace_shell" in names, "workspace_shell was not offered")
             call = {"name": "workspace_shell",
                     "arguments": json.dumps({"command": "cat notes/hello.txt; echo \"$TERM\"; pwd"})}
         return tool_reply(f"call_{self.stage}", call)
@@ -65,6 +66,10 @@ def run_shell(server, runner, timeout):
         state = Path(directory)
         workspace = state / "workspace"
         workspace.mkdir()
+        fixture = (Path(__file__).resolve().parents[2] / "crates" / "server" / "tests"
+                   / "fixtures" / "agent_tools_v062.sql")
+        with closing(sqlite3.connect(state / "metro.sqlite")) as db:
+            db.executescript(fixture.read_text(encoding="utf-8"))
         model = ShellModel()
         env = clean_env(directory)
         deadline = time.monotonic() + timeout
@@ -72,13 +77,15 @@ def run_shell(server, runner, timeout):
                                       model, deadline)
         call = partial(request, port, deadline)
         sid = create_space(call, alice, "Shell")
-        space = f"{SPACES}/{quote(sid, safe='')}"
-        room = f"{space}/rooms/lobby"
-        call(alice, "POST", f"{space}/members", body={"user_id": "bob"})
-        agents = call(alice, "GET", f"{space}/agents", read_json=True)
+        agents = call(alice, "GET", f"{SPACES}/{quote(sid, safe='')}/agents", read_json=True)
         for tool in ("workspace.write", "workspace.shell"):
             require(tool in agents["default_tools"] and tool in agents["agents"][0]["tools"],
                     f"{tool} is not on by default")
+
+        # Exercise the existing agent, not the freshly created one.
+        space = f"{SPACES}/s-0000000000000001"
+        room = f"{space}/rooms/lobby"
+        call(alice, "POST", f"{space}/members", body={"user_id": "bob"})
         token = issue_token(call, alice, f"{space}/runner-token", "issue the runner token")
         children.append(start_child(stack, "runner", runner, state, env | {
             "METRO_RUNNER_TOKEN": token,
@@ -139,7 +146,8 @@ def run_shell(server, runner, timeout):
         time.sleep(min(5, remaining(deadline)))
         require(not (workspace / "finished").exists(), "the stopped command kept running")
         check_processes(children, model)
-    print("PASS: write needed no approval; shell waited for the owner and ran in the workspace "
+    print("PASS: upgraded agent received write and shell; write needed no approval; "
+          "shell waited for the owner and ran in the workspace "
           "with TERM=dumb; stopping the run killed the command.")
 
 

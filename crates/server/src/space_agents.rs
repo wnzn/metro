@@ -177,6 +177,55 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Give agents with the full 0.6.2 runner tool set the two new defaults.
+/// Keep the original order and leave narrower allowlists as saved.
+pub(crate) fn migrate_runner_tools(conn: &Connection) -> anyhow::Result<()> {
+    const OLD_DEFAULTS: [&str; 5] = [
+        "workspace.list",
+        "workspace.read",
+        "workspace.check",
+        "workspace.mcp_list",
+        "workspace.mcp",
+    ];
+    let tx = conn.unchecked_transaction()?;
+    if tx.execute(
+        "INSERT INTO metro_meta (key, value) VALUES ('agent_runner_tools_v064', '1')
+         ON CONFLICT (key) DO NOTHING",
+        [],
+    )? == 1
+    {
+        let agents: Vec<(String, String)> = {
+            let mut stmt = tx.prepare("SELECT id, tools FROM space_agents")?;
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut update = tx.prepare("UPDATE space_agents SET tools = ?1 WHERE id = ?2")?;
+        for (id, raw) in agents {
+            // Like normal reads, never grant tools from an invalid allowlist.
+            let Ok(mut tools) = serde_json::from_str::<Vec<String>>(&raw) else {
+                continue;
+            };
+            if !OLD_DEFAULTS
+                .iter()
+                .all(|tool| tools.iter().any(|t| t == tool))
+            {
+                continue;
+            }
+            let before = tools.len();
+            for tool in [RunnerTool::Write, RunnerTool::Shell].map(RunnerTool::runner_name) {
+                if !tools.iter().any(|t| t == tool) {
+                    tools.push(tool.to_owned());
+                }
+            }
+            if tools.len() != before {
+                update.execute(params![serde_json::to_string(&tools)?, id])?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// The default agent of a new Space, in its creating transaction.
 pub fn seed_default(tx: &Transaction<'_>, space_id: &str) -> rusqlite::Result<()> {
     insert_default(
