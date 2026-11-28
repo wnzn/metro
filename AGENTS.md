@@ -626,13 +626,19 @@ see [New in Metro 0.6.4](docs/released-0.6.4.md); for later changes, see
   and Tailscale directly; the admin panel can't detect browser proxies.
   This doesn't relax provider URL rules.
 - **Updates** require a verified published release and an explicit
-  install action. Source and preview builds don't offer updates. Only
-  eligible managed Linux desktop installs update in-app; portable and
-  Windows copies are manual, and servers and Docker runners get notices
-  only. Standalone runner self-update verifies independently; the server
-  sends a version, never a URL or code. If recovery is uncertain, keep
-  journals, locks and database copies intact; document the verified
-  installer's read-only diagnostic, never an improvised repair.
+  install action. Source and preview builds don't offer updates. Eligible
+  managed Linux desktop installs update in-app. In the 0.6.5 source, not
+  released, so do managed Windows script installs and per-user MSI
+  installs. Older Windows script installs need one explicit update with
+  the verified installer script before in-app updates are enabled.
+  Portable copies stay manual; servers and Docker runners get notices only.
+  Standalone runner self-update verifies independently; the server sends a
+  version, never a URL or code. If recovery is uncertain, keep journals,
+  locks and database copies intact, and stop before opening the workspace.
+  Document the verified installer's read-only diagnostic where available,
+  never an improvised repair. The MSI helper re-verifies the exact MSI,
+  doesn't infer success from a dead PID, and never automatically downgrades
+  or restores the database.
 - The docs must not claim features that aren't implemented, or results that
   nobody recorded. When code and docs disagree, fix the docs. Record each
   verification run in `docs/acceptance.md`.

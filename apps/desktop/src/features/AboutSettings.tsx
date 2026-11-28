@@ -26,13 +26,15 @@ function notInApp(s: UpdateState) {
       ? "This Linux install uses an older layout. Run the current Metro Linux installer once to enable in-app updates."
       : "This install can check for updates, but can't apply them in Metro.";
     case "windows-msi": return "Windows updates are manual. Get the installer from Metro Releases and run it yourself. The Windows preview MSI is unsigned and Windows may warn you.";
-    case "windows-script": return "Windows updates are manual. Use the Windows install script from Metro Releases. Metro won't run an installer for you.";
+    case "windows-script": return s.reason === "manual_migration_required"
+      ? "Run the Windows installer script once with -Action Update to turn on in-app updates."
+      : "Windows updates are manual. Use the Windows install script from Metro Releases. Metro won't run an installer for you.";
     case "portable": return "This is a portable copy. Get the package for your platform from Metro Releases and extract it yourself. Metro won't replace this folder.";
     default: return "In-app updates aren't supported on this platform.";
   }
 }
 
-function failureMessage(code: string | undefined) {
+function failureMessage(code: string | undefined, msiOutcome = false) {
   switch (code) {
     case "offline": return "Couldn't reach GitHub. Check your connection and try again.";
     case "rate_limited": return "GitHub asked Metro to wait. Try again later.";
@@ -44,7 +46,11 @@ function failureMessage(code: string | undefined) {
     case "too_large": return "A release file was larger than expected. Metro didn't use it.";
     case "manifest":
     case "not_offered": return "Metro couldn't confirm a complete, published release.";
-    case "installer_busy": return "Another installation or update is using this Metro install. No update was installed. Try again when it finishes.";
+    case "installer_busy": return msiOutcome
+      ? "Another installation was running. Try again when it has finished."
+      : "Another installation or update is using this Metro install. No update was installed. Try again when it finishes.";
+    case "installer_cancelled": return "The update was cancelled. Metro wasn't changed.";
+    case "installer_failed": return "Windows Installer couldn't update Metro. Metro wasn't changed.";
     case "stage_verification_failed": return "Metro couldn't verify the staged update. Use the official installer to update manually.";
     case JOURNAL_UNCERTAIN: return "Metro couldn't verify the update journal. Stop here and contact the Metro maintainers.";
     case "backup_failed": return "Metro couldn't back up the local workspace. The update wasn't started.";
@@ -163,7 +169,8 @@ function UpdateOutcome(props: { updates: DesktopUpdates }) {
         case "rolled_back": return `Metro ${to} didn't start successfully. Metro went back to ${from}.`;
         case "not_confirmed": return `Metro ${to} didn't finish starting. Metro kept ${from}.`;
         case "install_failed": return `Metro didn't install ${to}. ${journalNeedsSupport(updates) ? failureMessage(JOURNAL_UNCERTAIN)
-          : failureCode ? failureMessage(failureCode) : "Metro couldn't confirm the stage was safe to use. Use the official installer to update manually."}`;
+          : failureCode ? failureMessage(failureCode, updates.state()?.current.install === "windows-msi")
+            : "Metro couldn't confirm the stage was safe to use. Use the official installer to update manually."}`;
       }
     };
     const copyDetails = async () => {
@@ -199,7 +206,8 @@ function ReleaseNotes(props: { release: NonNullable<UpdateState["latest"]> }) {
 
 function RestartUpdate(props: { target: UpdateOffer; updates: DesktopUpdates }) {
   const updates = props.updates;
-  const confirmation = signal<string | null>(null);
+  const confirmation = signal<"msi" | "interrupt" | null>(null);
+  const isMsi = () => updates.state()?.current.install === "windows-msi";
   const deferred = signal(false);
   let restartButton: ViewRef | undefined;
   let alive = true;
@@ -213,33 +221,47 @@ function RestartUpdate(props: { target: UpdateOffer; updates: DesktopUpdates }) 
   };
   const restart = async (confirmed: boolean) => {
     const target = props.target;
-    if (confirmed && confirmation() !== target.identity) return;
+    if (confirmed && confirmation() !== "interrupt") return;
     const refused = await updates.restart(target, confirmed);
     if (alive && updates.state()?.phase === "ready" && updates.offer()?.identity === target.identity) {
-      confirmation.set(refused === "would_interrupt" ? target.identity : null);
+      confirmation.set(refused === "would_interrupt" ? "interrupt" : null);
     }
   };
   return <Column gap={2}>
     <If when={deferred()} else={<ActionBar>
       <Action label="Restart now" variant="primary" testID="update-restart" viewRef={node => { restartButton = node; }}
         busyLabel="Checking work…" busy={updates.pending() === "restart" && !confirmation()}
-        disabled={!!updates.pending() || !!confirmation()} onPress={() => void restart(false)} />
+        disabled={!!updates.pending() || !!confirmation()} onPress={() => {
+          if (isMsi()) confirmation.set("msi");
+          else void restart(false);
+        }} />
       <Action label="Later" variant="ghost" testID="update-later" disabled={!!updates.pending()}
         onPress={() => { confirmation.set(null); deferred.set(true); }} />
     </ActionBar>}>
       <Action label="Show restart options" variant="ghost" testID="update-show-restart" onPress={() => deferred.set(false)} />
     </If>
-    <ConfirmInline open={confirmation() === props.target.identity} onOpenChange={open => { if (!open) confirmation.set(null); }}
+    <ConfirmInline open={!!confirmation()} onOpenChange={open => { if (!open) confirmation.set(null); }}
       returnFocus={() => restartButton} scopeKey={props.target.identity}
-      testID="update-interrupt" title="Work in progress" message={busyText()} confirmLabel="Restart anyway" variant="primary"
+      testID={confirmation() === "msi" ? "update-msi-restart" : "update-interrupt"}
+      title={confirmation() === "msi" ? undefined : "Work in progress"}
+      message={confirmation() === "msi" ? "Metro closes, Windows Installer updates it, then Metro starts again." : busyText()}
+      confirmLabel={confirmation() === "msi" ? "Restart now" : "Restart anyway"} variant="primary"
       busy={updates.pending() === "restart"} busyLabel="Restarting…" disabled={!!updates.pending()}
-      onConfirm={() => void restart(true)} />
+      onConfirm={() => void restart(confirmation() === "interrupt")} />
   </Column>;
 }
 
 function PublishedUpdates(props: { updates: DesktopUpdates }) {
   const updates = props.updates;
   const s = () => updates.state()!;
+  const install = () => s().current.install;
+  const diagnostic = () => {
+    if (install() === "windows-msi") return "";
+    return install() === "windows-script" ? " Use the verified Windows installer script with -Action Status for read-only diagnosis."
+      : " Use the verified Linux installer's status command for read-only diagnosis.";
+  };
+  const recoveryInstaller = () => install() === "windows-msi" ? "the Windows MSI"
+    : install() === "windows-script" ? "the Windows installer script" : "the Linux installer";
   const offer = updates.offer;
   const phase = () => s().phase;
   const actionBusy = () => !!updates.pending();
@@ -312,13 +334,13 @@ function PublishedUpdates(props: { updates: DesktopUpdates }) {
     </If>
     <If when={journalBlocked()}>
       <SettingRow label="Update recovery" testID="update-journal-recovery" stacked
-        description="Stop Metro, its bundled server and any installer. Keep the installation, update records and both database copies. Do not remove locks or records, change the current version, or run install, update or uninstall. Use the verified Linux installer's status command for read-only diagnosis. Share the diagnostic, not private files.">
+        description={`Stop Metro, its bundled server and any installer. Keep the installation, update records and both database copies. Do not remove locks or records, change the current version, or run install, update or uninstall.${diagnostic()} Share the diagnostic, not private files.`}>
         <OfficialLink label="Contact Metro maintainers" url={`${METRO_SOURCE}/issues`} testID="update-recovery-support" />
       </SettingRow>
     </If>
     <If when={!journalBlocked() && blocked()}>
       {version => <SettingRow label="Manual recovery" testID="update-manual-recovery" stacked
-        description={`The staged update to ${version()} wasn't used. To update manually, get the Linux installer from Metro's official releases.`}>
+        description={`The staged update to ${version()} wasn't used. To update manually, get ${recoveryInstaller()} from Metro's official releases.`}>
         <OfficialLink label="Open Metro releases" url={METRO_RELEASES} testID="update-recovery-release" />
       </SettingRow>}
     </If>

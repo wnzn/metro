@@ -1,7 +1,7 @@
 # Installers: desktop and runners
 
 This guide uses published installers. See [Updates](updates.md) for the
-update controls and Linux journal diagnostic.
+update controls and read-only journal diagnostics.
 
 > **Latest release: [Metro 0.6.4](https://github.com/wnzn/metro/releases/tag/v0.6.4)**
 > (2026-11-28, from `ddbfe42`). Releases are published automatically when a
@@ -108,7 +108,9 @@ wizard on native Windows.** See the [MSI notes](../packaging/windows-msi/README.
 - **Local runner support** is a checkbox, on by default (`LOCALRUNNER=1|0`):
   it sets up [the desktop's own runner](#the-desktops-own-runner) without a
   press in the app's own local workspace.
-- Updates reuse the remembered folder and choices. Remove it from
+- Updates reuse the remembered folder and choices. In the 0.6.5 source,
+  not released, the MSI [updates in the app](updates.md#msi-updates).
+  Updates are manual in the published 0.6.4 release. Remove it from
   **Settings → Apps → Installed apps**. Removal deletes only what it
   installed, so files you added stay, and your data in
   `%LOCALAPPDATA%\Metro\Desktop` is never touched.
@@ -134,6 +136,12 @@ The ZIP runs from any folder you extract it to
 - Installs to `%LOCALAPPDATA%\Programs\Metro\versions\<version>`, adds a
   Start menu shortcut and a per-user *Installed apps* entry. Your data in
   `%LOCALAPPDATA%\Metro\Desktop` is never touched.
+- In the 0.6.5 source, not released, the script puts `<root>\Metro.exe`
+  at the install root (`%LOCALAPPDATA%\Programs\Metro` by default).
+  Use it or the Start menu shortcut to start the current version.
+  [One manual update](updates.md#one-time-migration-for-older-installs)
+  turns on in-app updates for an older script install. An extracted
+  portable ZIP still updates manually.
 - **It won't install next to the MSI.** If the MSI already installed Metro
   for you, the script refuses `Install` and `Update` and tells you to update
   or remove Metro with the MSI instead. It never installs a second copy or
