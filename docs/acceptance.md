@@ -3,6 +3,37 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Source only: Metro 0.6.4 (2026-11-28, local)
+
+In the source, not released. Local Linux builds only; no release files
+and no native desktop check by a person.
+
+**Agent tool migration** on `fix/agent-tools-migration` at
+`7632ec0a23dba2c692c76b7c0522a7f8011bc60e` (version 0.6.4). A one-time
+startup migration appends missing `workspace.write` and
+`workspace.shell` to saved agent lists that hold all five pre-0.6.3
+default runner tools ([details](next-source.md)).
+
+- `cargo fmt --check` and
+  `cargo clippy --locked --workspace --all-targets -- -D warnings`
+  passed.
+- Packaging after the version bump:
+  `python3 -m unittest discover -s packaging`: 206 passed, 63 skipped.
+- The locked debug build passed (`metro-server`, `metro-runner`,
+  `metro-connector`, `metro-tui`).
+- The targeted Rust test `v062_agent_runner_tools_migrate_once` passed.
+- `cargo test --locked --workspace` with
+  `METRO_SERVER_BIN=$CARGO_TARGET_DIR/debug/metro-server` (needed because
+  the target directory isn't the default): 1,348 passed, 0 failed, 3
+  ignored, across 79 suites.
+- E2e 2/2 passed:
+  `tests/e2e/shell.py` and `tests/e2e/smoke.py`, each with
+  `--bin-dir "$CARGO_TARGET_DIR/debug" --timeout 60`. The `shell` run
+  starts from a 0.6.2-shaped SQLite fixture and exercises the migrated
+  agent and its model-facing tools.
+- Reviews: Opus 5.5, then Astra 6.2; both passed.
+- **Not verified:** native Windows, or real vendor runs and sign-ins.
+
 ## Published: Metro 0.6.3 (2026-11-27, GitHub release v0.6.3)
 
 **What was published.** The stable
