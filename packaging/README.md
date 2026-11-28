@@ -123,7 +123,9 @@ will be set up. They never say the runner is on.
 Apple silicon only (`macos-arm64`), on `metro-ci-macos-arm64` for trusted
 runs and GitHub's `macos-15` otherwise. It packages with `package.py`, ad hoc
 signs, installs with `install-metro-macos.sh` and runs
-`smoke-macos-launch.sh`. Its `dist-desktop-macos-arm64` artifact goes into
+`smoke-macos-launch.sh` where there's a GUI (Aqua) session, or
+`smoke-macos-headless.sh` where there isn't (a self-hosted runner started by
+a LaunchDaemon; a GitHub-hosted Mac without Aqua fails). Its `dist-desktop-macos-arm64` artifact goes into
 every preview and release: `release_assets.MACOS` and
 `release_signatures.MACOS_TARGETS` list it, the archive gets its own
 Sigstore bundle, and `install-metro-macos.sh` ships beside it.

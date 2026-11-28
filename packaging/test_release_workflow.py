@@ -380,7 +380,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         builds = {
             "runner-linux": "Build metro-runner in the bookworm toolchain image",
             "desktop-windows": "Build metro-desktop, metro-server and metro-tui (native, locked)",
-            "desktop-linux": "Build metro-desktop, metro-server and metro-tui (locked)",
+            "desktop-linux": "Build metro-desktop, metro-server and metro-tui (locked, in the pinned bookworm build image)",
             "desktop-macos": "Build metro-desktop, metro-server and metro-tui (native, locked)",
         }
         for job, step_name in builds.items():
@@ -408,6 +408,53 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("RELEASE_CHANNEL", str(images["jobs"]["media"]))
         # The Dockerfile defaults to a source build.
         self.assertIn("ARG METRO_RELEASE_CHANNEL=\n", (ROOT / "Dockerfile").read_text())
+
+    def test_shipped_linux_binaries_are_built_in_pinned_bookworm_images(self):
+        """Never against a self-hosted runner's newer glibc; package.py's limits stay the safety net."""
+        build = (ROOT / "packaging/Dockerfile.build").read_text()
+        linux_from = re.search(r"(?m)^FROM (\S+) AS linux$", build).group(1)
+        self.assertRegex(linux_from, r"^rust:1\.98\.1-bookworm@sha256:[0-9a-f]{64}$")
+        root = (ROOT / "Dockerfile").read_text()
+        self.assertRegex(root, r"(?m)^FROM rust:1\.98\.1-bookworm@sha256:[0-9a-f]{64} AS rust-base$")
+        job = self.release["jobs"]["desktop-linux"]
+        step, = [s for s in job["steps"] if "cargo build" in str(s.get("run", ""))]
+        run = step["run"]
+        self.assertIn("docker build --quiet --target linux -t metro-linux-build:ci - < packaging/Dockerfile.build", run)
+        self.assertIn("docker run --rm --network none --user \"$user\"", run)
+        self.assertIn("--env METRO_RELEASE_CHANNEL", run)
+        cargo = [line.strip() for line in run.splitlines() if "cargo build" in line]
+        self.assertEqual(cargo, ["cargo build --locked --release --target x86_64-unknown-linux-gnu --bin metro-desktop "
+                                 "--bin metro-server --bin metro-tui --offline"])
+        self.assertLess(run.index("metro-linux-build:ci \\\n"), run.index("cargo build"))
+        # The runner binary comes from the root Dockerfile's bookworm `build` stage.
+        runner = steps_text(self.release["jobs"]["runner-linux"])
+        self.assertIn("docker build --target build", runner)
+        self.assertNotIn("cargo build", runner)
+        # No other Linux job in release.yml compiles shipped binaries on the host.
+        for name in ("meta", "ui", "assets", "runner-linux"):
+            self.assertNotIn("cargo build", steps_text(self.release["jobs"][name]), name)
+        package = (ROOT / "packaging/package.py").read_text()
+        self.assertEqual(package.count("(2, 39)"), 4)  # launcher, renderer, server, tui
+        self.assertIn("elf(args.binary, (2, 36))", package)  # runner
+
+    def test_macos_smoke_runs_the_window_launch_only_with_a_gui_session(self):
+        step, = [s for s in self.release["jobs"]["desktop-macos"]["steps"]
+                 if s.get("name") == "Install into a path with spaces, then a clean start and shutdown"]
+        self.assertEqual(step["env"]["RUNNER_KIND"], "${{ runner.environment }}")
+        run = step["run"]
+        self.assertTrue(run.startswith("set -Eeuo pipefail\n"))
+        self.assertIn('session="$(launchctl managername 2>/dev/null || true)"', run)
+        branch = run[run.index('if [ "$session" = Aqua ]; then'):run.index("\nfi\n")]
+        aqua, headless = branch.split("\nelse\n")
+        self.assertIn("sh packaging/smoke-macos-launch.sh", aqua)
+        self.assertNotIn("headless", aqua)
+        # Without Aqua: only on a self-hosted runner, announced, and its failure fails the step.
+        lines = [line.strip() for line in headless.splitlines()]
+        self.assertEqual(lines[0], 'test "$RUNNER_KIND" = self-hosted')
+        self.assertIn("::notice title=macOS launch smoke::No Aqua (GUI) session", headless)
+        self.assertIn('sh packaging/smoke-macos-headless.sh "$app" "$manifest" "$RUNNER_TEMP/headless"', lines)
+        self.assertNotIn("|| true", headless)
+        self.assertNotIn("continue-on-error", step)
 
     def test_linux_desktop_job_has_only_blocking_steps(self):
         # The best-effort Xvfb launch could never fail CI, so it and its screenshot are gone.

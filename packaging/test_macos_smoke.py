@@ -147,5 +147,35 @@ class LaunchScriptTests(unittest.TestCase):
                 self.assertIn("macOS launch smoke failed: " + message, proc.stderr)
 
 
+HEADLESS = ROOT / "packaging/smoke-macos-headless.sh"
+
+
+@unittest.skipUnless(shutil.which("shasum"), "shasum is not installed")
+class HeadlessScriptTests(LaunchScriptTests):
+    """The headless check (no GUI session) names the same preflight failures before anything runs."""
+
+    def run_script(self, app, manifest_text, root):
+        manifest = root / "RELEASE.json"
+        manifest.write_text(manifest_text)
+        return subprocess.run(["sh", str(HEADLESS), str(app), str(manifest), str(root / "out")],
+                              capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
+
+    def assertIn(self, member, container, msg=None):  # noqa: N802 (unittest API)
+        super().assertIn(member.replace("macOS launch smoke failed: ", "macOS headless check failed: "),
+                         container, msg)
+
+    def test_without_lipo_the_architecture_check_fails_closed(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            app = self.app(root)
+            renderer = hashlib.sha256(b"renderer").hexdigest()
+            proc = self.run_script(app, '{"renderer": {"packaged_signed_sha256": "%s"}}' % renderer, root)
+            if shutil.which("lipo"):
+                self.skipTest("lipo is installed (a Mac): the fake binaries fail later, on a real check")
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn("architecture: Contents/MacOS/Metro is not arm64 only", proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

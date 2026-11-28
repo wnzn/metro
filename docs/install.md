@@ -182,9 +182,12 @@ Mac in every test build and every release, as
   the app but keeps your data.
 - **Updates are manual.** Metro on macOS doesn't update itself. Install
   each new version with `install-metro-macos.sh update`.
-- **Not verified yet.** CI is set up to install, start and stop it on a
-  Mac in each run, but no such run of the 0.6.5 source is recorded in
-  [acceptance](acceptance.md) yet, and no person has installed it on a Mac.
+- **Not verified yet.** CI is set up to install it on a Mac in each run.
+  On GitHub's Macs it also opens and closes the app; on Metro's own Mac
+  runner, which has no GUI session, it runs a headless check instead
+  (signatures, bundle files and the bundled server). No such run of the
+  0.6.5 source is recorded in [acceptance](acceptance.md) yet, and no
+  person has installed it on a Mac.
 
 ## The desktop's own runner
 

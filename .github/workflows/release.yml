@@ -789,13 +789,35 @@ jobs:
           cargo fetch --locked --target x86_64-unknown-linux-gnu
           python3 -I -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
           readelf --version | head -1
-      - name: Build metro-desktop, metro-server and metro-tui (locked)
+      # Inside packaging/Dockerfile.build's `linux` stage (rust:1.98.1-bookworm,
+      # pinned by digest; glibc 2.36), never against the runner's own glibc
+      # (Debian 13 has 2.41). package.py still refuses anything above 2.39.
+      # Offline, from the sources fetched above. Rootless Docker maps the
+      # container's root to this user; elsewhere the container runs as this
+      # user, so the build output is always the job's own.
+      - name: Build metro-desktop, metro-server and metro-tui (locked, in the pinned bookworm build image)
         env:
           # Official releases only (see runner-linux).
           METRO_RELEASE_CHANNEL: ${{ inputs.release && 'release' || '' }}
         run: |
           set -eu
-          cargo build --locked --release --target x86_64-unknown-linux-gnu --bin metro-desktop --bin metro-server --bin metro-tui
+          docker build --quiet --target linux -t metro-linux-build:ci - < packaging/Dockerfile.build
+          if docker info --format '{{json .SecurityOptions}}' | grep -q 'name=rootless'; then
+            user=0:0
+          else
+            user="$(id -u):$(id -g)"
+          fi
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          container_home="$RUNNER_TEMP/cargo-container"
+          mkdir -p "$container_home" "$cargo_home/registry" "$cargo_home/git"
+          docker run --rm --network none --user "$user" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source" --workdir /source \
+            --mount "type=bind,src=$container_home,dst=/cargo-home" \
+            --mount "type=bind,src=$cargo_home/registry,dst=/cargo-home/registry" \
+            --mount "type=bind,src=$cargo_home/git,dst=/cargo-home/git" \
+            --env CARGO_HOME=/cargo-home --env HOME=/tmp --env METRO_RELEASE_CHANNEL \
+            metro-linux-build:ci \
+            cargo build --locked --release --target x86_64-unknown-linux-gnu --bin metro-desktop --bin metro-server --bin metro-tui --offline
       - name: Third-party notices
         run: |
           set -eu
@@ -1045,11 +1067,16 @@ jobs:
             --ui-dir "$RUNNER_TEMP/out-macos/Metro.app" --nsh-root "$RUNNER_TEMP/nsh-macos/nsh" \
             --notices "$RUNNER_TEMP/notices-desktop.txt" --out-dir dist-macos
           ls -l dist-macos
+      # The window launch needs a GUI (Aqua) session: GitHub's macos-15 has one.
+      # A runner started by a LaunchDaemon (metro-ci-macos-arm64) has none, so
+      # there the headless check runs instead, says so, and fails the job on
+      # any failed check. A GitHub-hosted Mac without Aqua fails.
       - name: Install into a path with spaces, then a clean start and shutdown
         timeout-minutes: 8
         shell: bash
         env:
           VERSION: ${{ needs.meta.outputs.version }}
+          RUNNER_KIND: ${{ runner.environment }}
         run: |
           set -Eeuo pipefail
           # Every check runs under a named gate; a failure reports that gate and the
@@ -1103,10 +1130,23 @@ jobs:
           gate="inner bundle identifier dev.metro.desktop.ui"
           test "$(plutil -extract CFBundleIdentifier raw "$app/Contents/Helpers/MetroUI.app/Contents/Info.plist")" = dev.metro.desktop.ui
 
-          gate="launch smoke (smoke-macos-launch.sh names its own failing check)"
-          export METRO_DESKTOP_HOME="$home/desktop data"
-          sh packaging/smoke-macos-launch.sh "$app" "$home/Library/Application Support/Metro/Installer/RELEASE.json" \
-            "$RUNNER_TEMP/shot" "desktop-$TARGET"
+          manifest="$home/Library/Application Support/Metro/Installer/RELEASE.json"
+          gate="GUI session (launchctl managername)"
+          session="$(launchctl managername 2>/dev/null || true)"
+          if [ "$session" = Aqua ]; then
+            gate="launch smoke (smoke-macos-launch.sh names its own failing check)"
+            echo "macOS: Aqua session; running the window launch smoke"
+            export METRO_DESKTOP_HOME="$home/desktop data"
+            sh packaging/smoke-macos-launch.sh "$app" "$manifest" "$RUNNER_TEMP/shot" "desktop-$TARGET"
+          else
+            test "$RUNNER_KIND" = self-hosted
+            gate="headless check (smoke-macos-headless.sh names its own failing check)"
+            echo "::notice title=macOS launch smoke::No Aqua (GUI) session (launchctl managername: ${session:-none}); running the headless check instead of the window launch smoke."
+            sh packaging/smoke-macos-headless.sh "$app" "$manifest" "$RUNNER_TEMP/headless"
+            # The data folder the launch smoke would have created, for the uninstall check below.
+            export METRO_DESKTOP_HOME="$home/desktop data"
+            mkdir -p "$METRO_DESKTOP_HOME"
+          fi
 
           gate="update --no-local-runner removes only the marker"
           HOME="$home" sh "$i" update --archive "$a" --no-local-runner

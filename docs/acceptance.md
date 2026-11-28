@@ -34,6 +34,19 @@ python -B -m unittest discover -s ops/github-runner             # 34 tests, OK
 The pinned PowerShell `powershell-7.7.0-linux-x64.tar.gz` matched GitHub's
 asset digest `c89d9c68…` and ran (`7.7.0`) on Debian 13.
 
+Follow-up on the same branch (Linux build container, macOS headless check):
+
+- `desktop-linux`'s build step, run by hand on Debian 13 with rootful Docker
+  (the `--user` path, not the rootless one): `cargo build --release` of
+  `metro-desktop`, `metro-server` and `metro-tui` in `Dockerfile.build`'s
+  `linux` stage, offline, finished in 114 s. The binaries belong to the
+  invoking user, and `package.py`'s check reports glibc 2.34 for all three.
+- `smoke-macos-headless.sh`: shellcheck clean, and its preflight failures
+  were checked on Linux. It hasn't run on a Mac.
+- Rerun: packaging 298 tests OK (8 skipped), release-signatures 18 OK
+  (1 skipped), windows-signing 41 OK, ops/github-runner 34 OK, actionlint
+  clean.
+
 ## Published: Metro 0.6.4 (2026-11-28, GitHub release v0.6.4)
 
 **What was published.** The stable

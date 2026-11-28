@@ -293,6 +293,16 @@ bots, other branches and any case CI can't decide.
   single-use machines, so the Sigstore certificates still name a
   GitHub-hosted runner. Windows signing does too, except with the `kms`
   backend's own restricted runner ([below](#windows-releases-signed-or-unsigned)).
+- The Linux binaries that ship (desktop, server, terminal client, runner)
+  are compiled inside the pinned Debian 12 Rust image
+  (`packaging/Dockerfile.build`, `Dockerfile`), never against the
+  runner's own Debian 13 libraries. So they need glibc 2.36 at most, and
+  packaging refuses any that needs more than 2.39 (2.36 for the runner).
+- The Mac runner has no GUI session, so there the macOS build runs a
+  headless check instead of opening the app's window: the signatures,
+  `Info.plist` files, architecture and the bundled server's `/healthz`.
+  The run log says so, and a failed check fails the job. GitHub's
+  `macos-15` still opens the window.
 - **Consequence:** the Linux and macOS release files are built on those two
   persistent machines, which also run code from trusted pull requests.
   Anyone who controls one of them could change a release build. The
