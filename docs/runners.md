@@ -200,8 +200,8 @@ Space's directory in the workspace volume.
 These steps use the published runner image and need no Metro source. The
 workspaces live in a named Docker volume.
 
-> **Published:** `ghcr.io/wnzn/metro-runner:v0.6.3` is in
-> [Metro 0.6.3](https://github.com/wnzn/metro/releases/tag/v0.6.3). Pin it
+> **Published:** `ghcr.io/wnzn/metro-runner:v0.6.4` is in
+> [Metro 0.6.4](https://github.com/wnzn/metro/releases/tag/v0.6.4). Pin it
 > by the digest in the release's `IMAGES.txt`
 > ([deploy.md](deploy.md#release-files-and-images)). Contributors can build
 > the same image themselves ([development.md](development.md#images-and-binaries)).

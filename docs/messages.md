@@ -138,7 +138,9 @@ waits to steer a run, that run is interrupted and the message may go
 unanswered; send it again.
 
 Since 0.6.3, a request for [shell approval](runner.md#approvals) appears
-as run activity in the room or thread, not as a reply.
+as run activity in the room or thread, not as a reply. The
+[0.6.4 agent tool migration](released-0.6.4.md) doesn't change when
+shell commands require approval.
 
 ## Direct messages and the directory
 

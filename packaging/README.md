@@ -6,10 +6,10 @@ for one person, without compiling anything. Each one is a standalone file
 that's also published as a release asset next to the archives, and each is
 listed in `SHA256SUMS` (except `install-metro-macos.sh` while there are no
 Mac builds). The latest published release is
-[Metro 0.6.3](https://github.com/wnzn/metro/releases/tag/v0.6.3); its
-scripts are the 0.6.3 copies, so a change here after `f5c0cf2` isn't in
+[Metro 0.6.4](https://github.com/wnzn/metro/releases/tag/v0.6.4); its
+scripts are the 0.6.4 copies, so a change here after `ddbfe42` isn't in
 it until the next release
-([acceptance](../docs/acceptance.md#published-metro-063-2026-11-27-github-release-v063)).
+([acceptance](../docs/acceptance.md#published-metro-064-2026-11-28-github-release-v064)).
 
 Every installer checks the archive's SHA-256 before it extracts anything.
 It takes `--sha256 HEX`, `--checksum-file` (a `.sha256` sidecar or
@@ -156,7 +156,7 @@ For reference, this is how that code works:
 ## Release signing (protected `main` only)
 
 The pipeline below is implemented and covered by local contract tests. It
-published Metro 0.6.3 from `f5c0cf2` in CI run 46065803816 with Windows
+published Metro 0.6.4 from `ddbfe42` in CI run 46090688619 with Windows
 unsigned, as in previous releases. The signatures are the Sigstore bundles for
 `SHA256SUMS` and the two Linux archives, and the GHCR image signatures.
 Windows Authenticode signing has never run.

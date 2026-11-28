@@ -56,14 +56,14 @@ the Space's root, and absolute paths, `..` and symlinks anywhere in the path
 are refused. It creates missing parent folders (mode 755), replaces the file
 atomically, and never writes through a hard link. It never needs approval.
 
-Both new tools are in the agents' default tool list: new agents, and agents
+Both tools are in the agents' default tool list: new agents, and agents
 created without an explicit list, get them. In 0.6.3, agents created
 before it keep their saved list and don't gain them; a Space owner adds
 `workspace.write` and `workspace.shell` to their tool list.
 
-In the source, not released (0.6.4): a one-time migration when the
-server starts adds whichever of `workspace.write` and `workspace.shell`
-is missing to every saved agent list that holds all five earlier
+In 0.6.4, a one-time startup migration adds whichever of
+`workspace.write` and `workspace.shell` is missing to every saved
+agent list that holds all five earlier
 default runner tools (`workspace.list`, `workspace.read`,
 `workspace.check`, `workspace.mcp_list` and `workspace.mcp`). A list
 missing any of the five is left as it is, and its owner adds the tools.
@@ -274,10 +274,10 @@ runner image or the Linux runner binary. Either needs Linux ≥ 5.6
 (`openat2`). The remote runner must reach the server over `https://`, so
 expose the server through a TLS reverse proxy (see [deploy.md](deploy.md)).
 
-> **Published in [Metro 0.6.3](https://github.com/wnzn/metro/releases/tag/v0.6.3):**
-> the image `ghcr.io/wnzn/metro-runner:v0.6.3` (`linux/amd64`,
+> **Published in [Metro 0.6.4](https://github.com/wnzn/metro/releases/tag/v0.6.4):**
+> the image `ghcr.io/wnzn/metro-runner:v0.6.4` (`linux/amd64`,
 > `linux/arm64`; pin the digest from the release's `IMAGES.txt`) and the
-> binary archive `Metro-runner-0.6.3-linux-x64.tar.gz` with its `.sha256`
+> binary archive `Metro-runner-0.6.4-linux-x64.tar.gz` with its `.sha256`
 > ([deploy.md](deploy.md#release-files-and-images)). Building them yourself
 > is contributor tooling ([development.md](development.md#images-and-binaries)).
 
