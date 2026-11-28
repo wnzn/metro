@@ -12,13 +12,13 @@
 //! - **Download** happens only after the person clicks Update: the release is
 //!   fetched and verified again for exactly that version, then the file's
 //!   signed row (and for Linux the archive's own bundle) and `RELEASE.json`.
-//! - **Stage**: migrated Linux installs extract into `<root>/versions/<V>`
-//!   under the installer locks; nothing visible changes.
+//! - **Stage**: migrated script installs (Linux and Windows) extract into
+//!   `<root>/versions/<V>` under the installer locks; nothing visible changes.
 //! - **Apply** is the launcher's job (`crates/desktop/src/update.rs`): trial
 //!   start under a watchdog, then the pointer switch, or a rollback. The
 //!   primitives it uses live in [`install`].
 //!
-//! Portable copies, unmigrated Linux installs and Windows installs get a
+//! Portable copies, unmigrated script installs and MSI installs get a
 //! notice and the release page only.
 
 use std::path::{Path, PathBuf};
@@ -275,11 +275,26 @@ impl UpdaterConfig {
         install_dir: &Path,
         trial: Option<String>,
     ) -> Option<UpdaterConfig> {
-        let own = Version::parse(env!("CARGO_PKG_VERSION"))?;
-        let channel = Channel::current();
+        let own = own_version()?;
+        let channel = channel();
         let kind = install::detect(install_dir, &own, channel, trial.as_deref());
         let dir = desktop_root.join("update");
         crate::desktop::store::prepare_private_dir(&dir).ok()?;
+        #[cfg(feature = "e2e-test-release")]
+        if let Some((source, verifier)) = metro_release::e2e::release_source() {
+            return Some(UpdaterConfig {
+                dir,
+                install_dir: install_dir.to_path_buf(),
+                own,
+                channel,
+                kind,
+                source,
+                verifier: Arc::from(verifier),
+                trial,
+                ldd: PathBuf::from("ldd"),
+                trust: None,
+            });
+        }
         let trust = Arc::new(
             metro_release::trust_refresh::TrustRefresh::new(&dir.join("trust-cache")).ok()?,
         );
@@ -353,8 +368,41 @@ fn blocked_stage(status: &Status, own: Version, target: Version) -> bool {
         .is_some_and(|last| last.blocks(own, target))
 }
 
+/// Script installs with migrated locks. MSI installs are manual here; an
+/// in-app MSI path (`update::msi`) would be added as its own arm.
 fn supports_managed_update(kind: &InstallKind) -> bool {
-    matches!(kind, InstallKind::LinuxInstaller { root } if metro_release::installer_lock::migrated(root, install::MARKER))
+    match kind {
+        InstallKind::LinuxInstaller { .. } | InstallKind::WindowsScript { .. } => {
+            install::managed(kind)
+        }
+        InstallKind::WindowsMsi { .. } => false,
+        InstallKind::Portable | InstallKind::Unsupported(_) => false,
+    }
+}
+
+/// This build's version. In an e2e test build with the test release source
+/// active, the name of its `versions/<v>` folder, so one test binary can
+/// play several releases.
+pub fn own_version() -> Option<Version> {
+    #[cfg(feature = "e2e-test-release")]
+    if metro_release::e2e::active()
+        && let Some(v) = std::env::current_exe()
+            .and_then(|e| e.canonicalize())
+            .ok()
+            .and_then(|e| e.parent()?.file_name()?.to_str().and_then(Version::parse))
+    {
+        return Some(v);
+    }
+    Version::parse(env!("CARGO_PKG_VERSION"))
+}
+
+/// This build's channel (an e2e test build with the test source: release).
+pub fn channel() -> Channel {
+    #[cfg(feature = "e2e-test-release")]
+    if metro_release::e2e::active() {
+        return Channel::Release;
+    }
+    Channel::current()
 }
 
 fn latest_info(
@@ -598,12 +646,12 @@ impl Updater {
             (Channel::Preview, _) => Some("preview_build"),
             (_, InstallKind::Unsupported(_)) => Some("unsupported_platform"),
             (_, InstallKind::Portable) => Some("portable"),
-            (_, InstallKind::LinuxInstaller { .. }) if !self.can_update_in_app() => {
+            (_, InstallKind::LinuxInstaller { .. } | InstallKind::WindowsScript { .. })
+                if !self.can_update_in_app() =>
+            {
                 Some("manual_migration_required")
             }
-            (_, InstallKind::WindowsMsi { .. } | InstallKind::WindowsScript { .. }) => {
-                Some("manual_update_required")
-            }
+            (_, InstallKind::WindowsMsi { .. }) => Some("manual_update_required"),
             _ => None,
         };
         let mut v = json!({

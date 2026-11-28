@@ -1155,6 +1155,29 @@ class WindowsInAppUpdateGuardTests(unittest.TestCase):
                         install.index("Keep a copy of this script"))
 
 
+    def test_managed_layout_and_migration(self):
+        text = WINDOWS.read_text()
+        install = text[text.index("function Install-Metro {"):text.index("function Uninstall-Metro {")]
+        # The shortcut and the Installed-apps entry use the stable entry point.
+        self.assertIn("$exe = Join-Path $Root 'Metro.exe'", install)
+        self.assertIn("Set-FileAtomic (Join-Path $target 'Metro.exe') $null $exe", install)
+        self.assertIn("$lnk.WorkingDirectory = $Root", install)
+        self.assertIn("DisplayIcon = $exe", install)
+        # In-app updates are turned on last, after every other change.
+        migrate = install.index("Set-FileAtomic $null ([Text.Encoding]::ASCII.GetBytes($Migrated))")
+        for before in ("[IO.File]::Replace($tmp, $current", "$lnk.Save()", "Set-ItemProperty -Path $UninstallKey -Name NoRepair"):
+            self.assertLess(install.index(before), migrate, before)
+        self.assertIn('$Migrated = "metro-update-lock-v2`n"', text)
+        # A running entry point counts as running Metro.
+        running = text[text.index("function Test-Running"):text.index("function Get-Current")]
+        self.assertNotIn("'versions'", running)
+        # The reader knows everything the app journals.
+        reader = text[text.index("function Read-UpdateJournal"):text.index("function Assert-NoInAppUpdate")]
+        for field in ("'backup_manifest'", "'backing_up'", "@(1, 2)", "'cleanup'"):
+            self.assertIn(field, reader)
+        self.assertIn("desktop-update.json", text)
+
+
 @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 (pwsh) is not installed")
 class PowerShellTests(unittest.TestCase):
     def pwsh(self, *args, env=None):
@@ -1209,6 +1232,7 @@ $Mark = '.metro-desktop-install'
 $Sha256 = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash
 $Quiet = $true
 $UserData = Join-Path $Root 'unused'
+$WorkspaceData = $UserData
 $tokens = $null
 $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($Installer, [ref]$tokens, [ref]$errors)
@@ -1246,6 +1270,114 @@ try {
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertIn("fixture stopped after verifying exclusion", result.stdout)
                     self.assertFalse((dest / ".lock").exists())
+
+    JOURNAL_HARNESS = r"""
+param($Installer, $Root, $WorkspaceData, $Mode)
+$ErrorActionPreference = 'Stop'
+$Prog = 'install-metro-windows'
+$Mark = '.metro-desktop-install'
+$Migrated = "metro-update-lock-v2`n"
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Installer, [ref]$tokens, [ref]$errors)
+if ($errors) { throw 'could not parse installer' }
+foreach ($def in $ast.EndBlock.Statements) {
+    if ($def -is [System.Management.Automation.Language.FunctionDefinitionAst]) { . ([scriptblock]::Create($def.Extent.Text)) }
+}
+try {
+    switch ($Mode) {
+        'read' { $j = Read-UpdateJournal; if ($j) { "phase=$($j.Phase) to=$($j.To)" } else { 'none' } }
+        'assert' { $v = Assert-NoInAppUpdate; "allowed staged=$v" }
+        'migrate' {
+            "before=$(Test-Migrated)"
+            Set-FileAtomic $null ([Text.Encoding]::ASCII.GetBytes($Migrated)) (Join-Path $Root $Mark)
+            "after=$(Test-Migrated)"
+        }
+    }
+} catch { "refused: $($_.Exception.Message)" }
+"""
+
+    @staticmethod
+    def journal(phase, version=2, outcome=None, manifest=True, pid=True, **extra):
+        """Serialized like the app's `Journal` (serde field order, compact)."""
+        j = {"version": version, "id": "0123456789abcdef", "from": "0.9.0", "to": "0.9.1", "phase": phase}
+        if outcome:
+            j["outcome"] = outcome
+        j["local_db_snapshot"] = phase not in ("staged", "backing_up")
+        if version == 2 and manifest and phase not in ("staged", "backing_up"):
+            j["backup_manifest"] = "ab" * 32
+        if pid and phase not in ("staged", "backing_up"):
+            j["watchdog_pid"] = 4242
+        j.update(extra)
+        j["reported"] = False
+        j["started_at"] = 1800000000000
+        return json.dumps(j, separators=(",", ":"))
+
+    def test_windows_installer_reads_every_journal_the_app_writes(self):
+        cases = [
+            # (journal, current, gate, read, assert)
+            (None, "0.9.0", False, "none", "allowed staged="),
+            (self.journal("staged", 1), "0.9.0", False, "phase=staged to=0.9.1", "allowed staged=0.9.1"),
+            (self.journal("staged"), "0.9.0", False, "phase=staged to=0.9.1", "allowed staged=0.9.1"),
+            (self.journal("backing_up"), "0.9.0", False, "phase=backing_up", "middle of updating itself"),
+            (self.journal("trial"), "0.9.0", False, "phase=trial", "[update_recovery_required]"),
+            (self.journal("committing"), "0.9.1", False, "phase=committing", "[update_recovery_required]"),
+            (self.journal("rolling_back", detail="exited with 3"), "0.9.0", False, "phase=rolling_back",
+             "[update_recovery_required]"),
+            (self.journal("committed", outcome="updated"), "0.9.1", False, "phase=cleanup", "middle of updating"),
+            (self.journal("failed", outcome="rolled_back"), "0.9.0", False, "phase=cleanup", "middle of updating"),
+            (self.journal("failed", 1, outcome="not_confirmed", pid=False), "0.9.0", False, "phase=failed",
+             "allowed staged="),
+            (self.journal("staged", 1), "0.9.0", True, "phase=staged", "workspace update gate is still present"),
+            (None, "0.9.0", True, "none", "[update_journal_unknown]"),
+            # Not something this installation could have written.
+            (self.journal("trial", manifest=False), "0.9.0", False, "[update_journal_unknown]", "[update_journal_unknown]"),
+            (self.journal("trial", source_pid=7), "0.9.0", False, "[update_journal_unknown]", "[update_journal_unknown]"),
+            (self.journal("committed", outcome="updated"), "0.9.0", False, "[update_journal_unknown]",
+             "[update_journal_unknown]"),
+            (self.journal("backing_up", 1), "0.9.0", False, "[update_journal_unknown]", "[update_journal_unknown]"),
+            (self.journal("staged", 3), "0.9.0", False, "[update_journal_unknown]", "[update_journal_unknown]"),
+        ]
+        with tempfile.TemporaryDirectory(prefix="metro journal ") as d:
+            harness = Path(d) / "journal.ps1"
+            harness.write_text(self.JOURNAL_HARNESS)
+            for n, (journal, current, gate, want_read, want_assert) in enumerate(cases):
+                with self.subTest(n=n, journal=journal):
+                    root, workspace = Path(d) / f"root{n}", Path(d) / f"ws{n}"
+                    for v in ("0.9.0", "0.9.1"):
+                        (root / "versions" / v).mkdir(parents=True)
+                        (root / "versions" / v / "Metro.exe").write_bytes(b"MZ")
+                    (root / "current.txt").write_text(current)
+                    workspace.mkdir()
+                    if journal:
+                        (root / ".update.json").write_text(journal)
+                    if gate:
+                        (workspace / "desktop-update.json").write_text("{}")
+                    before = sorted((p, p.read_bytes() if p.is_file() else None) for p in Path(d).rglob("*")
+                                    if p.name != "journal.ps1")
+                    for mode, want in (("read", want_read), ("assert", want_assert)):
+                        r = self.pwsh("-File", harness, WINDOWS, root, workspace, mode)
+                        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                        self.assertIn(want, r.stdout, mode)
+                    after = sorted((p, p.read_bytes() if p.is_file() else None) for p in Path(d).rglob("*")
+                                   if p.name != "journal.ps1")
+                    self.assertEqual(before, after, "reading changes nothing")
+
+    def test_windows_installer_migration_marker_is_exact(self):
+        with tempfile.TemporaryDirectory(prefix="metro marker ") as d:
+            harness = Path(d) / "journal.ps1"
+            harness.write_text(self.JOURNAL_HARNESS)
+            root = Path(d) / "root"
+            root.mkdir()
+            marker = root / ".metro-desktop-install"
+            marker.write_bytes("\ufeffMetro desktop per-user install (managed by install-metro-windows).\r\n".encode())
+            r = self.pwsh("-File", harness, WINDOWS, root, root, "migrate")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("before=False", r.stdout)
+            self.assertIn("after=True", r.stdout)
+            # The same bytes the app checks (metro_release::installer_lock::MIGRATION).
+            self.assertEqual(marker.read_bytes(), b"metro-update-lock-v2\n")
+            self.assertEqual(sorted(p.name for p in root.iterdir()), [".metro-desktop-install"])
 
     def test_container_url_validation(self):
         missing = "/nonexistent/metro-token"  # a valid URL gets as far as the token file
