@@ -173,9 +173,34 @@ class Scripts(unittest.TestCase):
         self.assertIn('buttons == 1', s)
         self.assertIn('"msiexec"', s)
 
+    def test_app_files_are_read_only_through_the_shared_reader(self):
+        # The app renames over, deletes and holds its files open: every read
+        # goes through UpdateTestIo.ps1 (all share modes, retried, never a
+        # sharing violation taken as absent).
+        for f in ("test-msi-update.ps1", "msi-update-scenarios.ps1"):
+            code = "\n".join(l for l in (MSI_DIR / f).read_text(encoding="utf-8").splitlines()
+                             if not l.lstrip().startswith("#"))
+            for needle in ("Get-Content", "ReadAllText", "ReadAllBytes", "Get-FileHash", "[IO.File]::Open"):
+                self.assertNotIn(needle, code, f)
+            self.assertIn("UpdateTestIo.ps1", code, f)
+        # Functions returning `, @(...)` are counted directly, never as @(f).Count.
+        s = (MSI_DIR / "msi-update-scenarios.ps1").read_text(encoding="utf-8")
+        for fn in ("Get-UiStarts", "Get-MsiexecClients", "Read-SharedJsonLines"):
+            self.assertNotIn(f"@({fn}", s)
+            self.assertNotRegex(s, rf"\({fn}[^)]*\)\s*\|")
+        self.assertIn("'UpdateTestIo.ps1'", (MSI_DIR / "test-msi-update.ps1").read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(PWSH, "PowerShell 7 (pwsh) not available")
+    def test_shared_reader_and_scenario_functions_under_races(self):
+        p = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-File", str(MSI_DIR / "test-update-test-io.ps1")],
+                           capture_output=True, text=True, timeout=600)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn("FAIL", p.stdout)
+        self.assertGreaterEqual(p.stdout.count("PASS"), 28, p.stdout)
+
     @unittest.skipUnless(PWSH, "PowerShell 7 (pwsh) not available")
     def test_scripts_parse(self):
-        for f in ("test-msi-update.ps1", "msi-update-scenarios.ps1"):
+        for f in ("test-msi-update.ps1", "msi-update-scenarios.ps1", "UpdateTestIo.ps1", "test-update-test-io.ps1"):
             path = MSI_DIR / f
             cmd = ("$e=$null; $null=[System.Management.Automation.Language.Parser]::ParseFile("
                    f"'{path}',[ref]$null,[ref]$e); if ($e) {{ $e | % {{ $_.ToString() }}; exit 1 }}")
@@ -193,6 +218,53 @@ class Scripts(unittest.TestCase):
             body = text[text.index(params) + len(params):]
             assigned = {n.lower() for n in re.findall(r"^\s*\$(\w+)\s*=", body, re.M)}
             self.assertEqual(names & assigned - {"scenarios"}, set(), f)
+
+
+class WindowsPowerShell51(unittest.TestCase):
+    """Scripts that run under Windows PowerShell 5.1 (powershell.exe): the
+    installer, the container script, windows_update_e2e.py's lock holder and
+    the published 0.4.0 installer it starts from."""
+
+    @unittest.skipUnless(PWSH, "PowerShell 7 (pwsh) not available")
+    def test_no_powershell_7_or_dotnet_core_only_code(self):
+        import windows_update_e2e as e2e
+        with tempfile.TemporaryDirectory() as d:
+            hold = Path(d) / "hold-lock.ps1"
+            hold.write_text(e2e.HOLD_LOCK, encoding="utf-8")
+            files = [HERE / "install-metro-windows.ps1", HERE / "metro-runner-container.ps1", hold,
+                     HERE / "test-fixtures" / "install-metro-windows-0.4.0.ps1"]
+            p = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-File", str(HERE / "ps51-compat.ps1"),
+                                *map(str, files)], capture_output=True, text=True, timeout=300)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            bad = Path(d) / "bad.ps1"
+            bad.write_text("$a = $x ? 1 : 2\nGet-A && Get-B\nif ($IsWindows) { }\n[IO.File]::Move('a', 'b', $true)\n"
+                           "Get-Content x -AsByteStream\nSet-Content x -Encoding utf8NoBOM\n", encoding="utf-8")
+            p = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-File", str(HERE / "ps51-compat.ps1"), str(bad)],
+                               capture_output=True, text=True, timeout=300)
+            self.assertEqual(p.returncode, 1)
+            self.assertEqual(len(p.stdout.strip().splitlines()), 6, p.stdout)
+
+
+class E2eReads(unittest.TestCase):
+    """windows_update_e2e.py reads the app's files only through read_shared."""
+
+    def test_helpers(self):
+        import windows_update_e2e as e2e
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "ui.jsonl"
+            self.assertIsNone(e2e.read_shared(log))
+            self.assertEqual(e2e.read_json_lines(log), [])
+            log.write_bytes(b'{"event":"start"}\n{"event":"rea')
+            self.assertEqual(e2e.read_json_lines(log), [{"event": "start"}])
+            log.write_bytes(b'{"event":"start"}')
+            self.assertEqual(e2e.read_json_lines(log), [])
+            self.assertIsNone(e2e.read_shared(Path(d) / "no" / "such"))
+
+    def test_no_direct_reads_of_app_files(self):
+        text = (HERE / "windows_update_e2e.py").read_text(encoding="utf-8").split('"""', 2)[2]
+        self.assertNotIn(".read_text(", text)
+        self.assertEqual(text.count(".read_bytes()"), 3)  # the zip it wrote, the two input builds
+        self.assertNotIn("json.loads(path", text)
 
 
 if __name__ == "__main__":

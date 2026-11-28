@@ -32,6 +32,7 @@ $ErrorActionPreference = 'Stop'
 $Scenarios = @($Scenarios | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 . (Join-Path $PSScriptRoot 'MsiAutomation.ps1')
 . (Join-Path $PSScriptRoot 'MsiHarness.ps1')
+. (Join-Path $PSScriptRoot 'UpdateTestIo.ps1')
 
 $out = Join-Path $Root 'out'
 $result = [ordered] @{ name = $Name; stage = 'start'; user_sid = ''; scenarios = [Collections.Generic.List[object]]::new()
@@ -41,7 +42,7 @@ function Record([string] $What, [bool] $Ok, [string] $Detail = '') {
     if (-not $Ok) { throw "check '$What' failed: $Detail" }
 }
 
-$spec = Get-Content -LiteralPath (Join-Path $Root 'spec.json') -Raw | ConvertFrom-Json
+$spec = Read-SharedJson (Join-Path $Root 'spec.json')
 $LegacyKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\dev.metro.desktop'
 $RegKey = 'HKCU:\Software\Metro\Desktop MSI'
 
@@ -60,7 +61,20 @@ public static class MetroMsiDialogs {
   [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
   static string Cls(IntPtr h) { var s = new StringBuilder(256); GetClassName(h, s, 256); return s.ToString(); }
-  static string Txt(IntPtr h) { var s = new StringBuilder(256); GetWindowText(h, s, 256); return s.ToString(); }
+  static string Txt(IntPtr h) { var s = new StringBuilder(4096); GetWindowText(h, s, 4096); return s.ToString(); }
+  // The text of a visible dialog box owned by process `pid` (Metro's fatal
+  // message), or null.
+  public static string DialogText(int pid) {
+    string found = null;
+    EnumWindows((h, l) => {
+      uint owner; GetWindowThreadProcessId(h, out owner);
+      if (owner != (uint) pid || !IsWindowVisible(h) || Cls(h) != "#32770") return true;
+      var text = new StringBuilder();
+      EnumChildWindows(h, (c, l2) => { if (Cls(c) == "Static") text.Append(Txt(c)); return true; }, IntPtr.Zero);
+      found = text.ToString();
+      return false; }, IntPtr.Zero);
+    return found;
+  }
   public static int ClickOk() {
     int n = 0;
     EnumWindows((h, l) => {
@@ -80,6 +94,8 @@ public static class MetroMsiDialogs {
 }
 '@
 
+Add-Type -TypeDefinition $DismissSource
+
 function Start-DialogDismisser([string] $Log) {
     return Start-Job -ArgumentList $DismissSource, $Log -ScriptBlock {
         param($Source, $Log)
@@ -92,18 +108,47 @@ function Start-DialogDismisser([string] $Log) {
     }
 }
 
+# The test's own installs. 1618 (another installation is running): wait
+# until Windows Installer is idle and try again.
 function Invoke-Msiexec([string] $Arguments, [string] $LogName) {
-    $log = Join-Path $out $LogName
-    $p = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList "$Arguments /qn /norestart /l*v `"$log`"" -PassThru
-    $null = $p.Handle
-    if (-not $p.WaitForExit(600000)) { $p.Kill(); throw "msiexec timed out ($LogName)" }
-    return $p.ExitCode
+    for ($try = 1; ; $try++) {
+        $log = Join-Path $out $(if ($try -eq 1) { $LogName } else { "$LogName.$try" })
+        $p = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList "$Arguments /qn /norestart /l*v `"$log`"" -PassThru
+        $null = $p.Handle
+        if (-not $p.WaitForExit(600000)) { $p.Kill(); throw "msiexec timed out ($LogName)" }
+        if ($p.ExitCode -ne 1618 -or $try -ge 3) { return $p.ExitCode }
+        Wait-InstallerIdle '' 300
+    }
 }
 
+# The same facts the app checks: the _MSIExecute mutex (access denied counts
+# as busy) and a suspended installation (HKLM ...\Installer\InProgress).
 function Test-InstallerBusy {
+    if (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\InProgress') { return $true }
     try { $m = [Threading.Mutex]::OpenExisting('Global\_MSIExecute'); $m.Dispose(); return $true }
     catch [Threading.WaitHandleCannotBeOpenedException] { return $false }
     catch [UnauthorizedAccessException] { return $true }
+}
+
+# msiexec client processes whose command line names $Marker (a scenario's
+# folder); '' matches none.
+function Get-MsiexecClients([string] $Marker) {
+    if (-not $Marker) { return , @() }
+    return , @(Get-CimInstance Win32_Process -Filter "Name = 'msiexec.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf($Marker, [StringComparison]::OrdinalIgnoreCase) -ge 0 })
+}
+
+# Idle for 3 s in a row: no installation and no client of this scenario.
+function Wait-InstallerIdle([string] $Marker, [int] $Seconds) {
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    $since = $null
+    while ((Get-Date) -lt $deadline) {
+        if ((Test-InstallerBusy) -or (Get-MsiexecClients $Marker).Count) { $since = $null }
+        elseif (-not $since) { $since = Get-Date }
+        elseif (((Get-Date) - $since).TotalSeconds -ge 3) { return }
+        Start-Sleep -Milliseconds 200
+    }
+    throw "Windows Installer still busy after $Seconds s"
 }
 
 function Wait-Until([int] $Seconds, [string] $What, [scriptblock] $Probe) {
@@ -130,49 +175,33 @@ function Remove-AllMetro {
     }
 }
 
-function Read-Ui([string] $Dir) {
-    $f = Join-Path $Dir 'ui.jsonl'
-    if (-not (Test-Path -LiteralPath $f)) { return @() }
-    return @(Get-Content -LiteralPath $f | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json })
+# Every start event of the stand-in UI so far (always an array).
+function Get-UiStarts([string] $Dir) {
+    $lines = Read-SharedJsonLines (Join-Path $Dir 'ui.jsonl')
+    return , @($lines | Where-Object { (Get-Prop $_ 'event') -eq 'start' })
 }
 
-# The app replaces or removes these files while the test reads them: a file
-# that is gone counts as absent; one the app holds open is read again (a
-# sharing violation is never taken as absent).
-function Read-JsonFile([string] $Path) {
-    for ($i = 0; ; $i++) {
-        try { return [IO.File]::ReadAllText($Path) | ConvertFrom-Json }
-        catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] { return $null }
-        catch [IO.IOException] {
-            if ($i -ge 100) { throw }
-            Start-Sleep -Milliseconds 50
-        }
-    }
-}
-
-function Get-Journal([string] $DesktopHome) {
-    return Read-JsonFile (Join-Path $DesktopHome 'update\msi-update.json')
-}
-
+function Get-JournalPath([string] $DesktopHome) { return Join-Path $DesktopHome 'update\msi-update.json' }
+function Get-Journal([string] $DesktopHome) { return Read-SharedJson (Get-JournalPath $DesktopHome) }
 function Get-LastUpdate([string] $DesktopHome) {
-    $s = Read-JsonFile (Join-Path $DesktopHome 'update\status.json')
-    if ($s) { return $s.last_update }
-    return $null
+    return Get-Prop (Read-SharedJson (Join-Path $DesktopHome 'update\status.json')) 'last_update'
 }
 
 function Get-FilesVersion([string] $Dir) {
-    $f = Join-Path $Dir 'RELEASE.json'
-    if (-not (Test-Path -LiteralPath $f)) { return '' }
-    $m = Get-Content -LiteralPath $f -Raw | ConvertFrom-Json
-    $exe = (Get-FileHash -LiteralPath (Join-Path $Dir 'Metro.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($m.files.'Metro.exe' -ne $exe) { return 'mismatch' }
-    return [string] $m.version
+    $m = Read-SharedJson (Join-Path $Dir 'RELEASE.json')
+    if (-not $m) { return '' }
+    if ([string] (Get-Prop (Get-Prop $m 'files') 'Metro.exe') -ne (Get-SharedSha256 (Join-Path $Dir 'Metro.exe'))) { return 'mismatch' }
+    return [string] (Get-Prop $m 'version')
 }
 
+# Kill Metro (launcher, UI, helper copy) and wait until each one has exited,
+# so nothing holds the installed files when the uninstall starts.
 function Stop-Metro([string] $Dir, [string] $DesktopHome) {
-    Get-Process -ErrorAction SilentlyContinue | Where-Object {
+    $procs = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
         $p = $_.Path; $p -and ($p.StartsWith($Dir, 'OrdinalIgnoreCase') -or $p.StartsWith((Join-Path $DesktopHome 'update'), 'OrdinalIgnoreCase'))
-    } | Stop-Process -Force -ErrorAction SilentlyContinue
+    })
+    foreach ($p in $procs) { try { $p.Kill() } catch [InvalidOperationException] { } catch [ComponentModel.Win32Exception] { } }
+    foreach ($p in $procs) { $null = $p.WaitForExit(30000) }
 }
 
 function Start-Metro([string] $Dir, [string] $DesktopHome, [string] $UiOut, [string] $To, [int] $Attempts) {
@@ -190,8 +219,8 @@ function Assert-On([string] $Version, [string] $Dir, [string] $What) {
     $installed = @(Get-Installed)
     Record "$What`: product $Version" ($installed.Count -eq 1 -and $installed[0] -eq (Get-ProductVersion $Version)) ($installed -join ', ')
     $reg = Get-ItemProperty -LiteralPath $RegKey -ErrorAction SilentlyContinue
-    Record "$What`: remembered version and folder" ($reg -and [string] $reg.Version -eq $Version -and ([string] $reg.InstallDir).TrimEnd('\') -eq $Dir) `
-        "$(if ($reg) { "$($reg.Version) in $($reg.InstallDir)" })"
+    $regVersion, $regDir = [string] (Get-Prop $reg 'Version'), [string] (Get-Prop $reg 'InstallDir')
+    Record "$What`: remembered version and folder" ($regVersion -eq $Version -and $regDir.TrimEnd('\') -eq $Dir) "$regVersion in $regDir"
     Record "$What`: installed files $Version" ((Get-FilesVersion $Dir) -eq $Version) (Get-FilesVersion $Dir)
 }
 
@@ -202,7 +231,12 @@ function Get-ProductVersion([string] $Semver) {
 
 # Wait for the Nth UI start in $UiOut (1-based) and return it.
 function Wait-UiStart([string] $UiOut, [int] $N, [int] $Seconds) {
-    return Wait-Until $Seconds "UI start #$N" { $s = @(Read-Ui $UiOut | Where-Object { $_.event -eq 'start' }); if ($s.Count -ge $N) { $s[$N - 1] } }
+    return Wait-Until $Seconds "UI start #$N" { $s = Get-UiStarts $UiOut; if ($s.Count -ge $N) { $s[$N - 1] } }
+}
+
+function Wait-LastUpdate([string] $DesktopHome, [string] $Outcome, [int] $Seconds) {
+    try { return Wait-Until $Seconds "last update '$Outcome'" { $l = Get-LastUpdate $DesktopHome; if ((Get-Prop $l 'outcome') -eq $Outcome) { $l } } }
+    catch { return Get-LastUpdate $DesktopHome }
 }
 
 function Invoke-Scenario([string] $Scenario) {
@@ -226,8 +260,8 @@ function Invoke-Scenario([string] $Scenario) {
                 Record "$tag`: Metro B started" ($s.version -eq $spec.version_b) "started $($s.version)"
                 $null = Wait-Until 60 'the commit' { -not (Get-Journal $desktopHome) }
                 Assert-On $spec.version_b $dir "$tag (after)"
-                $last = Get-LastUpdate $desktopHome
-                Record "$tag`: last update 'updated'" ($last -and $last.outcome -eq 'updated' -and $last.to -eq $spec.version_b) ($last | ConvertTo-Json -Compress)
+                $last = Wait-LastUpdate $desktopHome 'updated' 60
+                Record "$tag`: last update 'updated'" ((Get-Prop $last 'outcome') -eq 'updated' -and (Get-Prop $last 'to') -eq $spec.version_b) ($last | ConvertTo-Json -Compress)
                 $left = @(Get-ChildItem -LiteralPath (Join-Path $desktopHome 'update') -Directory | Where-Object { $_.Name -like 'db-snapshot-*' -or $_.Name -like 'stage-*' })
                 Record "$tag`: backup and stage dropped" ($left.Count -eq 0) (($left | ForEach-Object Name) -join ', ')
                 $entry.outcome = 'updated'
@@ -240,9 +274,10 @@ function Invoke-Scenario([string] $Scenario) {
                     $null = Start-Metro $dir $desktopHome $uiOut $spec.version_b 1
                     $s = Wait-UiStart $uiOut 2 600
                     Record "$tag`: Metro A started again" ($s.version -eq $spec.version_a) "started $($s.version)"
-                    $last = $s.state.last_update
-                    Record "$tag`: About & updates shows install_failed" ($last -and $last.outcome -eq 'install_failed' -and $last.failure_code -eq 'installer_failed') ($last | ConvertTo-Json -Compress)
-                    Record "$tag`: update journal retired" (-not (Get-Journal $desktopHome))
+                    $last = Get-Prop (Get-Prop $s 'state') 'last_update'
+                    Record "$tag`: About & updates shows install_failed" ((Get-Prop $last 'outcome') -eq 'install_failed' -and (Get-Prop $last 'failure_code') -eq 'installer_failed') ($last | ConvertTo-Json -Compress)
+                    $retired = try { Wait-Until 30 'the journal to retire' { -not (Get-Journal $desktopHome) } } catch { $false }
+                    Record "$tag`: update journal retired" ([bool] $retired)
                     Assert-On $spec.version_a $dir "$tag (after the failure)"
                     $null = Wait-Until 60 'Metro A to exit' { -not (Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($dir, 'OrdinalIgnoreCase') }) }
                 } finally {
@@ -258,48 +293,64 @@ function Invoke-Scenario([string] $Scenario) {
             }
             { $_ -in 'helper-killed', 'helper-msiexec-killed' } {
                 $null = Start-Metro $dir $desktopHome $uiOut $spec.version_b 1
-                $j = Wait-Until 600 'installing' { $j = Get-Journal $desktopHome; if ($j -and $j.phase -eq 'installing') { $j } }
+                # Mid-msiexec: the helper has recorded its msiexec client.
+                $j = Wait-Until 600 'msiexec under the helper' {
+                    $j = Get-Journal $desktopHome
+                    $phase = Get-Prop $j 'phase'
+                    if ($phase -in 'installed', 'committed', 'failed') { throw "the update reached '$phase' before the kill" }
+                    if ($phase -eq 'installing' -and (Get-Prop $j 'msiexec')) { $j }
+                }
                 $helper = Get-Process -Id $j.helper.pid -ErrorAction SilentlyContinue
-                Record "$tag`: helper runs from the private copy" ($helper -and $helper.Path.StartsWith((Join-Path $desktopHome 'update\helper-'), 'OrdinalIgnoreCase')) "$(if ($helper) { $helper.Path })"
-                $helper | Stop-Process -Force
-                if ($Scenario -eq 'helper-msiexec-killed') {
-                    $j = Wait-Until 60 'msiexec recorded' { $j = Get-Journal $desktopHome; if ($j -and $j.PSObject.Properties['msiexec']) { $j } else { $null } }
-                    Get-Process -Id $j.msiexec.pid -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-                }
-                # The helper may die before or after starting msiexec.
-                $j = Get-Journal $desktopHome
-                if ($j -and $j.PSObject.Properties['msiexec']) {
-                    $client = Get-Process -Id $j.msiexec.pid -ErrorAction SilentlyContinue
-                    if ($client) { $null = $client.WaitForExit(600000) }
-                }
-                $null = Wait-Until 600 'Windows Installer to finish' { -not (Test-InstallerBusy) }
-                $before = Get-Content -LiteralPath (Join-Path $desktopHome 'update\msi-update.json') -Raw
+                $client = Get-Process -Id $j.msiexec.pid -ErrorAction SilentlyContinue
+                Record "$tag`: helper runs from the private copy" ($helper -and $helper.Path -and $helper.Path.StartsWith((Join-Path $desktopHome 'update\helper-'), 'OrdinalIgnoreCase')) "$(if ($helper) { $helper.Path })"
+                $victims = @($helper) + $(if ($Scenario -eq 'helper-msiexec-killed') { @($client) } else { @() })
+                foreach ($v in $victims) { if ($v) { try { $v.Kill() } catch [InvalidOperationException] { } } }
+                foreach ($v in $victims) { if ($v) { $null = $v.WaitForExit(30000) } }
+                # The kill must have landed before the helper finished: the
+                # journal still says installing.
+                $after = Get-Journal $desktopHome
+                Record "$tag`: killed while installing" ((Get-Prop $after 'phase') -eq 'installing') "phase $(Get-Prop $after 'phase')"
+                if ($Scenario -eq 'helper-killed' -and $client) { $null = $client.WaitForExit(600000) }
+                Wait-InstallerIdle $desktopHome 600
+                $before = Read-SharedText (Get-JournalPath $desktopHome)
+                Record "$tag`: journal kept for the next start" ($null -ne $before)
                 $installed = @(Get-Installed)
                 $files = Get-FilesVersion $dir
+                $starts = (Get-UiStarts $uiOut).Count
                 $p = Start-Metro $dir $desktopHome $uiOut '' 1
-                $starts = @(Read-Ui $uiOut | Where-Object { $_.event -eq 'start' }).Count
-                $s = $null
-                try { $s = Wait-UiStart $uiOut ($starts + 1) 90 } catch { $s = $null }
-                if ($s) {
-                    $want = if ($installed.Count -eq 1 -and $installed[0] -eq (Get-ProductVersion $spec.version_b)) { $spec.version_b } else { $spec.version_a }
-                    Record "$tag`: the next start runs the installed version" ($s.version -eq $want) "started $($s.version), installed $($installed -join ',') files $files"
-                    Assert-On $want $dir "$tag (next start)"
-                    if ($want -eq $spec.version_b) {
-                        $null = Wait-Until 60 'the commit' { -not (Get-Journal $desktopHome) }
-                        $entry.outcome = 'continued in B'
-                    } else {
-                        $last = Get-LastUpdate $desktopHome
-                        Record "$tag`: failure recorded" ($last -and $last.outcome -eq 'install_failed') ($last | ConvertTo-Json -Compress)
-                        $entry.outcome = 'stayed on A, failure recorded'
+                # The next start either runs a version (a UI start), stops with
+                # its message box, or exits; nothing else counts.
+                $next = Wait-Until 120 'the next start to decide' {
+                    $s = Get-UiStarts $uiOut
+                    if ($s.Count -gt $starts) { return @{ kind = 'start'; start = $s[$starts] } }
+                    $text = [MetroMsiDialogs]::DialogText($p.Id)
+                    if ($null -ne $text) { return @{ kind = 'stopped'; text = $text } }
+                    if ($p.HasExited) { return @{ kind = 'exited'; code = $p.ExitCode } }
+                }
+                $facts = "installed $($installed -join ','), files $files"
+                switch ($next.kind) {
+                    'start' {
+                        $s = $next.start
+                        $want = if ($installed.Count -eq 1 -and $installed[0] -eq (Get-ProductVersion $spec.version_b)) { $spec.version_b } else { $spec.version_a }
+                        Record "$tag`: the next start runs the installed version" ($s.version -eq $want) "started $($s.version), $facts"
+                        Assert-On $want $dir "$tag (next start)"
+                        if ($want -eq $spec.version_b) {
+                            $null = Wait-Until 60 'the commit' { -not (Get-Journal $desktopHome) }
+                            $entry.outcome = "continued in B ($facts)"
+                        } else {
+                            $last = Wait-LastUpdate $desktopHome 'install_failed' 60
+                            Record "$tag`: failure recorded" ((Get-Prop $last 'outcome') -eq 'install_failed') ($last | ConvertTo-Json -Compress)
+                            $entry.outcome = "stayed on A, failure recorded ($facts)"
+                        }
                     }
-                } else {
-                    # Stopped before the workspace: everything kept as it was.
-                    $after = Get-Content -LiteralPath (Join-Path $desktopHome 'update\msi-update.json') -Raw
-                    Record "$tag`: stopped safely: journal unchanged" ($after -ceq $before)
-                    $backups = @(Get-ChildItem -LiteralPath (Join-Path $desktopHome 'update') -Directory -Filter 'db-snapshot-*')
-                    Record "$tag`: stopped safely: backup kept" ($backups.Count -eq 1)
-                    $entry.outcome = "stopped safely (installed $($installed -join ','), files $files)"
-                    $p | Stop-Process -Force -ErrorAction SilentlyContinue
+                    'stopped' {
+                        # Stopped before the workspace: everything kept as it was.
+                        Record "$tag`: stopped safely: journal unchanged" ((Read-SharedText (Get-JournalPath $desktopHome)) -ceq $before)
+                        $backups = @(Get-ChildItem -LiteralPath (Join-Path $desktopHome 'update') -Directory -Filter 'db-snapshot-*')
+                        Record "$tag`: stopped safely: backup kept" ($backups.Count -eq 1)
+                        $entry.outcome = "stopped safely ($facts): $(($next.text -split "`n")[0])"
+                    }
+                    default { Record "$tag`: the next start decided" $false "exited with $($next.code) without a UI or a message ($facts)" }
                 }
             }
             default { throw "unknown scenario $Scenario" }
@@ -307,8 +358,7 @@ function Invoke-Scenario([string] $Scenario) {
         Write-Host "PASS  $tag`: $($entry.outcome)"
     } finally {
         Stop-Metro $dir $desktopHome
-        Start-Sleep -Seconds 1
-        try { Remove-AllMetro } catch { $result.checks.Add([ordered] @{ name = "$tag`: cleanup"; ok = $false; detail = $_.Exception.Message }) }
+        try { Wait-InstallerIdle $desktopHome 300; Remove-AllMetro } catch { $result.checks.Add([ordered] @{ name = "$tag`: cleanup"; ok = $false; detail = $_.Exception.Message }) }
         Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue
         $logs = Join-Path $desktopHome 'update\msiexec.log'
         if (Test-Path -LiteralPath $logs) { Copy-Item -LiteralPath $logs -Destination (Join-Path $out "$tag-update-msiexec.log") -Force }

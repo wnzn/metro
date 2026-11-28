@@ -40,6 +40,7 @@ if (-not ($env:CI -eq 'true' -or $IAcceptChangesToThisWindowsProfile)) {
 }
 . (Join-Path $PSScriptRoot 'MsiAutomation.ps1')
 . (Join-Path $PSScriptRoot 'MsiHarness.ps1')
+. (Join-Path $PSScriptRoot 'UpdateTestIo.ps1')
 
 $UpgradeCode = '{29BBE899-7D6A-49A7-B60E-F9644544D683}'
 if (-not $LogDir) { $LogDir = Join-Path ([IO.Path]::GetTempPath()) ('metro-msi-update-' + [Guid]::NewGuid().ToString('N')) }
@@ -47,7 +48,7 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 foreach ($f in $MsiA, $MsiB) { if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { throw "missing $f" } }
 if (-not (Test-Path -LiteralPath (Join-Path $ReleaseRoot "v$VersionB\SHA256SUMS"))) { throw "no fixture release v$VersionB under $ReleaseRoot" }
 $Failed = $false
-$Scripts = 'msi-update-scenarios.ps1', 'MsiAutomation.ps1', 'MsiHarness.ps1'
+$Scripts = 'msi-update-scenarios.ps1', 'MsiAutomation.ps1', 'MsiHarness.ps1', 'UpdateTestIo.ps1'
 
 function New-TestRoot([string] $Base, [string] $ReleaseBase) {
     New-Item -ItemType Directory -Path $Base | Out-Null   # fails if it already exists
@@ -61,8 +62,8 @@ function New-TestRoot([string] $Base, [string] $ReleaseBase) {
 }
 
 function Show-Result([string] $File, [string] $Who) {
-    if (-not (Test-Path -LiteralPath $File)) { Write-Host "FAIL  $Who wrote no result"; return $false }
-    $r = Get-Content -LiteralPath $File -Raw | ConvertFrom-Json
+    $r = Read-SharedJson $File
+    if (-not $r) { Write-Host "FAIL  $Who wrote no result"; return $false }
     foreach ($c in $r.checks) { Write-Host ("{0}  {1}: {2}{3}" -f $(if ($c.ok) { 'PASS' } else { 'FAIL' }), $Who, $c.name, $(if ($c.detail) { " ($($c.detail))" })) }
     foreach ($s in $r.scenarios) { Write-Host "INFO  $Who`: $($s.scenario) -> $($s.outcome)" }
     if ($r.error) { Write-Host "FAIL  $Who`: $($r.error)"; return $false }
@@ -76,10 +77,17 @@ try {
     $server = Start-Process -FilePath $Python -PassThru -WindowStyle Hidden -ArgumentList @(
         '-I', "`"$(Join-Path $PSScriptRoot 'update_fixture.py')`"", 'serve', '--root', "`"$ReleaseRoot`"",
         '--latest', $VersionB, '--port-file', "`"$portFile`"")
+    $null = $server.Handle
+    # The server may have created the file but not written the port yet.
     $deadline = (Get-Date).AddSeconds(30)
-    while (-not (Test-Path -LiteralPath $portFile) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
-    if (-not (Test-Path -LiteralPath $portFile)) { throw 'the fixture release server did not start' }
-    $base = "http://127.0.0.1:$((Get-Content -LiteralPath $portFile -Raw).Trim())"
+    $port = $null
+    while (-not $port -and (Get-Date) -lt $deadline) {
+        $t = Read-SharedText $portFile
+        if ($t -and $t.Trim() -match '^\d{1,5}$') { $port = $t.Trim() } else { Start-Sleep -Milliseconds 200 }
+        if ($server.HasExited) { throw "the fixture release server exited with $($server.ExitCode)" }
+    }
+    if (-not $port) { throw 'the fixture release server did not start' }
+    $base = "http://127.0.0.1:$port"
     Write-Host "fixture release v$VersionB at $base"
 
     # 1. The current user.
