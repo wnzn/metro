@@ -153,17 +153,38 @@ The ZIP runs from any folder you extract it to
 
 ## Desktop on macOS
 
-**There's no Mac download for now.** CI doesn't build Metro for macOS at
-the moment, for Apple silicon or Intel: GitHub's macOS build machines were
-too busy, and the builds kept getting cancelled. Releases ship Windows and
-Linux only, and test builds don't include a Mac either. There's no date for
-when Mac builds come back.
+**Metro 0.6.4 has no Mac download.** Releases up to 0.6.4 ship Windows and
+Linux only.
 
-The macOS installer, `install-metro-macos.sh`, stays in the source so Mac
-builds can return. It isn't published with releases for now, and it has
-never been verified. A Mac release was designed to be signed
-with a Developer ID certificate, notarized by Apple and stapled, but that
-has never run.
+**In the source, not released:** the 0.6.5 source builds an Apple-silicon
+Mac in every test build and every release, as
+`Metro-X.Y.Z-macos-arm64.tar.gz` with a `.sha256`, installed with
+`install-metro-macos.sh`. No release with it has been published yet.
+
+- **Apple silicon only.** It needs macOS 14 or newer. There's no Intel Mac
+  build.
+- **Ad hoc signed, not notarized.** It has no Developer ID signature, and
+  Apple hasn't notarized it. Its `RELEASE.json` says `"signing": "adhoc"`.
+  macOS may refuse to open it. The installer says so and never changes
+  Gatekeeper settings or removes quarantine. Don't change them for Metro
+  either.
+- **Check it first.** Verify `SHA256SUMS` with cosign
+  ([Check a download](#check-a-download)), then install with the archive
+  and that list:
+
+  ```sh
+  sh install-metro-macos.sh install --archive Metro-X.Y.Z-macos-arm64.tar.gz --checksum-file SHA256SUMS
+  ```
+
+  It installs `Metro.app` into `~/Applications/Metro Desktop/` and keeps
+  your data in `~/Library/Application Support/Metro/Desktop`.
+  `update --archive …` installs a newer version, and `uninstall` removes
+  the app but keeps your data.
+- **Updates are manual.** Metro on macOS doesn't update itself. Install
+  each new version with `install-metro-macos.sh update`.
+- **Not verified yet.** CI is set up to install, start and stop it on a
+  Mac in each run, but no such run of the 0.6.5 source is recorded in
+  [acceptance](acceptance.md) yet, and no person has installed it on a Mac.
 
 ## The desktop's own runner
 
@@ -377,13 +398,14 @@ that.
   downloaded only while signed in to GitHub. They expire after 7 or 14 days.
 - `preview-assets`: the Linux and Windows desktop archives, the Windows
   `….unsigned-preview.msi`, the Linux runner archive, their `.sha256` files,
-  the installer scripts and a `SHA256SUMS`.
+  the installer scripts and a `SHA256SUMS`. In the source, not released, it
+  also holds the ad hoc signed `…-macos-arm64.tar.gz`
+  ([macOS](#desktop-on-macos)).
 - The checksums only show that a file wasn't damaged in transit. They don't
   show who built it. Nothing in a test build is signed by Metro's
   publishers.
 - A test build's `RELEASE.json` says so (`unsigned-preview` on Windows). The
   installers say so too.
-- There's no Mac test build for now ([macOS](#desktop-on-macos)).
 - A run's tests aren't all guaranteed to pass. Check the run's status before
   you rely on one of its files.
 
@@ -427,16 +449,18 @@ workspace and the desktop app's `nsh.json` must name the same version.
 **Files** (for version `X.Y.Z`):
 
 - The desktop archives `Metro-X.Y.Z-linux-x64.tar.gz` and
-  `Metro-X.Y.Z-windows-x64.zip`, each with `metro-tui` inside. There's no
-  macOS archive for now ([macOS](#desktop-on-macos)).
+  `Metro-X.Y.Z-windows-x64.zip`, each with `metro-tui` inside. In the
+  source, not released: `Metro-X.Y.Z-macos-arm64.tar.gz`, ad hoc signed
+  ([macOS](#desktop-on-macos)).
 - The MSI: `Metro-X.Y.Z-windows-x64.unsigned-preview.msi` while Windows
   ships unsigned (now), `Metro-X.Y.Z-windows-x64.msi` once it's signed.
 - The runner archive `Metro-runner-X.Y.Z-linux-x64.tar.gz`.
 - A `.sha256` beside each archive and the MSI.
-- The five installer scripts (all except `install-metro-macos.sh`).
+- The five installer scripts (all except `install-metro-macos.sh`). In the
+  source, not released: six, with `install-metro-macos.sh`.
 - `SHA256SUMS`, which lists them all, with its Sigstore bundle
   `SHA256SUMS.sigstore.json`. The two Linux archives have their own
-  `.sigstore.json` too.
+  `.sigstore.json` too, and so does the macOS archive in the source.
 - `IMAGES.txt`.
 
 ### Check a download

@@ -1,3 +1,4 @@
 self-hosted-runner:
   labels:
-    - metro-ci-linux-x64
+    - metro-ci-linux-docker
+    - metro-ci-macos-arm64

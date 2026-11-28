@@ -144,14 +144,17 @@ class VersionTests(unittest.TestCase):
                 self.assertIn(f"Metro-{V}-linux-x64.tar.gz.sha256", names)
                 self.assertIn(f"Metro-{V}-windows-x64.zip", names)  # the ZIP keeps its name either way
                 self.assertIn(f"Metro-{V}-windows-x64.zip.sha256", names)
-                self.assertFalse(any("macos" in n for n in names))  # macOS builds are off for now
+                self.assertIn(f"Metro-{V}-macos-arm64.tar.gz.sigstore.json", names)
+                self.assertIn("install-metro-macos.sh", names)
+                self.assertFalse(any("macos-x64" in n for n in names))  # Apple silicon only
                 self.assertIn("SHA256SUMS.sigstore.json", names)
                 self.assertIn("IMAGES.txt", names)
                 self.assertEqual(names, signatures.binaries(V, mode) | signatures.INSTALLERS
                                  | {f"{n}.sha256" for n in signatures.binaries(V, mode)}
                                  | {"SHA256SUMS", "IMAGES.txt", "SHA256SUMS.sigstore.json",
                                     f"Metro-{V}-linux-x64.tar.gz.sigstore.json",
-                                    f"Metro-runner-{V}-linux-x64.tar.gz.sigstore.json"})
+                                    f"Metro-runner-{V}-linux-x64.tar.gz.sigstore.json",
+                                    f"Metro-{V}-macos-arm64.tar.gz.sigstore.json"})
 
 
     def test_prior_version_comes_from_the_push_before_commit_not_working_tree(self):
@@ -217,6 +220,10 @@ class WindowsSigningSwitchTests(unittest.TestCase):
                        f"--certificate-github-workflow-sha {SHA}", "Get-FileHash",
                        "sha256sum -c --ignore-missing SHA256SUMS", "docs/install.md#check-a-download"):
             self.assertIn(needle, unsigned)
+        for notes in (signed, unsigned):  # both modes say the Mac build is ad hoc and updates by hand
+            for needle in ("The macOS download is ad hoc signed, not notarized", f"Metro-{V}-macos-arm64.tar.gz",
+                           "install-metro-macos.sh", "doesn't update itself"):
+                self.assertIn(needle, notes)
         with self.assertRaisesRegex(rp.PolicyError, "unknown Windows signing mode"):
             rp.release_notes(V, SHA, "maybe")
         # Without an explicit mode the notes follow the checked-in switch.

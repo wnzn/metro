@@ -21,7 +21,7 @@ apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
   uidmap slirp4netns dbus-user-session \
   libicu76 git curl ca-certificates build-essential pkg-config xz-utils zstd unzip jq \
-  python3 python3-yaml desktop-file-utils libglib2.0-bin shellcheck
+  python3 python3-yaml desktop-file-utils libglib2.0-bin shellcheck chromium file
 
 if ! getent passwd "$U" >/dev/null; then
   useradd --system --user-group --create-home --home-dir "$H" --shell /bin/bash "$U"

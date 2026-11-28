@@ -2,17 +2,17 @@ name: Release artifacts
 
 # Reusable, read-only platform build and smoke gates. PRs and main pushes that
 # do not release get preview artifacts only. An eligible protected main push (a
-# version bump) instead hands off the Linux archives and, per
-# packaging/windows-release-signing.txt, either the verified Windows ZIP seed
-# for signing (signed) or the natively tested unsigned Windows build
-# (unsigned). No job in this tree can sign with credentials or publish.
+# version bump) instead hands off the Linux archives, the ad hoc signed
+# Apple-silicon macOS archive and, per packaging/windows-release-signing.txt,
+# either the verified Windows ZIP seed for signing (signed) or the natively
+# tested unsigned Windows build (unsigned). No job in this tree can sign with
+# credentials or publish.
 #
-# macOS builds are off for now, for every event: GitHub's macOS runners queued
-# for 15+ minutes and the jobs were cancelled. The macOS packaging code stays
-# (packaging/package.py, macos_release.py, install-metro-macos.sh,
-# smoke-macos-launch.sh). To restore the builds, take the `desktop-macos` job
-# and meta's macOS matrix step from this file at commit 106e5da, and the
-# `macos-sign` job from release-publish.yml there.
+# Runners (inputs.self_hosted, from ci.yml's `workflows` selector): Linux jobs
+# on `metro-ci-linux-docker` and the Mac on `metro-ci-macos-arm64` when true;
+# GitHub-hosted ubuntu-24.04 and macos-15 otherwise (forks, any doubt).
+# Native Windows jobs are always GitHub-hosted. There is no Intel Mac build
+# and no Developer ID signing or notarization.
 
 on:
   workflow_call:
@@ -25,6 +25,10 @@ on:
         description: 'Official builds: the checked-in version chosen by release_policy.py decide (no leading v).'
         type: string
         default: ''
+      self_hosted:
+        description: "Use Metro's self-hosted Linux and macOS runners (ci.yml decides: trusted events only)."
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -38,10 +42,31 @@ env:
 
 jobs:
   meta:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.self_hosted && 'metro-ci-linux-docker' || 'ubuntu-24.04' }}
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
+      # Recheck the repository, event and ref on the self-hosted runner before
+      # any checkout. Hosted runners skip this step.
+      - name: Self-hosted runner only for this repository's main push or same-repository PR to main
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        env:
+          WANT_OS: Linux
+          WANT_ARCH: X64
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = wnzn/metro
+          test "$GITHUB_REPOSITORY_ID" = 1467654868
+          case "$GITHUB_EVENT_NAME" in
+            push) test "$GITHUB_REF" = refs/heads/main ;;
+            pull_request)
+              test "$GITHUB_BASE_REF" = main
+              python3 -I -c 'import json, sys; pr = json.load(open(sys.argv[1]))["pull_request"]; sys.exit(not (pr["head"]["repo"]["id"] == pr["base"]["repo"]["id"] == 1467654868))' "$GITHUB_EVENT_PATH" ;;
+            *) exit 1 ;;
+          esac
+          test "$RUNNER_OS" = "$WANT_OS"
+          test "$RUNNER_ARCH" = "$WANT_ARCH"
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
@@ -77,9 +102,30 @@ jobs:
   # build: confinement uses Linux openat2.
   runner-linux:
     needs: meta
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.self_hosted && 'metro-ci-linux-docker' || 'ubuntu-24.04' }}
     timeout-minutes: 20
     steps:
+      # Recheck the repository, event and ref on the self-hosted runner before
+      # any checkout. Hosted runners skip this step.
+      - name: Self-hosted runner only for this repository's main push or same-repository PR to main
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        env:
+          WANT_OS: Linux
+          WANT_ARCH: X64
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = wnzn/metro
+          test "$GITHUB_REPOSITORY_ID" = 1467654868
+          case "$GITHUB_EVENT_NAME" in
+            push) test "$GITHUB_REF" = refs/heads/main ;;
+            pull_request)
+              test "$GITHUB_BASE_REF" = main
+              python3 -I -c 'import json, sys; pr = json.load(open(sys.argv[1]))["pull_request"]; sys.exit(not (pr["head"]["repo"]["id"] == pr["base"]["repo"]["id"] == 1467654868))' "$GITHUB_EVENT_PATH" ;;
+            *) exit 1 ;;
+          esac
+          test "$RUNNER_OS" = "$WANT_OS"
+          test "$RUNNER_ARCH" = "$WANT_ARCH"
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
@@ -183,8 +229,29 @@ jobs:
   # distribution as NSH_RUNTIME.
   ui:
     needs: meta
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.self_hosted && 'metro-ci-linux-docker' || 'ubuntu-24.04' }}
     steps:
+      # Recheck the repository, event and ref on the self-hosted runner before
+      # any checkout. Hosted runners skip this step.
+      - name: Self-hosted runner only for this repository's main push or same-repository PR to main
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        env:
+          WANT_OS: Linux
+          WANT_ARCH: X64
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = wnzn/metro
+          test "$GITHUB_REPOSITORY_ID" = 1467654868
+          case "$GITHUB_EVENT_NAME" in
+            push) test "$GITHUB_REF" = refs/heads/main ;;
+            pull_request)
+              test "$GITHUB_BASE_REF" = main
+              python3 -I -c 'import json, sys; pr = json.load(open(sys.argv[1]))["pull_request"]; sys.exit(not (pr["head"]["repo"]["id"] == pr["base"]["repo"]["id"] == 1467654868))' "$GITHUB_EVENT_PATH" ;;
+            *) exit 1 ;;
+          esac
+          test "$RUNNER_OS" = "$WANT_OS"
+          test "$RUNNER_ARCH" = "$WANT_ARCH"
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
@@ -675,9 +742,30 @@ jobs:
   # and installer checks, all blocking. There is no GUI launch here.
   desktop-linux:
     needs: [meta, ui]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.self_hosted && 'metro-ci-linux-docker' || 'ubuntu-24.04' }}
     timeout-minutes: 30
     steps:
+      # Recheck the repository, event and ref on the self-hosted runner before
+      # any checkout. Hosted runners skip this step.
+      - name: Self-hosted runner only for this repository's main push or same-repository PR to main
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        env:
+          WANT_OS: Linux
+          WANT_ARCH: X64
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = wnzn/metro
+          test "$GITHUB_REPOSITORY_ID" = 1467654868
+          case "$GITHUB_EVENT_NAME" in
+            push) test "$GITHUB_REF" = refs/heads/main ;;
+            pull_request)
+              test "$GITHUB_BASE_REF" = main
+              python3 -I -c 'import json, sys; pr = json.load(open(sys.argv[1]))["pull_request"]; sys.exit(not (pr["head"]["repo"]["id"] == pr["base"]["repo"]["id"] == 1467654868))' "$GITHUB_EVENT_PATH" ;;
+            *) exit 1 ;;
+          esac
+          test "$RUNNER_OS" = "$WANT_OS"
+          test "$RUNNER_ARCH" = "$WANT_ARCH"
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
@@ -829,17 +917,254 @@ jobs:
           overwrite: true
           retention-days: 14
 
-  # The preview aggregate: the Linux and Windows
+  # Apple-silicon macOS: builds and tests the launcher and server natively,
+  # packages the stock NSH macOS runtime (pinned asset and runtime digests) as
+  # the inner MetroUI.app, assembles and ad hoc signs the outer Metro.app,
+  # installs it with install-metro-macos.sh into a path with spaces and checks
+  # a clean start and shutdown. Ad hoc signed only: no Developer ID, no
+  # notarization, no Apple credentials anywhere. Its archive is a final output
+  # (dist-desktop-macos-arm64), in previews and in releases.
+  desktop-macos:
+    needs: meta
+    runs-on: ${{ inputs.self_hosted && 'metro-ci-macos-arm64' || 'macos-15' }}
+    timeout-minutes: 90
+    env:
+      TARGET: macos-arm64
+      RUST_TARGET: aarch64-apple-darwin
+      # Official longbridge/nsh v0.6.1 macOS arm64 asset.
+      NSH_ASSET: nsh-macos-arm64.tar.gz
+      NSH_ASSET_SHA256: ee1aed2a4d111fe90e6cceca4b9d5f834c9e11cfda525f8be984261a329c06de
+    steps:
+      # Recheck the repository, event and ref on the self-hosted runner before
+      # any checkout. Hosted runners skip this step.
+      - name: Self-hosted runner only for this repository's main push or same-repository PR to main
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        env:
+          WANT_OS: macOS
+          WANT_ARCH: ARM64
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = wnzn/metro
+          test "$GITHUB_REPOSITORY_ID" = 1467654868
+          case "$GITHUB_EVENT_NAME" in
+            push) test "$GITHUB_REF" = refs/heads/main ;;
+            pull_request)
+              test "$GITHUB_BASE_REF" = main
+              python3 -I -c 'import json, sys; pr = json.load(open(sys.argv[1]))["pull_request"]; sys.exit(not (pr["head"]["repo"]["id"] == pr["base"]["repo"]["id"] == 1467654868))' "$GITHUB_EVENT_PATH" ;;
+            *) exit 1 ;;
+          esac
+          test "$RUNNER_OS" = "$WANT_OS"
+          test "$RUNNER_ARCH" = "$WANT_ARCH"
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Runner architecture matches the target
+        run: |
+          set -eu
+          test "$(uname -m)" = arm64
+          sw_vers
+      - name: Install pinned NSH for macOS (asset digest, then runtime digest in package.py)
+        run: |
+          set -eu
+          archive="$RUNNER_TEMP/$NSH_ASSET"
+          curl --fail --silent --show-error --location --retry 3 --output "$archive" \
+            "https://github.com/longbridge/nsh/releases/download/$NSH_VERSION/$NSH_ASSET"
+          printf '%s  %s\n' "$NSH_ASSET_SHA256" "$archive" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/nsh-macos"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/nsh-macos"
+          printf '%s\n' "$RUNNER_TEMP/nsh-macos/nsh/bin" >> "$GITHUB_PATH"
+      - name: nsh package --target macos (inner MetroUI bundle, its own identifier)
+        working-directory: apps/desktop
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          # Package the pinned prebuilt runner. Without NSH_RUNTIME, nsh on a Mac
+          # with cargo builds an app-specific runner from source instead.
+          NSH_RUNTIME: ${{ runner.temp }}/nsh-macos/nsh/runtime
+        run: |
+          set -eu
+          python3 -I - "$GITHUB_WORKSPACE/packaging" "$TARGET" "$NSH_RUNTIME/macos/nsh-macos-app" <<'PY'
+          import hashlib, runpy, sys
+          pinned = runpy.run_path(sys.argv[1] + "/package.py")["NSH_MACOS_APPS"][sys.argv[2]][0]
+          got = hashlib.sha256(open(sys.argv[3], "rb").read()).hexdigest()
+          assert got == pinned, f"NSH_RUNTIME runner is not the pinned stock runtime: {got}"
+          PY
+          nsh package App.tsx --target macos --id dev.metro.desktop.ui --app-version "${VERSION#v}" \
+            --icon assets/metro-256.png --out "$RUNNER_TEMP/out-macos"
+          find "$RUNNER_TEMP/out-macos" | head -40
+          plutil -p "$RUNNER_TEMP/out-macos/Metro.app/Contents/Info.plist"
+          codesign --verify --strict --verbose=2 "$RUNNER_TEMP/out-macos/Metro.app"
+          codesign --display --verbose=2 "$RUNNER_TEMP/out-macos/Metro.app" 2>&1 | grep -E '^(Identifier|Format|CodeDirectory|Signature|TeamIdentifier)='
+          # Early, explicit: the inner executable is the stock runtime re-signed ad hoc
+          # (package.py repeats this check before it assembles the outer app).
+          python3 -I - "$GITHUB_WORKSPACE/packaging" "$NSH_RUNTIME/macos/nsh-macos-app" \
+            "$RUNNER_TEMP/out-macos/Metro.app/Contents" "$TARGET" <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, sys.argv[1])
+          import package
+          contents = Path(sys.argv[3])
+          package.stock_renderer(contents / "MacOS/Metro", Path(sys.argv[2]), contents, sys.argv[4])
+          print("inner executable: stock NSH runtime, re-signed ad hoc for", package.MACOS_UI_ID)
+          PY
+      - name: Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target "$RUST_TARGET"
+      # Previews only: official builds always compile from a clean target. Only
+      # main pushes write the cache.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ !inputs.release }}
+        with:
+          key: aarch64-apple-darwin
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Locked fetch and native tests of the launcher
+        run: |
+          set -eu
+          cargo fetch --locked --target "$RUST_TARGET"
+          python3 -I -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
+          cargo test --locked --release --target "$RUST_TARGET" -p metro-desktop
+      - name: Build metro-desktop, metro-server and metro-tui (native, locked)
+        env:
+          # Official releases only (see runner-linux).
+          METRO_RELEASE_CHANNEL: ${{ inputs.release && 'release' || '' }}
+        run: |
+          set -eu
+          cargo build --locked --release --target "$RUST_TARGET" --bin metro-desktop --bin metro-server --bin metro-tui
+      - name: Third-party notices
+        run: |
+          set -eu
+          python3 -I packaging/cargo-notices.py --target "$RUST_TARGET" \
+            --package metro-desktop --package metro-server --package metro-tui --out "$RUNNER_TEMP/notices-desktop.txt"
+      - name: Package (outer Metro.app, ad hoc signed)
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -eu
+          rel="target/$RUST_TARGET/release"
+          python3 -I packaging/package.py desktop --target "$TARGET" --version "$VERSION" \
+            --launcher "$rel/metro-desktop" --server "$rel/metro-server" --tui "$rel/metro-tui" \
+            --ui-dir "$RUNNER_TEMP/out-macos/Metro.app" --nsh-root "$RUNNER_TEMP/nsh-macos/nsh" \
+            --notices "$RUNNER_TEMP/notices-desktop.txt" --out-dir dist-macos
+          ls -l dist-macos
+      - name: Install into a path with spaces, then a clean start and shutdown
+        timeout-minutes: 8
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -Eeuo pipefail
+          # Every check runs under a named gate; a failure reports that gate and the
+          # script line. Nothing prints process arguments, the environment or tokens.
+          gate=setup
+          trap 'echo "::error title=macOS install smoke::gate \"$gate\" failed (step script line $LINENO)" >&2' ERR
+          # Exact folder inventory: names, kinds and the marker's mode, no extras.
+          # (Not `find | sort`: sort order follows the runner's en_US.UTF-8 collation.)
+          inventory() { # DIR NAME=KIND...  (KIND: dir, or empty-file-644)
+            python3 -I - "$@" <<'PY'
+          import stat, sys
+          from pathlib import Path
+          folder, want = Path(sys.argv[1]), dict(a.split("=", 1) for a in sys.argv[2:])
+          def kind(p):
+              st = p.lstat()
+              if stat.S_ISLNK(st.st_mode):
+                  return "symlink"
+              if stat.S_ISDIR(st.st_mode):
+                  return "dir"
+              if stat.S_ISREG(st.st_mode):
+                  return f"{'empty-' if st.st_size == 0 else ''}file-{stat.S_IMODE(st.st_mode):03o}"
+              return "other"
+          got = {p.name: kind(p) for p in folder.iterdir()}
+          if got != want:
+              print(f"{folder.name}: expected {sorted(want.items())}, found {sorted(got.items())}", file=sys.stderr)
+              sys.exit(1)
+          PY
+          }
+          home="$(mktemp -d "$RUNNER_TEMP/mac home.XXXXXX")"
+          home="$(cd "$home" && pwd -P)"
+          a="$GITHUB_WORKSPACE/dist-macos/Metro-$VERSION-$TARGET.tar.gz"
+          i="$GITHUB_WORKSPACE/packaging/install-metro-macos.sh"
+          dir="$home/Applications/Metro Desktop"
+          app="$dir/Metro.app"
+
+          gate="install (path with spaces)"
+          HOME="$home" sh "$i" install --archive "$a"
+          gate="install folder holds exactly Metro.app and the local-runner marker"
+          inventory "$dir" Metro.app=dir enable-local-runner=empty-file-644
+          gate="codesign --verify --deep --strict Metro.app"
+          codesign --verify --deep --strict "$app"
+          gate="codesign --verify --strict MetroUI.app"
+          codesign --verify --strict "$app/Contents/Helpers/MetroUI.app"
+          gate="codesign --verify --strict metro-tui"
+          codesign --verify --strict "$app/Contents/MacOS/metro-tui"
+          gate="metro-tui --help (exit 0, about text on stdout)"
+          "$app/Contents/MacOS/metro-tui" --help > "$RUNNER_TEMP/tui-help.txt"
+          grep -q "Metro conversations" "$RUNNER_TEMP/tui-help.txt"
+          gate="outer bundle identifier dev.metro.desktop"
+          test "$(plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist")" = dev.metro.desktop
+          gate="inner bundle identifier dev.metro.desktop.ui"
+          test "$(plutil -extract CFBundleIdentifier raw "$app/Contents/Helpers/MetroUI.app/Contents/Info.plist")" = dev.metro.desktop.ui
+
+          gate="launch smoke (smoke-macos-launch.sh names its own failing check)"
+          export METRO_DESKTOP_HOME="$home/desktop data"
+          sh packaging/smoke-macos-launch.sh "$app" "$home/Library/Application Support/Metro/Installer/RELEASE.json" \
+            "$RUNNER_TEMP/shot" "desktop-$TARGET"
+
+          gate="update --no-local-runner removes only the marker"
+          HOME="$home" sh "$i" update --archive "$a" --no-local-runner
+          inventory "$dir" Metro.app=dir
+          gate="uninstall removes the app folder and keeps Metro data"
+          HOME="$home" sh "$i" uninstall
+          test ! -e "$dir"
+          test -d "$METRO_DESKTOP_HOME"
+          gate="all checks passed"
+          echo "macOS install smoke passed"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: smoke-macos-arm64-screenshot
+          path: ${{ runner.temp }}/shot/*.png
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-desktop-macos-arm64
+          path: dist-macos/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+
+  # The preview aggregate: the Linux, Windows and macOS
   # desktop archives, the Windows MSI, the Linux runner, their .sha256
   # sidecars and the installer scripts in one SHA256SUMS, checked by the same
   # release_assets.py as the release but without signature requirements.
   assets:
-    needs: [meta, runner-linux, windows-distribution, desktop-linux]
+    needs: [meta, runner-linux, windows-distribution, desktop-linux, desktop-macos]
     if: ${{ !inputs.release }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.self_hosted && 'metro-ci-linux-docker' || 'ubuntu-24.04' }}
     permissions:
       contents: read
     steps:
+      # Recheck the repository, event and ref on the self-hosted runner before
+      # any checkout. Hosted runners skip this step.
+      - name: Self-hosted runner only for this repository's main push or same-repository PR to main
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        env:
+          WANT_OS: Linux
+          WANT_ARCH: X64
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = wnzn/metro
+          test "$GITHUB_REPOSITORY_ID" = 1467654868
+          case "$GITHUB_EVENT_NAME" in
+            push) test "$GITHUB_REF" = refs/heads/main ;;
+            pull_request)
+              test "$GITHUB_BASE_REF" = main
+              python3 -I -c 'import json, sys; pr = json.load(open(sys.argv[1]))["pull_request"]; sys.exit(not (pr["head"]["repo"]["id"] == pr["base"]["repo"]["id"] == 1467654868))' "$GITHUB_EVENT_PATH" ;;
+            *) exit 1 ;;
+          esac
+          test "$RUNNER_OS" = "$WANT_OS"
+          test "$RUNNER_ARCH" = "$WANT_ARCH"
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false

@@ -7,8 +7,13 @@ name: Release publication
 # windows-distribution built and tested natively), pin v<version> at that
 # commit, assemble the set, verify GHCR and Sigstore signatures, and publicly
 # promote the complete release. The tag is a marker, not a workflow trigger.
-# A release ships Windows and Linux only: macOS builds and signing are off for
-# now (see release.yml).
+# The ad hoc signed Apple-silicon macOS archive comes from release.yml as is:
+# there is no Developer ID signing or notarization.
+#
+# Every job here and in the trees it calls stays on GitHub-hosted runners:
+# they hold contents/packages write or a GitHub OIDC token (Sigstore keyless
+# signing), so they run on fresh, single-use machines, never on Metro's
+# persistent self-hosted runners.
 #
 # Every job after windows-sign states its own condition: with windows-sign
 # skipped (unsigned), GitHub would otherwise skip everything that depends on

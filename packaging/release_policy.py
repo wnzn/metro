@@ -333,6 +333,13 @@ def release_notes(version, sha, windows=None):
     windows = release_signatures.windows_signing() if windows is None else windows
     notes = (f"Metro {version}. Verify downloads with SHA256SUMS and its Sigstore bundle "
              "SHA256SUMS.sigstore.json. Container images by digest: IMAGES.txt.\n\n")
+    for target in release_signatures.MACOS_TARGETS:
+        notes += (
+            f"**The macOS download is ad hoc signed, not notarized.** Metro-{version}-{target}.tar.gz "
+            "(Apple silicon; its RELEASE.json says `adhoc`) has no Developer ID signature and Apple hasn't "
+            "notarized it, so macOS may refuse to open it. Install it with install-metro-macos.sh, and don't "
+            "change Gatekeeper settings for it. Metro on macOS doesn't update itself: install each new "
+            "version the same way.\n\n")
     if windows == "unsigned":
         msi = release_signatures.windows_msi(version, windows)
         notes += (

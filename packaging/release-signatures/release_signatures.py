@@ -24,9 +24,8 @@ SIGNER_WORKFLOW = "sign-release-assets.yml"
 CALLER_WORKFLOW = "ci.yml"
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?")
 COMMIT = re.compile(r"[0-9a-f]{40}")
-# install-metro-macos.sh ships only next to macOS archives (none for now; see MACOS_TARGETS).
 INSTALLERS = {
-    "install-metro-linux.sh", "install-metro-runner-linux.sh",
+    "install-metro-linux.sh", "install-metro-runner-linux.sh", "install-metro-macos.sh",
     "install-metro-windows.ps1", "metro-runner-container.sh", "metro-runner-container.ps1",
 }
 IMAGES = {
@@ -80,15 +79,15 @@ def resolve_tag(version):
     return matches.get(peeled, matches[ref])
 
 
+# The Macs a release ships (release_assets.MACOS): Apple silicon, ad hoc
+# signed (no Developer ID, not notarized).
+MACOS_TARGETS = ("macos-arm64",)
+
+
 def direct_archives(version):
-    return (f"Metro-{version}-linux-x64.tar.gz", f"Metro-runner-{version}-linux-x64.tar.gz")
-
-
-# The Macs a release ships (release_assets.MACOS): none for now. macOS builds
-# are off in CI (GitHub's macOS runners queued for 15+ minutes and jobs were
-# cancelled; see release.yml). When they return, list the targets here and add
-# install-metro-macos.sh to INSTALLERS again.
-MACOS_TARGETS = ()
+    """The .tar.gz archives that get their own Sigstore bundle (Linux and macOS)."""
+    return (f"Metro-{version}-linux-x64.tar.gz", f"Metro-runner-{version}-linux-x64.tar.gz",
+            *(f"Metro-{version}-{target}.tar.gz" for target in MACOS_TARGETS))
 
 # The checked-in switch for how official releases ship Windows. There is no
 # default and no environment override: only this file decides, so changing it
@@ -125,7 +124,7 @@ def binaries(version, windows=None):
     """The release archives and the MSI; `windows` is the signing mode (default: the checked-in one)."""
     return set(direct_archives(version)) | {
         f"Metro-{version}-windows-x64.zip", windows_msi(version, windows),
-    } | {f"Metro-{version}-{target}.tar.gz" for target in MACOS_TARGETS}
+    }
 
 
 def regular_file(path):
@@ -295,7 +294,7 @@ def verify_file(cosign, artifact, version, revision):
     tag_ref(version)
     name = artifact.name
     require(name == MANIFEST or name in direct_archives(version),
-            "expected SHA256SUMS or a Linux archive named for the exact release version")
+            "expected SHA256SUMS or a .tar.gz archive named for the exact release version")
 
     identity = workflow_uri(SIGNER_WORKFLOW)
     regular_file(artifact)

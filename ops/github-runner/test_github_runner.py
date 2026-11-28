@@ -58,12 +58,14 @@ class Dockerfile(unittest.TestCase):
         self.assertNotIn("NSH_CACHE", self.text)
         self.assertNotIn("registry.npmjs.org", (HERE / "compose.yaml").read_text())
 
-    def test_nsh_is_first_on_path_for_the_self_hosted_workflow(self):
-        # .github/workflows/self-hosted-ci.yml resolves `nsh` from PATH and checks its hash.
+    def test_nsh_is_first_on_path(self):
         self.assertIn("tar -xzf /tmp/nsh.tgz -C /opt", self.text)
         self.assertRegex(self.text, r"ENV PATH=/opt/nsh/bin:")
-        wf = (REPO / ".github/workflows/self-hosted-ci.yml").read_text(encoding="utf-8")
-        self.assertIn("runs-on: metro-ci-linux-x64", wf)
+
+    def test_no_workflow_routes_jobs_to_this_runner_any_more(self):
+        # Since 0.6.5 the desktop jobs run on metro-ci-linux-docker (ops/ci-hosts).
+        for wf in sorted((REPO / ".github/workflows").glob("*.yml")):
+            self.assertNotIn("metro-ci-linux-x64", wf.read_text(encoding="utf-8"), wf.name)
 
     def test_non_root_and_no_secrets(self):
         self.assertIn("USER 1001:1001", self.text)
