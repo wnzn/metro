@@ -122,6 +122,34 @@ metadata is ignored. The rules that follow:
   - a Basic-user (non-admin) token via `runas /trustlevel` when Windows allows
     it; otherwise that step is reported as SKIP
 
+## In-app updates (in the source, not released)
+
+The desktop app updates an MSI install itself (see
+`crates/connector/src/desktop/update/msi.rs` and `crates/desktop/src/msi.rs`):
+after the signed `SHA256SUMS` row verifies the downloaded MSI, **Restart now**
+backs up the stopped database, starts a copy of `Metro.exe` from
+`%LOCALAPPDATA%\Metro\Desktop\update\helper-<id>\` with `--update-helper <id>`,
+and exits. The helper verifies the exact MSI bytes again through a handle that
+stays open, runs `msiexec /i <msi> /passive /norestart REBOOT=ReallySuppress`
+with the remembered `INSTALLDIR`, `LOCALRUNNER` and `STARTMENUSHORTCUT`, and
+starts Metro again. The MSI needs nothing new for this: the same UpgradeCode,
+`RemoveExistingProducts` and the remembered values above already make it a
+per-user major upgrade in place.
+
+The journal (`update\msi-update.json`) records each phase. A start after a
+helper or msiexec died decides from Windows Installer's state (`_MSIExecute`,
+`Installer\InProgress`), the installed product version for the UpgradeCode
+(MSI API), the remembered version and folder, and `RELEASE.json` against
+`Metro.exe`; if they don't agree, Metro stops before opening the workspace and
+keeps the journal and the backup. With `/passive`, Windows Installer shows its
+own errors in a message box.
+
+Native tests (Windows CI only, they change the profile):
+`test-msi-update.ps1` with MSIs and a fixture release from `update_fixture.py`
+(e2e test builds; see that script's help). Scenarios are in
+`msi-update-scenarios.ps1`. `packaging/test_windows_msi_update.py` covers the
+fixtures and contracts on Linux.
+
 ## Known limits
 
 - The Visual C++ Redistributable (x64) is checked through its registry key,

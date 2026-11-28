@@ -173,6 +173,93 @@ jobs:
           path: ${{ runner.temp }}/fixtures/
           if-no-files-found: error
           retention-days: 3
+      # Previews only: ci.yml's windows-update-builds made the test launchers
+      # (never on a release run). MSIs A and B and a test release of B, for
+      # the `updates` job only; never part of the dist.
+      - if: steps.mode.outputs.mode == 'preview'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-update-e2e-builds
+          path: ${{ runner.temp }}/update-builds
+      - if: steps.mode.outputs.mode == 'preview'
+        name: In-app MSI update fixtures (test builds 1.0.0 and 1.0.1, test release of 1.0.1)
+        run: |
+          set -eu
+          m=packaging/windows-msi/build_msi.py
+          u=packaging/windows-msi/update_fixture.py
+          b="$RUNNER_TEMP/update-builds"
+          o="$RUNNER_TEMP/update-fixtures"
+          mkdir -p "$o/msi"
+          for v in 1.0.0 1.0.1; do
+            p="$(python3 -I "$u" payload --version "$v" --launcher "$b/launcher-$v.exe" --ui "$b/msi_update_ui.exe" \
+              --dest "$RUNNER_TEMP/update-payload-$v")"
+            python3 -I "$m" build --tools "$RUNNER_TEMP/msi-tools" --payload "$p" --version "$v" --preview \
+              --out "$o/msi/Metro-$v-windows-x64.unsigned-preview.msi"
+          done
+          python3 -I "$u" release --version 1.0.1 --msi "$o/msi/Metro-1.0.1-windows-x64.unsigned-preview.msi" \
+            --dest "$o/release"
+      - if: steps.mode.outputs.mode == 'preview'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-update-msi-fixtures
+          path: ${{ runner.temp }}/update-fixtures/
+          if-no-files-found: error
+          retention-days: 3
+
+  # Previews only: in-app updates on a fresh Windows VM with test builds and a
+  # loopback test release. The script/ZIP install (install, migrate, update,
+  # commit, rollback), then the per-user MSI (update, failure and retry,
+  # helper or msiexec killed; update and failure as a standard user).
+  # Uploads only logs.
+  updates:
+    if: needs.seed.outputs.mode == 'preview'
+    needs: seed
+    runs-on: windows-2025
+    permissions:
+      contents: read
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-update-e2e-builds
+          path: ${{ runner.temp }}/update-builds
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-update-msi-fixtures
+          path: ${{ runner.temp }}/update-fixtures
+      - name: Script install, in-app update, commit and rollback (packaging/windows_update_e2e.py)
+        id: script
+        timeout-minutes: 15
+        run: |
+          python -I -c "import sys; assert sys.version_info >= (3, 11), sys.version"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $b = "$env:RUNNER_TEMP\update-builds"
+          python -I packaging/windows_update_e2e.py --desktop "$b\launcher-1.0.0.exe" --ui-stub "$b\metro-ui-stub.exe" `
+            --log-dir "$env:RUNNER_TEMP\update-logs\script" --timeout 120
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # Independent of the script test: also run when it failed, so one red run reports both.
+      - name: MSI install, in-app update, failure and retry, helper killed (current and standard user)
+        if: ${{ !cancelled() && (steps.script.outcome == 'success' || steps.script.outcome == 'failure') }}
+        timeout-minutes: 45
+        run: |
+          $f = "$env:RUNNER_TEMP\update-fixtures"
+          & pwsh -NoProfile -NonInteractive -File (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows-msi\test-msi-update.ps1') `
+            -MsiA "$f\msi\Metro-1.0.0-windows-x64.unsigned-preview.msi" -MsiB "$f\msi\Metro-1.0.1-windows-x64.unsigned-preview.msi" `
+            -VersionA 1.0.0 -VersionB 1.0.1 -ReleaseRoot "$f\release" -LogDir "$env:RUNNER_TEMP\update-logs\msi" -StandardUser
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: windows-update-logs
+          path: ${{ runner.temp }}/update-logs/
+          if-no-files-found: ignore
+          retention-days: 7
 
   # Previews and unsigned releases: the unsigned build, checked and installed natively.
   # An unsigned release publishes exactly this job's dist-desktop-windows-x64.

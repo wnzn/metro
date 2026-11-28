@@ -32,6 +32,7 @@ use serde_json::{Value, json};
 
 pub mod apply;
 pub mod install;
+pub mod msi;
 
 pub use install::{InstallKind, Journal};
 
@@ -92,6 +93,9 @@ pub enum InstallFailure {
     InstallerBusy,
     StageVerificationFailed,
     BackupFailed,
+    // [msi lane] Windows Installer outcomes (never block a retry).
+    InstallerCancelled,
+    InstallerFailed,
 }
 
 impl LastUpdate {
@@ -276,12 +280,11 @@ impl UpdaterConfig {
         trial: Option<String>,
     ) -> Option<UpdaterConfig> {
         let own = own_version()?;
-        let channel = channel();
+        let (channel, test) = test_release();
         let kind = install::detect(install_dir, &own, channel, trial.as_deref());
         let dir = desktop_root.join("update");
         crate::desktop::store::prepare_private_dir(&dir).ok()?;
-        #[cfg(feature = "e2e-test-release")]
-        if let Some((source, verifier)) = metro_release::e2e::release_source() {
+        if let Some((source, verifier)) = test {
             return Some(UpdaterConfig {
                 dir,
                 install_dir: install_dir.to_path_buf(),
@@ -289,7 +292,7 @@ impl UpdaterConfig {
                 channel,
                 kind,
                 source,
-                verifier: Arc::from(verifier),
+                verifier,
                 trial,
                 ldd: PathBuf::from("ldd"),
                 trust: None,
@@ -312,6 +315,20 @@ impl UpdaterConfig {
             trust: Some(trust),
         })
     }
+}
+
+pub type TestRelease = (Source, Arc<dyn ReleaseVerifier>);
+
+/// This build's channel, and in an e2e test build (feature
+/// `e2e-test-release`, never in a release build) with
+/// `METRO_TEST_RELEASE_BASE` set, the loopback fixture source and test
+/// verifier (it then counts as a release build, like the server's).
+pub fn test_release() -> (Channel, Option<TestRelease>) {
+    #[cfg(feature = "e2e-test-release")]
+    if let Some((source, verifier)) = metro_release::e2e::release_source() {
+        return (channel(), Some((source, Arc::from(verifier))));
+    }
+    (channel(), None)
 }
 
 pub struct Updater {
@@ -368,28 +385,33 @@ fn blocked_stage(status: &Status, own: Version, target: Version) -> bool {
         .is_some_and(|last| last.blocks(own, target))
 }
 
-/// Script installs with migrated locks. MSI installs are manual here; an
-/// in-app MSI path (`update::msi`) would be added as its own arm.
+/// Linux and Windows script installs with migrated locks, and registered
+/// per-user MSI installs (`update::msi`).
 fn supports_managed_update(kind: &InstallKind) -> bool {
     match kind {
         InstallKind::LinuxInstaller { .. } | InstallKind::WindowsScript { .. } => {
             install::managed(kind)
         }
-        InstallKind::WindowsMsi { .. } => false,
+        // [msi lane] a registered per-user MSI install
+        InstallKind::WindowsMsi { .. } => true,
         InstallKind::Portable | InstallKind::Unsupported(_) => false,
     }
 }
 
 /// This build's version. In an e2e test build with the test release source
-/// active, the name of its `versions/<v>` folder, so one test binary can
-/// play several releases.
+/// active, the name of its `versions/<v>` folder (script installs), so one
+/// test binary can play several releases. Elsewhere (MSI) the built version.
 pub fn own_version() -> Option<Version> {
     #[cfg(feature = "e2e-test-release")]
     if metro_release::e2e::active()
         && let Some(v) = std::env::current_exe()
             .and_then(|e| e.canonicalize())
             .ok()
-            .and_then(|e| e.parent()?.file_name()?.to_str().and_then(Version::parse))
+            .and_then(|e| {
+                let dir = e.parent()?;
+                (dir.parent()?.file_name()? == "versions")
+                    .then(|| dir.file_name()?.to_str().and_then(Version::parse))?
+            })
     {
         return Some(v);
     }
@@ -651,7 +673,6 @@ impl Updater {
             {
                 Some("manual_migration_required")
             }
-            (_, InstallKind::WindowsMsi { .. }) => Some("manual_update_required"),
             _ => None,
         };
         let mut v = json!({
@@ -702,9 +723,6 @@ impl Updater {
         }
         if let Some(u) = &inner.status.last_update {
             v["last_update"] = serde_json::to_value(u).unwrap_or(Value::Null);
-        }
-        if matches!(self.cfg.kind, InstallKind::WindowsMsi { .. }) {
-            v["msi_note"] = "manual_update_required".into();
         }
         v
     }
@@ -1301,6 +1319,10 @@ impl Updater {
 
     /// `POST /v1/update/started`: the UI rendered (trial health signal).
     pub fn started(&self) -> bool {
+        // [msi lane] dispatch hook
+        if matches!(self.cfg.kind, InstallKind::WindowsMsi { .. }) {
+            return self.msi_started();
+        }
         let Some(id) = &self.cfg.trial else {
             return false;
         };

@@ -1177,6 +1177,24 @@ class WindowsInAppUpdateGuardTests(unittest.TestCase):
             self.assertIn(field, reader)
         self.assertIn("desktop-update.json", text)
 
+    def test_reader_fields_match_the_app_journal(self):
+        """The script reader's known fields are the Rust `Journal` fields a
+        script install can hold: `source_pid` is MSI-only and the app itself
+        rejects it in `<root>/.update.json`. The in-app MSI journal
+        (update/msi-update.json, `MsiJournal`) is not in the install root."""
+        import re
+        text = WINDOWS.read_text()
+        reader = text[text.index("function Read-UpdateJournal"):text.index("function Assert-NoInAppUpdate")]
+        known = re.search(r"\$known = @\(([^)]*)\)", reader).group(1)
+        ps = set(re.findall(r"'([a-z_]+)'", known))
+        rust = (HERE.parent / "crates/connector/src/desktop/update/install.rs").read_text()
+        body = rust[rust.index("pub struct Journal {"):]
+        body = body[:body.index("\n}\n")]
+        fields = set(re.findall(r"(?m)^\s*pub ([a-z_]+):", body))
+        self.assertIn("source_pid", fields)
+        self.assertIn("(msi || (phase != \"installing\" && self.source_pid.is_none()))", rust)
+        self.assertEqual(ps, fields - {"source_pid"})
+
 
 @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 (pwsh) is not installed")
 class PowerShellTests(unittest.TestCase):

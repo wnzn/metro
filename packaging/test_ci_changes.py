@@ -400,7 +400,11 @@ class WorkflowWiringTests(unittest.TestCase):
                    for name, job in self.jobs.items()}
         self.assertEqual({name: found for name, found in readers.items() if found},
                          {"rust": {"rust", "updates"}, "desktop": {"desktop"}, "containers": {"containers"},
-                          "packaging": {"packaging"}, "package-smoke": {"previews"}})
+                          "packaging": {"packaging"}, "package-smoke": {"previews"},
+                          "windows-update-builds": {"previews"}})
+        # The e2e update builds run exactly when package-smoke (their consumer) does.
+        self.assertEqual(self.jobs["windows-update-builds"]["if"], self.jobs["package-smoke"]["if"])
+        self.assertEqual(self.jobs["windows-update-builds"]["needs"], ["workflows", "release-policy"])
         for name in self.GATED:
             self.assertEqual(self.jobs[name]["needs"], ["workflows", "release-policy"], name)
         self.assertIn("needs.workflows.outputs.previews != 'false'", self.jobs["package-smoke"]["if"])

@@ -592,8 +592,11 @@ class ReleaseWorkflowTests(unittest.TestCase):
                     self.assertNotRegex(before, r"cargo (build|test|clippy)", name)
                     if file != "ci.yml":
                         self.assertEqual(step["if"], "${{ !inputs.release }}", name)
-        self.assertEqual(found, {"ci.yml": {"rust"},
+        self.assertEqual(found, {"ci.yml": {"rust", "windows-update-builds"},
                                  "release.yml": {"desktop-linux", "desktop-windows"}})
+        e2e, = [s for s in self.ci["jobs"]["windows-update-builds"]["steps"] if "rust-cache" in str(s.get("uses", ""))]
+        self.assertEqual(e2e["with"], {"key": "windows-update-e2e", "workspaces": ". -> target-e2e",
+                                       "save-if": main_only})
         keys = {name: self.release["jobs"][name]["steps"] for name in found["release.yml"]}
         self.assertEqual({name: next(s["with"]["key"] for s in steps if "rust-cache" in str(s.get("uses", "")))
                           for name, steps in keys.items()},
@@ -661,8 +664,52 @@ class ReleaseWorkflowTests(unittest.TestCase):
         })
         self.assertNotIn("continue-on-error", rust)
         self.assertEqual(uploads(rust), [])
+        # The native Windows update tests' builds: one step of their own job,
+        # own target dir, uploaded only as a non-dist artifact.
+        win = ci["jobs"]["windows-update-builds"]
+        step, = [s for s in win["steps"] if "e2e-test-release" in str(s)]
+        win["steps"].remove(step)
+        self.assertEqual(win["runs-on"], "windows-2025")
+        self.assertEqual(win["permissions"], {"contents": "read"})
+        self.assertEqual(set(step), {"name", "timeout-minutes", "run"})
+        self.assertIn("cargo build --offline --release --target x86_64-pc-windows-msvc --target-dir target-e2e "
+                      "-p metro-desktop `\n    --features e2e-test-release --bin metro-desktop "
+                      "--bin metro-ui-stub --example msi_update_ui\n", step["run"])
+        self.assertEqual(step["run"].count("cargo build"), 1)
+        self.assertIn("git checkout -- Cargo.toml Cargo.lock", step["run"])
+        self.assertEqual(uploads(win), ["windows-update-e2e-builds"])
+        upload, = [s for s in win["steps"] if "upload-artifact" in str(s.get("uses", ""))]
+        self.assertEqual(upload["with"]["path"], "${{ runner.temp }}/windows-update-e2e-builds/")
+        self.assertNotIn("target-e2e", str(upload))
+        self.assertEqual(self.ci["jobs"]["package-smoke"]["needs"], ["workflows", "release-policy", "windows-update-builds"])
+        self.assertNotIn("windows-update-builds", self.ci["jobs"]["release"]["needs"])
         for needle in E2E_RELEASE_WORKFLOW_MARKERS:
             self.assertNotIn(needle, yaml.safe_dump(ci))
+
+    def test_windows_update_tests_run_only_on_previews_and_ship_nothing(self):
+        dist = load("windows-distribution.yml")
+        seed, updates = dist["jobs"]["seed"], dist["jobs"]["updates"]
+        self.assertEqual(updates["if"], "needs.seed.outputs.mode == 'preview'")
+        self.assertEqual(updates["runs-on"], "windows-2025")
+        self.assertEqual(uploads(updates), ["windows-update-logs"])
+        self.assertEqual({d["name"] for d in downloads(updates)},
+                         {"windows-update-e2e-builds", "windows-update-msi-fixtures"})
+        # The seed job uses the test builds only in preview mode, and only for the update fixtures.
+        uses = [s for s in seed["steps"] if "update-builds" in str(s) or "update-fixtures" in str(s)]
+        self.assertEqual(len(uses), 3)
+        for s in uses:
+            self.assertEqual(s["if"], "steps.mode.outputs.mode == 'preview'")
+        self.assertIn("windows-update-msi-fixtures", uploads(seed))
+        for name, job in dist["jobs"].items():
+            for u in uploads(job):
+                if u.startswith("dist-"):
+                    self.assertNotIn("update", str([s for s in job["steps"] if "upload-artifact" in str(s.get("uses", ""))
+                                                    and s["with"]["name"] == u]), name)
+        text = steps_text(updates)
+        self.assertIn("packaging/windows_update_e2e.py", text)
+        self.assertIn("test-msi-update.ps1", text)
+        self.assertIn("-StandardUser", text)
+        self.assertNotIn("cargo", text)
 
     def test_signer_and_image_contracts_line_up(self):
         signer = (WF / "sign-release-assets.yml").read_text()

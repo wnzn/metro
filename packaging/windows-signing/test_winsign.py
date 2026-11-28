@@ -771,7 +771,7 @@ class Workflows(unittest.TestCase):
         for forbidden in ("environment:", "id-token", "self-hosted", "METRO_WINDOWS_SIGNING", "Invoke-MetroReleaseSigning",
                           "vars."):
             self.assertNotIn(forbidden, text)
-        self.assertEqual(set(jobs(text)), {"seed", "preview"})
+        self.assertEqual(set(jobs(text)), {"seed", "preview", "updates"})
         self.assertIn("if: needs.seed.outputs.mode == 'preview' || needs.seed.outputs.mode == 'unsigned-release'",
                       jobs(text)["preview"])
         self.assertIn("name: unsigned-desktop-windows-x64", jobs(text)["seed"])

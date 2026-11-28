@@ -403,6 +403,10 @@ fn getrandom_fill(b: &mut [u8]) -> Result<(), ()> {
 /// A journal that ended (committed/failed) since the last start, as
 /// `last_update`; it is removed. Cleans leftovers of finished updates.
 pub fn take_finished(kind: &InstallKind, update_dir: &Path, own: &Version) -> Option<LastUpdate> {
+    // [msi lane] dispatch hook
+    if matches!(kind, InstallKind::WindowsMsi { .. }) {
+        return super::msi::take_finished(update_dir, own);
+    }
     let own_s = own.to_string();
     let last = |j: &Journal, detail: Option<String>| LastUpdate {
         from: j.from.clone(),
@@ -450,6 +454,10 @@ fn finished_for(j: &Journal, own: &str) -> bool {
 /// Drop a staged update that is no longer offered (design 3.5: "otherwise
 /// it is deleted"): its version folder (never the current one) and journal.
 pub fn discard_staged(kind: &InstallKind, update_dir: &Path) {
+    // [msi lane] dispatch hook
+    if matches!(kind, InstallKind::WindowsMsi { .. }) {
+        return super::msi::discard_staged(update_dir);
+    }
     let Some(path) = journal_path(kind, update_dir) else {
         return;
     };
@@ -497,6 +505,10 @@ pub fn gate_legacy_msi(update_dir: &Path) -> io::Result<()> {
 
 /// A staged update waiting for its restart.
 pub fn staged(kind: &InstallKind, update_dir: &Path) -> Option<(Version, String)> {
+    // [msi lane] dispatch hook
+    if matches!(kind, InstallKind::WindowsMsi { .. }) {
+        return super::msi::staged(update_dir);
+    }
     let j = read_journal(&journal_path(kind, update_dir)?)?;
     if j.phase != "staged" {
         return None;
@@ -827,7 +839,7 @@ impl Drop for Lock {
     }
 }
 
-fn plain_dir(path: &Path) -> bool {
+pub(super) fn plain_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| {
         #[cfg(windows)]
         {
@@ -905,6 +917,10 @@ pub fn stage(
     let target = &release.version;
     if target <= own {
         return Err(stage_err("not_latest"));
+    }
+    // [msi lane] dispatch hook
+    if let InstallKind::WindowsMsi { dir } = kind {
+        return super::msi::stage(dir, update_dir, own, release, download);
     }
     let path = journal_path(kind, update_dir).ok_or_else(|| stage_err("not_in_app"))?;
     let locked_root = lock_root(kind, update_dir);
@@ -1216,7 +1232,7 @@ fn read_snapshot(snap: &Path, j: &Journal, expected: &str) -> io::Result<Snapsho
     Ok(record)
 }
 
-fn remove_owned_dir(path: &Path) -> io::Result<()> {
+pub(super) fn remove_owned_dir(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(_) if plain_dir(path) => fs::remove_dir_all(path)?,
         Ok(_) => return Err(io::ErrorKind::InvalidData.into()),
@@ -1226,7 +1242,7 @@ fn remove_owned_dir(path: &Path) -> io::Result<()> {
     metro_release::sync_parent(path)
 }
 
-fn clean_backup(update_dir: &Path, j: &Journal) -> io::Result<()> {
+pub(super) fn clean_backup(update_dir: &Path, j: &Journal) -> io::Result<()> {
     if j.version == 2 {
         let (tmp, published) = backup_paths(update_dir, j)?;
         remove_owned_dir(&tmp)?;
